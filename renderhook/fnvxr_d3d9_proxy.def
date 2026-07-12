@@ -1,0 +1,19 @@
+LIBRARY d3d9
+EXPORTS
+    D3DPERF_BeginEvent=_FNVXR_D3DPERF_BeginEvent@8
+    D3DPERF_EndEvent=_FNVXR_D3DPERF_EndEvent@0
+    D3DPERF_GetStatus=_FNVXR_D3DPERF_GetStatus@0
+    D3DPERF_QueryRepeatFrame=_FNVXR_D3DPERF_QueryRepeatFrame@0
+    D3DPERF_SetMarker=_FNVXR_D3DPERF_SetMarker@8
+    D3DPERF_SetOptions=_FNVXR_D3DPERF_SetOptions@4
+    D3DPERF_SetRegion=_FNVXR_D3DPERF_SetRegion@8
+    DebugSetLevel=_FNVXR_DebugSetLevel@4
+    DebugSetMute=_FNVXR_DebugSetMute@0
+    Direct3D9EnableMaximizedWindowedModeShim=_FNVXR_Direct3D9EnableMaximizedWindowedModeShim@4
+    Direct3DCreate9=_FNVXR_Direct3DCreate9@4
+    Direct3DCreate9Ex=_FNVXR_Direct3DCreate9Ex@8
+    Direct3DCreate9On12=_FNVXR_Direct3DCreate9On12@16
+    Direct3DCreate9On12Ex=_FNVXR_Direct3DCreate9On12Ex@16
+    Direct3DShaderValidatorCreate9=_FNVXR_Direct3DShaderValidatorCreate9@0
+    PSGPError=_FNVXR_PSGPError@0
+    PSGPSampleTexture=_FNVXR_PSGPSampleTexture@0

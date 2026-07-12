@@ -1,0 +1,13 @@
+LIBRARY xinput1_3
+EXPORTS
+    XInputGetState=_FNVXR_XInputGetState@8 @2
+    XInputSetState=_FNVXR_XInputSetState@8 @3
+    XInputGetCapabilities=_FNVXR_XInputGetCapabilities@12 @4
+    XInputEnable=_FNVXR_XInputEnable@4 @5
+    XInputGetDSoundAudioDeviceGuids=_FNVXR_XInputGetDSoundAudioDeviceGuids@12 @6
+    XInputGetBatteryInformation=_FNVXR_XInputGetBatteryInformation@12 @7
+    XInputGetKeystroke=_FNVXR_XInputGetKeystroke@12 @8
+    XInputGetStateEx=_FNVXR_XInputGetStateEx@8 @100 NONAME
+    XInputWaitForGuideButton=_FNVXR_XInputWaitForGuideButton@12 @101 NONAME
+    XInputCancelGuideButtonWait=_FNVXR_XInputCancelGuideButtonWait@4 @102 NONAME
+    XInputPowerOffController=_FNVXR_XInputPowerOffController@4 @103 NONAME

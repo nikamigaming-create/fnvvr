@@ -1,0 +1,8 @@
+LIBRARY dinput8
+EXPORTS
+    DirectInput8Create=_FNVXR_DirectInput8Create@20 @1
+    DllCanUnloadNow=_FNVXR_DllCanUnloadNow@0 @2
+    DllGetClassObject=_FNVXR_DllGetClassObject@12 @3
+    DllRegisterServer=_FNVXR_DllRegisterServer@0 @4
+    DllUnregisterServer=_FNVXR_DllUnregisterServer@0 @5
+    GetdfDIJoystick=_FNVXR_GetdfDIJoystick@4 @6
