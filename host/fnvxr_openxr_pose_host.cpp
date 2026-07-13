@@ -277,10 +277,23 @@ struct Renderer
     LONG stereoGameFrameSequence = 0;
     LONG stereoGamePoseSequence = 0;
     XrTime stereoGameRenderedDisplayTime = 0;
+    std::uint32_t stereoReferenceSpaceGeneration = 0;
+    std::uint32_t stereoProducerEpoch = 0;
+    std::array<XrView, 2> stereoSourceViews {
+        XrView { XR_TYPE_VIEW },
+        XrView { XR_TYPE_VIEW }
+    };
     uint64_t stereoStableFrameCount = 0;
     bool hasCachedSceneFrame = false;
     uint64_t lastStereoFrameUpdated = 0;
     uint64_t stereoFrameMisses = 0;
+    uint64_t stereoTransientReadMisses = 0;
+    std::chrono::steady_clock::time_point stereoAcceptedAt {};
+    size_t stereoPixelSamples = 0;
+    size_t stereoNonBlackSamples = 0;
+    size_t stereoMeaningfulDifferentSamples = 0;
+    std::uint32_t stereoLeftHash = 0;
+    std::uint32_t stereoRightHash = 0;
 };
 
 constexpr DWORD SharedVideoMagic = fnvxr::shared::D3D9FrameSharedMagic;
@@ -302,6 +315,8 @@ struct StereoPixelStats
 
 struct HostSharedBridge
 {
+    HANDLE inputProducerMutex = nullptr;
+    bool ownsInputProducerMutex = false;
     HANDLE xinputMapping = nullptr;
     fnvxr::shared::SharedXInputState* xinputState = nullptr;
     HANDLE dinputMapping = nullptr;
@@ -312,6 +327,11 @@ struct HostSharedBridge
     fnvxr::shared::SharedPlayerState* playerState = nullptr;
     std::uint32_t xinputPacket = 0;
     std::uint32_t dinputMouseClickPacket = 0;
+    std::int32_t dinputHeadLookX = 0;
+    std::int32_t dinputHeadLookY = 0;
+    std::int32_t dinputGyroLookX = 0;
+    std::int32_t dinputGyroLookY = 0;
+    std::uint32_t producerEpoch = 0;
 };
 
 constexpr LONG SharedPointerWidth = 1280;
@@ -1861,19 +1881,34 @@ StereoPixelStats analyzeStereoPixels(const std::array<std::vector<std::uint32_t>
     const size_t stride = static_cast<size_t>(std::max(1, envInt("FNVXR_STEREO_CONTENT_SAMPLE_STRIDE", 97)));
     const std::uint32_t blackThreshold =
         static_cast<std::uint32_t>(std::max(0, envInt("FNVXR_STEREO_CONTENT_BLACK_THRESHOLD", 8)));
+    const int meaningfulRgbDelta = std::max(1, envInt("FNVXR_STEREO_MIN_RGB_DELTA", 4));
     for (size_t i = 0; i < pixelCount; i += stride)
     {
-        const std::uint32_t left = eyePixels[0][i];
-        const std::uint32_t right = eyePixels[1][i];
+        const std::uint32_t left = eyePixels[0][i] & 0x00ffffffu;
+        const std::uint32_t right = eyePixels[1][i] & 0x00ffffffu;
         stats.leftHash ^= left;
         stats.leftHash *= 16777619u;
         stats.rightHash ^= right;
         stats.rightHash *= 16777619u;
         ++stats.samples;
-        if ((left & 0x00ffffffu) > blackThreshold || (right & 0x00ffffffu) > blackThreshold)
+        const int leftB = static_cast<int>(left & 0xffu);
+        const int leftG = static_cast<int>((left >> 8) & 0xffu);
+        const int leftR = static_cast<int>((left >> 16) & 0xffu);
+        const int rightB = static_cast<int>(right & 0xffu);
+        const int rightG = static_cast<int>((right >> 8) & 0xffu);
+        const int rightR = static_cast<int>((right >> 16) & 0xffu);
+        if (std::max({ leftR, leftG, leftB, rightR, rightG, rightB })
+            > static_cast<int>(blackThreshold))
+        {
             ++stats.nonBlackSamples;
-        if (left != right)
+        }
+        if (std::max({
+                std::abs(leftR - rightR),
+                std::abs(leftG - rightG),
+                std::abs(leftB - rightB) }) >= meaningfulRgbDelta)
+        {
             ++stats.differentSamples;
+        }
     }
     return stats;
 }
@@ -1892,7 +1927,12 @@ bool isMostlyBlackFrame(const std::vector<std::uint32_t>& pixels)
     size_t nonBlackSamples = 0;
     for (size_t i = 0; i < pixels.size(); i += stride)
     {
-        if ((pixels[i] & 0x00ffffffu) > blackThreshold)
+        const std::uint32_t pixel = pixels[i] & 0x00ffffffu;
+        const std::uint32_t maxChannel = std::max({
+            pixel & 0xffu,
+            (pixel >> 8) & 0xffu,
+            (pixel >> 16) & 0xffu });
+        if (maxChannel > blackThreshold)
             ++nonBlackSamples;
     }
     return nonBlackSamples < minNonBlackSamples;
@@ -1913,7 +1953,10 @@ bool readSharedD3D9StereoFrame(
     sequenceOut = 0;
     if (!renderer.sharedStereoView)
     {
-        renderer.sharedStereoMapping = OpenFileMappingA(FILE_MAP_READ, FALSE, "Local\\FNVXR_D3D9_StereoFrame_v1");
+        renderer.sharedStereoMapping = OpenFileMappingA(
+            FILE_MAP_READ,
+            FALSE,
+            fnvxr::shared::D3D9StereoFrameSharedMappingName);
         if (!renderer.sharedStereoMapping)
             return false;
 
@@ -1930,17 +1973,25 @@ bool readSharedD3D9StereoFrame(
     }
 
     const auto* header = reinterpret_cast<const SharedStereoHeader*>(renderer.sharedStereoView);
-    if (header->magic != SharedStereoMagic || header->writing)
+    constexpr std::uint32_t mappingSize =
+        sizeof(SharedStereoHeader) + SharedVideoMaxWidth * SharedVideoMaxHeight * 4 * 2;
+    if (header->magic != SharedStereoMagic
+        || header->version != fnvxr::shared::D3D9StereoFrameSharedVersion
+        || header->headerBytes != sizeof(SharedStereoHeader)
+        || header->leftPayloadOffset != sizeof(SharedStereoHeader)
+        || header->totalMappingBytes != mappingSize
+        || header->writing)
         return false;
 
     const LONG sequenceBefore = header->sequence;
     if (sequenceBefore == renderer.lastSharedStereoSequence)
         return false;
     const bool requireNativeStereo = envEnabled("FNVXR_REQUIRE_NATIVE_STEREO", true);
-    const bool nativeSameFrame =
-        header->producerMode == static_cast<LONG>(fnvxr::shared::StereoProducerNativeSameFrame)
+    const bool coherentSameTickProducer =
+        (header->producerMode == static_cast<LONG>(fnvxr::shared::StereoProducerNativeSameFrame)
+            || header->producerMode == static_cast<LONG>(fnvxr::shared::StereoProducerSingleTraversal))
         && header->renderPairSequence > 0;
-    if (requireNativeStereo && !nativeSameFrame)
+    if (requireNativeStereo && !coherentSameTickProducer)
         return false;
     separated = header->separated != 0;
     worldCandidate = header->worldCandidate != 0;
@@ -1954,6 +2005,47 @@ bool readSharedD3D9StereoFrame(
     const XrTime renderedDisplayTime = static_cast<XrTime>(header->renderedDisplayTime);
     if (renderedDisplayTime <= 0)
         return false;
+    const std::uint32_t sourceReferenceGeneration = header->referenceSpaceGeneration;
+    const std::uint32_t sourceProducerEpoch = header->producerEpoch;
+    if (sourceReferenceGeneration == 0 || sourceProducerEpoch == 0)
+        return false;
+
+    std::array<XrView, 2> sourceViews {
+        XrView { XR_TYPE_VIEW },
+        XrView { XR_TYPE_VIEW }
+    };
+    const float* sourceRot[2] { header->leftEyeRot, header->rightEyeRot };
+    const float* sourcePos[2] { header->leftEyePos, header->rightEyePos };
+    const float* sourceFov[2] { header->leftFov, header->rightFov };
+    for (int eye = 0; eye < 2; ++eye)
+    {
+        const float quatLengthSquared = sourceRot[eye][0] * sourceRot[eye][0]
+            + sourceRot[eye][1] * sourceRot[eye][1]
+            + sourceRot[eye][2] * sourceRot[eye][2]
+            + sourceRot[eye][3] * sourceRot[eye][3];
+        if (!std::isfinite(quatLengthSquared)
+            || quatLengthSquared < 0.25f
+            || quatLengthSquared > 4.0f)
+        {
+            return false;
+        }
+        for (int component = 0; component < 3; ++component)
+        {
+            if (!std::isfinite(sourcePos[eye][component]))
+                return false;
+        }
+        for (int component = 0; component < 4; ++component)
+        {
+            if (!std::isfinite(sourceFov[eye][component]))
+                return false;
+        }
+        sourceViews[eye].pose.orientation = {
+            sourceRot[eye][0], sourceRot[eye][1], sourceRot[eye][2], sourceRot[eye][3] };
+        sourceViews[eye].pose.position = {
+            sourcePos[eye][0], sourcePos[eye][1], sourcePos[eye][2] };
+        sourceViews[eye].fov = {
+            sourceFov[eye][0], sourceFov[eye][1], sourceFov[eye][2], sourceFov[eye][3] };
+    }
 
     const int sourceWidth = header->width;
     const int sourceHeight = header->height;
@@ -1967,8 +2059,15 @@ bool readSharedD3D9StereoFrame(
         return false;
     }
 
-    const auto* leftPixels = renderer.sharedStereoView + sizeof(SharedStereoHeader);
-    const auto* rightPixels = leftPixels + static_cast<size_t>(sourcePitch) * sourceHeight;
+    const std::uint32_t requiredRightOffset =
+        static_cast<std::uint32_t>(sizeof(SharedStereoHeader)
+            + static_cast<std::size_t>(sourcePitch) * sourceHeight);
+    const std::uint64_t payloadEnd = static_cast<std::uint64_t>(header->rightPayloadOffset)
+        + static_cast<std::uint64_t>(sourcePitch) * sourceHeight;
+    if (header->rightPayloadOffset != requiredRightOffset || payloadEnd > header->totalMappingBytes)
+        return false;
+    const auto* leftPixels = renderer.sharedStereoView + header->leftPayloadOffset;
+    const auto* rightPixels = renderer.sharedStereoView + header->rightPayloadOffset;
     copySharedPlaneToTexturePixels(
         leftPixels,
         sourceWidth,
@@ -1990,6 +2089,9 @@ bool readSharedD3D9StereoFrame(
         return false;
 
     renderer.lastSharedStereoSequence = sequenceBefore;
+    renderer.stereoReferenceSpaceGeneration = sourceReferenceGeneration;
+    renderer.stereoProducerEpoch = sourceProducerEpoch;
+    renderer.stereoSourceViews = sourceViews;
     poseSequenceOut = poseSequence;
     renderedDisplayTimeOut = renderedDisplayTime;
     sequenceOut = sequenceBefore;
@@ -1997,11 +2099,21 @@ bool readSharedD3D9StereoFrame(
     return true;
 }
 
-bool readSharedStereoState(Renderer& renderer, bool& uiActive, bool& worldReady)
+bool readSharedStereoState(
+    Renderer& renderer,
+    bool& uiActive,
+    bool& worldReady,
+    LONG* sequenceOut = nullptr)
 {
+    if (sequenceOut)
+        *sequenceOut = 0;
+
     if (!renderer.sharedStereoView)
     {
-        renderer.sharedStereoMapping = OpenFileMappingA(FILE_MAP_READ, FALSE, "Local\\FNVXR_D3D9_StereoFrame_v1");
+        renderer.sharedStereoMapping = OpenFileMappingA(
+            FILE_MAP_READ,
+            FALSE,
+            fnvxr::shared::D3D9StereoFrameSharedMappingName);
         if (!renderer.sharedStereoMapping)
             return false;
 
@@ -2018,7 +2130,14 @@ bool readSharedStereoState(Renderer& renderer, bool& uiActive, bool& worldReady)
     }
 
     const auto* header = reinterpret_cast<const SharedStereoHeader*>(renderer.sharedStereoView);
-    if (header->magic != SharedStereoMagic || header->writing)
+    constexpr std::uint32_t mappingSize =
+        sizeof(SharedStereoHeader) + SharedVideoMaxWidth * SharedVideoMaxHeight * 4 * 2;
+    if (header->magic != SharedStereoMagic
+        || header->version != fnvxr::shared::D3D9StereoFrameSharedVersion
+        || header->headerBytes != sizeof(SharedStereoHeader)
+        || header->leftPayloadOffset != sizeof(SharedStereoHeader)
+        || header->totalMappingBytes != mappingSize
+        || header->writing)
         return false;
 
     const LONG sequenceBefore = header->sequence;
@@ -2031,14 +2150,19 @@ bool readSharedStereoState(Renderer& renderer, bool& uiActive, bool& worldReady)
     const bool stereoUiActive = header->uiActive != 0;
     const bool poseValid = header->poseValid != 0;
     const bool poseTimed = header->renderedDisplayTime > 0;
-    const bool nativeSameFrame =
-        header->producerMode == static_cast<LONG>(fnvxr::shared::StereoProducerNativeSameFrame)
+    const bool coherentSameTickProducer =
+        (header->producerMode == static_cast<LONG>(fnvxr::shared::StereoProducerNativeSameFrame)
+            || header->producerMode == static_cast<LONG>(fnvxr::shared::StereoProducerSingleTraversal))
         && header->renderPairSequence > 0;
-    const bool acceptedProducer = !envEnabled("FNVXR_REQUIRE_NATIVE_STEREO", true) || nativeSameFrame;
+    const bool acceptedProducer =
+        !envEnabled("FNVXR_REQUIRE_NATIVE_STEREO", true) || coherentSameTickProducer;
     MemoryBarrier();
     const LONG sequenceAfter = header->sequence;
     if (sequenceBefore != sequenceAfter || header->writing)
         return false;
+
+    if (sequenceOut)
+        *sequenceOut = sequenceAfter;
 
     uiActive = stereoUiActive;
     worldReady =
@@ -2138,21 +2262,43 @@ std::int16_t thumbValue(float value)
 
 bool initHostSharedBridge(HostSharedBridge& bridge)
 {
+    bridge.producerEpoch = static_cast<std::uint32_t>(
+        GetTickCount64() ^ (static_cast<std::uint64_t>(GetCurrentProcessId()) << 16));
+    if (bridge.producerEpoch == 0)
+        bridge.producerEpoch = 1;
+    bridge.inputProducerMutex = CreateMutexA(
+        nullptr,
+        TRUE,
+        fnvxr::shared::InputCoreProducerMutexName);
+    if (!bridge.inputProducerMutex)
+        return false;
+    if (GetLastError() == ERROR_ALREADY_EXISTS)
+    {
+        const DWORD waitResult = WaitForSingleObject(bridge.inputProducerMutex, 0);
+        if (waitResult != WAIT_OBJECT_0 && waitResult != WAIT_ABANDONED)
+        {
+            CloseHandle(bridge.inputProducerMutex);
+            bridge.inputProducerMutex = nullptr;
+            return false;
+        }
+    }
+    bridge.ownsInputProducerMutex = true;
+
     bool xinputExisted = false;
     bool dinputExisted = false;
     bool vrPoseExisted = false;
     bool playerExisted = false;
     bridge.xinputState = mapOrCreateSharedState<fnvxr::shared::SharedXInputState>(
         bridge.xinputMapping,
-        "Local\\FNVXR_XInput_State",
+        fnvxr::shared::XInputSharedMappingName,
         xinputExisted);
     bridge.dinputState = mapOrCreateSharedState<fnvxr::shared::SharedDInputState>(
         bridge.dinputMapping,
-        "Local\\FNVXR_DInput_State",
+        fnvxr::shared::DInputSharedMappingName,
         dinputExisted);
     bridge.vrPoseState = mapOrCreateSharedState<fnvxr::shared::SharedVrPoseState>(
         bridge.vrPoseMapping,
-        "Local\\FNVXR_VR_Pose_State",
+        fnvxr::shared::VrPoseSharedMappingName,
         vrPoseExisted);
     bridge.playerState = mapOrCreateSharedState<fnvxr::shared::SharedPlayerState>(
         bridge.playerMapping,
@@ -2171,11 +2317,28 @@ bool initHostSharedBridge(HostSharedBridge& bridge)
         bridge.xinputState->magic = fnvxr::shared::XInputSharedMagic;
         bridge.xinputState->version = fnvxr::shared::XInputSharedVersion;
     }
-    bridge.xinputState->connected = 1;
-    bridge.xinputState->reserved[fnvxr::shared::XInputReservedRetailConsumed] = 0;
-    bridge.xinputState->reserved[fnvxr::shared::XInputReservedAutoRun] = 0;
-    bridge.xinputState->reserved[fnvxr::shared::XInputReservedMovementMode] = 0;
-    bridge.xinputPacket = bridge.xinputState->packet;
+    else if ((bridge.xinputState->sequence & 1) != 0)
+    {
+        // The named producer lease proves no live host owns this abandoned
+        // write. Keep it odd while replacing every producer field with a
+        // neutral payload, then publish the repaired frame once.
+        bridge.xinputState->magic = fnvxr::shared::XInputSharedMagic;
+        bridge.xinputState->version = fnvxr::shared::XInputSharedVersion;
+        bridge.xinputState->packet = 0;
+        bridge.xinputState->buttons = 0;
+        bridge.xinputState->leftTrigger = 0;
+        bridge.xinputState->rightTrigger = 0;
+        bridge.xinputState->leftThumbX = 0;
+        bridge.xinputState->leftThumbY = 0;
+        bridge.xinputState->rightThumbX = 0;
+        bridge.xinputState->rightThumbY = 0;
+        bridge.xinputState->connected = 0;
+        fnvxr::shared::endSequencedSharedWrite(bridge.xinputState->sequence);
+    }
+    fnvxr::shared::SharedXInputState xinputSnapshot {};
+    if (!fnvxr::shared::readSequencedSharedSnapshot(bridge.xinputState, xinputSnapshot, 1024))
+        return false;
+    bridge.xinputPacket = xinputSnapshot.packet;
 
     const bool dinputValid = dinputExisted
         && bridge.dinputState->magic == fnvxr::shared::DInputSharedMagic
@@ -2186,12 +2349,53 @@ bool initHostSharedBridge(HostSharedBridge& bridge)
         bridge.dinputState->magic = fnvxr::shared::DInputSharedMagic;
         bridge.dinputState->version = fnvxr::shared::DInputSharedVersion;
     }
-    bridge.dinputMouseClickPacket = bridge.dinputState->mouseClickPacket;
-    bridge.dinputState->gyroLookActive = 0;
-    bridge.dinputState->gyroLookX = 0;
-    bridge.dinputState->gyroLookY = 0;
-    bridge.dinputState->gameplayFlags = 0;
-    bridge.dinputState->aimTrigger = 0;
+    else if ((bridge.dinputState->sequence & 1) != 0)
+    {
+        bridge.dinputState->magic = fnvxr::shared::DInputSharedMagic;
+        bridge.dinputState->version = fnvxr::shared::DInputSharedVersion;
+        bridge.dinputState->frame = 0;
+        bridge.dinputState->clientX = 0;
+        bridge.dinputState->clientY = 0;
+        bridge.dinputState->pointerActive = 0;
+        bridge.dinputState->mouseClickPacket = 0;
+        // keyboardAcceptPacket is an independent plugin-owned atomic mailbox.
+        bridge.dinputState->menuInputActive = 0;
+        bridge.dinputState->gameplayControlsActive = 0;
+        bridge.dinputState->leftStickX = 0;
+        bridge.dinputState->leftStickY = 0;
+        bridge.dinputState->rightStickX = 0;
+        bridge.dinputState->rightStickY = 0;
+        bridge.dinputState->headLookActive = 0;
+        bridge.dinputState->headLookX = 0;
+        bridge.dinputState->headLookY = 0;
+        bridge.dinputState->gyroLookActive = 0;
+        bridge.dinputState->gyroLookX = 0;
+        bridge.dinputState->gyroLookY = 0;
+        bridge.dinputState->leftGrip = 0;
+        bridge.dinputState->rightGrip = 0;
+        bridge.dinputState->gameplayFlags = 0;
+        bridge.dinputState->aimTrigger = 0;
+        fnvxr::shared::endSequencedSharedWrite(bridge.dinputState->sequence);
+    }
+    fnvxr::shared::SharedDInputState dinputSnapshot {};
+    if (!fnvxr::shared::readSequencedSharedSnapshot(bridge.dinputState, dinputSnapshot, 1024))
+        return false;
+    bridge.dinputMouseClickPacket = dinputSnapshot.mouseClickPacket;
+    bridge.dinputHeadLookX = dinputSnapshot.headLookX;
+    bridge.dinputHeadLookY = dinputSnapshot.headLookY;
+    bridge.dinputGyroLookX = dinputSnapshot.gyroLookX;
+    bridge.dinputGyroLookY = dinputSnapshot.gyroLookY;
+    if (fnvxr::shared::beginSequencedSharedWrite(bridge.dinputState->sequence))
+    {
+        bridge.dinputState->headLookActive = 0;
+        bridge.dinputState->gyroLookActive = 0;
+        bridge.dinputState->pointerActive = 0;
+        bridge.dinputState->menuInputActive = 0;
+        bridge.dinputState->gameplayControlsActive = 0;
+        bridge.dinputState->gameplayFlags = 0;
+        bridge.dinputState->aimTrigger = 0;
+        fnvxr::shared::endSequencedSharedWrite(bridge.dinputState->sequence);
+    }
 
     const bool vrPoseValid = vrPoseExisted
         && bridge.vrPoseState->magic == fnvxr::shared::VrPoseSharedMagic
@@ -2204,9 +2408,39 @@ bool initHostSharedBridge(HostSharedBridge& bridge)
         bridge.vrPoseState->hmdRot[3] = 1.0f;
         bridge.vrPoseState->leftRot[3] = 1.0f;
         bridge.vrPoseState->rightRot[3] = 1.0f;
+        bridge.vrPoseState->leftAimRot[3] = 1.0f;
+        bridge.vrPoseState->rightAimRot[3] = 1.0f;
         bridge.vrPoseState->leftEyeRot[3] = 1.0f;
         bridge.vrPoseState->rightEyeRot[3] = 1.0f;
     }
+    else if ((bridge.vrPoseState->sequence & 1) != 0)
+    {
+        // The producer mutex proves this odd sequence was abandoned by an old
+        // host. Finish that transaction with a completely neutral, untracked
+        // pose so consumers can recover instead of spinning on it forever.
+        bridge.vrPoseState->magic = fnvxr::shared::VrPoseSharedMagic;
+        bridge.vrPoseState->version = fnvxr::shared::VrPoseSharedVersion;
+        bridge.vrPoseState->frame = 0;
+        bridge.vrPoseState->predictedDisplayTime = 0;
+        bridge.vrPoseState->trackingFlags = 0;
+        bridge.vrPoseState->referenceSpaceGeneration = 0;
+        bridge.vrPoseState->producerEpoch = bridge.producerEpoch;
+        fnvxr::shared::endSequencedSharedWrite(bridge.vrPoseState->sequence);
+    }
+    // The producer lease belongs to this process now. Always replace any
+    // abandoned even payload with a neutral record carrying the new epoch
+    // before bridge-ready is announced; otherwise a consumer can briefly act
+    // on the previous host's still-tracked pose.
+    if (!fnvxr::shared::beginSequencedSharedWrite(bridge.vrPoseState->sequence))
+        return false;
+    bridge.vrPoseState->magic = fnvxr::shared::VrPoseSharedMagic;
+    bridge.vrPoseState->version = fnvxr::shared::VrPoseSharedVersion;
+    bridge.vrPoseState->frame = 0;
+    bridge.vrPoseState->predictedDisplayTime = 0;
+    bridge.vrPoseState->trackingFlags = 0;
+    bridge.vrPoseState->referenceSpaceGeneration = 0;
+    bridge.vrPoseState->producerEpoch = bridge.producerEpoch;
+    fnvxr::shared::endSequencedSharedWrite(bridge.vrPoseState->sequence);
 
     const bool playerValid = playerExisted
         && bridge.playerState->magic == fnvxr::shared::PlayerSharedMagic
@@ -2220,31 +2454,44 @@ bool initHostSharedBridge(HostSharedBridge& bridge)
     return true;
 }
 
-bool sharedPlayerWeaponOut(const HostSharedBridge& bridge)
+bool readSharedPlayerState(
+    const HostSharedBridge& bridge,
+    fnvxr::shared::SharedPlayerState& snapshot)
 {
     const auto* state = bridge.playerState;
     if (!state)
         return false;
 
-    const LONG sequenceBefore = state->sequence;
-    if (sequenceBefore & 1)
-        return false;
-
-    MemoryBarrier();
-    fnvxr::shared::SharedPlayerState snapshot {};
-    std::memcpy(&snapshot, state, sizeof(snapshot));
-    MemoryBarrier();
-
-    const LONG sequenceAfter = state->sequence;
-    if (sequenceBefore != sequenceAfter || (sequenceAfter & 1))
-        return false;
-    if (snapshot.magic != fnvxr::shared::PlayerSharedMagic
-        || snapshot.version != fnvxr::shared::PlayerSharedVersion)
+    for (int attempt = 0; attempt < 4; ++attempt)
     {
-        return false;
-    }
+        const LONG sequenceBefore = state->sequence;
+        if (sequenceBefore & 1)
+        {
+            YieldProcessor();
+            continue;
+        }
 
-    return (snapshot.flags & fnvxr::shared::PlayerSharedFlagWeaponOut) != 0;
+        MemoryBarrier();
+        fnvxr::shared::SharedPlayerState candidate {};
+        std::memcpy(&candidate, state, sizeof(candidate));
+        MemoryBarrier();
+
+        const LONG sequenceAfter = state->sequence;
+        if (sequenceBefore != sequenceAfter || (sequenceAfter & 1))
+        {
+            YieldProcessor();
+            continue;
+        }
+        if (candidate.magic != fnvxr::shared::PlayerSharedMagic
+            || candidate.version != fnvxr::shared::PlayerSharedVersion)
+        {
+            return false;
+        }
+
+        snapshot = candidate;
+        return true;
+    }
+    return false;
 }
 
 void writePoseToShared(const XrPosef& pose, float rot[4], float pos[3])
@@ -2268,6 +2515,51 @@ void writeFovToShared(const XrFovf& fov, float out[4])
 
 void closeHostSharedBridge(HostSharedBridge& bridge)
 {
+    if (bridge.xinputState
+        && fnvxr::shared::beginSequencedSharedWrite(bridge.xinputState->sequence))
+    {
+        bridge.xinputState->magic = fnvxr::shared::XInputSharedMagic;
+        bridge.xinputState->version = fnvxr::shared::XInputSharedVersion;
+        bridge.xinputState->packet = ++bridge.xinputPacket;
+        bridge.xinputState->buttons = 0;
+        bridge.xinputState->leftTrigger = 0;
+        bridge.xinputState->rightTrigger = 0;
+        bridge.xinputState->leftThumbX = 0;
+        bridge.xinputState->leftThumbY = 0;
+        bridge.xinputState->rightThumbX = 0;
+        bridge.xinputState->rightThumbY = 0;
+        bridge.xinputState->connected = 0;
+        fnvxr::shared::endSequencedSharedWrite(bridge.xinputState->sequence);
+    }
+    if (bridge.dinputState
+        && fnvxr::shared::beginSequencedSharedWrite(bridge.dinputState->sequence))
+    {
+        ++bridge.dinputState->frame;
+        bridge.dinputState->clientX = 0;
+        bridge.dinputState->clientY = 0;
+        bridge.dinputState->pointerActive = 0;
+        bridge.dinputState->menuInputActive = 0;
+        bridge.dinputState->gameplayControlsActive = 0;
+        bridge.dinputState->leftStickX = 0;
+        bridge.dinputState->leftStickY = 0;
+        bridge.dinputState->rightStickX = 0;
+        bridge.dinputState->rightStickY = 0;
+        bridge.dinputState->headLookActive = 0;
+        bridge.dinputState->gyroLookActive = 0;
+        bridge.dinputState->leftGrip = 0;
+        bridge.dinputState->rightGrip = 0;
+        bridge.dinputState->gameplayFlags = 0;
+        bridge.dinputState->aimTrigger = 0;
+        fnvxr::shared::endSequencedSharedWrite(bridge.dinputState->sequence);
+    }
+    if (bridge.vrPoseState
+        && fnvxr::shared::beginSequencedSharedWrite(bridge.vrPoseState->sequence))
+    {
+        ++bridge.vrPoseState->frame;
+        bridge.vrPoseState->trackingFlags = 0;
+        bridge.vrPoseState->predictedDisplayTime = 0;
+        fnvxr::shared::endSequencedSharedWrite(bridge.vrPoseState->sequence);
+    }
     if (bridge.xinputState)
     {
         UnmapViewOfFile(bridge.xinputState);
@@ -2308,6 +2600,14 @@ void closeHostSharedBridge(HostSharedBridge& bridge)
         CloseHandle(bridge.playerMapping);
         bridge.playerMapping = nullptr;
     }
+    if (bridge.inputProducerMutex)
+    {
+        if (bridge.ownsInputProducerMutex)
+            ReleaseMutex(bridge.inputProducerMutex);
+        CloseHandle(bridge.inputProducerMutex);
+        bridge.inputProducerMutex = nullptr;
+        bridge.ownsInputProducerMutex = false;
+    }
 }
 
 void publishHostSharedBridge(
@@ -2323,18 +2623,15 @@ void publishHostSharedBridge(
     bool weaponOut,
     std::uint32_t runtimeMenuBits,
     std::uint32_t poseTrackingFlags,
+    std::uint32_t referenceSpaceGeneration,
+    const XrPosef& leftAimPose,
+    const XrPosef& rightAimPose,
     const XrView* views,
     std::uint32_t viewCount)
 {
     if (!bridge.xinputState || !bridge.dinputState || !bridge.vrPoseState)
         return;
 
-    bridge.xinputState->magic = fnvxr::shared::XInputSharedMagic;
-    bridge.xinputState->version = fnvxr::shared::XInputSharedVersion;
-    bridge.xinputState->connected = 1;
-    bridge.xinputState->packet = ++bridge.xinputPacket;
-    bridge.xinputState->leftTrigger = triggerByte(frame.leftTrigger);
-    bridge.xinputState->rightTrigger = triggerByte(frame.rightTrigger);
     const bool suppressMenuAnalog =
         menuInputActive && envEnabled("FNVXR_XINPUT_MENU_SUPPRESS_ANALOG", true);
     const bool pipBoyRightStickNav =
@@ -2345,10 +2642,10 @@ void publishHostSharedBridge(
         && envEnabled("FNVXR_PIPBOY_SPLIT_STICK_NAV", true);
     const bool suppressLeftMenuAnalog = suppressMenuAnalog && !pipBoySplitStickNav;
     const bool suppressRightMenuAnalog = suppressMenuAnalog && !(pipBoyRightStickNav || pipBoySplitStickNav);
-    bridge.xinputState->leftThumbX = suppressLeftMenuAnalog ? 0 : thumbValue(frame.leftThumbstickX);
-    bridge.xinputState->leftThumbY = suppressLeftMenuAnalog ? 0 : thumbValue(frame.leftThumbstickY);
-    bridge.xinputState->rightThumbX = suppressRightMenuAnalog ? 0 : thumbValue(frame.rightThumbstickX);
-    bridge.xinputState->rightThumbY = suppressRightMenuAnalog ? 0 : thumbValue(frame.rightThumbstickY);
+    const std::int16_t leftThumbX = suppressLeftMenuAnalog ? 0 : thumbValue(frame.leftThumbstickX);
+    const std::int16_t leftThumbY = suppressLeftMenuAnalog ? 0 : thumbValue(frame.leftThumbstickY);
+    const std::int16_t rightThumbX = suppressRightMenuAnalog ? 0 : thumbValue(frame.rightThumbstickX);
+    const std::int16_t rightThumbY = suppressRightMenuAnalog ? 0 : thumbValue(frame.rightThumbstickY);
     std::uint16_t buttons = 0;
     if (menuInputActive && envEnabled("FNVXR_XINPUT_MENU_STICK_TO_DPAD", false))
     {
@@ -2409,27 +2706,22 @@ void publishHostSharedBridge(
     }
     previousLeftGripPipBoyHeld = leftGripPipBoyHeld;
     previousRightGripMenuHeld = rightGripMenuHeld;
-    bridge.xinputState->buttons = buttons;
+    if (fnvxr::shared::beginSequencedSharedWrite(bridge.xinputState->sequence))
+    {
+        bridge.xinputState->magic = fnvxr::shared::XInputSharedMagic;
+        bridge.xinputState->version = fnvxr::shared::XInputSharedVersion;
+        bridge.xinputState->connected = 1;
+        bridge.xinputState->packet = ++bridge.xinputPacket;
+        bridge.xinputState->buttons = buttons;
+        bridge.xinputState->leftTrigger = triggerByte(frame.leftTrigger);
+        bridge.xinputState->rightTrigger = triggerByte(frame.rightTrigger);
+        bridge.xinputState->leftThumbX = leftThumbX;
+        bridge.xinputState->leftThumbY = leftThumbY;
+        bridge.xinputState->rightThumbX = rightThumbX;
+        bridge.xinputState->rightThumbY = rightThumbY;
+        fnvxr::shared::endSequencedSharedWrite(bridge.xinputState->sequence);
+    }
 
-    bridge.dinputState->magic = fnvxr::shared::DInputSharedMagic;
-    bridge.dinputState->version = fnvxr::shared::DInputSharedVersion;
-    bridge.dinputState->frame = static_cast<std::uint32_t>(frame.frame);
-    bridge.dinputState->pointerActive = menuPointer.active ? 1u : 0u;
-    bridge.dinputState->menuInputActive = menuInputActive ? 1u : 0u;
-    bridge.dinputState->gameplayControlsActive = gameplayControlsActive ? 1u : 0u;
-    bridge.dinputState->leftStickX = static_cast<std::int32_t>(std::lround(std::clamp(frame.leftThumbstickX, -1.0f, 1.0f) * 32767.0f));
-    bridge.dinputState->leftStickY = static_cast<std::int32_t>(std::lround(std::clamp(frame.leftThumbstickY, -1.0f, 1.0f) * 32767.0f));
-    bridge.dinputState->rightStickX = static_cast<std::int32_t>(std::lround(std::clamp(frame.rightThumbstickX, -1.0f, 1.0f) * 32767.0f));
-    bridge.dinputState->rightStickY = static_cast<std::int32_t>(std::lround(std::clamp(frame.rightThumbstickY, -1.0f, 1.0f) * 32767.0f));
-    bridge.dinputState->headLookActive = headspaceLook.active ? 1u : 0u;
-    bridge.dinputState->headLookX = headspaceLook.yawMicroradians;
-    bridge.dinputState->headLookY = headspaceLook.pitchMicroradians;
-    bridge.dinputState->gyroLookActive = gyroAimLook.active ? 1u : 0u;
-    bridge.dinputState->gyroLookX = gyroAimLook.yawMicroradians;
-    bridge.dinputState->gyroLookY = gyroAimLook.pitchMicroradians;
-    bridge.dinputState->leftGrip = static_cast<std::int32_t>(std::lround(std::clamp(frame.leftGrip, 0.0f, 1.0f) * 32767.0f));
-    bridge.dinputState->rightGrip = static_cast<std::int32_t>(std::lround(std::clamp(frame.rightGrip, 0.0f, 1.0f) * 32767.0f));
-    bridge.dinputState->aimTrigger = triggerByte(frame.leftTrigger);
     const float aimThreshold = std::clamp(envFloat("FNVXR_HEADSPACE_LOOK_AIM_TRIGGER", 0.35f), 0.0f, 1.0f);
     std::uint32_t gameplayFlags = 0;
     if (gameplayControlsActive && frame.leftTrigger >= aimThreshold)
@@ -2438,22 +2730,61 @@ void publishHostSharedBridge(
         gameplayFlags |= fnvxr::shared::DInputGameplayFlagWeaponOut;
     if (gameplayControlsActive && (frame.buttons & fnvxr::LeftThumbstick) != 0)
         gameplayFlags |= fnvxr::shared::DInputGameplayFlagThirdPersonZoomHeld;
-    bridge.dinputState->gameplayFlags = gameplayFlags;
     const float normalizedX = std::clamp(menuPointer.x, 0.0f, 1.0f);
     const float normalizedY = std::clamp(menuPointer.y, 0.0f, 1.0f);
     const LONG sharedPointerWidth = static_cast<LONG>(std::max(2, envInt("FNVXR_UI_SHARED_WIDTH", SharedPointerWidth)));
     const LONG sharedPointerHeight = static_cast<LONG>(std::max(2, envInt("FNVXR_UI_SHARED_HEIGHT", SharedPointerHeight)));
-    bridge.dinputState->clientX = static_cast<LONG>(lroundf(normalizedX * static_cast<float>(sharedPointerWidth - 1)));
-    bridge.dinputState->clientY = static_cast<LONG>(lroundf(normalizedY * static_cast<float>(sharedPointerHeight - 1)));
+    const LONG clientX = static_cast<LONG>(lroundf(normalizedX * static_cast<float>(sharedPointerWidth - 1)));
+    const LONG clientY = static_cast<LONG>(lroundf(normalizedY * static_cast<float>(sharedPointerHeight - 1)));
     if (hostClick)
         ++bridge.dinputMouseClickPacket;
-    bridge.dinputState->mouseClickPacket = bridge.dinputMouseClickPacket;
+    bridge.dinputHeadLookX = fnvxr::shared::addWrappedInt32(
+        bridge.dinputHeadLookX,
+        headspaceLook.active ? headspaceLook.yawMicroradians : 0);
+    bridge.dinputHeadLookY = fnvxr::shared::addWrappedInt32(
+        bridge.dinputHeadLookY,
+        headspaceLook.active ? headspaceLook.pitchMicroradians : 0);
+    bridge.dinputGyroLookX = fnvxr::shared::addWrappedInt32(
+        bridge.dinputGyroLookX,
+        gyroAimLook.active ? gyroAimLook.yawMicroradians : 0);
+    bridge.dinputGyroLookY = fnvxr::shared::addWrappedInt32(
+        bridge.dinputGyroLookY,
+        gyroAimLook.active ? gyroAimLook.pitchMicroradians : 0);
+    if (fnvxr::shared::beginSequencedSharedWrite(bridge.dinputState->sequence))
+    {
+        bridge.dinputState->magic = fnvxr::shared::DInputSharedMagic;
+        bridge.dinputState->version = fnvxr::shared::DInputSharedVersion;
+        bridge.dinputState->frame = static_cast<std::uint32_t>(frame.frame);
+        bridge.dinputState->clientX = clientX;
+        bridge.dinputState->clientY = clientY;
+        bridge.dinputState->pointerActive = menuPointer.active ? 1u : 0u;
+        bridge.dinputState->mouseClickPacket = bridge.dinputMouseClickPacket;
+        bridge.dinputState->menuInputActive = menuInputActive ? 1u : 0u;
+        bridge.dinputState->gameplayControlsActive = gameplayControlsActive ? 1u : 0u;
+        bridge.dinputState->leftStickX = static_cast<std::int32_t>(std::lround(std::clamp(frame.leftThumbstickX, -1.0f, 1.0f) * 32767.0f));
+        bridge.dinputState->leftStickY = static_cast<std::int32_t>(std::lround(std::clamp(frame.leftThumbstickY, -1.0f, 1.0f) * 32767.0f));
+        bridge.dinputState->rightStickX = static_cast<std::int32_t>(std::lround(std::clamp(frame.rightThumbstickX, -1.0f, 1.0f) * 32767.0f));
+        bridge.dinputState->rightStickY = static_cast<std::int32_t>(std::lround(std::clamp(frame.rightThumbstickY, -1.0f, 1.0f) * 32767.0f));
+        bridge.dinputState->headLookActive = headspaceLook.active ? 1u : 0u;
+        bridge.dinputState->headLookX = bridge.dinputHeadLookX;
+        bridge.dinputState->headLookY = bridge.dinputHeadLookY;
+        bridge.dinputState->gyroLookActive = gyroAimLook.active ? 1u : 0u;
+        bridge.dinputState->gyroLookX = bridge.dinputGyroLookX;
+        bridge.dinputState->gyroLookY = bridge.dinputGyroLookY;
+        bridge.dinputState->leftGrip = static_cast<std::int32_t>(std::lround(std::clamp(frame.leftGrip, 0.0f, 1.0f) * 32767.0f));
+        bridge.dinputState->rightGrip = static_cast<std::int32_t>(std::lround(std::clamp(frame.rightGrip, 0.0f, 1.0f) * 32767.0f));
+        bridge.dinputState->gameplayFlags = gameplayFlags;
+        bridge.dinputState->aimTrigger = triggerByte(frame.leftTrigger);
+        fnvxr::shared::endSequencedSharedWrite(bridge.dinputState->sequence);
+    }
 
-    InterlockedIncrement(&bridge.vrPoseState->sequence);
-    MemoryBarrier();
+    if (!fnvxr::shared::beginSequencedSharedWrite(bridge.vrPoseState->sequence))
+        return;
     bridge.vrPoseState->magic = fnvxr::shared::VrPoseSharedMagic;
     bridge.vrPoseState->version = fnvxr::shared::VrPoseSharedVersion;
     bridge.vrPoseState->trackingFlags = poseTrackingFlags;
+    bridge.vrPoseState->referenceSpaceGeneration = referenceSpaceGeneration;
+    bridge.vrPoseState->producerEpoch = bridge.producerEpoch;
     bridge.vrPoseState->frame = frame.frame;
     bridge.vrPoseState->predictedDisplayTime = static_cast<std::int64_t>(predictedDisplayTime);
     bridge.vrPoseState->hmdRot[0] = frame.hmdRot.x;
@@ -2477,6 +2808,14 @@ void publishHostSharedBridge(
     bridge.vrPoseState->rightPos[0] = frame.rightPos.x;
     bridge.vrPoseState->rightPos[1] = frame.rightPos.y;
     bridge.vrPoseState->rightPos[2] = frame.rightPos.z;
+    writePoseToShared(
+        leftAimPose,
+        bridge.vrPoseState->leftAimRot,
+        bridge.vrPoseState->leftAimPos);
+    writePoseToShared(
+        rightAimPose,
+        bridge.vrPoseState->rightAimRot,
+        bridge.vrPoseState->rightAimPos);
     if (views && viewCount >= 2)
     {
         writePoseToShared(views[0].pose, bridge.vrPoseState->leftEyeRot, bridge.vrPoseState->leftEyePos);
@@ -2506,8 +2845,7 @@ void publishHostSharedBridge(
         bridge.vrPoseState->leftFov[3] = 0.0f;
         std::memcpy(bridge.vrPoseState->rightFov, bridge.vrPoseState->leftFov, sizeof(bridge.vrPoseState->rightFov));
     }
-    MemoryBarrier();
-    InterlockedIncrement(&bridge.vrPoseState->sequence);
+    fnvxr::shared::endSequencedSharedWrite(bridge.vrPoseState->sequence);
 }
 
 void closeSharedD3D9VideoFrame(Renderer& renderer)
@@ -2717,6 +3055,12 @@ bool updateWorldTexture(ID3D11Device* device, Renderer& renderer)
 
 bool updateStereoGameTextures(ID3D11Device* device, Renderer& renderer)
 {
+    if (renderer.stereoGameFrameSequence == 0)
+    {
+        renderer.stereoTransientReadMisses = 0;
+        renderer.stereoAcceptedAt = {};
+    }
+
     if (renderer.hasCachedSceneFrame && envEnabled("FNVXR_CACHE_ONLY", false))
         return true;
 
@@ -2730,6 +3074,7 @@ bool updateStereoGameTextures(ID3D11Device* device, Renderer& renderer)
         renderer.stereoGameRenderedDisplayTime = 0;
         renderer.stereoStableFrameCount = 0;
         renderer.stereoFrameMisses = 0;
+        renderer.stereoTransientReadMisses = 0;
         return false;
     }
 
@@ -2750,11 +3095,73 @@ bool updateStereoGameTextures(ID3D11Device* device, Renderer& renderer)
             renderedDisplayTime,
             sourceSequence))
     {
+        // The OpenXR consumer commonly polls faster than the retail D3D9
+        // producer. Reusing the same still-valid sequence is not a stereo
+        // failure, but retaining an explicitly invalidated sequence can show
+        // stale actors or stale cell geometry. Keep only a coherent source
+        // sequence that the producer still advertises as world-ready.
+        bool sourceUiActive = false;
+        bool sourceWorldReady = false;
+        LONG advertisedSequence = 0;
+        const bool haveSourceState = readSharedStereoState(
+            renderer,
+            sourceUiActive,
+            sourceWorldReady,
+            &advertisedSequence);
+        if (haveSourceState
+            && !sourceUiActive
+            && sourceWorldReady
+            && advertisedSequence == renderer.stereoGameFrameSequence
+            && renderer.stereoGameFrameSequence > 0
+            && renderer.stereoStableFrameCount > 0)
+        {
+            const auto now = std::chrono::steady_clock::now();
+            const uint64_t maxSameSequenceMs = static_cast<uint64_t>(
+                std::max(1, envInt("FNVXR_STEREO_MAX_SAME_SEQUENCE_MS", 250)));
+            const bool producerFresh = renderer.stereoAcceptedAt.time_since_epoch().count() != 0
+                && now >= renderer.stereoAcceptedAt
+                && static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now - renderer.stereoAcceptedAt).count()) <= maxSameSequenceMs;
+            if (producerFresh)
+            {
+                renderer.stereoFrameMisses = 0;
+                renderer.stereoTransientReadMisses = 0;
+                return true;
+            }
+
+            std::cout << "stereoGameFrame same sequence expired"
+                      << " seq=" << renderer.stereoGameFrameSequence
+                      << " maxAgeMs=" << maxSameSequenceMs
+                      << "; falling back to live retail plane\n";
+        }
+
+        const uint64_t transientReadGracePolls = static_cast<uint64_t>(
+            std::max(1, envInt("FNVXR_STEREO_TRANSIENT_READ_GRACE_POLLS", 4)));
+        if (!haveSourceState)
+            ++renderer.stereoTransientReadMisses;
+        else
+            renderer.stereoTransientReadMisses = 0;
+        if (!haveSourceState
+            && renderer.stereoGameFrameSequence > 0
+            && renderer.stereoStableFrameCount > 0
+            && renderer.stereoTransientReadMisses <= transientReadGracePolls)
+        {
+            if (renderer.stereoTransientReadMisses == 1)
+            {
+                std::cout << "stereoGameFrame transient producer read overlap"
+                          << " seq=" << renderer.stereoGameFrameSequence
+                          << " stable=" << renderer.stereoStableFrameCount
+                          << " grace=" << renderer.stereoTransientReadMisses << "/" << transientReadGracePolls
+                          << "\n";
+            }
+            return true;
+        }
+
         ++renderer.stereoFrameMisses;
         const uint64_t staleLimit =
-            static_cast<uint64_t>(std::max(1, envInt("FNVXR_STEREO_STALE_FRAME_LIMIT", 180)));
+            static_cast<uint64_t>(std::max(1, envInt("FNVXR_STEREO_STALE_FRAME_LIMIT", 2)));
         if (renderer.hasStereoGameFrame
-            && envEnabled("FNVXR_STEREO_RETAIN_LAST_VALID_ON_REJECT", true)
+            && envEnabled("FNVXR_STEREO_RETAIN_LAST_VALID_ON_REJECT", false)
             && renderer.stereoFrameMisses <= staleLimit)
         {
             return true;
@@ -2779,9 +3186,9 @@ bool updateStereoGameTextures(ID3D11Device* device, Renderer& renderer)
     {
         ++renderer.stereoFrameMisses;
         const uint64_t staleLimit =
-            static_cast<uint64_t>(std::max(1, envInt("FNVXR_STEREO_STALE_FRAME_LIMIT", 180)));
+            static_cast<uint64_t>(std::max(1, envInt("FNVXR_STEREO_STALE_FRAME_LIMIT", 2)));
         if (renderer.hasStereoGameFrame
-            && envEnabled("FNVXR_STEREO_RETAIN_LAST_VALID_ON_REJECT", true)
+            && envEnabled("FNVXR_STEREO_RETAIN_LAST_VALID_ON_REJECT", false)
             && renderer.stereoFrameMisses <= staleLimit)
         {
             if (renderer.stereoFrameMisses <= 5 || renderer.stereoFrameMisses % 120 == 0)
@@ -2858,6 +3265,13 @@ bool updateStereoGameTextures(ID3D11Device* device, Renderer& renderer)
     renderer.stereoGameFrameSeparated = true;
     renderer.stereoGameFrameWorldCandidate = worldCandidate;
     renderer.stereoFrameMisses = 0;
+    renderer.stereoTransientReadMisses = 0;
+    renderer.stereoAcceptedAt = std::chrono::steady_clock::now();
+    renderer.stereoPixelSamples = pixelStats.samples;
+    renderer.stereoNonBlackSamples = pixelStats.nonBlackSamples;
+    renderer.stereoMeaningfulDifferentSamples = pixelStats.differentSamples;
+    renderer.stereoLeftHash = pixelStats.leftHash;
+    renderer.stereoRightHash = pixelStats.rightHash;
     ++renderer.lastStereoFrameUpdated;
     if (renderer.lastStereoFrameUpdated <= 8
         || renderer.lastStereoFrameUpdated % 60 == 0
@@ -3277,11 +3691,22 @@ GamePlane gamePlaneFromHmd(const XrPosef& hmdPose)
 
     XMVECTOR planeOrientation =
         XMVectorSet(hmdPose.orientation.x, hmdPose.orientation.y, hmdPose.orientation.z, hmdPose.orientation.w);
-    if (envFloat("FNVXR_GAME_PLANE_REMOVE_ROLL", 1.0f) != 0.0f)
+    if (envFloat("FNVXR_GAME_PLANE_REMOVE_ROLL", 1.0f) != 0.0f
+        || envFloat("FNVXR_GAME_PLANE_REMOVE_PITCH", 1.0f) != 0.0f)
     {
         XMVECTOR hmdForward =
             XMVector3Normalize(XMVector3Rotate(XMVectorSet(0.0f, 0.0f, -1.0f, 0.0f), planeOrientation));
         const XMVECTOR worldUp = XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
+        if (envFloat("FNVXR_GAME_PLANE_REMOVE_PITCH", 1.0f) != 0.0f)
+        {
+            // A fallback/menu surface is not the native 3D camera.  Recenter
+            // it at eye height using headset yaw only so looking down while
+            // pressing the chord cannot throw the surface underneath the
+            // user and masquerade as a broken 3D-camera recenter.
+            hmdForward = safeNormalize3(
+                XMVectorSetY(hmdForward, 0.0f),
+                XMVectorSet(0.0f, 0.0f, -1.0f, 0.0f));
+        }
         XMMATRIX viewNoRoll = XMMatrixLookToRH(XMVectorZero(), hmdForward, worldUp);
         XMMATRIX planeWorld = XMMatrixInverse(nullptr, viewNoRoll);
         planeOrientation = XMQuaternionRotationMatrix(planeWorld);
@@ -5627,7 +6052,11 @@ bool locate(OpenXr& xr, XrSpace space, XrSpace baseSpace, XrTime time, fnvxr::Qu
     if (xr.locateSpace(space, baseSpace, time, &location) != XR_SUCCESS)
         return false;
 
-    const XrSpaceLocationFlags required = XR_SPACE_LOCATION_ORIENTATION_VALID_BIT | XR_SPACE_LOCATION_POSITION_VALID_BIT;
+    const XrSpaceLocationFlags required =
+        XR_SPACE_LOCATION_ORIENTATION_VALID_BIT
+        | XR_SPACE_LOCATION_POSITION_VALID_BIT
+        | XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT
+        | XR_SPACE_LOCATION_POSITION_TRACKED_BIT;
     if ((location.locationFlags & required) != required)
         return false;
 
@@ -5642,7 +6071,11 @@ bool locatePose(OpenXr& xr, XrSpace space, XrSpace baseSpace, XrTime time, XrPos
     if (xr.locateSpace(space, baseSpace, time, &location) != XR_SUCCESS)
         return false;
 
-    const XrSpaceLocationFlags required = XR_SPACE_LOCATION_ORIENTATION_VALID_BIT | XR_SPACE_LOCATION_POSITION_VALID_BIT;
+    const XrSpaceLocationFlags required =
+        XR_SPACE_LOCATION_ORIENTATION_VALID_BIT
+        | XR_SPACE_LOCATION_POSITION_VALID_BIT
+        | XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT
+        | XR_SPACE_LOCATION_POSITION_TRACKED_BIT;
     if ((location.locationFlags & required) != required)
         return false;
 
@@ -5702,7 +6135,9 @@ void drainOpenXrEvents(
     bool& shouldSyncFrames,
     bool& shouldReadInput,
     bool& exitRequested,
-    bool& lossPending)
+    bool& lossPending,
+    bool& referenceSpaceChangePending,
+    XrTime& referenceSpaceChangeTime)
 {
     XrEventDataBuffer event { XR_TYPE_EVENT_DATA_BUFFER };
     while (xr.pollEvent(instance, &event) == XR_SUCCESS)
@@ -5755,6 +6190,25 @@ void drainOpenXrEvents(
                 shouldSyncFrames = false;
                 shouldReadInput = false;
             }
+        }
+        else if (event.type == XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING)
+        {
+            const auto* changed = reinterpret_cast<const XrEventDataReferenceSpaceChangePending*>(&event);
+            const bool affectsPublishedBase = changed->referenceSpaceType == XR_REFERENCE_SPACE_TYPE_LOCAL;
+            if (affectsPublishedBase)
+            {
+                referenceSpaceChangePending = true;
+                referenceSpaceChangeTime = changed->changeTime;
+            }
+            std::cout << "referenceSpaceChangePending affectsPublishedBase="
+                      << static_cast<int>(affectsPublishedBase)
+                      << " type=" << static_cast<int>(changed->referenceSpaceType)
+                      << " changeTime=" << changed->changeTime
+                      << " poseValid=" << static_cast<int>(changed->poseValid)
+                      << " previousSpacePos=("
+                      << changed->poseInPreviousSpace.position.x << ","
+                      << changed->poseInPreviousSpace.position.y << ","
+                      << changed->poseInPreviousSpace.position.z << ")\n";
         }
 
         event = { XR_TYPE_EVENT_DATA_BUFFER };
@@ -6207,15 +6661,24 @@ int main(int argc, char** argv)
     if (result != XR_SUCCESS)
         return 19;
 
-    if (!pollUntilSessionReady(xr, instance, session))
-        return 20;
-
     HostSharedBridge sharedBridge {};
     if (!initHostSharedBridge(sharedBridge))
     {
         std::cerr << "host shared bridge init failed\n";
+        closeHostSharedBridge(sharedBridge);
         closeSharedD3D9VideoFrame(renderer);
         return 21;
+    }
+    // This is the launcher handshake. The OpenXR instance/session/actions and
+    // all cross-bitness mappings now exist, so retail may start safely even
+    // when the runtime keeps an unworn headset in IDLE. Input remains neutral
+    // until READY/FOCUSED and the first pose frame is published.
+    std::cout << "fnvxrHostBridgeReady xrSessionCreated=1 sharedMappingsReady=1\n" << std::flush;
+
+    if (!pollUntilSessionReady(xr, instance, session))
+    {
+        closeHostSharedBridge(sharedBridge);
+        return 20;
     }
 
     const HostMode mode = hostMode();
@@ -6259,6 +6722,13 @@ int main(int argc, char** argv)
     uint64_t gameUiRenderFrames = 0;
     uint64_t lastSharedStereoWorldReadyFrame = 0;
     bool cachedSharedStereoWorldReady = false;
+    std::uint32_t stereoCellFormId = 0;
+    uint64_t stereoCellStableFrames = 0;
+    uint64_t stereoCellEpochPlayerFrame = 0;
+    uint64_t stereoCellLastPlayerFrame = 0;
+    bool stereoCellKnown = false;
+    uint64_t sharedPlayerReadMisses = 0;
+    bool lastSharedPlayerWeaponOut = false;
     bool previousLoggedGameplayPlaneSize = false;
     bool previousLoggedPipBoyGripMode = false;
     bool previousLoggedPipBoyMenuMode = false;
@@ -6277,6 +6747,9 @@ int main(int argc, char** argv)
     bool previousShouldReadInput = false;
     bool exitRequested = false;
     bool lossPending = false;
+    std::uint32_t referenceSpaceGeneration = 1;
+    bool referenceSpaceChangePending = false;
+    XrTime referenceSpaceChangeTime = 0;
 
     for (uint64_t frameIndex = 1; targetFrames == 0 || frameIndex <= targetFrames; ++frameIndex)
     {
@@ -6288,7 +6761,9 @@ int main(int argc, char** argv)
             shouldSyncFrames,
             shouldReadInput,
             exitRequested,
-            lossPending);
+            lossPending,
+            referenceSpaceChangePending,
+            referenceSpaceChangeTime);
         const bool inputFocusLost = previousShouldReadInput && !shouldReadInput;
         const bool inputFocusRegained = shouldReadInput && !previousShouldReadInput;
         if (inputFocusLost || inputFocusRegained)
@@ -6333,6 +6808,24 @@ int main(int argc, char** argv)
             }
             std::cerr << "xrWaitFrame failed: " << resultName(result) << "\n";
             break;
+        }
+
+        // The pending event can arrive before the runtime's advertised
+        // discontinuity. Change generations on the first pose sample at or
+        // after changeTime so camera and controller consumers invalidate the
+        // exact frame whose LOCAL-space coordinates changed.
+        if (referenceSpaceChangePending
+            && (referenceSpaceChangeTime <= 0
+                || frameState.predictedDisplayTime >= referenceSpaceChangeTime))
+        {
+            ++referenceSpaceGeneration;
+            if (referenceSpaceGeneration == 0)
+                referenceSpaceGeneration = 1;
+            std::cout << "referenceSpaceChangeActivated generation=" << referenceSpaceGeneration
+                      << " changeTime=" << referenceSpaceChangeTime
+                      << " displayTime=" << frameState.predictedDisplayTime << "\n";
+            referenceSpaceChangePending = false;
+            referenceSpaceChangeTime = 0;
         }
 
         XrFrameBeginInfo beginInfo { XR_TYPE_FRAME_BEGIN_INFO };
@@ -6545,6 +7038,10 @@ int main(int argc, char** argv)
         XrPosef rightAimPose = lastRightAimPose;
         XrPosef hmdPose = lastHmdPose;
         XrPosef rawHmdPose = lastHmdPose;
+        XrPosef rawLeftPose = lastLeftPose;
+        XrPosef rawRightPose = lastRightPose;
+        XrPosef rawLeftAimPose = lastLeftAimPose;
+        XrPosef rawRightAimPose = lastRightAimPose;
         XrPosef trackedPose {};
         const bool hmdTracked = locatePose(xr, viewSpace, localSpace, frameState.predictedDisplayTime, trackedPose);
         if (hmdTracked)
@@ -6555,15 +7052,31 @@ int main(int argc, char** argv)
         const bool leftHandTracked = leftHandPoseActive
             && locatePose(xr, leftSpace, localSpace, frameState.predictedDisplayTime, trackedPose);
         if (leftHandTracked)
+        {
+            rawLeftPose = trackedPose;
             lastLeftPose = smoothPose(lastLeftPose, trackedPose, 0.35f);
+        }
         const bool rightHandTracked = rightHandPoseActive
             && locatePose(xr, rightSpace, localSpace, frameState.predictedDisplayTime, trackedPose);
         if (rightHandTracked)
+        {
+            rawRightPose = trackedPose;
             lastRightPose = smoothPose(lastRightPose, trackedPose, 0.35f);
-        if (leftAimPoseActive && locatePose(xr, leftAimSpace, localSpace, frameState.predictedDisplayTime, trackedPose))
+        }
+        const bool leftAimTracked = leftAimPoseActive
+            && locatePose(xr, leftAimSpace, localSpace, frameState.predictedDisplayTime, trackedPose);
+        if (leftAimTracked)
+        {
+            rawLeftAimPose = trackedPose;
             lastLeftAimPose = smoothPose(lastLeftAimPose, trackedPose, 0.35f);
-        if (rightAimPoseActive && locatePose(xr, rightAimSpace, localSpace, frameState.predictedDisplayTime, trackedPose))
+        }
+        const bool rightAimTracked = rightAimPoseActive
+            && locatePose(xr, rightAimSpace, localSpace, frameState.predictedDisplayTime, trackedPose);
+        if (rightAimTracked)
+        {
+            rawRightAimPose = trackedPose;
             lastRightAimPose = smoothPose(lastRightAimPose, trackedPose, 0.35f);
+        }
         leftPose = lastLeftPose;
         rightPose = lastRightPose;
         leftAimPose = lastLeftAimPose;
@@ -6575,8 +7088,9 @@ int main(int argc, char** argv)
         const BodyRig bodyRig = solveBodyRig(hmdPose, leftPose, rightPose);
 
         const bool gripRecenter =
-            (rightThumbstick.value && rightGrip.value > 0.50f)
-            || (leftThumbstick.value && leftGrip.value > 0.50f);
+            !stereoWorldRuntimeEnabled()
+            && ((rightThumbstick.value && rightGrip.value > 0.50f)
+                || (leftThumbstick.value && leftGrip.value > 0.50f));
         const int autoCenterFrames = envInt("FNVXR_GAME_PLANE_AUTO_CENTER_FRAMES", 0);
         const bool lockPlaneToHead = envEnabled("FNVXR_GAME_PLANE_LOCK_TO_HEAD", false);
         const bool autoCenter =
@@ -6649,8 +7163,95 @@ int main(int argc, char** argv)
             heldSharedStereoWorldReady ? false : sharedStereoUiActive;
         const bool haveRuntimeUiState =
             readSharedRuntimeUiActive(renderer, runtimeUiActive, runtimeGameplayActive, runtimeCameraActive, runtimeMenuBits);
+        fnvxr::shared::SharedPlayerState playerSnapshot {};
+        const bool havePlayerSnapshot = readSharedPlayerState(sharedBridge, playerSnapshot);
+        if (havePlayerSnapshot)
+            sharedPlayerReadMisses = 0;
+        else
+            ++sharedPlayerReadMisses;
+        const uint64_t sharedPlayerReadGraceFrames = static_cast<uint64_t>(
+            std::max(1, envInt("FNVXR_PLAYER_STATE_READ_GRACE_FRAMES", 4)));
+        const bool transientPlayerReadMiss = !havePlayerSnapshot
+            && stereoCellKnown
+            && sharedPlayerReadMisses <= sharedPlayerReadGraceFrames;
+        if (havePlayerSnapshot)
+        {
+            lastSharedPlayerWeaponOut =
+                (playerSnapshot.flags & fnvxr::shared::PlayerSharedFlagWeaponOut) != 0;
+        }
+        else if (!transientPlayerReadMiss)
+        {
+            lastSharedPlayerWeaponOut = false;
+        }
+        const bool currentCellGameplay = havePlayerSnapshot
+            && (playerSnapshot.flags & fnvxr::shared::PlayerSharedFlagGameplay) != 0;
+        const bool currentCellKnown = currentCellGameplay
+            && (playerSnapshot.flags & fnvxr::shared::PlayerSharedFlagCellKnown) != 0
+            && playerSnapshot.currentCellFormId != 0
+            && playerSnapshot.frame != 0;
+        const std::uint32_t currentCellFormId = currentCellKnown
+            ? playerSnapshot.currentCellFormId
+            : 0;
+        const bool cellChanged = currentCellKnown
+            && stereoCellKnown
+            && (currentCellFormId != stereoCellFormId
+                || playerSnapshot.frame < stereoCellLastPlayerFrame);
+        const bool cellAcquired = currentCellKnown && !stereoCellKnown;
+        if (transientPlayerReadMiss)
+        {
+            // A sequence-guarded writer can be briefly odd while xNVSE is
+            // publishing. Preserve the last proven cell without advancing its
+            // stability counter; sustained loss still fails closed below.
+        }
+        else if (!currentCellKnown)
+        {
+            stereoCellKnown = false;
+            stereoCellFormId = 0;
+            stereoCellStableFrames = 0;
+            stereoCellEpochPlayerFrame = 0;
+            stereoCellLastPlayerFrame = 0;
+        }
+        else if (cellAcquired || cellChanged)
+        {
+            const std::uint32_t previousCellFormId = stereoCellFormId;
+            stereoCellKnown = true;
+            stereoCellFormId = currentCellFormId;
+            stereoCellStableFrames = 1;
+            stereoCellEpochPlayerFrame = playerSnapshot.frame;
+            stereoCellLastPlayerFrame = playerSnapshot.frame;
+            renderer.hasStereoGameFrame = false;
+            renderer.stereoGameFrameSeparated = false;
+            renderer.stereoGameFrameWorldCandidate = false;
+            renderer.stereoGameFrameSequence = 0;
+            renderer.stereoGamePoseSequence = 0;
+            renderer.stereoGameRenderedDisplayTime = 0;
+            renderer.stereoStableFrameCount = 0;
+            renderer.stereoFrameMisses = 0;
+            renderer.stereoTransientReadMisses = 0;
+            renderer.stereoAcceptedAt = {};
+            missingStereoFrames = 0;
+            cachedSharedStereoWorldReady = false;
+            lastSharedStereoWorldReadyFrame = 0;
+            std::cout << "stereoCellEpoch frame=" << frame.frame
+                      << " previous=0x" << std::hex << previousCellFormId
+                      << " current=0x" << currentCellFormId << std::dec
+                      << " acquired=" << static_cast<int>(cellAcquired)
+                      << " changed=" << static_cast<int>(cellChanged)
+                      << "; stereo handoff reset\n";
+        }
+        else
+        {
+            stereoCellLastPlayerFrame = playerSnapshot.frame;
+            stereoCellStableFrames = playerSnapshot.frame >= stereoCellEpochPlayerFrame
+                ? playerSnapshot.frame - stereoCellEpochPlayerFrame + 1
+                : 0;
+        }
+        const uint64_t stereoCellStableRequired = static_cast<uint64_t>(
+            std::max(1, envInt("FNVXR_STEREO_CELL_STABLE_FRAMES", 60)));
+        const bool stereoCellStable = stereoCellKnown
+            && stereoCellStableFrames >= stereoCellStableRequired;
         const bool requireWorldStereoBeforeGameplay =
-            envEnabled("FNVXR_REQUIRE_WORLD_STEREO", false);
+            envEnabled("FNVXR_REQUIRE_WORLD_STEREO_BEFORE_GAMEPLAY_UI", false);
         bool gameUiMode = haveRuntimeUiState
             ? !(runtimeGameplayActive
                 && (!requireWorldStereoBeforeGameplay
@@ -6803,6 +7404,7 @@ int main(int argc, char** argv)
         const bool allowStereoFullscreen =
             allowCacheFullscreen
             || (stereoWorldIntent
+                && stereoCellStable
                 && (!gameUiMode || worldBehindMenu)
                 && (vrMode || worldBehindMenu));
         const bool showGameplayPlane =
@@ -6818,7 +7420,7 @@ int main(int argc, char** argv)
             &&
             (gameUiMode || showGameplayPlane)
             && envEnabled("FNVXR_SHOW_GAME_PLANE", true);
-        const uint64_t stereoStaleFrameLimit = static_cast<uint64_t>(std::max(1, envInt("FNVXR_STEREO_STALE_FRAME_LIMIT", 180)));
+        const uint64_t stereoStaleFrameLimit = static_cast<uint64_t>(std::max(1, envInt("FNVXR_STEREO_STALE_FRAME_LIMIT", 2)));
         const uint64_t stereoStableHandoffFrames =
             static_cast<uint64_t>(std::max(1, envInt("FNVXR_STEREO_STABLE_HANDOFF_FRAMES", 6)));
         const bool allowStereoWorld2dFallback =
@@ -6839,7 +7441,7 @@ int main(int argc, char** argv)
             && (haveRuntimeUiState ? (!runtimeUiActive || runtimeGameplayActive) : !gameUiMode);
         const float headspaceAimTrigger = std::clamp(envFloat("FNVXR_HEADSPACE_LOOK_AIM_TRIGGER", 0.35f), 0.0f, 1.0f);
         const bool headspaceAimHeld = gameplayControlsActive && frame.leftTrigger >= headspaceAimTrigger;
-        const bool weaponOut = gameplayControlsActive && sharedPlayerWeaponOut(sharedBridge);
+        const bool weaponOut = gameplayControlsActive && lastSharedPlayerWeaponOut;
         const bool precisionAimActive = weaponOut;
         const bool handspaceLookRequiresWeaponOut = envEnabled("FNVXR_HANDSPACE_LOOK_REQUIRES_WEAPON_OUT", true);
         if (gameplayControlsActive && !previousGameplayControlsActive)
@@ -6884,7 +7486,7 @@ int main(int argc, char** argv)
             && gameplayControlsActive
             && !headspaceGameplayWarmup
             && precisionAimActive
-            && rightAimPoseActive;
+            && rightAimTracked;
         gyroAimLook = sampleRightHandGyroLook(
             gyroAimLookTracker,
             rightAimPose,
@@ -6895,7 +7497,7 @@ int main(int argc, char** argv)
             && !headspaceGameplayWarmup
             && !precisionAimActive
             && (!handspaceLookRequiresWeaponOut || weaponOut)
-            && rightAimPoseActive;
+            && rightAimTracked;
         handspaceLook = sampleRightHandspaceLook(
             handspaceLookTracker,
             rightAimPose,
@@ -6917,8 +7519,12 @@ int main(int argc, char** argv)
             envEqualsIgnoreCase("FNVXR_MENU_POINTER_HAND", "head")
             || envEqualsIgnoreCase("FNVXR_MENU_POINTER_SOURCE", "head");
         const bool pointerHeadFallback = envEnabled("FNVXR_MENU_POINTER_HEAD_FALLBACK", false);
-        const MenuPointer leftMenuPointer = menuPointerFromAimPose(leftAimPose, gamePlane);
-        const MenuPointer rightMenuPointer = menuPointerFromAimPose(rightAimPose, gamePlane);
+        const MenuPointer leftMenuPointer = leftAimTracked
+            ? menuPointerFromAimPose(leftAimPose, gamePlane)
+            : MenuPointer {};
+        const MenuPointer rightMenuPointer = rightAimTracked
+            ? menuPointerFromAimPose(rightAimPose, gamePlane)
+            : MenuPointer {};
         const MenuPointer headMenuPointer = menuPointerFromAimPose(hmdTracked ? rawHmdPose : hmdPose, gamePlane);
         MenuPointer menuPointer = rightMenuPointer;
         const char* menuPointerSource = rightMenuPointer.active ? "right" : "none";
@@ -6991,12 +7597,15 @@ int main(int argc, char** argv)
         frame.menuPointerActive = menuPointer.active ? 1 : 0;
         frame.menuPointerX = menuPointer.x;
         frame.menuPointerY = menuPointer.y;
-        frame.hmdRot = toQuat(hmdPose.orientation);
-        frame.hmdPos = toVec3(hmdPose.position);
-        frame.leftRot = toQuat(leftPose.orientation);
-        frame.leftPos = toVec3(leftPose.position);
-        frame.rightRot = toQuat(rightPose.orientation);
-        frame.rightPos = toVec3(rightPose.position);
+        // Shared retail tracking must preserve the same predicted-time sample
+        // for head and hands. Independent smoothing creates artificial
+        // head/hand lag and makes a stationary physical pose swim in view.
+        frame.hmdRot = toQuat(rawHmdPose.orientation);
+        frame.hmdPos = toVec3(rawHmdPose.position);
+        frame.leftRot = toQuat(rawLeftPose.orientation);
+        frame.leftPos = toVec3(rawLeftPose.position);
+        frame.rightRot = toQuat(rawRightPose.orientation);
+        frame.rightPos = toVec3(rawRightPose.position);
         std::uint32_t poseTrackingFlags = 0;
         if (hmdTracked)
             poseTrackingFlags |= fnvxr::shared::VrPoseTrackingHmd;
@@ -7008,6 +7617,14 @@ int main(int argc, char** argv)
             poseTrackingFlags |= fnvxr::shared::VrPoseTrackingLeftGripCurrent;
         if (rightHandTracked)
             poseTrackingFlags |= fnvxr::shared::VrPoseTrackingRightGripCurrent;
+        if (leftAimPoseActive)
+            poseTrackingFlags |= fnvxr::shared::VrPoseTrackingLeftAimActive;
+        if (rightAimPoseActive)
+            poseTrackingFlags |= fnvxr::shared::VrPoseTrackingRightAimActive;
+        if (leftAimTracked)
+            poseTrackingFlags |= fnvxr::shared::VrPoseTrackingLeftAimCurrent;
+        if (rightAimTracked)
+            poseTrackingFlags |= fnvxr::shared::VrPoseTrackingRightAimCurrent;
 
         XrFrameEndInfo endInfo { XR_TYPE_FRAME_END_INFO };
         std::vector<XrView> views(viewConfigCount);
@@ -7019,6 +7636,7 @@ int main(int argc, char** argv)
             { XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW }
         };
         bool submitProjectionLayer = false;
+        bool submittedStereoFullscreen = false;
 
         XrViewLocateInfo viewLocateInfo { XR_TYPE_VIEW_LOCATE_INFO };
         viewLocateInfo.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
@@ -7050,6 +7668,9 @@ int main(int argc, char** argv)
             weaponOut,
             runtimeMenuBits,
             poseTrackingFlags,
+            referenceSpaceGeneration,
+            rawLeftAimPose,
+            rawRightAimPose,
             (result == XR_SUCCESS && viewCountOutput >= 2 && viewsValid) ? views.data() : nullptr,
             (result == XR_SUCCESS && viewCountOutput >= 2 && viewsValid) ? viewCountOutput : 0);
         if (frameIndex <= 5
@@ -7160,50 +7781,21 @@ int main(int argc, char** argv)
                 allowStereoFullscreen
                 && renderer.hasStereoGameFrame
                 && renderer.stereoGameFrameSeparated
-                && renderer.stereoStableFrameCount >= stereoStableHandoffFrames;
+                && renderer.stereoStableFrameCount >= stereoStableHandoffFrames
+                && renderer.stereoReferenceSpaceGeneration == referenceSpaceGeneration
+                && renderer.stereoProducerEpoch == sharedBridge.producerEpoch;
+            submittedStereoFullscreen = stereoFullscreenActive;
             std::vector<XrView> submitViews = views;
-            bool usingHistoricalStereoViews = false;
+            bool usingSourceStereoViews = false;
             if (stereoFullscreenActive && renderer.stereoGameRenderedDisplayTime > 0)
             {
-                std::vector<XrView> historicalViews(viewConfigCount);
-                for (auto& view : historicalViews)
-                    view.type = XR_TYPE_VIEW;
-
-                XrViewLocateInfo historicalLocateInfo = viewLocateInfo;
-                historicalLocateInfo.displayTime = renderer.stereoGameRenderedDisplayTime;
-                XrViewState historicalViewState { XR_TYPE_VIEW_STATE };
-                uint32_t historicalViewCount = 0;
-                const XrResult historicalResult = xr.locateViews(
-                    session,
-                    &historicalLocateInfo,
-                    &historicalViewState,
-                    static_cast<uint32_t>(historicalViews.size()),
-                    &historicalViewCount,
-                    historicalViews.data());
-                const bool historicalViewsValid =
-                    historicalResult == XR_SUCCESS
-                    && historicalViewCount >= 2
-                    && ((historicalViewState.viewStateFlags & requiredViewState) == requiredViewState);
-                if (historicalViewsValid)
-                {
-                    submitViews = std::move(historicalViews);
-                    usingHistoricalStereoViews = true;
-                }
-                else
-                {
-                    static uint64_t historicalLocateFailures = 0;
-                    ++historicalLocateFailures;
-                    if (historicalLocateFailures <= 8 || historicalLocateFailures % 120 == 0)
-                    {
-                        std::cerr << "historical stereo xrLocateViews failed result="
-                                  << resultName(historicalResult)
-                                  << " renderedDisplayTime=" << renderer.stereoGameRenderedDisplayTime
-                                  << " currentDisplayTime=" << frameState.predictedDisplayTime
-                                  << " viewCount=" << historicalViewCount
-                                  << " viewStateFlags=0x" << std::hex << historicalViewState.viewStateFlags << std::dec
-                                  << "; using current frame views\n";
-                    }
-                }
+                // These are the exact per-eye poses/FOV copied atomically with
+                // the D3D9 pixels. Never label historical pixels with current
+                // xrLocateViews output; the compositor can reproject from the
+                // source pose to this frame's display time.
+                submitViews[0] = renderer.stereoSourceViews[0];
+                submitViews[1] = renderer.stereoSourceViews[1];
+                usingSourceStereoViews = true;
             }
             const bool monoFullscreenFallback =
                 allowStereoFullscreen
@@ -7273,6 +7865,10 @@ int main(int argc, char** argv)
                           << " pointerSource=" << menuPointerSource
                           << " runtimeUiStuckFrames=" << runtimeUiStuckFrames
                           << " haveRuntimeUiState=" << static_cast<int>(haveRuntimeUiState)
+                          << " cellKnown=" << static_cast<int>(stereoCellKnown)
+                          << " cell=0x" << std::hex << stereoCellFormId << std::dec
+                          << " cellStable=" << static_cast<int>(stereoCellStable)
+                          << " cellStableFrames=" << stereoCellStableFrames << "/" << stereoCellStableRequired
                           << " hasGameTexture=" << static_cast<int>(renderer.hasGameTextureFrame)
                           << " gameTextureUpdates=" << renderer.gameTextureUpdates
                           << " hasWorldTexture=" << static_cast<int>(renderer.hasWorldTextureFrame)
@@ -7285,10 +7881,11 @@ int main(int argc, char** argv)
                           << " stereoSeq=" << renderer.stereoGameFrameSequence
                           << " stereoPoseSeq=" << renderer.stereoGamePoseSequence
                           << " stereoRenderedTime=" << renderer.stereoGameRenderedDisplayTime
-                          << " historicalStereoViews=" << static_cast<int>(usingHistoricalStereoViews)
+                          << " exactSourceStereoViews=" << static_cast<int>(usingSourceStereoViews)
                           << " stereoStable=" << renderer.stereoStableFrameCount << "/" << stereoStableHandoffFrames
                           << " stereoUpdates=" << renderer.lastStereoFrameUpdated
                           << " stereoMisses=" << renderer.stereoFrameMisses
+                          << " stereoTransientReads=" << renderer.stereoTransientReadMisses
                           << " missingStereoFrames=" << missingStereoFrames
                           << "\n";
             }
@@ -7388,6 +7985,29 @@ int main(int argc, char** argv)
             endInfo.layers = nullptr;
         }
         const XrResult endResult = xr.endFrame(session, &endInfo);
+        if (frameIndex <= 12
+            || frameIndex % 60 == 0
+            || !submitProjectionLayer
+            || endResult != XR_SUCCESS)
+        {
+            std::cout
+                << "{\"event\":\"fnvxrOpenXrSubmit\",\"frame\":" << frameIndex
+                << ",\"predictedDisplayTime\":" << frameState.predictedDisplayTime
+                << ",\"sourceStereoSequence\":" << renderer.stereoGameFrameSequence
+                << ",\"sourcePoseSequence\":" << renderer.stereoGamePoseSequence
+                << ",\"sourceRenderedDisplayTime\":" << renderer.stereoGameRenderedDisplayTime
+                << ",\"leftHash\":\"0x" << std::hex << renderer.stereoLeftHash
+                << "\",\"rightHash\":\"0x" << renderer.stereoRightHash << std::dec
+                << "\",\"pixelSamples\":" << renderer.stereoPixelSamples
+                << ",\"nonBlackSamples\":" << renderer.stereoNonBlackSamples
+                << ",\"meaningfulDifferentSamples\":" << renderer.stereoMeaningfulDifferentSamples
+                << ",\"stereoFullscreen\":" << (submittedStereoFullscreen ? "true" : "false")
+                << ",\"runtimeGameplay\":" << (runtimeGameplayActive ? "true" : "false")
+                << ",\"projectionLayerSubmitted\":" << (submitProjectionLayer ? "true" : "false")
+                << ",\"layerCount\":" << endInfo.layerCount
+                << ",\"xrEndFrame\":\"" << resultName(endResult) << "\"}"
+                << "\n";
+        }
         if (endResult == XR_SESSION_LOSS_PENDING)
         {
             lossPending = true;

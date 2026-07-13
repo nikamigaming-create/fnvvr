@@ -4,15 +4,23 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 
 namespace fnvxr::shared
 {
 constexpr std::uint32_t XInputSharedMagic = 0x58564e46; // FNVX
-constexpr std::uint32_t XInputSharedVersion = 1;
+constexpr std::uint32_t XInputSharedVersion = 2;
+inline constexpr char XInputSharedMappingName[] = "Local\\FNVXR_XInput_State_v2";
 constexpr std::uint32_t DInputSharedMagic = 0x49444e46; // FNDI
-constexpr std::uint32_t DInputSharedVersion = 7;
+constexpr std::uint32_t DInputSharedVersion = 9;
+inline constexpr char DInputSharedMappingName[] = "Local\\FNVXR_DInput_State_v9";
+inline constexpr char InputCoreProducerMutexName[] = "Local\\FNVXR_Input_Core_Producer_v2_v9";
 constexpr std::uint32_t VrPoseSharedMagic = 0x52505646; // FVPR
-constexpr std::uint32_t VrPoseSharedVersion = 4;
+constexpr std::uint32_t VrPoseSharedVersion = 7;
+inline constexpr char VrPoseSharedMappingName[] = "Local\\FNVXR_VR_Pose_State_v7";
+constexpr std::uint32_t VrOriginSharedMagic = 0x4f565846; // FXVO
+constexpr std::uint32_t VrOriginSharedVersion = 3;
+inline constexpr char VrOriginSharedMappingName[] = "Local\\FNVXR_VR_Origin_State_v3";
 constexpr std::uint32_t CameraSharedMagic = 0x43585646; // FNXC
 constexpr std::uint32_t CameraSharedVersion = 1;
 constexpr std::uint32_t RuntimeSharedMagic = 0x53585646; // FNVS
@@ -24,19 +32,21 @@ constexpr std::uint32_t CommandSharedVersion = 1;
 constexpr std::uint32_t InputEventSharedMagic = 0x49564e46; // FNVI
 constexpr std::uint32_t InputEventSharedVersion = 1;
 constexpr std::uint32_t InputEventQueueLength = 64;
-constexpr std::uint32_t OpenMwPlayerSharedMagic = 0x4f4d4e46; // FNMO
-constexpr std::uint32_t OpenMwPlayerSharedVersion = 1;
 constexpr std::uint32_t D3D9FrameSharedMagic = 0x46585646; // FNVF
 constexpr std::uint32_t D3D9StereoFrameSharedMagic = 0x53585646; // FNXS
+constexpr std::uint32_t D3D9StereoFrameSharedVersion = 3;
+inline constexpr char D3D9StereoFrameSharedMappingName[] = "Local\\FNVXR_D3D9_StereoFrame_v3";
 constexpr std::uint32_t D3D9SharedFrameMaxWidth = 4096;
 constexpr std::uint32_t D3D9SharedFrameMaxHeight = 2560;
 
 // Describes how the two eye images in SharedD3D9StereoFrameHeader were made.
-// NativeSameFrame is the only production VR mode: both complete eye renders
-// come from one simulation tick and are published as a single pair.
+// NativeSameFrame is the legacy two-engine-traversal producer. SingleTraversal
+// applies the HMD pose to the retail camera once, builds one Gamebryo scene,
+// and replays that exact D3D draw stream into both eyes from the same tick.
 constexpr std::uint32_t StereoProducerUnknown = 0;
 constexpr std::uint32_t StereoProducerDrawReplay = 1;
 constexpr std::uint32_t StereoProducerNativeSameFrame = 2;
+constexpr std::uint32_t StereoProducerSingleTraversal = 3;
 
 constexpr std::uint32_t RuntimePhaseUnknown = 0;
 constexpr std::uint32_t RuntimePhaseMenu = 1;
@@ -50,20 +60,28 @@ constexpr std::uint32_t RuntimeDialogMenuBit = 1u << 3;
 constexpr std::uint32_t RuntimeVatsMenuBit = 1u << 4;
 constexpr std::uint32_t RuntimeLoadingMenuBit = 1u << 5;
 constexpr std::uint32_t RuntimePipBoyMenuBit = 1u << 6;
+constexpr std::uint32_t RuntimeGenericMenuBit = 1u << 7;
 constexpr std::uint32_t RuntimeInteractiveMenuBits =
-    RuntimeMenuModeBit
-    | RuntimeStartMenuBit
+    RuntimeStartMenuBit
     | RuntimeRaceSexMenuBit
     | RuntimeDialogMenuBit
     | RuntimeVatsMenuBit
-    | RuntimePipBoyMenuBit;
+    | RuntimePipBoyMenuBit
+    | RuntimeGenericMenuBit;
 constexpr std::uint32_t RuntimeBlockingMenuBits =
     RuntimeStartMenuBit
     | RuntimeRaceSexMenuBit
     | RuntimeDialogMenuBit
     | RuntimeVatsMenuBit
     | RuntimeLoadingMenuBit
-    | RuntimePipBoyMenuBit;
+    | RuntimePipBoyMenuBit
+    | RuntimeGenericMenuBit;
+
+inline bool runtimeUiInputAllowed(std::uint32_t menuBits)
+{
+    return (menuBits & RuntimeInteractiveMenuBits) != 0u
+        && (menuBits & RuntimeLoadingMenuBit) == 0u;
+}
 
 inline bool runtimeGameplayPhase(std::uint32_t phase, std::uint32_t menuBits, std::uint32_t showroomActive)
 {
@@ -123,11 +141,16 @@ constexpr std::uint32_t VrPoseTrackingLeftGripActive = 1u << 1;
 constexpr std::uint32_t VrPoseTrackingRightGripActive = 1u << 2;
 constexpr std::uint32_t VrPoseTrackingLeftGripCurrent = 1u << 3;
 constexpr std::uint32_t VrPoseTrackingRightGripCurrent = 1u << 4;
+constexpr std::uint32_t VrPoseTrackingLeftAimActive = 1u << 5;
+constexpr std::uint32_t VrPoseTrackingRightAimActive = 1u << 6;
+constexpr std::uint32_t VrPoseTrackingLeftAimCurrent = 1u << 7;
+constexpr std::uint32_t VrPoseTrackingRightAimCurrent = 1u << 8;
 
 struct SharedXInputState
 {
     std::uint32_t magic;
     std::uint32_t version;
+    volatile LONG sequence;
     std::uint32_t packet;
     std::uint16_t buttons;
     std::uint8_t leftTrigger;
@@ -144,11 +167,13 @@ struct SharedDInputState
 {
     std::uint32_t magic;
     std::uint32_t version;
+    volatile LONG sequence;
     std::uint32_t frame;
     LONG clientX;
     LONG clientY;
     std::uint32_t pointerActive;
     std::uint32_t mouseClickPacket;
+    // Plugin-owned atomic fallback mailbox; host payload writes preserve it.
     std::uint32_t keyboardAcceptPacket;
     std::uint32_t menuInputActive;
     std::uint32_t gameplayControlsActive;
@@ -157,6 +182,9 @@ struct SharedDInputState
     std::int32_t rightStickX;
     std::int32_t rightStickY;
     std::uint32_t headLookActive;
+    // Cumulative signed microradian counters. Consumers difference consecutive
+    // samples with wrappedInt32Delta so a frame can be polled at most once
+    // without losing motion when producer frames are skipped.
     std::int32_t headLookX;
     std::int32_t headLookY;
     std::uint32_t gyroLookActive;
@@ -167,6 +195,90 @@ struct SharedDInputState
     std::uint32_t gameplayFlags;
     std::uint32_t aimTrigger;
 };
+
+// The input bridges are mapped into several independently scheduled processes.
+// Writers mark the sequence odd while mutating producer-owned frame fields and
+// even only after that frame is complete. Readers either copy one matching even
+// sequence or reject the sample; they must never act on a torn
+// button/trigger/stick combination. SharedXInputState::reserved is an explicit
+// exception: its three bytes are independent atomic status mailboxes owned by
+// the retail proxy/plugin, not part of the host payload transaction.
+inline bool beginSequencedSharedWrite(volatile LONG& sequence)
+{
+    for (int attempt = 0; attempt < 1024; ++attempt)
+    {
+        const LONG before = sequence;
+        if ((before & 1) != 0)
+        {
+            YieldProcessor();
+            continue;
+        }
+        if (InterlockedCompareExchange(&sequence, before + 1, before) == before)
+        {
+            MemoryBarrier();
+            return true;
+        }
+        YieldProcessor();
+    }
+    return false;
+}
+
+inline void endSequencedSharedWrite(volatile LONG& sequence)
+{
+    MemoryBarrier();
+    InterlockedIncrement(&sequence);
+}
+
+inline std::int32_t addWrappedInt32(std::int32_t value, std::int32_t delta)
+{
+    std::uint32_t valueBits = 0;
+    std::uint32_t deltaBits = 0;
+    std::memcpy(&valueBits, &value, sizeof(valueBits));
+    std::memcpy(&deltaBits, &delta, sizeof(deltaBits));
+    const std::uint32_t resultBits = valueBits + deltaBits;
+    std::int32_t result = 0;
+    std::memcpy(&result, &resultBits, sizeof(result));
+    return result;
+}
+
+inline std::int32_t wrappedInt32Delta(std::int32_t current, std::int32_t previous)
+{
+    std::uint32_t currentBits = 0;
+    std::uint32_t previousBits = 0;
+    std::memcpy(&currentBits, &current, sizeof(currentBits));
+    std::memcpy(&previousBits, &previous, sizeof(previousBits));
+    const std::uint32_t deltaBits = currentBits - previousBits;
+    std::int32_t delta = 0;
+    std::memcpy(&delta, &deltaBits, sizeof(delta));
+    return delta;
+}
+
+template <typename T>
+inline bool readSequencedSharedSnapshot(const T* state, T& snapshot, int attempts = 4)
+{
+    if (!state)
+        return false;
+
+    for (int attempt = 0; attempt < attempts; ++attempt)
+    {
+        const LONG sequenceBefore = state->sequence;
+        if ((sequenceBefore & 1) != 0)
+        {
+            YieldProcessor();
+            continue;
+        }
+
+        MemoryBarrier();
+        std::memcpy(&snapshot, state, sizeof(snapshot));
+        MemoryBarrier();
+
+        const LONG sequenceAfter = state->sequence;
+        if (sequenceBefore == sequenceAfter && (sequenceAfter & 1) == 0)
+            return true;
+        YieldProcessor();
+    }
+    return false;
+}
 
 struct SharedVrPoseState
 {
@@ -187,9 +299,41 @@ struct SharedVrPoseState
     float rightEyePos[3];
     float leftFov[4];
     float rightFov[4];
-    // Occupies the former trailing alignment padding, keeping this mapping at
-    // 208 bytes while allowing retail IK to reject inactive controllers.
+    // Grip poses remain the wrist/arm anchors. Aim poses are kept separately
+    // so retail weapon visuals can use the runtime-defined pointing direction
+    // without moving the wrist away from the physical controller.
+    float leftAimRot[4];
+    float leftAimPos[3];
+    float rightAimRot[4];
+    float rightAimPos[3];
     std::uint32_t trackingFlags;
+    // Incremented by the OpenXR host when LOCAL space changes. Consumers must
+    // invalidate every recenter/body anchor derived from an older generation.
+    std::uint32_t referenceSpaceGeneration;
+    // Nonzero identity of the current host process. Generation numbers can
+    // repeat after a restart; consumers reset all origins when this changes.
+    std::uint32_t producerEpoch;
+};
+
+// The D3D9 native camera transaction is the authority that chooses the
+// gameplay recenter sample. The 32-bit retail rig reads this record so camera
+// and controller transforms cannot latch two subtly different origins.
+struct SharedVrOriginState
+{
+    std::uint32_t magic;
+    std::uint32_t version;
+    volatile LONG sequence;
+    std::uint32_t active;
+    std::uint32_t generation;
+    std::uint32_t poseSequence;
+    std::uint64_t poseFrame;
+    float originRot[4];
+    float originPos[3];
+    std::uint32_t producerEpoch;
+    std::uint32_t renderPoseSequence;
+    std::uint32_t reserved;
+    std::uint64_t renderPoseFrame;
+    std::int64_t renderedDisplayTime;
 };
 
 struct SharedCameraState
@@ -235,6 +379,8 @@ struct SharedD3D9FrameHeader
 struct SharedD3D9StereoFrameHeader
 {
     std::uint32_t magic;
+    std::uint32_t version;
+    std::uint32_t headerBytes;
     volatile LONG writing;
     volatile LONG sequence;
     LONG width;
@@ -255,6 +401,12 @@ struct SharedD3D9StereoFrameHeader
     float rightFov[4];
     LONG producerMode;
     LONG renderPairSequence;
+    std::uint32_t leftPayloadOffset;
+    std::uint32_t rightPayloadOffset;
+    std::uint32_t totalMappingBytes;
+    std::uint32_t referenceSpaceGeneration;
+    std::uint32_t producerEpoch;
+    std::uint32_t reserved;
 };
 
 struct SharedPlayerState
@@ -314,17 +466,29 @@ struct SharedInputEventQueue
     SharedInputEvent events[InputEventQueueLength];
 };
 
-static_assert(sizeof(SharedXInputState) == 28, "SharedXInputState layout changed");
-static_assert(sizeof(SharedDInputState) == 96, "SharedDInputState layout changed unexpectedly");
-static_assert(sizeof(SharedVrPoseState) == 208, "SharedVrPoseState layout changed unexpectedly");
+static_assert(sizeof(SharedXInputState) == 32, "SharedXInputState layout changed");
+static_assert(sizeof(SharedDInputState) == 100, "SharedDInputState layout changed unexpectedly");
+static_assert(sizeof(SharedVrPoseState) == 272, "SharedVrPoseState layout changed unexpectedly");
+static_assert(sizeof(SharedVrOriginState) == 88, "SharedVrOriginState layout changed unexpectedly");
 static_assert(sizeof(SharedCameraState) == 80, "SharedCameraState layout changed");
 static_assert(sizeof(SharedRuntimeState) == 88, "SharedRuntimeState layout changed");
 static_assert(sizeof(SharedD3D9FrameHeader) == 28, "SharedD3D9FrameHeader layout changed");
-static_assert(sizeof(SharedD3D9StereoFrameHeader) == 152, "SharedD3D9StereoFrameHeader layout changed");
+static_assert(sizeof(SharedD3D9StereoFrameHeader) == 184, "SharedD3D9StereoFrameHeader layout changed");
 static_assert(sizeof(SharedPlayerState) == 160, "SharedPlayerState layout changed");
 static_assert(sizeof(SharedCommandState) == 216, "SharedCommandState layout changed");
 static_assert(sizeof(SharedInputEvent) == 32, "SharedInputEvent layout changed");
 static_assert(sizeof(SharedInputEventQueue) == 2088, "SharedInputEventQueue layout changed");
+static_assert(offsetof(SharedXInputState, sequence) == 8, "SharedXInputState sequence offset changed");
+static_assert(offsetof(SharedXInputState, packet) == 12, "SharedXInputState packet offset changed");
+static_assert(offsetof(SharedXInputState, buttons) == 16, "SharedXInputState buttons offset changed");
+static_assert(offsetof(SharedXInputState, connected) == 28, "SharedXInputState connected offset changed");
+static_assert(offsetof(SharedXInputState, reserved) == 29, "SharedXInputState mailbox offset changed");
+static_assert(offsetof(SharedDInputState, sequence) == 8, "SharedDInputState sequence offset changed");
+static_assert(offsetof(SharedDInputState, frame) == 12, "SharedDInputState frame offset changed");
+static_assert(offsetof(SharedDInputState, mouseClickPacket) == 28, "SharedDInputState click offset changed");
+static_assert(offsetof(SharedDInputState, keyboardAcceptPacket) == 32, "SharedDInputState accept offset changed");
+static_assert(offsetof(SharedDInputState, gameplayFlags) == 92, "SharedDInputState gameplay flags offset changed");
+static_assert(offsetof(SharedDInputState, aimTrigger) == 96, "SharedDInputState aim trigger offset changed");
 static_assert(offsetof(SharedPlayerState, sequence) == 8, "SharedPlayerState sequence offset changed");
 static_assert(offsetof(SharedPlayerState, frame) == 16, "SharedPlayerState frame offset changed");
 static_assert(
@@ -342,8 +506,19 @@ static_assert(offsetof(SharedInputEventQueue, writeSequence) == 12, "SharedInput
 static_assert(offsetof(SharedInputEventQueue, events) == 40, "SharedInputEventQueue events offset changed");
 static_assert(offsetof(SharedVrPoseState, predictedDisplayTime) == 24, "SharedVrPoseState predictedDisplayTime offset changed");
 static_assert(offsetof(SharedVrPoseState, hmdRot) == 32, "SharedVrPoseState hmdRot offset changed");
-static_assert(offsetof(SharedD3D9StereoFrameHeader, renderedDisplayTime) == 48, "SharedD3D9StereoFrameHeader renderedDisplayTime offset changed");
-static_assert(offsetof(SharedD3D9StereoFrameHeader, leftEyeRot) == 56, "SharedD3D9StereoFrameHeader leftEyeRot offset changed");
-static_assert(offsetof(SharedD3D9StereoFrameHeader, producerMode) == 144, "SharedD3D9StereoFrameHeader producerMode offset changed");
-static_assert(offsetof(SharedD3D9StereoFrameHeader, renderPairSequence) == 148, "SharedD3D9StereoFrameHeader renderPairSequence offset changed");
+static_assert(offsetof(SharedVrPoseState, leftAimRot) == 204, "SharedVrPoseState leftAimRot offset changed");
+static_assert(offsetof(SharedVrPoseState, rightAimRot) == 232, "SharedVrPoseState rightAimRot offset changed");
+static_assert(offsetof(SharedVrPoseState, trackingFlags) == 260, "SharedVrPoseState trackingFlags offset changed");
+static_assert(offsetof(SharedVrPoseState, referenceSpaceGeneration) == 264, "SharedVrPoseState reference generation offset changed");
+static_assert(offsetof(SharedVrOriginState, poseFrame) == 24, "SharedVrOriginState pose frame offset changed");
+static_assert(offsetof(SharedVrOriginState, originRot) == 32, "SharedVrOriginState rotation offset changed");
+static_assert(offsetof(SharedVrOriginState, renderPoseSequence) == 64, "SharedVrOriginState render pose sequence offset changed");
+static_assert(offsetof(SharedVrOriginState, renderPoseFrame) == 72, "SharedVrOriginState render pose frame offset changed");
+static_assert(offsetof(SharedD3D9StereoFrameHeader, writing) == 12, "SharedD3D9StereoFrameHeader writing offset changed");
+static_assert(offsetof(SharedD3D9StereoFrameHeader, sequence) == 16, "SharedD3D9StereoFrameHeader sequence offset changed");
+static_assert(offsetof(SharedD3D9StereoFrameHeader, renderedDisplayTime) == 56, "SharedD3D9StereoFrameHeader renderedDisplayTime offset changed");
+static_assert(offsetof(SharedD3D9StereoFrameHeader, leftEyeRot) == 64, "SharedD3D9StereoFrameHeader leftEyeRot offset changed");
+static_assert(offsetof(SharedD3D9StereoFrameHeader, producerMode) == 152, "SharedD3D9StereoFrameHeader producerMode offset changed");
+static_assert(offsetof(SharedD3D9StereoFrameHeader, renderPairSequence) == 156, "SharedD3D9StereoFrameHeader renderPairSequence offset changed");
+static_assert(offsetof(SharedD3D9StereoFrameHeader, leftPayloadOffset) == 160, "SharedD3D9StereoFrameHeader payload offset changed");
 }

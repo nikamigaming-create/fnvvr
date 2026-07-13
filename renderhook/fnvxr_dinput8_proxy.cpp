@@ -50,6 +50,13 @@ bool g_loggedInputEventOpenFailed = false;
 bool g_loggedXInputSharedOpen = false;
 bool g_loggedXInputSharedOpenFailed = false;
 bool g_loggedXInputConsumed = false;
+bool g_xinputConsumptionLatched = false;
+SRWLOCK g_dinputSnapshotLock = SRWLOCK_INIT;
+SharedDInputState g_lastStableDInput {};
+bool g_haveLastStableDInput = false;
+bool g_dinputReturningNeutral = false;
+std::uint32_t g_lastAdvancingDInputFrame = 0;
+ULONGLONG g_lastDInputAdvanceMs = 0;
 
 bool buildLogPath(char* path, size_t pathSize, const char* relativePath)
 {
@@ -119,7 +126,7 @@ SharedDInputState* sharedState()
     if (g_shared)
         return g_shared;
 
-    g_mapping = OpenFileMappingA(FILE_MAP_READ, FALSE, "Local\\FNVXR_DInput_State");
+    g_mapping = OpenFileMappingA(FILE_MAP_READ, FALSE, fnvxr::shared::DInputSharedMappingName);
     if (!g_mapping)
     {
         if (!g_loggedSharedOpenFailed)
@@ -132,6 +139,14 @@ SharedDInputState* sharedState()
 
     g_shared = static_cast<SharedDInputState*>(
         MapViewOfFile(g_mapping, FILE_MAP_READ, 0, 0, sizeof(SharedDInputState)));
+    if (!g_shared)
+    {
+        const DWORD error = GetLastError();
+        CloseHandle(g_mapping);
+        g_mapping = nullptr;
+        logLine("shared map failed err=%lu\n", error);
+        return nullptr;
+    }
     if (g_shared && !g_loggedSharedOpen)
     {
         g_loggedSharedOpen = true;
@@ -171,7 +186,7 @@ SharedXInputState* xinputSharedState()
     if (g_xinputShared)
         return g_xinputShared;
 
-    g_xinputMapping = OpenFileMappingA(FILE_MAP_READ, FALSE, "Local\\FNVXR_XInput_State");
+    g_xinputMapping = OpenFileMappingA(FILE_MAP_READ, FALSE, fnvxr::shared::XInputSharedMappingName);
     if (!g_xinputMapping)
     {
         if (!g_loggedXInputSharedOpenFailed)
@@ -184,6 +199,14 @@ SharedXInputState* xinputSharedState()
 
     g_xinputShared = static_cast<SharedXInputState*>(
         MapViewOfFile(g_xinputMapping, FILE_MAP_READ, 0, 0, sizeof(SharedXInputState)));
+    if (!g_xinputShared)
+    {
+        const DWORD error = GetLastError();
+        CloseHandle(g_xinputMapping);
+        g_xinputMapping = nullptr;
+        logLine("xinput shared map failed err=%lu\n", error);
+        return nullptr;
+    }
     if (g_xinputShared && !g_loggedXInputSharedOpen)
     {
         g_loggedXInputSharedOpen = true;
@@ -194,31 +217,43 @@ SharedXInputState* xinputSharedState()
 
 bool xinputAnalogConsumed()
 {
-    const SharedXInputState* shared = xinputSharedState();
-    const bool consumed = shared
-        && shared->magic == XInputSharedMagic
-        && shared->version == XInputSharedVersion
-        && shared->reserved[XInputReservedRetailConsumed] != 0;
+    if (g_xinputConsumptionLatched)
+        return true;
+
+    SharedXInputState* mapped = xinputSharedState();
+    SharedXInputState snapshot {};
+    const bool stable = fnvxr::shared::readSequencedSharedSnapshot(mapped, snapshot);
+    const bool consumed = stable
+        && snapshot.magic == XInputSharedMagic
+        && snapshot.version == XInputSharedVersion
+        && *reinterpret_cast<volatile std::uint8_t*>(
+            &mapped->reserved[XInputReservedRetailConsumed]) != 0;
     if (consumed && !g_loggedXInputConsumed)
     {
         g_loggedXInputConsumed = true;
         logLine("xinput analog consumed: disabling DInput keyboard movement fallback packet=%lu ls=%d,%d rs=%d,%d\n",
-            shared->packet,
-            static_cast<int>(shared->leftThumbX),
-            static_cast<int>(shared->leftThumbY),
-            static_cast<int>(shared->rightThumbX),
-            static_cast<int>(shared->rightThumbY));
+            snapshot.packet,
+            static_cast<int>(snapshot.leftThumbX),
+            static_cast<int>(snapshot.leftThumbY),
+            static_cast<int>(snapshot.rightThumbX),
+            static_cast<int>(snapshot.rightThumbY));
     }
-    return consumed;
+    if (consumed)
+        g_xinputConsumptionLatched = true;
+    return g_xinputConsumptionLatched;
 }
 
 bool xinputAutoRunEnabled()
 {
-    const SharedXInputState* shared = xinputSharedState();
-    return shared
-        && shared->magic == XInputSharedMagic
-        && shared->version == XInputSharedVersion
-        && shared->reserved[XInputReservedAutoRun] != 0;
+    SharedXInputState* mapped = xinputSharedState();
+    if (!mapped
+        || mapped->magic != XInputSharedMagic
+        || mapped->version != XInputSharedVersion)
+    {
+        return false;
+    }
+    return *reinterpret_cast<volatile std::uint8_t*>(
+        &mapped->reserved[XInputReservedAutoRun]) != 0;
 }
 
 bool validShared(const SharedDInputState* shared)
@@ -226,6 +261,62 @@ bool validShared(const SharedDInputState* shared)
     return shared
         && shared->magic == DInputSharedMagic
         && shared->version == DInputSharedVersion;
+}
+
+LONG envLong(const char* name, LONG fallback);
+
+bool readSharedSnapshot(SharedDInputState& snapshot)
+{
+    SharedDInputState* mapped = sharedState();
+    if (!mapped)
+        return false;
+
+    const ULONGLONG nowMs = GetTickCount64();
+    const ULONGLONG staleMs = static_cast<ULONGLONG>(
+        std::max<LONG>(50, envLong("FNVXR_DINPUT_STALE_FRAME_MS", 250)));
+
+    AcquireSRWLockExclusive(&g_dinputSnapshotLock);
+    SharedDInputState current {};
+    const bool currentValid = fnvxr::shared::readSequencedSharedSnapshot(mapped, current)
+        && validShared(&current);
+    if (currentValid)
+    {
+        if (!g_haveLastStableDInput || current.frame != g_lastAdvancingDInputFrame)
+        {
+            g_lastAdvancingDInputFrame = current.frame;
+            g_lastDInputAdvanceMs = nowMs;
+        }
+        g_lastStableDInput = current;
+        g_haveLastStableDInput = true;
+    }
+
+    const bool fresh = g_haveLastStableDInput
+        && g_lastDInputAdvanceMs != 0
+        && nowMs - g_lastDInputAdvanceMs <= staleMs;
+    if (fresh)
+    {
+        snapshot = g_lastStableDInput;
+        g_dinputReturningNeutral = false;
+        ReleaseSRWLockExclusive(&g_dinputSnapshotLock);
+        return true;
+    }
+
+    snapshot = {};
+    snapshot.magic = DInputSharedMagic;
+    snapshot.version = DInputSharedVersion;
+    if (g_haveLastStableDInput)
+    {
+        snapshot.frame = g_lastStableDInput.frame;
+        snapshot.mouseClickPacket = g_lastStableDInput.mouseClickPacket;
+        snapshot.keyboardAcceptPacket = g_lastStableDInput.keyboardAcceptPacket;
+        snapshot.headLookX = g_lastStableDInput.headLookX;
+        snapshot.headLookY = g_lastStableDInput.headLookY;
+        snapshot.gyroLookX = g_lastStableDInput.gyroLookX;
+        snapshot.gyroLookY = g_lastStableDInput.gyroLookY;
+    }
+    g_dinputReturningNeutral = true;
+    ReleaseSRWLockExclusive(&g_dinputSnapshotLock);
+    return true;
 }
 
 bool validInputEvents(const SharedInputEventQueue* queue)
@@ -338,6 +429,23 @@ bool handspaceLookActive(const SharedDInputState* shared)
         && shared->gyroLookActive != 0
         && !precisionLookActive(shared)
         && envEnabled("FNVXR_DINPUT_HANDSPACE_LOOK_ENABLE", true);
+}
+
+std::uint32_t gameplayLookModeSignature(const SharedDInputState* shared)
+{
+    if (!validShared(shared))
+        return 0;
+
+    std::uint32_t signature = 0;
+    if (gameplayControlsActive(shared))
+        signature |= 1u << 0;
+    if (shared->headLookActive != 0)
+        signature |= 1u << 1;
+    if (shared->gyroLookActive != 0)
+        signature |= 1u << 2;
+    if ((shared->gameplayFlags & DInputGameplayFlagWeaponOut) != 0)
+        signature |= 1u << 3;
+    return signature;
 }
 
 bool keyboardMovementEnabled()
@@ -487,9 +595,11 @@ void computeGameplayLookDeltas(
         && envEnabled("FNVXR_THIRD_PERSON_L3_ENABLE", true);
     if (!thirdPersonZoomHeld)
     {
-        if (std::abs(shared->rightStickX) > stickDeadzone)
+        const bool rightStickLookEnabled = envEnabled("FNVXR_DINPUT_RIGHT_STICK_LOOK_ENABLE", true);
+        if (rightStickLookEnabled && std::abs(shared->rightStickX) > stickDeadzone)
             stickX = static_cast<LONG>(std::lround(static_cast<float>(shared->rightStickX) / 32767.0f * stickScale));
-        if (envEnabled("FNVXR_DINPUT_RIGHT_STICK_PITCH_ENABLE", true)
+        if (rightStickLookEnabled
+            && envEnabled("FNVXR_DINPUT_RIGHT_STICK_PITCH_ENABLE", true)
             && std::abs(shared->rightStickY) > stickDeadzone)
         {
             stickY = static_cast<LONG>(std::lround(static_cast<float>(-shared->rightStickY) / 32767.0f * stickScale));
@@ -536,6 +646,14 @@ void computeGameplayLookDeltas(
 
 void cleanup()
 {
+    AcquireSRWLockExclusive(&g_dinputSnapshotLock);
+    g_lastStableDInput = {};
+    g_haveLastStableDInput = false;
+    g_dinputReturningNeutral = false;
+    g_lastAdvancingDInputFrame = 0;
+    g_lastDInputAdvanceMs = 0;
+    ReleaseSRWLockExclusive(&g_dinputSnapshotLock);
+    g_xinputConsumptionLatched = false;
     if (g_shared)
     {
         UnmapViewOfFile(g_shared);
@@ -582,6 +700,15 @@ public:
         , m_keyboard(keyboard)
     {
         logLine("wrap device mouse=%d keyboard=%d real=%p\n", mouse ? 1 : 0, keyboard ? 1 : 0, realDevice);
+        SharedDInputState initial {};
+        if (readSharedSnapshot(initial))
+        {
+            m_lastMouseClickPacket = initial.mouseClickPacket;
+            m_lastKeyboardAcceptPacket = initial.keyboardAcceptPacket;
+            commitGameplayLookSample(&initial);
+        }
+        if (const SharedInputEventQueue* queue = inputEventQueue(); validInputEvents(queue))
+            m_lastInputEventSequence = queue->writeSequence;
     }
 
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, LPVOID* out) override
@@ -621,7 +748,8 @@ public:
         if (FAILED(hr) || !data)
             return hr;
 
-        SharedDInputState* shared = sharedState();
+        SharedDInputState snapshot {};
+        const SharedDInputState* shared = readSharedSnapshot(snapshot) ? &snapshot : nullptr;
         if (m_mouse && !m_loggedMouseStatePoll)
         {
             m_loggedMouseStatePoll = true;
@@ -700,7 +828,8 @@ public:
             return hr;
 
         DWORD written = *count;
-        SharedDInputState* shared = sharedState();
+        SharedDInputState snapshot {};
+        const SharedDInputState* shared = readSharedSnapshot(snapshot) ? &snapshot : nullptr;
         if (!m_loggedBufferedPoll)
         {
             m_loggedBufferedPoll = true;
@@ -820,6 +949,57 @@ public:
     HRESULT STDMETHODCALLTYPE GetImageInfo(LPDIDEVICEIMAGEINFOHEADERA value) override { return m_real->GetImageInfo(value); }
 
 private:
+    void commitGameplayLookSample(const SharedDInputState* shared)
+    {
+        if (!validShared(shared))
+            return;
+        m_lastLookFrame = shared->frame;
+        m_lastHeadLookX = shared->headLookX;
+        m_lastHeadLookY = shared->headLookY;
+        m_lastGyroLookX = shared->gyroLookX;
+        m_lastGyroLookY = shared->gyroLookY;
+        m_lastLookModeSignature = gameplayLookModeSignature(shared);
+        m_haveLookSample = true;
+    }
+
+    bool prepareGameplayLookSample(
+        const SharedDInputState* shared,
+        SharedDInputState& sample)
+    {
+        if (!validShared(shared))
+            return false;
+
+        if (!m_haveLookSample)
+        {
+            commitGameplayLookSample(shared);
+            return false;
+        }
+        if (shared->frame == m_lastLookFrame)
+            return false;
+
+        // The cumulative hand-look counters intentionally carry either
+        // precision gyro or hand-space motion. Rebaseline at a source/scale
+        // transition so skipped producer frames cannot be replayed using the
+        // new mode's sensitivity.
+        if (gameplayLookModeSignature(shared) != m_lastLookModeSignature)
+        {
+            commitGameplayLookSample(shared);
+            return false;
+        }
+
+        sample = *shared;
+        sample.headLookX = fnvxr::shared::wrappedInt32Delta(shared->headLookX, m_lastHeadLookX);
+        sample.headLookY = fnvxr::shared::wrappedInt32Delta(shared->headLookY, m_lastHeadLookY);
+        sample.gyroLookX = fnvxr::shared::wrappedInt32Delta(shared->gyroLookX, m_lastGyroLookX);
+        sample.gyroLookY = fnvxr::shared::wrappedInt32Delta(shared->gyroLookY, m_lastGyroLookY);
+        if (!gameplayControlsActive(&sample))
+        {
+            commitGameplayLookSample(shared);
+            return false;
+        }
+        return true;
+    }
+
     void injectMouseStateFields(const SharedDInputState* shared, LONG& lX, LONG& lY, LONG& lZ, BYTE* buttons)
     {
         consumeInputEventsForMouseState(lX, lY, lZ, buttons);
@@ -860,15 +1040,17 @@ private:
             }
         }
 
-        if (validShared(shared) && shared->mouseClickPacket != m_lastStateMouseClickPacket)
+        if (validShared(shared) && shared->mouseClickPacket != m_lastMouseClickPacket)
         {
-            m_lastStateMouseClickPacket = shared->mouseClickPacket;
+            m_lastMouseClickPacket = shared->mouseClickPacket;
             buttons[0] = 0x80;
             logLine("inject state mouse button0 packet=%lu\n", shared->mouseClickPacket);
         }
 
-        if (gameplayControlsActive(shared))
+        SharedDInputState lookSample {};
+        if (prepareGameplayLookSample(shared, lookSample))
         {
+            const SharedDInputState* look = &lookSample;
             LONG lookX = 0;
             LONG lookY = 0;
             LONG stickX = 0;
@@ -880,14 +1062,14 @@ private:
             bool aimHeld = false;
             float headScale = 0.0f;
             float gyroScale = 0.0f;
-            computeGameplayLookDeltas(shared, lookX, lookY, stickX, stickY, headX, headY, gyroX, gyroY, aimHeld, headScale, gyroScale);
+            computeGameplayLookDeltas(look, lookX, lookY, stickX, stickY, headX, headY, gyroX, gyroY, aimHeld, headScale, gyroScale);
             lX += lookX;
             lY += lookY;
             if ((lookX || lookY) && !m_loggedGameplayMouseLook)
             {
                 m_loggedGameplayMouseLook = true;
                 logLine(
-                    "inject state gameplay mouse-look dx=%ld dy=%ld stick=%ld,%ld head=%ld,%ld gyro=%ld,%ld aim=%d aimTrigger=%lu headScale=%ld gyroScale=%ld flags=0x%lx rs=%ld,%ld headRaw=%lu,%ld,%ld gyroRaw=%lu,%ld,%ld active=%lu menu=%lu\n",
+                    "inject state gameplay mouse-look dx=%ld dy=%ld stick=%ld,%ld head=%ld,%ld gyro=%ld,%ld aim=%d aimTrigger=%lu headScale=%ld gyroScale=%ld flags=0x%lx rs=%ld,%ld headDelta=%lu,%ld,%ld gyroDelta=%lu,%ld,%ld active=%lu menu=%lu\n",
                     lookX,
                     lookY,
                     stickX,
@@ -897,21 +1079,22 @@ private:
                     gyroX,
                     gyroY,
                     aimHeld ? 1 : 0,
-                    shared->aimTrigger,
+                    look->aimTrigger,
                     static_cast<LONG>(std::lround(headScale)),
                     static_cast<LONG>(std::lround(gyroScale)),
-                    static_cast<unsigned long>(shared->gameplayFlags),
-                    static_cast<LONG>(shared->rightStickX),
-                    static_cast<LONG>(shared->rightStickY),
-                    shared->headLookActive,
-                    static_cast<LONG>(shared->headLookX),
-                    static_cast<LONG>(shared->headLookY),
-                    shared->gyroLookActive,
-                    static_cast<LONG>(shared->gyroLookX),
-                    static_cast<LONG>(shared->gyroLookY),
-                    shared->gameplayControlsActive,
-                    shared->menuInputActive);
+                    static_cast<unsigned long>(look->gameplayFlags),
+                    static_cast<LONG>(look->rightStickX),
+                    static_cast<LONG>(look->rightStickY),
+                    look->headLookActive,
+                    static_cast<LONG>(look->headLookX),
+                    static_cast<LONG>(look->headLookY),
+                    look->gyroLookActive,
+                    static_cast<LONG>(look->gyroLookX),
+                    static_cast<LONG>(look->gyroLookY),
+                    look->gameplayControlsActive,
+                    look->menuInputActive);
             }
+            commitGameplayLookSample(shared);
         }
     }
 
@@ -934,9 +1117,9 @@ private:
 
         injectGameplayKeyboardState(shared, keys);
 
-        if (shared->keyboardAcceptPacket != m_lastKeyboardStateAcceptPacket)
+        if (shared->keyboardAcceptPacket != m_lastKeyboardAcceptPacket)
         {
-            m_lastKeyboardStateAcceptPacket = shared->keyboardAcceptPacket;
+            m_lastKeyboardAcceptPacket = shared->keyboardAcceptPacket;
             keys[DIK_RETURN] = 0x80;
             logLine("inject state keyboard accept packet=%lu\n", shared->keyboardAcceptPacket);
         }
@@ -1010,21 +1193,12 @@ private:
         if (!keys)
             return;
 
-        for (std::uint32_t code = 0; code < 256; ++code)
-        {
-            if (m_pendingStateInputKeyRelease[code])
-            {
-                m_forcedInputKeys[code] = false;
-                m_pendingStateInputKeyRelease[code] = false;
-            }
-        }
-
         const SharedInputEventQueue* queue = inputEventQueue();
         if (!validInputEvents(queue))
             return;
 
         const LONG writeSequence = queue->writeSequence;
-        for (LONG sequence = inputEventStartSequence(m_lastStateInputEventSequence, writeSequence);
+        for (LONG sequence = inputEventStartSequence(m_lastInputEventSequence, writeSequence);
              sequence <= writeSequence;
              ++sequence)
         {
@@ -1044,14 +1218,13 @@ private:
                     break;
                 case fnvxr::shared::InputEventTypeKeyTap:
                     keys[event.code] = 0x80;
-                    m_pendingStateInputKeyRelease[event.code] = true;
                     logInputEventOnce("state key tap", event);
                     break;
                 default:
                     break;
             }
         }
-        m_lastStateInputEventSequence = writeSequence;
+        m_lastInputEventSequence = writeSequence;
 
         for (std::uint32_t code = 0; code < 256; ++code)
         {
@@ -1065,21 +1238,12 @@ private:
         if (!buttons)
             return;
 
-        for (std::uint32_t button = 0; button < 8; ++button)
-        {
-            if (m_pendingStateInputMouseRelease[button])
-            {
-                m_forcedInputMouseButtons[button] = false;
-                m_pendingStateInputMouseRelease[button] = false;
-            }
-        }
-
         const SharedInputEventQueue* queue = inputEventQueue();
         if (!validInputEvents(queue))
             return;
 
         const LONG writeSequence = queue->writeSequence;
-        for (LONG sequence = inputEventStartSequence(m_lastStateInputEventSequence, writeSequence);
+        for (LONG sequence = inputEventStartSequence(m_lastInputEventSequence, writeSequence);
              sequence <= writeSequence;
              ++sequence)
         {
@@ -1107,7 +1271,6 @@ private:
                     if (event.code < 8)
                     {
                         buttons[event.code] = 0x80;
-                        m_pendingStateInputMouseRelease[event.code] = true;
                         logInputEventOnce("state mouse tap", event);
                     }
                     break;
@@ -1124,7 +1287,7 @@ private:
                     break;
             }
         }
-        m_lastStateInputEventSequence = writeSequence;
+        m_lastInputEventSequence = writeSequence;
 
         for (std::uint32_t button = 0; button < 8; ++button)
         {
@@ -1153,26 +1316,38 @@ private:
             return;
 
         const LONG writeSequence = queue->writeSequence;
-        for (LONG sequence = inputEventStartSequence(m_lastBufferedInputEventSequence, writeSequence);
+        LONG lastRepresentedSequence = m_lastInputEventSequence;
+        for (LONG sequence = inputEventStartSequence(m_lastInputEventSequence, writeSequence);
              sequence <= writeSequence;
              ++sequence)
         {
             SharedInputEvent event {};
             if (!readInputEvent(queue, sequence, event) || event.code >= 256)
+            {
+                lastRepresentedSequence = sequence;
                 continue;
+            }
 
             if (event.type == fnvxr::shared::InputEventTypeKeyDown)
             {
+                if (written >= requested)
+                    break;
                 appendEvent(outData, requested, written, event.code, 0x80);
+                m_forcedInputKeys[event.code] = true;
                 logInputEventOnce("buffered key down", event);
             }
             else if (event.type == fnvxr::shared::InputEventTypeKeyUp)
             {
+                if (written >= requested)
+                    break;
                 appendEvent(outData, requested, written, event.code, 0x00);
+                m_forcedInputKeys[event.code] = false;
                 logInputEventOnce("buffered key up", event);
             }
             else if (event.type == fnvxr::shared::InputEventTypeKeyTap)
             {
+                if (written >= requested)
+                    break;
                 const DWORD before = written;
                 appendEvent(outData, requested, written, event.code, 0x80);
                 if (written > before)
@@ -1184,8 +1359,9 @@ private:
                     logInputEventOnce("buffered key tap", event);
                 }
             }
+            lastRepresentedSequence = sequence;
         }
-        m_lastBufferedInputEventSequence = writeSequence;
+        m_lastInputEventSequence = lastRepresentedSequence;
     }
 
     void appendInputQueueMouseEvents(LPDIDEVICEOBJECTDATA outData, DWORD requested, DWORD& written)
@@ -1208,26 +1384,38 @@ private:
             return;
 
         const LONG writeSequence = queue->writeSequence;
-        for (LONG sequence = inputEventStartSequence(m_lastBufferedInputEventSequence, writeSequence);
+        LONG lastRepresentedSequence = m_lastInputEventSequence;
+        for (LONG sequence = inputEventStartSequence(m_lastInputEventSequence, writeSequence);
              sequence <= writeSequence;
              ++sequence)
         {
             SharedInputEvent event {};
             if (!readInputEvent(queue, sequence, event))
+            {
+                lastRepresentedSequence = sequence;
                 continue;
+            }
 
             if (event.type == fnvxr::shared::InputEventTypeMouseButtonDown && event.code < 8)
             {
+                if (written >= requested)
+                    break;
                 appendEvent(outData, requested, written, DIMOFS_BUTTON0 + event.code, 0x80);
+                m_forcedInputMouseButtons[event.code] = true;
                 logInputEventOnce("buffered mouse down", event);
             }
             else if (event.type == fnvxr::shared::InputEventTypeMouseButtonUp && event.code < 8)
             {
+                if (written >= requested)
+                    break;
                 appendEvent(outData, requested, written, DIMOFS_BUTTON0 + event.code, 0x00);
+                m_forcedInputMouseButtons[event.code] = false;
                 logInputEventOnce("buffered mouse up", event);
             }
             else if (event.type == fnvxr::shared::InputEventTypeMouseButtonTap && event.code < 8)
             {
+                if (written >= requested)
+                    break;
                 const DWORD before = written;
                 appendEvent(outData, requested, written, DIMOFS_BUTTON0 + event.code, 0x80);
                 if (written > before)
@@ -1241,6 +1429,9 @@ private:
             }
             else if (event.type == fnvxr::shared::InputEventTypeMouseMove)
             {
+                const DWORD requiredSlots = (event.value0 != 0 ? 1u : 0u) + (event.value1 != 0 ? 1u : 0u);
+                if (requiredSlots > requested - written)
+                    break;
                 if (event.value0)
                     appendEvent(outData, requested, written, DIMOFS_X, static_cast<DWORD>(event.value0));
                 if (event.value1)
@@ -1249,11 +1440,14 @@ private:
             }
             else if (event.type == fnvxr::shared::InputEventTypeMouseWheel)
             {
+                if (written >= requested)
+                    break;
                 appendEvent(outData, requested, written, DIMOFS_Z, static_cast<DWORD>(event.value0));
                 logInputEventOnce("buffered mouse wheel", event);
             }
+            lastRepresentedSequence = sequence;
         }
-        m_lastBufferedInputEventSequence = writeSequence;
+        m_lastInputEventSequence = lastRepresentedSequence;
     }
 
     void logInputEventOnce(const char* label, const SharedInputEvent& event)
@@ -1289,48 +1483,52 @@ private:
 
         if (!validPointer(shared))
         {
-            m_hasLastBufferedPointer = false;
+            m_hasLastPointer = false;
         }
         else
         {
             const POINT mapped = mapSharedPointerToInput(shared);
-            if (!m_hasLastBufferedPointer)
+            if (!m_hasLastPointer)
             {
-                m_lastBufferedX = mapped.x;
-                m_lastBufferedY = mapped.y;
-                m_hasLastBufferedPointer = true;
+                m_lastX = mapped.x;
+                m_lastY = mapped.y;
+                m_hasLastPointer = true;
             }
 
-            const LONG dx = mapped.x - m_lastBufferedX;
-            const LONG dy = mapped.y - m_lastBufferedY;
-            m_lastBufferedX = mapped.x;
-            m_lastBufferedY = mapped.y;
-            if (dx)
+            const LONG dx = mapped.x - m_lastX;
+            const LONG dy = mapped.y - m_lastY;
+            const DWORD requiredPointerSlots = (dx != 0 ? 1u : 0u) + (dy != 0 ? 1u : 0u);
+            if (requiredPointerSlots <= requested - written)
             {
-                appendEvent(outData, requested, written, DIMOFS_X, static_cast<DWORD>(dx));
-                if (!m_loggedBufferedMove)
+                m_lastX = mapped.x;
+                m_lastY = mapped.y;
+                if (dx)
                 {
-                    m_loggedBufferedMove = true;
-                    logLine(
-                        "inject buffered mouse dx=%ld dy=%ld raw=%ld,%ld mapped=%ld,%ld\n",
-                        dx,
-                        dy,
-                        shared->clientX,
-                        shared->clientY,
-                        mapped.x,
-                        mapped.y);
+                    appendEvent(outData, requested, written, DIMOFS_X, static_cast<DWORD>(dx));
+                    if (!m_loggedBufferedMove)
+                    {
+                        m_loggedBufferedMove = true;
+                        logLine(
+                            "inject buffered mouse dx=%ld dy=%ld raw=%ld,%ld mapped=%ld,%ld\n",
+                            dx,
+                            dy,
+                            shared->clientX,
+                            shared->clientY,
+                            mapped.x,
+                            mapped.y);
+                    }
                 }
+                if (dy)
+                    appendEvent(outData, requested, written, DIMOFS_Y, static_cast<DWORD>(dy));
             }
-            if (dy)
-                appendEvent(outData, requested, written, DIMOFS_Y, static_cast<DWORD>(dy));
         }
 
-        if (validShared(shared) && shared->mouseClickPacket != m_lastBufferedMouseClickPacket)
+        if (validShared(shared) && shared->mouseClickPacket != m_lastMouseClickPacket)
         {
             if (written < requested)
             {
                 appendEvent(outData, requested, written, DIMOFS_BUTTON0, 0x80);
-                m_lastBufferedMouseClickPacket = shared->mouseClickPacket;
+                m_lastMouseClickPacket = shared->mouseClickPacket;
                 m_pendingBufferedMouseButton0Release = true;
                 if (written < requested)
                 {
@@ -1341,8 +1539,10 @@ private:
             }
         }
 
-        if (gameplayControlsActive(shared))
+        SharedDInputState lookSample {};
+        if (prepareGameplayLookSample(shared, lookSample))
         {
+            const SharedDInputState* look = &lookSample;
             LONG lookX = 0;
             LONG lookY = 0;
             LONG stickX = 0;
@@ -1354,39 +1554,45 @@ private:
             bool aimHeld = false;
             float headScale = 0.0f;
             float gyroScale = 0.0f;
-            computeGameplayLookDeltas(shared, lookX, lookY, stickX, stickY, headX, headY, gyroX, gyroY, aimHeld, headScale, gyroScale);
-            if (lookX)
-                appendEvent(outData, requested, written, DIMOFS_X, static_cast<DWORD>(lookX));
-            if (lookY)
-                appendEvent(outData, requested, written, DIMOFS_Y, static_cast<DWORD>(lookY));
-            if ((lookX || lookY) && !m_loggedGameplayBufferedMouseLook)
+            computeGameplayLookDeltas(look, lookX, lookY, stickX, stickY, headX, headY, gyroX, gyroY, aimHeld, headScale, gyroScale);
+            const DWORD requiredLookSlots = (lookX != 0 ? 1u : 0u) + (lookY != 0 ? 1u : 0u);
+            const bool delivered = requiredLookSlots <= requested - written;
+            if (delivered)
             {
-                m_loggedGameplayBufferedMouseLook = true;
-                logLine(
-                    "inject buffered gameplay mouse-look dx=%ld dy=%ld stick=%ld,%ld head=%ld,%ld gyro=%ld,%ld aim=%d aimTrigger=%lu headScale=%ld gyroScale=%ld flags=0x%lx rs=%ld,%ld headRaw=%lu,%ld,%ld gyroRaw=%lu,%ld,%ld active=%lu menu=%lu\n",
-                    lookX,
-                    lookY,
-                    stickX,
-                    stickY,
-                    headX,
-                    headY,
-                    gyroX,
-                    gyroY,
-                    aimHeld ? 1 : 0,
-                    shared->aimTrigger,
-                    static_cast<LONG>(std::lround(headScale)),
-                    static_cast<LONG>(std::lround(gyroScale)),
-                    static_cast<unsigned long>(shared->gameplayFlags),
-                    static_cast<LONG>(shared->rightStickX),
-                    static_cast<LONG>(shared->rightStickY),
-                    shared->headLookActive,
-                    static_cast<LONG>(shared->headLookX),
-                    static_cast<LONG>(shared->headLookY),
-                    shared->gyroLookActive,
-                    static_cast<LONG>(shared->gyroLookX),
-                    static_cast<LONG>(shared->gyroLookY),
-                    shared->gameplayControlsActive,
-                    shared->menuInputActive);
+                if (lookX)
+                    appendEvent(outData, requested, written, DIMOFS_X, static_cast<DWORD>(lookX));
+                if (lookY)
+                    appendEvent(outData, requested, written, DIMOFS_Y, static_cast<DWORD>(lookY));
+                commitGameplayLookSample(shared);
+                if ((lookX || lookY) && !m_loggedGameplayBufferedMouseLook)
+                {
+                    m_loggedGameplayBufferedMouseLook = true;
+                    logLine(
+                        "inject buffered gameplay mouse-look dx=%ld dy=%ld stick=%ld,%ld head=%ld,%ld gyro=%ld,%ld aim=%d aimTrigger=%lu headScale=%ld gyroScale=%ld flags=0x%lx rs=%ld,%ld headDelta=%lu,%ld,%ld gyroDelta=%lu,%ld,%ld active=%lu menu=%lu\n",
+                        lookX,
+                        lookY,
+                        stickX,
+                        stickY,
+                        headX,
+                        headY,
+                        gyroX,
+                        gyroY,
+                        aimHeld ? 1 : 0,
+                        look->aimTrigger,
+                        static_cast<LONG>(std::lround(headScale)),
+                        static_cast<LONG>(std::lround(gyroScale)),
+                        static_cast<unsigned long>(look->gameplayFlags),
+                        static_cast<LONG>(look->rightStickX),
+                        static_cast<LONG>(look->rightStickY),
+                        look->headLookActive,
+                        static_cast<LONG>(look->headLookX),
+                        static_cast<LONG>(look->headLookY),
+                        look->gyroLookActive,
+                        static_cast<LONG>(look->gyroLookX),
+                        static_cast<LONG>(look->gyroLookY),
+                        look->gameplayControlsActive,
+                        look->menuInputActive);
+                }
             }
         }
     }
@@ -1409,12 +1615,12 @@ private:
         if (!validShared(shared))
             return;
 
-        if (shared->keyboardAcceptPacket != m_lastBufferedKeyboardAcceptPacket)
+        if (shared->keyboardAcceptPacket != m_lastKeyboardAcceptPacket)
         {
             if (written < requested)
             {
                 appendEvent(outData, requested, written, DIK_RETURN, 0x80);
-                m_lastBufferedKeyboardAcceptPacket = shared->keyboardAcceptPacket;
+                m_lastKeyboardAcceptPacket = shared->keyboardAcceptPacket;
                 m_pendingBufferedKeyboardAcceptRelease = true;
                 if (written < requested)
                 {
@@ -1447,8 +1653,10 @@ private:
         if (pressed == previous)
             return;
 
-        previous = pressed;
+        if (written >= requested)
+            return;
         appendEvent(outData, requested, written, offset, pressed ? 0x80 : 0x00);
+        previous = pressed;
         if (pressed)
             pendingRelease = false;
     }
@@ -1506,15 +1714,17 @@ private:
     bool m_mouse = false;
     bool m_keyboard = false;
     bool m_hasLastPointer = false;
-    bool m_hasLastBufferedPointer = false;
     LONG m_lastX = 0;
     LONG m_lastY = 0;
-    LONG m_lastBufferedX = 0;
-    LONG m_lastBufferedY = 0;
-    std::uint32_t m_lastStateMouseClickPacket = 0;
-    std::uint32_t m_lastKeyboardStateAcceptPacket = 0;
-    std::uint32_t m_lastBufferedMouseClickPacket = 0;
-    std::uint32_t m_lastBufferedKeyboardAcceptPacket = 0;
+    std::uint32_t m_lastMouseClickPacket = 0;
+    std::uint32_t m_lastKeyboardAcceptPacket = 0;
+    bool m_haveLookSample = false;
+    std::uint32_t m_lastLookFrame = 0;
+    std::int32_t m_lastHeadLookX = 0;
+    std::int32_t m_lastHeadLookY = 0;
+    std::int32_t m_lastGyroLookX = 0;
+    std::int32_t m_lastGyroLookY = 0;
+    std::uint32_t m_lastLookModeSignature = 0;
     bool m_loggedMouseMove = false;
     bool m_loggedBufferedMove = false;
     bool m_loggedGameplayMouseLook = false;
@@ -1526,13 +1736,10 @@ private:
     bool m_loggedBufferedPoll = false;
     bool m_loggedCooperativeLevel = false;
     std::uint32_t m_loggedInputEvents = 0;
-    LONG m_lastStateInputEventSequence = 0;
-    LONG m_lastBufferedInputEventSequence = 0;
+    LONG m_lastInputEventSequence = 0;
     bool m_forcedInputKeys[256] {};
-    bool m_pendingStateInputKeyRelease[256] {};
     bool m_pendingBufferedInputKeyRelease[256] {};
     bool m_forcedInputMouseButtons[8] {};
-    bool m_pendingStateInputMouseRelease[8] {};
     bool m_pendingBufferedInputMouseRelease[8] {};
     bool m_pendingBufferedMouseButton0Release = false;
     bool m_pendingBufferedKeyboardAcceptRelease = false;
@@ -1674,9 +1881,11 @@ extern "C" HRESULT WINAPI FNVXR_GetdfDIJoystick(LPCDIDATAFORMAT* out)
     return DIERR_GENERIC;
 }
 
-BOOL APIENTRY DllMain(HMODULE, DWORD reason, LPVOID)
+BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
 {
-    if (reason == DLL_PROCESS_DETACH)
-        cleanup();
+    if (reason == DLL_PROCESS_ATTACH)
+        DisableThreadLibraryCalls(module);
+    // Do not block or call FreeLibrary while the loader lock is held. The
+    // process owns this proxy for its lifetime and the OS releases resources.
     return TRUE;
 }

@@ -8,10 +8,12 @@ param(
 $ErrorActionPreference = "Stop"
 
 $Root = Split-Path -Parent $PSScriptRoot
+. (Join-Path $PSScriptRoot "fnvxr-sidecar-common.ps1")
+$GameRoot = Resolve-FnvxrGameRoot -GameRoot $GameRoot
 $BuildDir = Join-Path $Root "build"
 $BuildWin32Dir = Join-Path $Root "build-win32"
 $ReportRoot = Join-Path $Root "local\pcvr-setup-checks"
-$Stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+$Stamp = Get-Date -Format "yyyyMMdd-HHmmss-fff"
 $ReportDir = Join-Path $ReportRoot $Stamp
 $ReportPath = Join-Path $ReportDir "manifest.json"
 
@@ -89,8 +91,6 @@ function Get-LaunchSensitiveProcess {
         "FalloutNV",
         "nvse_loader",
         "fnvxr_openxr_pose_host",
-        "openmw",
-        "openmw_vr",
         "vrserver",
         "vrcompositor",
         "SteamVR"
@@ -124,9 +124,7 @@ Invoke-SetupStep "build x64 host and proof targets" {
         "fnvxr_shared_state_probe",
         "fnvxr_protocol_layout_test",
         "fnvxr_stereo_math_test",
-        "fnvxr_player_transform_test",
-        "fnvxr_plugin_exports_test",
-        "fnvxr_nvse_bridge_test"
+        "fnvxr_player_transform_test"
     )
 }
 

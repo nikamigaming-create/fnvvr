@@ -1,5 +1,5 @@
 param(
-    [string]$Configuration = "Debug",
+    [string]$Configuration = "Release",
     [string]$GameRoot = $(if ($env:FNVXR_GAME_ROOT) { $env:FNVXR_GAME_ROOT } else { "C:\Program Files (x86)\Steam\steamapps\common\Fallout New Vegas" }),
     [int]$GameBackbufferWidth = 2048,
     [int]$GameBackbufferHeight = 1280,
@@ -25,7 +25,8 @@ param(
     [switch]$ValidateOnly,
     [double]$D3D9ShaderSanityOffset = 0,
     [string]$D3D9ShaderSanitySlot = "c1w",
-    [string]$D3D9ShaderAllowVertexHashes = ""
+    [string]$D3D9ShaderAllowVertexHashes = "",
+    [string]$D3D9ShaderWvpContracts = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -34,7 +35,7 @@ $ErrorActionPreference = "Stop"
 
 $Root = Split-Path -Parent $PSScriptRoot
 $RunRoot = Join-Path $Root "local\retail-sidecar-runs"
-$Stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+$Stamp = Get-Date -Format "yyyyMMdd-HHmmss-fff"
 $StartedAt = (Get-Date).ToString("o")
 $RunDir = Join-Path $RunRoot $Stamp
 $DebugLog = Join-Path $RunDir "launcher-debug.log"
@@ -256,11 +257,15 @@ if ($EnableStereoWorld -or $EnableD3D9ShaderStereo -or $StereoProducerProofOnly)
     Write-FnvxrCheckpoint -Path $DebugLog -Message "quad 2D runtime enabled; stereo world disabled by default"
 }
 if ($EnableD3D9ShaderStereo) {
-    $env:FNVXR_D3D9_SHADER_STEREO = "1"
-    $env:FNVXR_D3D9_SHADER_MATRIX_DELTA = "1"
+    if ([string]::IsNullOrWhiteSpace($D3D9ShaderWvpContracts)) {
+        throw "-EnableD3D9ShaderStereo requires verified -D3D9ShaderWvpContracts entries in fnv8/sha256/byteCount@register@column-or-row form."
+    }
+    $env:FNVXR_D3D9_SHADER_STEREO = "0"
+    $env:FNVXR_D3D9_SHADER_MATRIX_DELTA = "0"
     $env:FNVXR_D3D9_SHADER_MATRIX_ORDER = "column"
     $env:FNVXR_D3D9_SHADER_MATRIX_REQUIRE_SHARED_CAMERA = "1"
-    $env:FNVXR_D3D9_SHADER_WVP_REPLAY = "0"
+    $env:FNVXR_D3D9_SHADER_WVP_REPLAY = "1"
+    $env:FNVXR_D3D9_SHADER_WVP_CONTRACTS = $D3D9ShaderWvpContracts
     $env:FNVXR_D3D9_SHADER_MATRIX_MAX_CANDIDATES = "1"
     $env:FNVXR_D3D9_SHADER_PATCH_START_REGISTER = "0"
     if (-not [string]::IsNullOrWhiteSpace($D3D9ShaderAllowVertexHashes)) {
@@ -347,7 +352,7 @@ $manifest = [ordered]@{
         applied = [bool]$activationReachApplied
     }
     mapping = "Local\FNVXR_D3D9_Frame_v1"
-    stereoMapping = "Local\FNVXR_D3D9_StereoFrame_v1"
+    stereoMapping = "Local\FNVXR_D3D9_StereoFrame_v3"
     openXrHostLaunched = $false
     forcedMenuAction = $false
     uiGrid = "${UiWidth}x${UiHeight}"

@@ -1,6 +1,7 @@
 #define WIN32_LEAN_AND_MEAN
 
 #include <windows.h>
+#include <bcrypt.h>
 #include <d3d9.h>
 #include <intrin.h>
 
@@ -8,6 +9,7 @@
 #include "../protocol/fnvxr_shared_state.h"
 
 #include <algorithm>
+#include <cfloat>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -130,6 +132,8 @@ IDirect3DVertexShader9* gActiveVertexShader = nullptr;
 IDirect3DPixelShader9* gActivePixelShader = nullptr;
 std::uint32_t gActiveVertexShaderHash = 0;
 std::uint32_t gActivePixelShaderHash = 0;
+std::uint8_t gActiveVertexShaderSha256[32] {};
+UINT gActiveVertexShaderByteCount = 0;
 fnvxr::stereo::Matrix4 gBaseView {};
 fnvxr::stereo::Matrix4 gBaseProjection {};
 fnvxr::stereo::EyeMatrices gEyeMatrices {};
@@ -141,6 +145,7 @@ bool gHaveProjection = false;
 LONG gLoggedEyeMatrices = 0;
 LONG gLoggedEyePoseScale = 0;
 bool gNativeStereoEnabled = false;
+bool gNativeSingleTraversalReplayEnabled = false;
 bool gNativeStereoHookInstalled = false;
 bool gNativeStereoRuntimeDisabled = false;
 bool gInNativeStereoHook = false;
@@ -152,13 +157,28 @@ void* gNativeCameraMatrixTrampoline = nullptr;
 void* gNativeGeometrySubmitTrampoline = nullptr;
 IDirect3DDevice9* gNativeStereoDevice = nullptr;
 LONG gNativeStereoPairsThisPresent = 0;
+LONG gNativeSingleTraversalFramesThisPresent = 0;
 LONG gNativeStereoRenderPairSequence = 0;
 volatile LONG gNativeActiveEye = -1;
+float gNativeSingleTraversalIpdUnits = 0.0f;
+float gNativeSingleTraversalFov[2][4] {};
 LONG gLoggedNativeStereoPair = 0;
 LONG gLoggedNativeStereoFailure = 0;
 LONG gLoggedPresentPerf = 0;
 LONG gOriginalDoRenderCallsThisPresent = 0;
 LONGLONG gOriginalDoRenderTicksThisPresent = 0;
+LONG gNativeDoRenderHookEntriesThisPresent = 0;
+LONG gNativeDoRenderStereoAttemptsThisPresent = 0;
+LONG gNativeDoRenderGateMaskThisPresent = 0;
+LONG gNativeLastDoRenderHookPresentFrame = -1;
+LONG gNativeHookSilentGameplayFrames = 0;
+LONG gLoggedNativeHookContinuity = 0;
+LONG gLoggedNativePassEquivalence = 0;
+LONG gNativePassRejectedThisPresent = 0;
+LONG gNativePassMismatchThisPresent = 0;
+LONG gNativeEquivalentPairsInSequence = 0;
+LONG gNativeEquivalentLastPresentFrame = -2;
+bool gNativePassEquivalenceWasBlocked = false;
 LONG gNativeCameraMatrixOverrides = 0;
 LONG gNativeCameraMatrixOverridesThisPair[2] {};
 LONG gNativeGeometryRearmsThisPair[2] {};
@@ -256,6 +276,21 @@ constexpr UINT MaxShaderStereoAllowVertexHashes = 32;
 std::uint32_t gShaderStereoAllowVertexHashes[MaxShaderStereoAllowVertexHashes] {};
 LONG gShaderStereoAllowVertexHashCount = 0;
 LONG gShaderStereoAllowVertexHashesLoaded = 0;
+struct ShaderWvpContract
+{
+    std::uint32_t vertexHash = 0;
+    std::uint8_t vertexSha256[32] {};
+    UINT byteCount = 0;
+    UINT startRegister = 0;
+    bool columnVector = true;
+};
+constexpr UINT MaxShaderWvpContracts = 64;
+ShaderWvpContract gShaderWvpContracts[MaxShaderWvpContracts] {};
+LONG gShaderWvpContractCount = 0;
+LONG gShaderWvpContractsLoaded = 0;
+LONG gShaderWorldDrawCandidates = 0;
+LONG gShaderWorldDraws = 0;
+LONG gShaderContractCoveredWorldDraws = 0;
 LONG gLoggedShaderStereoRejectedByHash = 0;
 LONG gLoggedStereoVisualCoverageRejected = 0;
 LONG gConsecutiveStereoVisualCoverageFrames = 0;
@@ -340,6 +375,19 @@ LONG gNativeObservedProjectionCalls[2] {};
 std::uint32_t gNativeVsConstantStreamHash[2] { 2166136261u, 2166136261u };
 LONG gNativeVsConstantCalls[2] {};
 LONG gNativeDrawCalls[2] {};
+
+constexpr LONG NativeDoRenderGateDisabled = 1 << 0;
+constexpr LONG NativeDoRenderGateRuntimeDisabled = 1 << 1;
+constexpr LONG NativeDoRenderGateReentrant = 1 << 2;
+constexpr LONG NativeDoRenderGateNoDevice = 1 << 3;
+constexpr LONG NativeDoRenderGateRendererArgument = 1 << 4;
+constexpr LONG NativeDoRenderGateUi = 1 << 5;
+constexpr LONG NativeDoRenderGateAlreadyPaired = 1 << 6;
+constexpr LONG NativeDoRenderGateFirstPerson = 1 << 7;
+constexpr LONG NativeDoRenderGatePose = 1 << 8;
+constexpr LONG NativeDoRenderGateCamera = 1 << 9;
+constexpr LONG NativeDoRenderGateTargets = 1 << 10;
+constexpr LONG NativeDoRenderGateCellTransition = 1 << 11;
 IDirect3DBaseTexture9* gActiveTextures[MaxTrackedSamplers] {};
 LONG gLoggedStereoSurfaceTwinCreated = 0;
 LONG gLoggedStereoSurfaceTwinFailed = 0;
@@ -356,6 +404,8 @@ constexpr DWORD SharedCameraMagic = fnvxr::shared::CameraSharedMagic;
 constexpr DWORD SharedCameraVersion = fnvxr::shared::CameraSharedVersion;
 constexpr DWORD SharedRuntimeMagic = fnvxr::shared::RuntimeSharedMagic;
 constexpr DWORD SharedRuntimeVersion = fnvxr::shared::RuntimeSharedVersion;
+constexpr DWORD SharedPlayerMagic = fnvxr::shared::PlayerSharedMagic;
+constexpr DWORD SharedPlayerVersion = fnvxr::shared::PlayerSharedVersion;
 constexpr std::uintptr_t MenuVisibilityArrayAddress = 0x011F308F;
 constexpr std::uintptr_t IsMenuModeAddress = 0x00702360;
 constexpr UINT kMenuTypeInventory = 0x3EA;
@@ -374,8 +424,10 @@ constexpr UINT SharedVideoMaxHeight = fnvxr::shared::D3D9SharedFrameMaxHeight;
 using SharedVideoHeader = fnvxr::shared::SharedD3D9FrameHeader;
 using SharedStereoHeader = fnvxr::shared::SharedD3D9StereoFrameHeader;
 using fnvxr::shared::SharedVrPoseState;
+using fnvxr::shared::SharedVrOriginState;
 using fnvxr::shared::SharedCameraState;
 using fnvxr::shared::SharedRuntimeState;
+using fnvxr::shared::SharedPlayerState;
 
 HANDLE gSharedVideoMapping = nullptr;
 std::uint8_t* gSharedVideoView = nullptr;
@@ -396,10 +448,14 @@ std::uint8_t* gSharedWorldVideoView = nullptr;
 LONG gSharedWorldVideoCaptures = 0;
 HANDLE gSharedVrPoseMapping = nullptr;
 SharedVrPoseState* gSharedVrPose = nullptr;
+HANDLE gSharedVrOriginMapping = nullptr;
+SharedVrOriginState* gSharedVrOrigin = nullptr;
 HANDLE gSharedCameraMapping = nullptr;
 SharedCameraState* gSharedCamera = nullptr;
 HANDLE gSharedRuntimeMapping = nullptr;
 SharedRuntimeState* gSharedRuntime = nullptr;
+HANDLE gSharedPlayerMapping = nullptr;
+SharedPlayerState* gSharedPlayer = nullptr;
 fnvxr::stereo::Matrix4 gSharedCameraView {};
 bool gSharedCameraActive = false;
 bool gSharedCameraRawActive = false;
@@ -408,6 +464,10 @@ bool gHaveVrPoseOrigin = false;
 bool gNativeGameplayPoseOriginLatched = false;
 float gVrPoseOrigin[3] {};
 float gVrPoseOriginRot[4] { 0.0f, 0.0f, 0.0f, 1.0f };
+LONG gVrPoseOriginPoseSequence = 0;
+std::uint64_t gVrPoseOriginPoseFrame = 0;
+std::uint32_t gVrPoseOriginGeneration = 0;
+std::uint32_t gVrPoseOriginProducerEpoch = 0;
 float gVrWorldYawCos = 1.0f;
 float gVrWorldYawSin = 0.0f;
 float gVrWorldYawHalfCos = 1.0f;
@@ -423,17 +483,32 @@ SharedVrPoseState gLatestVrPoseSnapshot {};
 LONG gLatestVrPoseSnapshotSequence = 0;
 std::int64_t gLatestVrPoseDisplayTime = 0;
 bool gLatestVrPoseSnapshotValid = false;
+LARGE_INTEGER gLatestVrPoseAcceptedAt {};
 SharedVrPoseState gNativeStereoRenderedPoseSnapshot {};
 LONG gNativeStereoRenderedPoseSequence = 0;
 std::int64_t gNativeStereoRenderedDisplayTime = 0;
 bool gNativeStereoRenderedPoseValid = false;
 LONG gLastVrPoseSequence = 0;
 std::uint64_t gLastVrPoseFrame = 0;
+std::uint32_t gLastVrReferenceSpaceGeneration = 0;
+std::uint32_t gLastVrProducerEpoch = 0;
+std::uint32_t gPublishedVrOriginGeneration = 0;
+bool gPublishedVrOriginActive = false;
+std::uint64_t gLastHeadBodyInvariantPoseFrame = 0;
 LONG gLastCameraSequence = 0;
 LONG gLastRuntimeSequence = 0;
 SharedCameraState gLatestSharedCameraSnapshot {};
 LONG gLatestSharedCameraSnapshotSequence = 0;
 bool gLatestSharedCameraSnapshotValid = false;
+SharedPlayerState gLatestSharedPlayerSnapshot {};
+LONG gLatestSharedPlayerSnapshotSequence = 0;
+bool gLatestSharedPlayerSnapshotValid = false;
+std::uint32_t gNativeStableCellFormId = 0;
+std::uint64_t gNativeCellChangePlayerFrame = 0;
+std::uint64_t gNativeDoubleTraversalHoldUntilPlayerFrame = 0;
+bool gNativeCellTransitionReady = false;
+LONG gNativeSharedPlayerReadMisses = 0;
+LONG gLoggedNativeCellTransition = 0;
 LONG gLoggedSharedCamera = 0;
 LONG gLoggedSharedRuntime = 0;
 LONG gLoggedSharedRuntimeMissing = 0;
@@ -456,6 +531,13 @@ bool readEnvBool(const char* name, bool fallback);
 bool telemetryHammerEnabled();
 bool shouldTelemetryHammerLog(LONG count, const char* strideEnv, LONG fallbackStride);
 void installNativeStereoEngineHook(IDirect3DDevice9* device);
+bool buildLogPath(char* path, size_t pathSize, const char* leafName);
+
+bool stereoReplayTransactionAllowed()
+{
+    return !gNativeSingleTraversalReplayEnabled
+        || (gInNativeStereoHook && gNativeActiveEye == 2);
+}
 
 double secondsBetween(const LARGE_INTEGER& start, const LARGE_INTEGER& end)
 {
@@ -908,24 +990,169 @@ void fnv1aContinue(std::uint32_t& hash, const void* data, std::size_t byteCount)
         hash = 1;
 }
 
-template <typename ShaderT>
-std::uint32_t hashD3DShaderBytecode(ShaderT* shader)
+void dumpD3DShaderBytecode(
+    const char* stage,
+    std::uint32_t hash,
+    const std::uint8_t sha256[32],
+    const std::uint8_t* bytes,
+    UINT byteCount)
 {
+    if (!stage || hash == 0 || !sha256 || !bytes || byteCount == 0
+        || !readEnvBool("FNVXR_D3D9_DUMP_SHADER_BYTECODE", false))
+    {
+        return;
+    }
+
+    char shaHex[65] {};
+    for (UINT index = 0; index < 32; ++index)
+        sprintf_s(shaHex + index * 2, sizeof(shaHex) - index * 2, "%02x", sha256[index]);
+    char leafName[128] {};
+    sprintf_s(leafName, "fnvxr_shader_%s_%s.bin", stage, shaHex);
+    char path[MAX_PATH] {};
+    if (!buildLogPath(path, sizeof(path), leafName))
+        return;
+
+    HANDLE file = CreateFileA(
+        path,
+        GENERIC_WRITE,
+        FILE_SHARE_READ,
+        nullptr,
+        CREATE_NEW,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+    if (file == INVALID_HANDLE_VALUE)
+        return;
+
+    DWORD written = 0;
+    const BOOL writeOk = WriteFile(file, bytes, byteCount, &written, nullptr);
+    CloseHandle(file);
+    char event[448] {};
+    sprintf_s(
+        event,
+        "{\"event\":\"fnvxrShaderBytecodeDump\",\"stage\":\"%s\",\"fnv1a32\":\"%08x\",\"sha256\":\"%s\",\"bytes\":%u,\"written\":%lu,\"success\":%s,\"file\":\"%s\"}",
+        stage,
+        hash,
+        shaHex,
+        byteCount,
+        static_cast<unsigned long>(written),
+        writeOk && written == byteCount ? "true" : "false",
+        leafName);
+    logLine(event);
+}
+
+bool sha256Bytes(const std::uint8_t* bytes, UINT byteCount, std::uint8_t digest[32])
+{
+    if (!bytes || byteCount == 0 || !digest)
+        return false;
+
+    BCRYPT_ALG_HANDLE algorithm = nullptr;
+    BCRYPT_HASH_HANDLE hash = nullptr;
+    DWORD objectBytes = 0;
+    DWORD returned = 0;
+    std::uint8_t* object = nullptr;
+    bool ok = false;
+    if (BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0) >= 0
+        && BCryptGetProperty(
+            algorithm,
+            BCRYPT_OBJECT_LENGTH,
+            reinterpret_cast<PUCHAR>(&objectBytes),
+            sizeof(objectBytes),
+            &returned,
+            0) >= 0
+        && objectBytes > 0)
+    {
+        object = new (std::nothrow) std::uint8_t[objectBytes];
+        if (object
+            && BCryptCreateHash(algorithm, &hash, object, objectBytes, nullptr, 0, 0) >= 0
+            && BCryptHashData(hash, const_cast<PUCHAR>(bytes), byteCount, 0) >= 0
+            && BCryptFinishHash(hash, digest, 32, 0) >= 0)
+        {
+            ok = true;
+        }
+    }
+    if (hash)
+        BCryptDestroyHash(hash);
+    if (algorithm)
+        BCryptCloseAlgorithmProvider(algorithm, 0);
+    delete[] object;
+    return ok;
+}
+
+struct ShaderFingerprint
+{
+    std::uint32_t fnv1a32 = 0;
+    std::uint8_t sha256[32] {};
+    UINT byteCount = 0;
+};
+
+struct ShaderFingerprintCacheEntry
+{
+    IUnknown* shader = nullptr;
+    bool vertex = false;
+    ShaderFingerprint fingerprint {};
+};
+
+constexpr UINT MaxShaderFingerprintCacheEntries = 1024;
+ShaderFingerprintCacheEntry gShaderFingerprintCache[MaxShaderFingerprintCacheEntries] {};
+UINT gShaderFingerprintCacheCount = 0;
+SRWLOCK gShaderFingerprintCacheLock = SRWLOCK_INIT;
+
+template <typename ShaderT>
+ShaderFingerprint fingerprintD3DShaderBytecode(ShaderT* shader, const char* stage, bool vertex)
+{
+    ShaderFingerprint empty {};
     if (!shader)
-        return 0;
+        return empty;
+
+    AcquireSRWLockShared(&gShaderFingerprintCacheLock);
+    for (UINT index = 0; index < gShaderFingerprintCacheCount; ++index)
+    {
+        const auto& entry = gShaderFingerprintCache[index];
+        if (entry.shader == shader && entry.vertex == vertex)
+        {
+            const ShaderFingerprint cached = entry.fingerprint;
+            ReleaseSRWLockShared(&gShaderFingerprintCacheLock);
+            return cached;
+        }
+    }
+    ReleaseSRWLockShared(&gShaderFingerprintCacheLock);
 
     UINT byteCount = 0;
     if (FAILED(shader->GetFunction(nullptr, &byteCount)) || byteCount == 0 || byteCount > 1024 * 1024)
-        return 0;
+        return empty;
 
     auto* bytes = new (std::nothrow) std::uint8_t[byteCount];
     if (!bytes)
-        return 0;
+        return empty;
 
     const HRESULT result = shader->GetFunction(bytes, &byteCount);
-    const std::uint32_t hash = SUCCEEDED(result) ? fnv1aHashBytes(bytes, byteCount) : 0;
+    ShaderFingerprint fingerprint {};
+    if (SUCCEEDED(result))
+    {
+        fingerprint.fnv1a32 = fnv1aHashBytes(bytes, byteCount);
+        fingerprint.byteCount = byteCount;
+        if (!sha256Bytes(bytes, byteCount, fingerprint.sha256))
+            fingerprint = {};
+    }
+    if (fingerprint.fnv1a32 != 0)
+        dumpD3DShaderBytecode(stage, fingerprint.fnv1a32, fingerprint.sha256, bytes, byteCount);
     delete[] bytes;
-    return hash;
+
+    if (fingerprint.fnv1a32 != 0)
+    {
+        AcquireSRWLockExclusive(&gShaderFingerprintCacheLock);
+        if (gShaderFingerprintCacheCount < MaxShaderFingerprintCacheEntries)
+        {
+            shader->AddRef();
+            gShaderFingerprintCache[gShaderFingerprintCacheCount++] = {
+                shader,
+                vertex,
+                fingerprint
+            };
+        }
+        ReleaseSRWLockExclusive(&gShaderFingerprintCacheLock);
+    }
+    return fingerprint;
 }
 
 bool shaderPairMatches(const StereoShaderPairHash& pair, std::uint32_t vertexHash, std::uint32_t pixelHash)
@@ -1029,6 +1256,160 @@ bool currentShaderPairIsConfiguredStereoSkip()
         gActivePixelShaderHash);
 }
 
+void loadShaderWvpContracts()
+{
+    if (InterlockedCompareExchange(&gShaderWvpContractsLoaded, 1, 0) != 0)
+        return;
+
+    char value[4096] {};
+    if (GetEnvironmentVariableA(
+            "FNVXR_D3D9_SHADER_WVP_CONTRACTS",
+            value,
+            static_cast<DWORD>(sizeof(value))) == 0)
+    {
+        logLine("shader WVP contract count=0; programmable world draws fail closed");
+        return;
+    }
+
+    auto hexNibble = [](char ch) -> int {
+        if (ch >= '0' && ch <= '9') return ch - '0';
+        if (ch >= 'a' && ch <= 'f') return 10 + ch - 'a';
+        if (ch >= 'A' && ch <= 'F') return 10 + ch - 'A';
+        return -1;
+    };
+
+    char* cursor = value;
+    LONG count = 0;
+    bool malformed = false;
+    while (*cursor && count < static_cast<LONG>(MaxShaderWvpContracts))
+    {
+        skipShaderPairListDelimiters(cursor);
+        if (!*cursor)
+            break;
+
+        char* entryEnd = cursor;
+        while (*entryEnd && *entryEnd != ';' && *entryEnd != ',')
+            ++entryEnd;
+        while (entryEnd > cursor && (entryEnd[-1] == ' ' || entryEnd[-1] == '\t'))
+            --entryEnd;
+
+        char* part = cursor;
+        std::uint32_t fnvHash = 0;
+        for (int index = 0; index < 8; ++index)
+        {
+            const int nibble = part + index < entryEnd ? hexNibble(part[index]) : -1;
+            if (nibble < 0)
+            {
+                malformed = true;
+                break;
+            }
+            fnvHash = (fnvHash << 4) | static_cast<std::uint32_t>(nibble);
+        }
+        if (malformed || part + 8 >= entryEnd || part[8] != '/')
+        {
+            malformed = true;
+            break;
+        }
+        part += 9;
+
+        std::uint8_t sha256[32] {};
+        for (int index = 0; index < 32; ++index)
+        {
+            const int high = part + index * 2 < entryEnd ? hexNibble(part[index * 2]) : -1;
+            const int low = part + index * 2 + 1 < entryEnd ? hexNibble(part[index * 2 + 1]) : -1;
+            if (high < 0 || low < 0)
+            {
+                malformed = true;
+                break;
+            }
+            sha256[index] = static_cast<std::uint8_t>((high << 4) | low);
+        }
+        if (malformed || part + 64 >= entryEnd || part[64] != '/')
+        {
+            malformed = true;
+            break;
+        }
+        part += 65;
+
+        char* end = part;
+        const unsigned long byteCount = std::strtoul(part, &end, 10);
+        if (end == part || end >= entryEnd || *end != '@'
+            || byteCount == 0 || byteCount > 1024 * 1024)
+        {
+            malformed = true;
+            break;
+        }
+        part = end + 1;
+        const unsigned long start = std::strtoul(part, &end, 10);
+        if (end == part || end >= entryEnd || *end != '@'
+            || start > MaxTrackedVsConstants - 4)
+        {
+            malformed = true;
+            break;
+        }
+        part = end + 1;
+        const size_t orderLength = static_cast<size_t>(entryEnd - part);
+        const bool columnVector = orderLength == 6 && _strnicmp(part, "column", 6) == 0;
+        const bool rowVector = orderLength == 3 && _strnicmp(part, "row", 3) == 0;
+        if (!columnVector && !rowVector)
+        {
+            malformed = true;
+            break;
+        }
+
+        bool duplicate = false;
+        for (LONG index = 0; index < count; ++index)
+        {
+            if (gShaderWvpContracts[index].vertexHash == fnvHash
+                || std::memcmp(gShaderWvpContracts[index].vertexSha256, sha256, sizeof(sha256)) == 0)
+            {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate)
+        {
+            malformed = true;
+            break;
+        }
+
+        ShaderWvpContract& contract = gShaderWvpContracts[count++];
+        contract.vertexHash = fnvHash;
+        std::memcpy(contract.vertexSha256, sha256, sizeof(sha256));
+        contract.byteCount = static_cast<UINT>(byteCount);
+        contract.startRegister = static_cast<UINT>(start);
+        contract.columnVector = columnVector;
+        cursor = *entryEnd ? entryEnd + 1 : entryEnd;
+    }
+
+    if (malformed || (*cursor && count >= static_cast<LONG>(MaxShaderWvpContracts)))
+    {
+        std::memset(gShaderWvpContracts, 0, sizeof(gShaderWvpContracts));
+        count = 0;
+        logLine("shader WVP contract list malformed/ambiguous; all programmable world draws fail closed");
+    }
+    gShaderWvpContractCount = count;
+    char message[192] {};
+    sprintf_s(message, "shader WVP verified strong-fingerprint contract count=%ld", count);
+    logLine(message);
+}
+
+const ShaderWvpContract* currentShaderWvpContract()
+{
+    loadShaderWvpContracts();
+    for (LONG index = 0; index < gShaderWvpContractCount; ++index)
+    {
+        if (gShaderWvpContracts[index].vertexHash == gActiveVertexShaderHash
+            && gShaderWvpContracts[index].byteCount == gActiveVertexShaderByteCount
+            && std::memcmp(
+                gShaderWvpContracts[index].vertexSha256,
+                gActiveVertexShaderSha256,
+                sizeof(gActiveVertexShaderSha256)) == 0)
+            return &gShaderWvpContracts[index];
+    }
+    return nullptr;
+}
+
 void loadShaderStereoAllowVertexHashes()
 {
     if (InterlockedCompareExchange(&gShaderStereoAllowVertexHashesLoaded, 1, 0) != 0)
@@ -1081,10 +1462,36 @@ void loadShaderStereoAllowVertexHashes()
 
 bool currentVertexShaderAllowedForStereoPatch()
 {
+    if (currentShaderWvpContract())
+        return true;
+
     loadShaderStereoAllowVertexHashes();
     const LONG count = gShaderStereoAllowVertexHashCount;
     if (count <= 0)
+    {
+        // c0-c3 is not a universal WVP contract in Fallout's D3D9 pipeline.
+        // Treat an empty allowlist as "patch nothing" unless an explicit
+        // diagnostic launch opts back into broad probing.  The old allow-all
+        // behavior rewrote screen/post-process constants and could turn one
+        // draw into a giant near-camera occluder.
+        if (!readEnvBool("FNVXR_D3D9_SHADER_ALLOW_UNVERIFIED_PATCHES", false))
+        {
+            const LONG logCount = InterlockedIncrement(&gLoggedShaderStereoRejectedByHash);
+            if (logCount <= 16 || logCount % 5000 == 0)
+            {
+                char message[224] {};
+                sprintf_s(
+                    message,
+                    "shader stereo skipped count=%ld reason=no_verified_wvp_contract vsHash=0x%08x psHash=0x%08x",
+                    logCount,
+                    gActiveVertexShaderHash,
+                    gActivePixelShaderHash);
+                logLine(message);
+            }
+            return false;
+        }
         return true;
+    }
 
     for (LONG i = 0; i < count && i < static_cast<LONG>(MaxShaderStereoAllowVertexHashes); ++i)
     {
@@ -1282,11 +1689,18 @@ void rotateByVrWorldYaw(const float in[3], float out[3])
 
 void correctedVrWorldQuat(float out[4], const float in[4])
 {
-    out[0] = gVrWorldYawHalfCos * in[0] + gVrWorldYawHalfSin * in[2];
-    out[1] = gVrWorldYawHalfCos * in[1] + gVrWorldYawHalfSin * in[3];
-    out[2] = gVrWorldYawHalfCos * in[2] - gVrWorldYawHalfSin * in[0];
-    out[3] = gVrWorldYawHalfCos * in[3] - gVrWorldYawHalfSin * in[1];
-    normalizeQuat(out);
+    const fnvxr::stereo::Quaternion origin {
+        gVrPoseOriginRot[0],
+        gVrPoseOriginRot[1],
+        gVrPoseOriginRot[2],
+        gVrPoseOriginRot[3]
+    };
+    const fnvxr::stereo::Quaternion current { in[0], in[1], in[2], in[3] };
+    const fnvxr::stereo::Quaternion relative = fnvxr::stereo::relativeOrientation(origin, current);
+    out[0] = relative.x;
+    out[1] = relative.y;
+    out[2] = relative.z;
+    out[3] = relative.w;
 }
 
 void readPoseAxisMode(char* buffer, size_t bufferSize)
@@ -1665,7 +2079,10 @@ SharedVrPoseState* sharedVrPoseState()
     if (gSharedVrPose)
         return gSharedVrPose;
 
-    gSharedVrPoseMapping = OpenFileMappingA(FILE_MAP_READ, FALSE, "Local\\FNVXR_VR_Pose_State");
+    gSharedVrPoseMapping = OpenFileMappingA(
+        FILE_MAP_READ,
+        FALSE,
+        fnvxr::shared::VrPoseSharedMappingName);
     if (!gSharedVrPoseMapping)
         return nullptr;
 
@@ -1680,6 +2097,108 @@ SharedVrPoseState* sharedVrPoseState()
 
     logLine("shared VR pose mapped");
     return gSharedVrPose;
+}
+
+SharedVrOriginState* sharedVrOriginState()
+{
+    if (gSharedVrOrigin)
+        return gSharedVrOrigin;
+
+    gSharedVrOriginMapping = CreateFileMappingA(
+        INVALID_HANDLE_VALUE,
+        nullptr,
+        PAGE_READWRITE,
+        0,
+        sizeof(SharedVrOriginState),
+        fnvxr::shared::VrOriginSharedMappingName);
+    if (!gSharedVrOriginMapping)
+        return nullptr;
+
+    gSharedVrOrigin = static_cast<SharedVrOriginState*>(MapViewOfFile(
+        gSharedVrOriginMapping,
+        FILE_MAP_READ | FILE_MAP_WRITE,
+        0,
+        0,
+        sizeof(SharedVrOriginState)));
+    if (!gSharedVrOrigin)
+    {
+        CloseHandle(gSharedVrOriginMapping);
+        gSharedVrOriginMapping = nullptr;
+        return nullptr;
+    }
+
+    // This proxy is the sole writer. Reinitialize stale contents left alive by
+    // a consumer handle before publishing the first authoritative origin.
+    ZeroMemory(gSharedVrOrigin, sizeof(*gSharedVrOrigin));
+    gSharedVrOrigin->magic = fnvxr::shared::VrOriginSharedMagic;
+    gSharedVrOrigin->version = fnvxr::shared::VrOriginSharedVersion;
+    MemoryBarrier();
+    logLine("shared VR origin publisher mapped");
+    return gSharedVrOrigin;
+}
+
+void publishSharedVrOrigin(bool active, const SharedVrPoseState* pose = nullptr, LONG poseSequence = 0)
+{
+    SharedVrOriginState* origin = sharedVrOriginState();
+    if (!origin)
+        return;
+
+    InterlockedIncrement(&origin->sequence);
+    MemoryBarrier();
+    origin->magic = fnvxr::shared::VrOriginSharedMagic;
+    origin->version = fnvxr::shared::VrOriginSharedVersion;
+    origin->active = active ? 1u : 0u;
+    origin->generation = active ? gVrPoseOriginGeneration
+                                : (pose ? pose->referenceSpaceGeneration : gLastVrReferenceSpaceGeneration);
+    origin->poseSequence = active && gVrPoseOriginPoseSequence > 0
+        ? static_cast<std::uint32_t>(gVrPoseOriginPoseSequence)
+        : 0u;
+    origin->poseFrame = active ? gVrPoseOriginPoseFrame : 0u;
+    for (int i = 0; i < 4; ++i)
+        origin->originRot[i] = active ? gVrPoseOriginRot[i] : (i == 3 ? 1.0f : 0.0f);
+    for (int i = 0; i < 3; ++i)
+        origin->originPos[i] = active ? gVrPoseOrigin[i] : 0.0f;
+    origin->producerEpoch = active ? gVrPoseOriginProducerEpoch
+                                   : (pose ? pose->producerEpoch : gLastVrProducerEpoch);
+    origin->renderPoseSequence = active && poseSequence > 0
+        ? static_cast<std::uint32_t>(poseSequence)
+        : 0u;
+    origin->reserved = 0;
+    origin->renderPoseFrame = active && pose ? pose->frame : 0u;
+    origin->renderedDisplayTime = active && pose ? pose->predictedDisplayTime : 0;
+    MemoryBarrier();
+    InterlockedIncrement(&origin->sequence);
+
+    gPublishedVrOriginActive = active;
+    gPublishedVrOriginGeneration = active && pose ? pose->referenceSpaceGeneration : 0u;
+}
+
+void closeNativeStereoOriginLease(const char* reason)
+{
+    if (!gPublishedVrOriginActive)
+        return;
+    publishSharedVrOrigin(false);
+    char message[224] {};
+    sprintf_s(message, "native stereo origin lease closed reason=%s", reason ? reason : "unknown");
+    logLine(message);
+}
+
+void openNativeStereoOriginLease(const SharedVrPoseState& pose)
+{
+    publishSharedVrOrigin(true, &pose, gLatestVrPoseSnapshotSequence);
+    char message[384] {};
+    sprintf_s(
+        message,
+        "native stereo origin lease opened epoch=%lu generation=%lu originPoseSeq=%ld originPoseFrame=%llu renderPoseSeq=%ld renderPoseFrame=%llu originPos=(%.5f %.5f %.5f) originYawQuat=(%.6f %.6f %.6f %.6f)",
+        static_cast<unsigned long>(gVrPoseOriginProducerEpoch),
+        static_cast<unsigned long>(gVrPoseOriginGeneration),
+        gVrPoseOriginPoseSequence,
+        static_cast<unsigned long long>(gVrPoseOriginPoseFrame),
+        gLatestVrPoseSnapshotSequence,
+        static_cast<unsigned long long>(pose.frame),
+        gVrPoseOrigin[0], gVrPoseOrigin[1], gVrPoseOrigin[2],
+        gVrPoseOriginRot[0], gVrPoseOriginRot[1], gVrPoseOriginRot[2], gVrPoseOriginRot[3]);
+    logLine(message);
 }
 
 bool finiteArray(const float* values, int count)
@@ -1731,6 +2250,7 @@ bool d3d9VrPoseInputEnabled()
 {
     return stereoWorldRuntimeEnabled()
         && (gNativeStereoEnabled
+            || gNativeSingleTraversalReplayEnabled
             || readEnvBool("FNVXR_D3D9_APPLY_HMD_POSE", false)
             || readEnvBool("FNVXR_D3D9_STEREO_REPLAY", true)
             || readEnvBool("FNVXR_D3D9_SHARED_STEREO", true));
@@ -1741,6 +2261,9 @@ bool vrPoseSnapshotLooksUsable(const SharedVrPoseState& snapshot)
     return snapshot.magic == SharedVrPoseMagic
         && snapshot.version == SharedVrPoseVersion
         && snapshot.frame != 0
+        && snapshot.referenceSpaceGeneration != 0
+        && snapshot.producerEpoch != 0
+        && (snapshot.trackingFlags & fnvxr::shared::VrPoseTrackingHmd) != 0
         && posePositionLooksUsable(snapshot.hmdPos)
         && posePositionLooksUsable(snapshot.leftPos)
         && posePositionLooksUsable(snapshot.rightPos)
@@ -1773,6 +2296,32 @@ bool readStableSharedVrPose(SharedVrPoseState& snapshotOut, LONG& sequenceOut)
         {
             if (!gLatestVrPoseSnapshotValid)
                 return false;
+
+            LARGE_INTEGER now {};
+            QueryPerformanceCounter(&now);
+            const double maxAgeSeconds = static_cast<double>(
+                readEnvFloat("FNVXR_D3D9_POSE_MAX_SAME_SEQUENCE_MS", 250.0f)) / 1000.0;
+            if (gLatestVrPoseAcceptedAt.QuadPart == 0
+                || maxAgeSeconds <= 0.0
+                || secondsBetween(gLatestVrPoseAcceptedAt, now) > maxAgeSeconds)
+            {
+                const LONG logCount = InterlockedIncrement(&gLoggedSharedVrPoseInvalid);
+                if (logCount <= 16 || logCount % 300 == 0)
+                {
+                    char message[224] {};
+                    sprintf_s(
+                        message,
+                        "shared VR pose rejected: stale sequence=%ld frame=%llu ageMs=%.1f limitMs=%.1f",
+                        sequenceBefore,
+                        static_cast<unsigned long long>(gLatestVrPoseSnapshot.frame),
+                        gLatestVrPoseAcceptedAt.QuadPart == 0
+                            ? -1.0
+                            : secondsBetween(gLatestVrPoseAcceptedAt, now) * 1000.0,
+                        maxAgeSeconds * 1000.0);
+                    logLine(message);
+                }
+                return false;
+            }
 
             snapshotOut = gLatestVrPoseSnapshot;
             sequenceOut = gLatestVrPoseSnapshotSequence;
@@ -1822,6 +2371,180 @@ SharedCameraState* sharedCameraState()
 
     logLine("shared camera mapped");
     return gSharedCamera;
+}
+
+SharedPlayerState* sharedPlayerState()
+{
+    if (gSharedPlayer)
+        return gSharedPlayer;
+
+    gSharedPlayerMapping = OpenFileMappingA(FILE_MAP_READ, FALSE, "Local\\FNVXR_Player_State");
+    if (!gSharedPlayerMapping)
+        return nullptr;
+
+    gSharedPlayer = static_cast<SharedPlayerState*>(
+        MapViewOfFile(gSharedPlayerMapping, FILE_MAP_READ, 0, 0, sizeof(SharedPlayerState)));
+    if (!gSharedPlayer)
+    {
+        CloseHandle(gSharedPlayerMapping);
+        gSharedPlayerMapping = nullptr;
+        return nullptr;
+    }
+
+    logLine("shared player state mapped for native stereo transition guard");
+    return gSharedPlayer;
+}
+
+bool readStableSharedPlayerState(SharedPlayerState& snapshotOut, LONG& sequenceOut)
+{
+    SharedPlayerState* player = sharedPlayerState();
+    if (!player)
+        return false;
+
+    for (int attempt = 0; attempt < 4; ++attempt)
+    {
+        const LONG sequenceBefore = player->sequence;
+        if ((sequenceBefore & 1) != 0)
+        {
+            YieldProcessor();
+            continue;
+        }
+
+        MemoryBarrier();
+        const SharedPlayerState snapshot = *player;
+        MemoryBarrier();
+        const LONG sequenceAfter = player->sequence;
+        if (sequenceBefore != sequenceAfter || (sequenceAfter & 1) != 0)
+        {
+            YieldProcessor();
+            continue;
+        }
+        if (snapshot.magic != SharedPlayerMagic || snapshot.version != SharedPlayerVersion)
+            return false;
+
+        snapshotOut = snapshot;
+        sequenceOut = sequenceAfter;
+        return true;
+    }
+    return false;
+}
+
+bool nativeStereoCellTransitionReady()
+{
+    if (!readEnvBool("FNVXR_D3D9_NATIVE_REQUIRE_STABLE_CELL", true))
+        return true;
+
+    SharedPlayerState snapshot {};
+    LONG sequence = 0;
+    const bool snapshotReady = readStableSharedPlayerState(snapshot, sequence);
+    if (!snapshotReady)
+    {
+        const LONG readMisses = InterlockedIncrement(&gNativeSharedPlayerReadMisses);
+        const LONG graceHooks = static_cast<LONG>((std::max)(
+            0.0f,
+            readEnvFloat("FNVXR_D3D9_NATIVE_PLAYER_READ_GRACE_HOOKS", 4.0f)));
+        if (gLatestSharedPlayerSnapshotValid && readMisses <= graceHooks)
+        {
+            gNativeCellTransitionReady = false;
+            gNativeEquivalentPairsInSequence = 0;
+            gNativeEquivalentLastPresentFrame = -2;
+            gNativePassEquivalenceWasBlocked = true;
+            if (readMisses == 1)
+                logLine("native stereo cell guard saw transient sequence overlap; traversal suspended without resetting cell epoch");
+            return false;
+        }
+    }
+    else
+    {
+        InterlockedExchange(&gNativeSharedPlayerReadMisses, 0);
+    }
+    const bool gameplay = snapshotReady
+        && (snapshot.flags & fnvxr::shared::PlayerSharedFlagGameplay) != 0;
+    const bool cellKnown = snapshotReady
+        && (snapshot.flags & fnvxr::shared::PlayerSharedFlagCellKnown) != 0
+        && snapshot.currentCellFormId != 0;
+    if (!snapshotReady || !gameplay || !cellKnown)
+    {
+        const bool wasReady = gNativeCellTransitionReady;
+        gLatestSharedPlayerSnapshotValid = false;
+        gNativeStableCellFormId = 0;
+        gNativeCellChangePlayerFrame = 0;
+        gNativeDoubleTraversalHoldUntilPlayerFrame = 0;
+        gNativeCellTransitionReady = false;
+        gNativeEquivalentPairsInSequence = 0;
+        gNativeEquivalentLastPresentFrame = -2;
+        gNativePassEquivalenceWasBlocked = true;
+        const LONG logCount = InterlockedIncrement(&gLoggedNativeCellTransition);
+        if (wasReady || logCount <= 8 || logCount % 240 == 0)
+        {
+            char message[320] {};
+            sprintf_s(
+                message,
+                "native stereo cell guard waiting snapshot=%d gameplay=%d cellKnown=%d flags=0x%lx cell=0x%08lx playerFrame=%llu sequence=%ld",
+                snapshotReady ? 1 : 0,
+                gameplay ? 1 : 0,
+                cellKnown ? 1 : 0,
+                static_cast<unsigned long>(snapshot.flags),
+                static_cast<unsigned long>(snapshot.currentCellFormId),
+                static_cast<unsigned long long>(snapshot.frame),
+                sequence);
+            logLine(message);
+        }
+        return false;
+    }
+
+    gLatestSharedPlayerSnapshot = snapshot;
+    gLatestSharedPlayerSnapshotSequence = sequence;
+    gLatestSharedPlayerSnapshotValid = true;
+    const bool cellChanged = gNativeStableCellFormId == 0
+        || gNativeStableCellFormId != snapshot.currentCellFormId
+        || snapshot.frame < gNativeCellChangePlayerFrame;
+    if (cellChanged)
+    {
+        const std::uint32_t previousCell = gNativeStableCellFormId;
+        gNativeStableCellFormId = snapshot.currentCellFormId;
+        gNativeCellChangePlayerFrame = snapshot.frame;
+        gNativeDoubleTraversalHoldUntilPlayerFrame = 0;
+        gNativeCellTransitionReady = false;
+        gNativeEquivalentPairsInSequence = 0;
+        gNativeEquivalentLastPresentFrame = -2;
+        gNativePassEquivalenceWasBlocked = true;
+        char message[320] {};
+        sprintf_s(
+            message,
+            "native stereo cell transition previous=0x%08lx current=0x%08lx playerFrame=%llu sequence=%ld; double traversal suspended",
+            static_cast<unsigned long>(previousCell),
+            static_cast<unsigned long>(snapshot.currentCellFormId),
+            static_cast<unsigned long long>(snapshot.frame),
+            sequence);
+        logLine(message);
+    }
+
+    const std::uint64_t settleFrames = static_cast<std::uint64_t>((std::max)(
+        0.0f,
+        readEnvFloat("FNVXR_D3D9_NATIVE_CELL_SETTLE_PLAYER_FRAMES", 45.0f)));
+    const std::uint64_t stableFrames = snapshot.frame >= gNativeCellChangePlayerFrame
+        ? snapshot.frame - gNativeCellChangePlayerFrame
+        : 0;
+    const bool cellSettled = stableFrames >= settleFrames;
+    const bool mismatchHoldActive = snapshot.frame < gNativeDoubleTraversalHoldUntilPlayerFrame;
+    const bool ready = cellSettled && !mismatchHoldActive;
+    if (ready && !gNativeCellTransitionReady)
+    {
+        char message[320] {};
+        sprintf_s(
+            message,
+            "native stereo traversal guard settled cell=0x%08lx playerFrame=%llu stableFrames=%llu required=%llu mismatchHoldUntil=%llu sequence=%ld",
+            static_cast<unsigned long>(snapshot.currentCellFormId),
+            static_cast<unsigned long long>(snapshot.frame),
+            static_cast<unsigned long long>(stableFrames),
+            static_cast<unsigned long long>(settleFrames),
+            static_cast<unsigned long long>(gNativeDoubleTraversalHoldUntilPlayerFrame),
+            sequence);
+        logLine(message);
+    }
+    gNativeCellTransitionReady = ready;
+    return ready;
 }
 
 bool matrix33LooksUsable(const float* m)
@@ -2008,12 +2731,49 @@ void updateSharedVrPose()
     SharedVrPoseState pose {};
     LONG sequence = 0;
     if (!readStableSharedVrPose(pose, sequence))
+    {
+        // Never keep applying the last good HMD transform after its shared
+        // transaction has become unreadable or stale. The retained origin is
+        // harmless; rendering stays closed until a fresh tracked pose arrives.
+        gLatestVrPoseSnapshotValid = false;
+        gNativeStereoRenderedPoseValid = false;
+        gHaveVrBodyFrame = false;
+        // Preserve the last authoritative body origin across a transient
+        // seqlock overlap. Rendering and the public rig lease close now; the
+        // next fresh pose resumes in the same frame instead of recentering.
+        if (gPublishedVrOriginActive)
+            publishSharedVrOrigin(false);
         return;
+    }
+
+    const bool poseSequenceAdvanced = sequence != gLastVrPoseSequence;
+    if ((gLastVrReferenceSpaceGeneration != 0
+            && pose.referenceSpaceGeneration != gLastVrReferenceSpaceGeneration)
+        || (gLastVrProducerEpoch != 0 && pose.producerEpoch != gLastVrProducerEpoch))
+    {
+        gHaveVrPoseOrigin = false;
+        gHaveVrBodyFrame = false;
+        gNativeGameplayPoseOriginLatched = false;
+        publishSharedVrOrigin(false, &pose, sequence);
+        char message[192] {};
+        sprintf_s(
+            message,
+            "shared VR producer/reference changed epoch=%lu->%lu generation=%lu->%lu; invalidating camera and rig origin",
+            static_cast<unsigned long>(gLastVrProducerEpoch),
+            static_cast<unsigned long>(pose.producerEpoch),
+            static_cast<unsigned long>(gLastVrReferenceSpaceGeneration),
+            static_cast<unsigned long>(pose.referenceSpaceGeneration));
+        logLine(message);
+    }
+    gLastVrReferenceSpaceGeneration = pose.referenceSpaceGeneration;
+    gLastVrProducerEpoch = pose.producerEpoch;
 
     if (gLastVrPoseFrame != 0 && pose.frame < gLastVrPoseFrame)
     {
         gHaveVrPoseOrigin = false;
+        gHaveVrBodyFrame = false;
         gNativeGameplayPoseOriginLatched = false;
+        publishSharedVrOrigin(false, &pose, sequence);
         logLine("shared VR pose frame regressed; resetting origin");
     }
 
@@ -2023,6 +2783,8 @@ void updateSharedVrPose()
     gLatestVrPoseSnapshotSequence = sequence;
     gLatestVrPoseDisplayTime = pose.predictedDisplayTime;
     gLatestVrPoseSnapshotValid = true;
+    if (poseSequenceAdvanced)
+        QueryPerformanceCounter(&gLatestVrPoseAcceptedAt);
     float rawCenter[3] {
         (pose.leftEyePos[0] + pose.rightEyePos[0]) * 0.5f,
         (pose.leftEyePos[1] + pose.rightEyePos[1]) * 0.5f,
@@ -2049,19 +2811,48 @@ void updateSharedVrPose()
         gVrPoseOrigin[0] = rawCenter[0];
         gVrPoseOrigin[1] = rawCenter[1];
         gVrPoseOrigin[2] = rawCenter[2];
-        copyNormalizedQuat(gVrPoseOriginRot, pose.hmdRot);
-        captureVrWorldYawCorrection(gVrPoseOriginRot);
+        float capturedHmdRot[4] {};
+        copyNormalizedQuat(capturedHmdRot, pose.hmdRot);
+        captureVrWorldYawCorrection(capturedHmdRot);
+        const fnvxr::stereo::Quaternion yawOrigin =
+            fnvxr::stereo::gravityAlignedYawOrientation({
+                capturedHmdRot[0], capturedHmdRot[1], capturedHmdRot[2], capturedHmdRot[3] });
+        gVrPoseOriginRot[0] = yawOrigin.x;
+        gVrPoseOriginRot[1] = yawOrigin.y;
+        gVrPoseOriginRot[2] = yawOrigin.z;
+        gVrPoseOriginRot[3] = yawOrigin.w;
         gHaveVrPoseOrigin = true;
+        gVrPoseOriginPoseSequence = sequence;
+        gVrPoseOriginPoseFrame = pose.frame;
+        gVrPoseOriginGeneration = pose.referenceSpaceGeneration;
+        gVrPoseOriginProducerEpoch = pose.producerEpoch;
         gHaveVrBodyFrame = false;
         logLine("shared VR body origin latched");
     }
 
-    const float rawHeadDelta[3] {
-        rawCenter[0] - gVrPoseOrigin[0],
-        rawCenter[1] - gVrPoseOrigin[1],
-        rawCenter[2] - gVrPoseOrigin[2]
+    const fnvxr::stereo::Quaternion originOrientation {
+        gVrPoseOriginRot[0],
+        gVrPoseOriginRot[1],
+        gVrPoseOriginRot[2],
+        gVrPoseOriginRot[3]
     };
-    rotateByVrWorldYaw(rawHeadDelta, gLatestHeadLocalMeters);
+    const fnvxr::stereo::Vector3 originPosition {
+        gVrPoseOrigin[0],
+        gVrPoseOrigin[1],
+        gVrPoseOrigin[2]
+    };
+    const fnvxr::stereo::Vector3 currentHeadPosition {
+        rawCenter[0],
+        rawCenter[1],
+        rawCenter[2]
+    };
+    const fnvxr::stereo::Vector3 headInOrigin = fnvxr::stereo::positionInOriginFrame(
+        originOrientation,
+        originPosition,
+        currentHeadPosition);
+    gLatestHeadLocalMeters[0] = headInOrigin.x;
+    gLatestHeadLocalMeters[1] = headInOrigin.y;
+    gLatestHeadLocalMeters[2] = headInOrigin.z;
     gLatestHmdDelta[0] = gLatestHeadLocalMeters[0];
     gLatestHmdDelta[1] = gLatestHeadLocalMeters[1];
     gLatestHmdDelta[2] = gLatestHeadLocalMeters[2];
@@ -2076,13 +2867,66 @@ void updateSharedVrPose()
         pose.rightEyePos[1] - rawCenter[1],
         pose.rightEyePos[2] - rawCenter[2]
     };
-    rotateByVrWorldYaw(rawLeftEyeLocal, gLatestLeftEyeLocalMeters);
-    rotateByVrWorldYaw(rawRightEyeLocal, gLatestRightEyeLocalMeters);
+    const fnvxr::stereo::Vector3 leftEyeInOrigin = fnvxr::stereo::vectorInOriginFrame(
+        originOrientation,
+        { rawLeftEyeLocal[0], rawLeftEyeLocal[1], rawLeftEyeLocal[2] });
+    const fnvxr::stereo::Vector3 rightEyeInOrigin = fnvxr::stereo::vectorInOriginFrame(
+        originOrientation,
+        { rawRightEyeLocal[0], rawRightEyeLocal[1], rawRightEyeLocal[2] });
+    gLatestLeftEyeLocalMeters[0] = leftEyeInOrigin.x;
+    gLatestLeftEyeLocalMeters[1] = leftEyeInOrigin.y;
+    gLatestLeftEyeLocalMeters[2] = leftEyeInOrigin.z;
+    gLatestRightEyeLocalMeters[0] = rightEyeInOrigin.x;
+    gLatestRightEyeLocalMeters[1] = rightEyeInOrigin.y;
+    gLatestRightEyeLocalMeters[2] = rightEyeInOrigin.z;
 
     float currentRot[4] {};
     copyNormalizedQuat(currentRot, pose.hmdRot);
     correctedVrWorldQuat(gLatestHmdRotDelta, currentRot);
     gHaveVrBodyFrame = true;
+
+    if ((pose.frame <= 10 || (pose.frame % 15) == 0)
+        && pose.frame != gLastHeadBodyInvariantPoseFrame)
+    {
+        gLastHeadBodyInvariantPoseFrame = pose.frame;
+        const float qx = gLatestHmdRotDelta[0];
+        const float qy = gLatestHmdRotDelta[1];
+        const float qz = gLatestHmdRotDelta[2];
+        const float qw = gLatestHmdRotDelta[3];
+        const float hmdYaw = atan2f(
+            2.0f * (qw * qy + qx * qz),
+            1.0f - 2.0f * (qy * qy + qz * qz));
+        const float playerYaw = gLatestSharedPlayerSnapshotValid
+            ? atan2f(
+                gLatestSharedPlayerSnapshot.playerWorldRot[3],
+                gLatestSharedPlayerSnapshot.playerWorldRot[0])
+            : 0.0f;
+        const float cameraYaw = gLatestSharedPlayerSnapshotValid
+            ? atan2f(
+                gLatestSharedPlayerSnapshot.cameraWorldRot[3],
+                gLatestSharedPlayerSnapshot.cameraWorldRot[0])
+            : 0.0f;
+        const float eyeCenterError =
+            absFloat(gLatestLeftEyeLocalMeters[0] + gLatestRightEyeLocalMeters[0])
+            + absFloat(gLatestLeftEyeLocalMeters[1] + gLatestRightEyeLocalMeters[1])
+            + absFloat(gLatestLeftEyeLocalMeters[2] + gLatestRightEyeLocalMeters[2]);
+        char invariant[640] {};
+        sprintf_s(
+            invariant,
+            "{\"event\":\"fnvxrHeadBodyInvariant\",\"poseFrame\":%llu,\"poseSeq\":%ld,\"playerValid\":%s,\"hmdYaw\":%.7f,\"playerYaw\":%.7f,\"cameraYaw\":%.7f,\"headLocal\":[%.6f,%.6f,%.6f],\"eyeCenterError\":%.8f,\"rawIpdMeters\":%.6f}",
+            static_cast<unsigned long long>(pose.frame),
+            sequence,
+            gLatestSharedPlayerSnapshotValid ? "true" : "false",
+            hmdYaw,
+            playerYaw,
+            cameraYaw,
+            gLatestHeadLocalMeters[0],
+            gLatestHeadLocalMeters[1],
+            gLatestHeadLocalMeters[2],
+            eyeCenterError,
+            gLatestRawIpdMeters);
+        logLine(invariant);
+    }
 
     const LONG logCount = InterlockedIncrement(&gLoggedSharedVrPose);
     if (logCount <= 12 || logCount % 300 == 0)
@@ -2146,7 +2990,45 @@ void updateEyeMatrices()
 
     updateSharedCameraState();
     const fnvxr::stereo::Matrix4& stereoBaseView = baseViewForStereo();
-    gEyeMatrices = fnvxr::stereo::makeEyeMatrices(stereoBaseView, gBaseProjection, gIpdGameUnits);
+    const bool singleTraversalActive = gInNativeStereoHook && gNativeActiveEye == 2;
+    const float effectiveIpdUnits = singleTraversalActive
+            && std::isfinite(gNativeSingleTraversalIpdUnits)
+            && gNativeSingleTraversalIpdUnits > 0.1f
+            && gNativeSingleTraversalIpdUnits < 12.0f
+        ? gNativeSingleTraversalIpdUnits
+        : gIpdGameUnits;
+    gEyeMatrices = fnvxr::stereo::makeEyeMatrices(
+        stereoBaseView,
+        gBaseProjection,
+        effectiveIpdUnits);
+    if (singleTraversalActive
+        && readEnvBool("FNVXR_D3D9_NATIVE_ASYMMETRIC_FOV", true))
+    {
+        const float leftTangents[4] {
+            std::tan(gNativeSingleTraversalFov[0][0]),
+            std::tan(gNativeSingleTraversalFov[0][1]),
+            std::tan(gNativeSingleTraversalFov[0][2]),
+            std::tan(gNativeSingleTraversalFov[0][3])
+        };
+        const float rightTangents[4] {
+            std::tan(gNativeSingleTraversalFov[1][0]),
+            std::tan(gNativeSingleTraversalFov[1][1]),
+            std::tan(gNativeSingleTraversalFov[1][2]),
+            std::tan(gNativeSingleTraversalFov[1][3])
+        };
+        gEyeMatrices.leftProjection = fnvxr::stereo::projectionFromTangents(
+            gBaseProjection,
+            leftTangents[0],
+            leftTangents[1],
+            leftTangents[2],
+            leftTangents[3]);
+        gEyeMatrices.rightProjection = fnvxr::stereo::projectionFromTangents(
+            gBaseProjection,
+            rightTangents[0],
+            rightTangents[1],
+            rightTangents[2],
+            rightTangents[3]);
+    }
     const bool usingSharedCamera = readEnvBool("FNVXR_D3D9_USE_SHARED_CAMERA_VIEW", true) && gSharedCameraActive;
     const bool stereoSuppressedForUi = suppressStereoForUiMode();
     const bool screenSpaceProjection = currentProjectionLooksScreenSpace();
@@ -2403,6 +3285,12 @@ void readShaderMatrixOrder(char* order, size_t orderSize)
     if (!order || orderSize == 0)
         return;
 
+    if (const ShaderWvpContract* contract = currentShaderWvpContract())
+    {
+        strcpy_s(order, orderSize, contract->columnVector ? "column" : "row");
+        return;
+    }
+
     if (GetEnvironmentVariableA("FNVXR_D3D9_SHADER_MATRIX_ORDER", order, static_cast<DWORD>(orderSize)) == 0)
         strcpy_s(order, orderSize, "column");
 }
@@ -2450,7 +3338,15 @@ bool setEyeShaderWvpConstants(
         return false;
     }
 
-    const UINT start = static_cast<UINT>(readEnvFloat("FNVXR_D3D9_SHADER_WVP_START_REGISTER", 0.0f));
+    const ShaderWvpContract* contract = currentShaderWvpContract();
+    if (!contract && !readEnvBool("FNVXR_D3D9_SHADER_ALLOW_UNVERIFIED_PATCHES", false))
+    {
+        logShaderStereoSkip("wvp_missing_verified_contract");
+        return false;
+    }
+    const UINT start = contract
+        ? contract->startRegister
+        : static_cast<UINT>(readEnvFloat("FNVXR_D3D9_SHADER_WVP_START_REGISTER", 0.0f));
     if (!haveTrackedShaderMatrixAt(start))
     {
         logShaderStereoSkip("wvp_c0_c3_not_cached");
@@ -2501,12 +3397,14 @@ bool setEyeShaderWvpConstants(
         char message[768] {};
         sprintf_s(
             message,
-            "shader WVP replay count=%ld eye=%s start=%u result=0x%08lx order=%s delta=%.6f baseT=(%.4f %.4f %.4f) eyeT=(%.4f %.4f %.4f) old03=%.5f old30=%.5f new03=%.5f new30=%.5f",
+            "shader WVP replay count=%ld eye=%s start=%u result=0x%08lx order=%s vsHash=0x%08x psHash=0x%08x delta=%.6f baseT=(%.4f %.4f %.4f) eyeT=(%.4f %.4f %.4f) old03=%.5f old30=%.5f new03=%.5f new30=%.5f",
             logCount,
             eyeName ? eyeName : "unknown",
             start,
             static_cast<unsigned long>(result),
             order,
+            gActiveVertexShaderHash,
+            gActivePixelShaderHash,
             matrixMaxAbsDifference(originalWvp, patchedWvp),
             originalViewMatrix.m[3][0],
             originalViewMatrix.m[3][1],
@@ -2566,6 +3464,8 @@ UINT shaderMatrixAlignment()
 
 UINT shaderMatrixPatchStartRegister()
 {
+    if (const ShaderWvpContract* contract = currentShaderWvpContract())
+        return contract->startRegister;
     return static_cast<UINT>(readEnvFloat("FNVXR_D3D9_SHADER_PATCH_START_REGISTER", 0.0f));
 }
 
@@ -3596,6 +4496,13 @@ void releaseSharedVrPose()
     }
     gHaveVrPoseOrigin = false;
     gNativeGameplayPoseOriginLatched = false;
+    gLatestVrPoseSnapshotValid = false;
+    gNativeStereoRenderedPoseValid = false;
+    gLatestVrPoseSnapshotSequence = 0;
+    gNativeStereoRenderedPoseSequence = 0;
+    gLatestVrPoseAcceptedAt.QuadPart = 0;
+    gLastVrReferenceSpaceGeneration = 0;
+    gLastVrProducerEpoch = 0;
     gVrPoseOrigin[0] = 0.0f;
     gVrPoseOrigin[1] = 0.0f;
     gVrPoseOrigin[2] = 0.0f;
@@ -3603,6 +4510,10 @@ void releaseSharedVrPose()
     gVrPoseOriginRot[1] = 0.0f;
     gVrPoseOriginRot[2] = 0.0f;
     gVrPoseOriginRot[3] = 1.0f;
+    gVrPoseOriginPoseSequence = 0;
+    gVrPoseOriginPoseFrame = 0;
+    gVrPoseOriginGeneration = 0;
+    gVrPoseOriginProducerEpoch = 0;
     gLatestHmdDelta[0] = 0.0f;
     gLatestHmdDelta[1] = 0.0f;
     gLatestHmdDelta[2] = 0.0f;
@@ -3659,6 +4570,45 @@ void releaseSharedRuntime()
         CloseHandle(gSharedRuntimeMapping);
         gSharedRuntimeMapping = nullptr;
     }
+}
+
+void releaseSharedVrOriginPublisher()
+{
+    if (gSharedVrOrigin)
+    {
+        publishSharedVrOrigin(false);
+        UnmapViewOfFile(gSharedVrOrigin);
+        gSharedVrOrigin = nullptr;
+    }
+    if (gSharedVrOriginMapping)
+    {
+        CloseHandle(gSharedVrOriginMapping);
+        gSharedVrOriginMapping = nullptr;
+    }
+    gPublishedVrOriginActive = false;
+    gPublishedVrOriginGeneration = 0;
+}
+
+void releaseSharedPlayer()
+{
+    if (gSharedPlayer)
+    {
+        UnmapViewOfFile(gSharedPlayer);
+        gSharedPlayer = nullptr;
+    }
+    if (gSharedPlayerMapping)
+    {
+        CloseHandle(gSharedPlayerMapping);
+        gSharedPlayerMapping = nullptr;
+    }
+    gLatestSharedPlayerSnapshot = {};
+    gLatestSharedPlayerSnapshotSequence = 0;
+    gLatestSharedPlayerSnapshotValid = false;
+    gNativeStableCellFormId = 0;
+    gNativeCellChangePlayerFrame = 0;
+    gNativeDoubleTraversalHoldUntilPlayerFrame = 0;
+    gNativeCellTransitionReady = false;
+    gNativeSharedPlayerReadMisses = 0;
 }
 
 bool sharedVideoEnabled()
@@ -3725,7 +4675,7 @@ bool ensureSharedStereo()
         PAGE_READWRITE,
         0,
         mappingSize,
-        "Local\\FNVXR_D3D9_StereoFrame_v1");
+        fnvxr::shared::D3D9StereoFrameSharedMappingName);
     if (!gSharedStereoMapping)
     {
         logLine("shared stereo CreateFileMapping failed");
@@ -3745,6 +4695,10 @@ bool ensureSharedStereo()
     auto* header = reinterpret_cast<SharedStereoHeader*>(gSharedStereoView);
     std::memset(header, 0, sizeof(*header));
     header->magic = SharedStereoMagic;
+    header->version = fnvxr::shared::D3D9StereoFrameSharedVersion;
+    header->headerBytes = sizeof(SharedStereoHeader);
+    header->leftPayloadOffset = sizeof(SharedStereoHeader);
+    header->totalMappingBytes = mappingSize;
     logLine("shared D3D9 stereo frame mapping ready");
     return true;
 }
@@ -4677,7 +5631,7 @@ bool captureNativePostprocessDraw(
     const LONG pairSequence = static_cast<LONG>(gNativeStereoRenderPairSequence + 1);
     if (pairSequence <= 3 || pairSequence % 120 == 0)
     {
-        char message[512] {};
+        char message[576] {};
         sprintf_s(
             message,
             "native postprocess draw recorded pair=%ld ordinal=%ld kind=%s target=%p size=%ux%u format=%lu viewport=%lux%lu vsHash=0x%08x psHash=0x%08x",
@@ -5223,10 +6177,10 @@ bool ensureStereoTargets(IDirect3DDevice9* device)
     return true;
 }
 
-// Fallout: New Vegas 1.4.0.525 retail render entry point. This is the full
-// Gamebryo render boundary, above scene culling, shader constant generation,
-// depth, and post processing. Running this boundary twice from one invocation
-// produces a same-simulation-frame eye pair; it is not alternate-eye rendering.
+// Fallout: New Vegas 1.4.0.525 retail render entry point. The production VR
+// path applies an HMD-centered camera here exactly once, lets Gamebryo cull and
+// submit one coherent scene, then mirrors each resulting D3D9 draw to both eye
+// targets. The legacy two-traversal path remains code-gated for diagnostics.
 constexpr std::uintptr_t FalloutDoRenderFrameAddress = 0x008706B0;
 constexpr std::uintptr_t FalloutWorldSceneGraphAddress = 0x011DEB7C;
 constexpr std::uintptr_t FalloutNiCameraSetViewFrustumAddress = 0x00A6FAF0;
@@ -5284,6 +6238,7 @@ struct NativeCameraSnapshot
 struct NativeStereoRig
 {
     NativeMatrix3 headRotation {};
+    NativeMatrix3 eyeRotation[2] {};
     NativeVector3 eyeOffsetUnits[2] {};
     float fov[2][4] {};
     SharedVrPoseState pose {};
@@ -5311,6 +6266,30 @@ NativeMatrix3 multiplyNativeMatrix3(const NativeMatrix3& a, const NativeMatrix3&
         }
     }
     return result;
+}
+
+float determinantNativeMatrix3(const NativeMatrix3& matrix)
+{
+    return matrix.m[0][0] * (matrix.m[1][1] * matrix.m[2][2] - matrix.m[1][2] * matrix.m[2][1])
+        - matrix.m[0][1] * (matrix.m[1][0] * matrix.m[2][2] - matrix.m[1][2] * matrix.m[2][0])
+        + matrix.m[0][2] * (matrix.m[1][0] * matrix.m[2][1] - matrix.m[1][1] * matrix.m[2][0]);
+}
+
+float orthonormalErrorNativeMatrix3(const NativeMatrix3& matrix)
+{
+    float maxError = 0.0f;
+    for (int columnA = 0; columnA < 3; ++columnA)
+    {
+        for (int columnB = 0; columnB < 3; ++columnB)
+        {
+            float dot = 0.0f;
+            for (int row = 0; row < 3; ++row)
+                dot += matrix.m[row][columnA] * matrix.m[row][columnB];
+            const float expected = columnA == columnB ? 1.0f : 0.0f;
+            maxError = (std::max)(maxError, absFloat(dot - expected));
+        }
+    }
+    return maxError;
 }
 
 void readNativeHeadAxisMode(char* buffer, size_t bufferSize)
@@ -5539,7 +6518,7 @@ bool prepareNativeStereoRig(NativeStereoRig& rig)
             logLine("native stereo gameplay pose origin latched");
         }
     }
-    if (!gNativeStereoEnabled
+    if ((!gNativeStereoEnabled && !gNativeSingleTraversalReplayEnabled)
         || !gHaveVrBodyFrame
         || !gLatestVrPoseSnapshotValid
         || gLatestVrPoseSnapshotSequence <= 0
@@ -5552,25 +6531,55 @@ bool prepareNativeStereoRig(NativeStereoRig& rig)
     rig.poseSequence = gLatestVrPoseSnapshotSequence;
     rig.displayTime = gLatestVrPoseDisplayTime;
 
-    const fnvxr::stereo::Matrix4 xrHeadRotation = rotationMatrixFromQuat(gLatestHmdRotDelta);
-    const fnvxr::stereo::Matrix4 gameHeadRotation = nativeHeadRotationFromXrRotation(xrHeadRotation);
+    const fnvxr::stereo::Quaternion relativeHead {
+        gLatestHmdRotDelta[0],
+        gLatestHmdRotDelta[1],
+        gLatestHmdRotDelta[2],
+        gLatestHmdRotDelta[3]
+    };
+    const fnvxr::stereo::Matrix3 gameHeadRotation =
+        fnvxr::stereo::gamebryoHeadRotation(relativeHead);
     for (int row = 0; row < 3; ++row)
     {
         for (int column = 0; column < 3; ++column)
         {
-            // rotationMatrixFromQuat is laid out for D3D's row-vector view
-            // convention.  NiTransform::world uses matrix-times-column-vector;
-            // transpose the local HMD rotation before composing it into the
-            // retail NiCamera.  Without this, pitch/roll are perceived as an
-            // inverted or upside-down head response.
-            rig.headRotation.m[row][column] = gameHeadRotation.m[column][row];
+            // The native helper returns Gamebryo's column-vector basis
+            // directly, avoiding an easy-to-invert row/column transpose.
+            rig.headRotation.m[row][column] = gameHeadRotation.m[row][column];
         }
     }
 
     const float* localEyes[2] { gLatestLeftEyeLocalMeters, gLatestRightEyeLocalMeters };
+    const float* sourceEyeRotations[2] { rig.pose.leftEyeRot, rig.pose.rightEyeRot };
     const float* sourceFov[2] { rig.pose.leftFov, rig.pose.rightFov };
     for (int eye = 0; eye < 2; ++eye)
     {
+        const fnvxr::stereo::Quaternion relativeEye = fnvxr::stereo::relativeOrientation(
+            {
+                gVrPoseOriginRot[0],
+                gVrPoseOriginRot[1],
+                gVrPoseOriginRot[2],
+                gVrPoseOriginRot[3]
+            },
+            {
+                sourceEyeRotations[eye][0],
+                sourceEyeRotations[eye][1],
+                sourceEyeRotations[eye][2],
+                sourceEyeRotations[eye][3]
+            });
+        const fnvxr::stereo::Matrix3 gameEyeRotation =
+            fnvxr::stereo::gamebryoHeadRotation(relativeEye);
+        for (int row = 0; row < 3; ++row)
+        {
+            for (int column = 0; column < 3; ++column)
+                rig.eyeRotation[eye].m[row][column] = gameEyeRotation.m[row][column];
+        }
+        if (absFloat(determinantNativeMatrix3(rig.eyeRotation[eye]) - 1.0f) > 0.002f
+            || orthonormalErrorNativeMatrix3(rig.eyeRotation[eye]) > 0.002f)
+        {
+            return false;
+        }
+
         float localXrMeters[3] {};
         float localGameMeters[3] {};
         composeLocalXrMeters(localEyes[eye], localXrMeters);
@@ -5592,7 +6601,12 @@ bool writeNativeEyeCameraState(const NativeCameraSnapshot& base, const NativeSte
 
     NativeNiTransform desiredWorld = base.world;
     if (readEnvBool("FNVXR_D3D9_NATIVE_APPLY_HEAD_ROTATION", true))
-        desiredWorld.rotation = multiplyNativeMatrix3(base.world.rotation, rig.headRotation);
+    {
+        // The exact per-eye OpenXR pose is body-local and belongs to the same
+        // immutable transaction as this eye's pixels. Preserve the retail
+        // camera/player basis and apply that eye delta on its local side.
+        desiredWorld.rotation = multiplyNativeMatrix3(base.world.rotation, rig.eyeRotation[eye]);
+    }
 
     const NativeVector3 worldOffset = transformNativeVector(base.world.rotation, rig.eyeOffsetUnits[eye]);
     desiredWorld.translation.x += worldOffset.x;
@@ -5630,6 +6644,76 @@ bool writeNativeEyeCameraState(const NativeCameraSnapshot& base, const NativeSte
     return setNativeCameraFrustum(base.camera, frustum);
 }
 
+NativeNiTransform nativeCenterWorldTransform(
+    const NativeCameraSnapshot& base,
+    const NativeStereoRig& rig)
+{
+    NativeNiTransform desiredWorld = base.world;
+    if (readEnvBool("FNVXR_D3D9_NATIVE_APPLY_HEAD_ROTATION", true))
+        desiredWorld.rotation = multiplyNativeMatrix3(base.world.rotation, rig.headRotation);
+
+    const NativeVector3 centerOffsetUnits {
+        (rig.eyeOffsetUnits[0].x + rig.eyeOffsetUnits[1].x) * 0.5f,
+        (rig.eyeOffsetUnits[0].y + rig.eyeOffsetUnits[1].y) * 0.5f,
+        (rig.eyeOffsetUnits[0].z + rig.eyeOffsetUnits[1].z) * 0.5f
+    };
+    const NativeVector3 worldOffset = transformNativeVector(base.world.rotation, centerOffsetUnits);
+    desiredWorld.translation.x += worldOffset.x;
+    desiredWorld.translation.y += worldOffset.y;
+    desiredWorld.translation.z += worldOffset.z;
+    return desiredWorld;
+}
+
+bool writeNativeCenterCameraState(const NativeCameraSnapshot& base, const NativeStereoRig& rig)
+{
+    if (!base.camera)
+        return false;
+
+    // Both eye offsets contain the recentered head translation plus their
+    // individual eye displacement. Their midpoint is the physical head/eye
+    // center used for the one conservative Gamebryo traversal.
+    const NativeNiTransform desiredWorld = nativeCenterWorldTransform(base, rig);
+    const NativeNiTransform desiredLocal = localTransformForDesiredWorld(base.camera, desiredWorld);
+
+    NativeNiFrustum frustum = base.frustum;
+    if (readEnvBool("FNVXR_D3D9_NATIVE_ASYMMETRIC_FOV", true))
+    {
+        // Cull once with the union of both OpenXR eye frusta. The D3D replay
+        // path later applies the per-eye view split to the same submitted draw
+        // list, so neither eye can lose geometry solely because it was culled
+        // for the other eye.
+        frustum.left = (std::min)(std::tan(rig.fov[0][0]), std::tan(rig.fov[1][0]));
+        frustum.right = (std::max)(std::tan(rig.fov[0][1]), std::tan(rig.fov[1][1]));
+        frustum.top = (std::max)(std::tan(rig.fov[0][2]), std::tan(rig.fov[1][2]));
+        frustum.bottom = (std::min)(std::tan(rig.fov[0][3]), std::tan(rig.fov[1][3]));
+        frustum.orthographic = 0;
+    }
+
+    __try
+    {
+        const auto address = reinterpret_cast<std::uintptr_t>(base.camera);
+        std::memcpy(
+            reinterpret_cast<void*>(address + NiAvObjectLocalTransformOffset),
+            &desiredLocal,
+            sizeof(desiredLocal));
+        std::memcpy(
+            reinterpret_cast<void*>(address + NiAvObjectWorldTransformOffset),
+            &desiredWorld,
+            sizeof(desiredWorld));
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+    return setNativeCameraFrustum(base.camera, frustum);
+}
+
+bool applyNativeCenterCamera(const NativeCameraSnapshot& base, const NativeStereoRig& rig)
+{
+    return writeNativeCenterCameraState(base, rig)
+        && updateNativeCameraWorldToCamera(base.camera);
+}
+
 bool applyNativeEyeCamera(const NativeCameraSnapshot& base, const NativeStereoRig& rig, int eye)
 {
     // The camera matrix rebuild consumes both the world transform and the
@@ -5644,14 +6728,18 @@ void __fastcall hookedNativeCameraUpdateWorldToCamera(void* camera, void*)
     const LONG eye = gNativeActiveEye;
     if (gInNativeStereoHook
         && eye >= 0
-        && eye <= 1
+        && eye <= 2
         && camera
         && camera == gNativeActiveCamera.camera)
     {
-        if (writeNativeEyeCameraState(gNativeActiveCamera, gNativeActiveRig, static_cast<int>(eye)))
+        const bool written = eye == 2
+            ? writeNativeCenterCameraState(gNativeActiveCamera, gNativeActiveRig)
+            : writeNativeEyeCameraState(gNativeActiveCamera, gNativeActiveRig, static_cast<int>(eye));
+        if (written)
         {
             InterlockedIncrement(&gNativeCameraMatrixOverrides);
-            InterlockedIncrement(&gNativeCameraMatrixOverridesThisPair[eye]);
+            if (eye <= 1)
+                InterlockedIncrement(&gNativeCameraMatrixOverridesThisPair[eye]);
         }
         else
         {
@@ -5862,10 +6950,10 @@ void logNativeCameraBasisIfChanged(
         rightRelative = multiplyNativeMatrix3(inverseBase, afterRight.world.rotation);
     }
     const float headLeftDelta = haveRelative
-        ? nativeFloatArrayMaxDelta(&rig.headRotation.m[0][0], &leftRelative.m[0][0], 9)
+        ? nativeFloatArrayMaxDelta(&rig.eyeRotation[0].m[0][0], &leftRelative.m[0][0], 9)
         : 0.0f;
     const float headRightDelta = haveRelative
-        ? nativeFloatArrayMaxDelta(&rig.headRotation.m[0][0], &rightRelative.m[0][0], 9)
+        ? nativeFloatArrayMaxDelta(&rig.eyeRotation[1].m[0][0], &rightRelative.m[0][0], 9)
         : 0.0f;
     const float leftRightDelta = haveRelative
         ? nativeFloatArrayMaxDelta(&leftRelative.m[0][0], &rightRelative.m[0][0], 9)
@@ -5898,6 +6986,261 @@ void logNativeCameraBasisIfChanged(
     logLine(message);
 }
 
+struct NativePassEquivalence
+{
+    bool guardEnabled = true;
+    bool equivalent = false;
+    bool underfilled = false;
+    bool resolvedTargetMismatch = false;
+    bool drawMismatch = false;
+    bool vsCallMismatch = false;
+    LONG draws[2] {};
+    LONG vsCalls[2] {};
+    LONG resolvedCopies[2] {};
+    LONG fullSizeCandidates = 0;
+    LONG candidateSeenAsymmetry = 0;
+    LONG candidateSnapshotAsymmetry = 0;
+    LONG drawDelta = 0;
+    LONG vsCallDelta = 0;
+    LONG minEyeDraws = 0;
+    LONG minEyeVsCalls = 0;
+    LONG maxDrawDelta = 0;
+    LONG maxVsCallDelta = 0;
+    LONG recoveryPairs = 1;
+    float drawDeltaRatio = 0.0f;
+    float vsCallDeltaRatio = 0.0f;
+    float maxDrawDeltaRatio = 0.0f;
+    float maxVsCallDeltaRatio = 0.0f;
+};
+
+LONG nativeCountDelta(LONG left, LONG right)
+{
+    return left >= right ? left - right : right - left;
+}
+
+float nativeCountDeltaRatio(LONG left, LONG right)
+{
+    const LONG maximum = (std::max)(left, right);
+    return maximum > 0
+        ? static_cast<float>(nativeCountDelta(left, right)) / static_cast<float>(maximum)
+        : 0.0f;
+}
+
+NativePassEquivalence evaluateNativePassEquivalence()
+{
+    NativePassEquivalence result {};
+    result.guardEnabled = readEnvBool("FNVXR_D3D9_NATIVE_EQUIVALENCE_GUARD", true);
+    result.draws[0] = gNativeDrawCalls[0];
+    result.draws[1] = gNativeDrawCalls[1];
+    result.vsCalls[0] = gNativeVsConstantCalls[0];
+    result.vsCalls[1] = gNativeVsConstantCalls[1];
+    result.resolvedCopies[0] = gNativeResolvedCopies[0];
+    result.resolvedCopies[1] = gNativeResolvedCopies[1];
+    for (UINT index = 0; index < MaxNativeFullSizeTargetCandidates; ++index)
+    {
+        const NativeFullSizeTargetCandidate& candidate = gNativeFullSizeTargetCandidates[index];
+        if (!candidate.original)
+            continue;
+        ++result.fullSizeCandidates;
+        if (candidate.seen[0] != candidate.seen[1])
+            ++result.candidateSeenAsymmetry;
+        if (candidate.snapshotted[0] != candidate.snapshotted[1])
+            ++result.candidateSnapshotAsymmetry;
+    }
+    result.drawDelta = nativeCountDelta(result.draws[0], result.draws[1]);
+    result.vsCallDelta = nativeCountDelta(result.vsCalls[0], result.vsCalls[1]);
+    result.drawDeltaRatio = nativeCountDeltaRatio(result.draws[0], result.draws[1]);
+    result.vsCallDeltaRatio = nativeCountDeltaRatio(result.vsCalls[0], result.vsCalls[1]);
+    result.minEyeDraws = static_cast<LONG>((std::max)(
+        0.0f,
+        readEnvFloat("FNVXR_D3D9_NATIVE_EQUIVALENCE_MIN_EYE_DRAWS", 64.0f)));
+    result.minEyeVsCalls = static_cast<LONG>((std::max)(
+        0.0f,
+        readEnvFloat("FNVXR_D3D9_NATIVE_EQUIVALENCE_MIN_EYE_VS_CALLS", 64.0f)));
+    result.maxDrawDelta = static_cast<LONG>((std::max)(
+        0.0f,
+        readEnvFloat("FNVXR_D3D9_NATIVE_EQUIVALENCE_MAX_DRAW_DELTA", 96.0f)));
+    result.maxVsCallDelta = static_cast<LONG>((std::max)(
+        0.0f,
+        readEnvFloat("FNVXR_D3D9_NATIVE_EQUIVALENCE_MAX_VS_CALL_DELTA", 192.0f)));
+    result.maxDrawDeltaRatio = (std::max)(
+        0.0f,
+        readEnvFloat("FNVXR_D3D9_NATIVE_EQUIVALENCE_MAX_DRAW_RATIO", 0.20f));
+    result.maxVsCallDeltaRatio = (std::max)(
+        0.0f,
+        readEnvFloat("FNVXR_D3D9_NATIVE_EQUIVALENCE_MAX_VS_CALL_RATIO", 0.20f));
+    result.recoveryPairs = static_cast<LONG>((std::max)(
+        1.0f,
+        readEnvFloat("FNVXR_D3D9_NATIVE_EQUIVALENCE_RECOVERY_PAIRS", 3.0f)));
+
+    result.underfilled = (std::min)(result.draws[0], result.draws[1]) < result.minEyeDraws
+        || (std::min)(result.vsCalls[0], result.vsCalls[1]) < result.minEyeVsCalls;
+    result.resolvedTargetMismatch = readEnvBool(
+        "FNVXR_D3D9_NATIVE_EQUIVALENCE_REQUIRE_MATCHED_RESOLVED_TARGETS",
+        true)
+        && ((result.resolvedCopies[0] > 0) != (result.resolvedCopies[1] > 0));
+    result.drawMismatch = result.drawDelta > result.maxDrawDelta
+        && result.drawDeltaRatio > result.maxDrawDeltaRatio;
+    result.vsCallMismatch = result.vsCallDelta > result.maxVsCallDelta
+        && result.vsCallDeltaRatio > result.maxVsCallDeltaRatio;
+    result.equivalent = !result.guardEnabled
+        || (!result.underfilled
+            && !result.resolvedTargetMismatch
+            && !result.drawMismatch
+            && !result.vsCallMismatch);
+    return result;
+}
+
+bool updateNativePassEquivalenceContinuity(
+    const NativePassEquivalence& equivalence,
+    LONG presentFrame)
+{
+    if (!equivalence.guardEnabled)
+    {
+        gNativeEquivalentPairsInSequence = equivalence.recoveryPairs;
+        gNativeEquivalentLastPresentFrame = presentFrame;
+        return true;
+    }
+
+    if (!equivalence.equivalent)
+    {
+        gNativeEquivalentPairsInSequence = 0;
+        gNativeEquivalentLastPresentFrame = -2;
+        gNativePassEquivalenceWasBlocked = true;
+        return false;
+    }
+
+    if (gNativeEquivalentLastPresentFrame != presentFrame - 1)
+        gNativeEquivalentPairsInSequence = 0;
+    gNativeEquivalentLastPresentFrame = presentFrame;
+    ++gNativeEquivalentPairsInSequence;
+    if (gNativeEquivalentPairsInSequence < equivalence.recoveryPairs)
+    {
+        gNativePassEquivalenceWasBlocked = true;
+        return false;
+    }
+    return true;
+}
+
+bool restoreNativeLeftEyeAsMono(IDirect3DDevice9* device)
+{
+    if (!device || !gRealStretchRect || !gLeftEyeSurface)
+        return false;
+
+    IDirect3DSurface9* backBuffer = nullptr;
+    if (FAILED(device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &backBuffer)) || !backBuffer)
+        return false;
+    const HRESULT result = gRealStretchRect(
+        device,
+        gLeftEyeSurface,
+        nullptr,
+        backBuffer,
+        nullptr,
+        D3DTEXF_NONE);
+    releaseSurface(backBuffer);
+    return SUCCEEDED(result);
+}
+
+void rejectNativeStereoPair(
+    IDirect3DDevice9* device,
+    const NativePassEquivalence& equivalence,
+    LONG pairSequence,
+    LONG presentFrame)
+{
+    closeNativeStereoOriginLease("native-pair-rejected");
+    const bool restoredMono = restoreNativeLeftEyeAsMono(device);
+    if (equivalence.guardEnabled
+        && !equivalence.equivalent
+        && gLatestSharedPlayerSnapshotValid)
+    {
+        const std::uint64_t holdFrames = static_cast<std::uint64_t>((std::max)(
+            0.0f,
+            readEnvFloat("FNVXR_D3D9_NATIVE_MISMATCH_HOLD_PLAYER_FRAMES", 45.0f)));
+        gNativeDoubleTraversalHoldUntilPlayerFrame = (std::max)(
+            gNativeDoubleTraversalHoldUntilPlayerFrame,
+            gLatestSharedPlayerSnapshot.frame + holdFrames);
+        gNativeCellTransitionReady = false;
+    }
+    InterlockedExchange(&gNativePassRejectedThisPresent, 1);
+    InterlockedExchange(
+        &gNativePassMismatchThisPresent,
+        equivalence.equivalent ? 0 : 1);
+    InterlockedExchange(&gNativePostprocessFanoutDrawsThisPresent, 0);
+    InterlockedExchange(&gNativePostprocessFinalWritesThisPresent, 0);
+    gNativePostprocessFanoutActive = false;
+    gNativePipelineTraceThisPair = false;
+    gNativePipelineTracePostprocessWindow = false;
+    gNativeStereoRenderedPoseValid = false;
+
+    const LONG logCount = InterlockedIncrement(&gLoggedNativePassEquivalence);
+    if (logCount <= 48 || logCount % 120 == 0)
+    {
+        const char* reason = equivalence.underfilled
+            ? "underfilled"
+            : (equivalence.resolvedTargetMismatch
+                ? "resolved-target-asymmetry"
+                : (equivalence.drawMismatch
+                    ? "draw-divergence"
+                    : (equivalence.vsCallMismatch ? "vs-call-divergence" : "recovery-warmup")));
+        char message[768] {};
+        sprintf_s(
+            message,
+            "native stereo pair rejected pair=%ld presentFrame=%ld reason=%s restoredMono=%d recovery=%ld/%ld mismatchHoldUntil=%llu resolvedCopies=%ld/%ld targetCandidates=%ld seenAsymmetry=%ld snapshotAsymmetry=%ld draws=%ld/%ld drawDelta=%ld drawRatio=%.4f drawLimits=%ld/%.4f vsCalls=%ld/%ld vsDelta=%ld vsRatio=%.4f vsLimits=%ld/%.4f",
+            pairSequence,
+            presentFrame,
+            reason,
+            restoredMono ? 1 : 0,
+            static_cast<LONG>(gNativeEquivalentPairsInSequence),
+            equivalence.recoveryPairs,
+            static_cast<unsigned long long>(gNativeDoubleTraversalHoldUntilPlayerFrame),
+            equivalence.resolvedCopies[0],
+            equivalence.resolvedCopies[1],
+            equivalence.fullSizeCandidates,
+            equivalence.candidateSeenAsymmetry,
+            equivalence.candidateSnapshotAsymmetry,
+            equivalence.draws[0],
+            equivalence.draws[1],
+            equivalence.drawDelta,
+            equivalence.drawDeltaRatio,
+            equivalence.maxDrawDelta,
+            equivalence.maxDrawDeltaRatio,
+            equivalence.vsCalls[0],
+            equivalence.vsCalls[1],
+            equivalence.vsCallDelta,
+            equivalence.vsCallDeltaRatio,
+            equivalence.maxVsCallDelta,
+            equivalence.maxVsCallDeltaRatio);
+        logLine(message);
+    }
+}
+
+void logNativePassEquivalenceRecovery(
+    const NativePassEquivalence& equivalence,
+    LONG pairSequence,
+    LONG presentFrame)
+{
+    if (!gNativePassEquivalenceWasBlocked)
+        return;
+    gNativePassEquivalenceWasBlocked = false;
+    char message[448] {};
+    sprintf_s(
+        message,
+        "native stereo equivalence recovered pair=%ld presentFrame=%ld recovery=%ld/%ld draws=%ld/%ld drawRatio=%.4f vsCalls=%ld/%ld vsRatio=%.4f",
+        pairSequence,
+        presentFrame,
+        static_cast<LONG>(gNativeEquivalentPairsInSequence),
+        equivalence.recoveryPairs,
+        equivalence.draws[0],
+        equivalence.draws[1],
+        equivalence.drawDeltaRatio,
+        equivalence.vsCalls[0],
+        equivalence.vsCalls[1],
+        equivalence.vsCallDeltaRatio);
+    logLine(message);
+}
+
+void publishSharedStereoInvalid(bool uiActive, const char* reason);
+
 void __fastcall hookedDoRenderFrame(
     void* osGlobals,
     void*,
@@ -5905,34 +7248,267 @@ void __fastcall hookedDoRenderFrame(
     std::uint8_t arg1,
     std::uint8_t arg2)
 {
-    if (!gNativeStereoEnabled
-        || gNativeStereoRuntimeDisabled
-        || gInNativeStereoHook
-        || !gNativeStereoDevice
-        || renderer != nullptr
-        || suppressStereoForUiMode()
-        || gNativeStereoPairsThisPresent > 0)
+    InterlockedIncrement(&gNativeDoRenderHookEntriesThisPresent);
+    InterlockedExchange(&gNativeLastDoRenderHookPresentFrame, static_cast<LONG>(gPresentFrames));
+
+    LONG gateMask = 0;
+    if (!gNativeStereoEnabled && !gNativeSingleTraversalReplayEnabled)
+        gateMask |= NativeDoRenderGateDisabled;
+    if (gNativeStereoRuntimeDisabled)
+        gateMask |= NativeDoRenderGateRuntimeDisabled;
+    if (gInNativeStereoHook)
+        gateMask |= NativeDoRenderGateReentrant;
+    if (!gNativeStereoDevice)
+        gateMask |= NativeDoRenderGateNoDevice;
+    if (renderer != nullptr)
+        gateMask |= NativeDoRenderGateRendererArgument;
+    if (suppressStereoForUiMode())
+        gateMask |= NativeDoRenderGateUi;
+    if (gNativeStereoPairsThisPresent > 0 || gNativeSingleTraversalFramesThisPresent > 0)
+        gateMask |= NativeDoRenderGateAlreadyPaired;
+    if (gateMask != 0)
     {
+        InterlockedOr(&gNativeDoRenderGateMaskThisPresent, gateMask);
+        if ((gateMask & (NativeDoRenderGateDisabled
+                | NativeDoRenderGateRuntimeDisabled
+                | NativeDoRenderGateUi
+                | NativeDoRenderGateNoDevice
+                | NativeDoRenderGateRendererArgument)) != 0)
+        {
+            closeNativeStereoOriginLease("render-gate");
+        }
         callOriginalDoRenderFrame(osGlobals, renderer, arg1, arg2);
         return;
     }
 
     if (!nativeStereoFirstPersonReady())
     {
+        closeNativeStereoOriginLease("first-person-gate");
+        InterlockedOr(&gNativeDoRenderGateMaskThisPresent, NativeDoRenderGateFirstPerson);
+        callOriginalDoRenderFrame(osGlobals, renderer, arg1, arg2);
+        return;
+    }
+
+    if (!nativeStereoCellTransitionReady())
+    {
+        closeNativeStereoOriginLease("cell-transition-gate");
+        InterlockedOr(&gNativeDoRenderGateMaskThisPresent, NativeDoRenderGateCellTransition);
         callOriginalDoRenderFrame(osGlobals, renderer, arg1, arg2);
         return;
     }
 
     NativeStereoRig rig {};
     NativeCameraSnapshot camera {};
-    if (!prepareNativeStereoRig(rig)
-        || !readNativeWorldCamera(camera)
-        || !ensureStereoTargets(gNativeStereoDevice))
+    const bool rigReady = prepareNativeStereoRig(rig);
+    const bool cameraReady = rigReady && readNativeWorldCamera(camera);
+    const bool targetsReady = cameraReady && ensureStereoTargets(gNativeStereoDevice);
+    if (!rigReady || !cameraReady || !targetsReady)
     {
+        closeNativeStereoOriginLease("pose-camera-target-unavailable");
+        LONG unavailableMask = 0;
+        if (!rigReady)
+            unavailableMask |= NativeDoRenderGatePose;
+        else if (!cameraReady)
+            unavailableMask |= NativeDoRenderGateCamera;
+        else if (!targetsReady)
+            unavailableMask |= NativeDoRenderGateTargets;
+        InterlockedOr(&gNativeDoRenderGateMaskThisPresent, unavailableMask);
         const LONG failure = InterlockedIncrement(&gLoggedNativeStereoFailure);
         if (failure <= 16 || failure % 120 == 0)
-            logLine("native stereo pair skipped: pose, camera, or eye targets unavailable");
+        {
+            char message[256] {};
+            sprintf_s(
+                message,
+                "native stereo pair skipped unavailableMask=0x%lx pose=%d camera=%d targets=%d",
+                static_cast<unsigned long>(unavailableMask),
+                rigReady ? 1 : 0,
+                cameraReady ? 1 : 0,
+                targetsReady ? 1 : 0);
+            logLine(message);
+        }
         callOriginalDoRenderFrame(osGlobals, renderer, arg1, arg2);
+        return;
+    }
+
+    InterlockedIncrement(&gNativeDoRenderStereoAttemptsThisPresent);
+
+    if (gNativeSingleTraversalReplayEnabled)
+    {
+        const LONG presentBefore = static_cast<LONG>(gPresentFrames);
+        const LONG replayDrawsBefore = static_cast<LONG>(gStereoReplayDrawsThisPresent);
+        const LONG shaderWorldCandidatesBefore = static_cast<LONG>(gShaderWorldDrawCandidates);
+        const LONG shaderWorldDrawsBefore = static_cast<LONG>(gShaderWorldDraws);
+        const LONG shaderCoveredDrawsBefore = static_cast<LONG>(gShaderContractCoveredWorldDraws);
+        LARGE_INTEGER begin {};
+        LARGE_INTEGER end {};
+        QueryPerformanceCounter(&begin);
+
+        const NativeVector3 eyeDelta {
+            rig.eyeOffsetUnits[1].x - rig.eyeOffsetUnits[0].x,
+            rig.eyeOffsetUnits[1].y - rig.eyeOffsetUnits[0].y,
+            rig.eyeOffsetUnits[1].z - rig.eyeOffsetUnits[0].z
+        };
+        gNativeSingleTraversalIpdUnits = std::sqrt(
+            eyeDelta.x * eyeDelta.x + eyeDelta.y * eyeDelta.y + eyeDelta.z * eyeDelta.z);
+        std::memcpy(gNativeSingleTraversalFov, rig.fov, sizeof(gNativeSingleTraversalFov));
+        gNativeActiveCamera = camera;
+        gNativeActiveRig = rig;
+        gInNativeStereoHook = true;
+        InterlockedExchange(&gNativeActiveEye, 2);
+        const NativeNiTransform expectedCenterWorld = nativeCenterWorldTransform(camera, rig);
+        openNativeStereoOriginLease(rig.pose);
+        const bool centerApplied = applyNativeCenterCamera(camera, rig);
+        if (centerApplied)
+            callOriginalDoRenderFrame(osGlobals, renderer, arg1, arg2);
+        closeNativeStereoOriginLease(centerApplied ? "traversal-complete" : "center-camera-apply-failed");
+
+        NativeCameraSnapshot cameraAfter {};
+        const bool cameraAfterValid = centerApplied && readNativeWorldCamera(cameraAfter);
+        const float centerCameraDelta = cameraAfterValid
+            ? nativeFloatArrayMaxDelta(
+                reinterpret_cast<const float*>(&expectedCenterWorld),
+                reinterpret_cast<const float*>(&cameraAfter.world),
+                sizeof(NativeNiTransform) / sizeof(float))
+            : FLT_MAX;
+        const float maxCenterCameraDelta = readEnvFloat(
+            "FNVXR_D3D9_NATIVE_CENTER_CAMERA_MAX_DELTA",
+            0.05f);
+        const bool centerCameraStable = cameraAfterValid
+            && std::isfinite(centerCameraDelta)
+            && centerCameraDelta <= maxCenterCameraDelta;
+
+        InterlockedExchange(&gNativeActiveEye, -1);
+        restoreNativeCamera(camera);
+        gInNativeStereoHook = false;
+        gNativeActiveCamera = {};
+        gNativeActiveRig = {};
+        gNativeSingleTraversalIpdUnits = 0.0f;
+        std::memset(gNativeSingleTraversalFov, 0, sizeof(gNativeSingleTraversalFov));
+        QueryPerformanceCounter(&end);
+
+        if (!centerApplied)
+        {
+            closeNativeStereoOriginLease("center-camera-apply-failed");
+            const LONG failure = InterlockedIncrement(&gLoggedNativeStereoFailure);
+            if (failure <= 16 || failure % 120 == 0)
+                logLine("single-traversal stereo skipped: center camera apply failed");
+            callOriginalDoRenderFrame(osGlobals, renderer, arg1, arg2);
+            return;
+        }
+
+        if (static_cast<LONG>(gPresentFrames) != presentBefore)
+        {
+            closeNativeStereoOriginLease("present-inside-render");
+            gNativeStereoRuntimeDisabled = true;
+            logLine("single-traversal stereo disabled: Fallout presented from inside DoRenderFrame");
+            return;
+        }
+
+        if (!centerCameraStable)
+        {
+            closeNativeStereoOriginLease("center-camera-drift");
+            const LONG failure = InterlockedIncrement(&gLoggedNativeStereoFailure);
+            if (failure <= 16 || failure % 120 == 0)
+            {
+                char rejected[320] {};
+                sprintf_s(
+                    rejected,
+                    "single-traversal stereo rejected: center camera drifted cameraAfterValid=%d maxDelta=%.7g allowed=%.7g",
+                    cameraAfterValid ? 1 : 0,
+                    centerCameraDelta,
+                    maxCenterCameraDelta);
+                logLine(rejected);
+            }
+            return;
+        }
+
+        const LONG replayDraws = static_cast<LONG>(gStereoReplayDrawsThisPresent) - replayDrawsBefore;
+        const LONG shaderWorldCandidates =
+            static_cast<LONG>(gShaderWorldDrawCandidates) - shaderWorldCandidatesBefore;
+        const LONG shaderWorldDraws = static_cast<LONG>(gShaderWorldDraws) - shaderWorldDrawsBefore;
+        const LONG shaderCoveredDraws =
+            static_cast<LONG>(gShaderContractCoveredWorldDraws) - shaderCoveredDrawsBefore;
+        const double shaderContractCoverage = shaderWorldCandidates > 0
+            ? static_cast<double>(shaderCoveredDraws) / static_cast<double>(shaderWorldCandidates)
+            : 0.0;
+        const double requiredShaderCoverage = static_cast<double>(
+            readEnvFloat("FNVXR_D3D9_SHADER_MIN_CONTRACT_COVERAGE", 1.0f));
+        const bool shaderCoverageReady = gShaderWvpContractCount > 0
+            && shaderWorldCandidates > 0
+            && shaderWorldDraws == shaderWorldCandidates
+            && shaderCoveredDraws == shaderWorldCandidates
+            && shaderContractCoverage >= requiredShaderCoverage;
+        if (!shaderCoverageReady)
+        {
+            closeNativeStereoOriginLease("shader-contract-coverage");
+            gNativeStereoRenderedPoseValid = false;
+            const LONG failure = InterlockedIncrement(&gLoggedNativeStereoFailure);
+            if (failure <= 48 || failure % 120 == 0)
+            {
+                char rejected[512] {};
+                sprintf_s(
+                    rejected,
+                    "single-traversal stereo rejected: shader contract coverage replayDraws=%ld programmableCandidates=%ld replayedWorldDraws=%ld covered=%ld fraction=%.8f required=%.8f contracts=%ld",
+                    replayDraws,
+                    shaderWorldCandidates,
+                    shaderWorldDraws,
+                    shaderCoveredDraws,
+                    shaderContractCoverage,
+                    requiredShaderCoverage,
+                    gShaderWvpContractCount);
+                logLine(rejected);
+            }
+            return;
+        }
+
+        const LONG pairSequence = InterlockedIncrement(&gNativeStereoRenderPairSequence);
+        gNativeStereoRenderedPoseSnapshot = rig.pose;
+        gNativeStereoRenderedPoseSequence = rig.poseSequence;
+        gNativeStereoRenderedDisplayTime = rig.displayTime;
+        gNativeStereoRenderedPoseValid = true;
+        InterlockedIncrement(&gNativeSingleTraversalFramesThisPresent);
+        const LONG pairLog = InterlockedIncrement(&gLoggedNativeStereoPair);
+        if (pairLog <= 24 || pairLog % 120 == 0)
+        {
+            const float headDeterminant = determinantNativeMatrix3(rig.headRotation);
+            const float headOrthonormalError = orthonormalErrorNativeMatrix3(rig.headRotation);
+            char message[1536] {};
+            sprintf_s(
+                message,
+                "{\"event\":\"fnvxrSingleTraversalStereo\",\"pair\":%ld,\"presentFrame\":%ld,\"poseSeq\":%ld,\"renderMs\":%.3f,\"originalTraversals\":1,\"replayDraws\":%ld,\"programmableWorldCandidates\":%ld,\"programmableWorldDraws\":%ld,\"contractCoveredWorldDraws\":%ld,\"shaderContractCoverage\":%.8f,\"verifiedShaderContracts\":%ld,\"centerCameraApplied\":true,\"centerCameraStable\":true,\"centerCameraDelta\":%.8g,\"headDeterminant\":%.8g,\"headOrthonormalError\":%.8g,\"headLocal\":[%.6f,%.6f,%.6f],\"headRotation\":[%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g],\"leftOffset\":[%.6f,%.6f,%.6f],\"rightOffset\":[%.6f,%.6f,%.6f]}",
+                pairSequence,
+                presentBefore,
+                rig.poseSequence,
+                secondsBetween(begin, end) * 1000.0,
+                replayDraws,
+                shaderWorldCandidates,
+                shaderWorldDraws,
+                shaderCoveredDraws,
+                shaderContractCoverage,
+                gShaderWvpContractCount,
+                centerCameraDelta,
+                headDeterminant,
+                headOrthonormalError,
+                gLatestHeadLocalMeters[0],
+                gLatestHeadLocalMeters[1],
+                gLatestHeadLocalMeters[2],
+                rig.headRotation.m[0][0],
+                rig.headRotation.m[0][1],
+                rig.headRotation.m[0][2],
+                rig.headRotation.m[1][0],
+                rig.headRotation.m[1][1],
+                rig.headRotation.m[1][2],
+                rig.headRotation.m[2][0],
+                rig.headRotation.m[2][1],
+                rig.headRotation.m[2][2],
+                rig.eyeOffsetUnits[0].x,
+                rig.eyeOffsetUnits[0].y,
+                rig.eyeOffsetUnits[0].z,
+                rig.eyeOffsetUnits[1].x,
+                rig.eyeOffsetUnits[1].y,
+                rig.eyeOffsetUnits[1].z);
+            logLine(message);
+        }
         return;
     }
 
@@ -6077,9 +7653,12 @@ void __fastcall hookedDoRenderFrame(
                 static_cast<LONG>(gPresentFrames) != presentBefore ? 1 : 0);
             logLine(message);
         }
+        if (gNativeStereoEnabled)
+            publishSharedStereoInvalid(false, "incomplete-native-pair");
         return;
     }
 
+    const LONG pairSequence = InterlockedIncrement(&gNativeStereoRenderPairSequence);
     logNativeCameraBasisIfChanged(
         rig,
         camera,
@@ -6087,6 +7666,18 @@ void __fastcall hookedDoRenderFrame(
         cameraAfterLeftValid,
         cameraAfterRight,
         cameraAfterRightValid);
+
+    const NativePassEquivalence passEquivalence = evaluateNativePassEquivalence();
+    if (!updateNativePassEquivalenceContinuity(passEquivalence, presentBefore))
+    {
+        rejectNativeStereoPair(
+            gNativeStereoDevice,
+            passEquivalence,
+            pairSequence,
+            presentBefore);
+        return;
+    }
+    logNativePassEquivalenceRecovery(passEquivalence, pairSequence, presentBefore);
 
     gNativeStereoRenderedPoseSnapshot = rig.pose;
     gNativeStereoRenderedPoseSequence = rig.poseSequence;
@@ -6099,7 +7690,6 @@ void __fastcall hookedDoRenderFrame(
         && gNativeResolvedCopies[1] > 0;
     gNativePipelineTracePostprocessWindow = gNativePipelineTraceThisPair;
     InterlockedIncrement(&gNativeStereoPairsThisPresent);
-    const LONG pairSequence = InterlockedIncrement(&gNativeStereoRenderPairSequence);
     QueryPerformanceCounter(&end);
 
     const LONG pairLog = InterlockedIncrement(&gLoggedNativeStereoPair);
@@ -6125,10 +7715,10 @@ void __fastcall hookedDoRenderFrame(
             reinterpret_cast<const float*>(&gNativeObservedProjection[0]),
             reinterpret_cast<const float*>(&gNativeObservedProjection[1]),
             16);
-        char message[1024] {};
+        char message[1280] {};
         sprintf_s(
             message,
-            "native same-frame stereo pair=%ld presentFrame=%ld poseSeq=%ld renderMs=%.3f camera=%p cameraMatrixOverrides=%ld/%ld/%ld cameraAfterValid=%d/%d cameraWorldDelta=%.7g cameraMatrixDelta=%.7g fixedViewCalls=%ld/%ld fixedViewDelta=%.7g fixedProjectionCalls=%ld/%ld fixedProjectionDelta=%.7g vsCalls=%ld/%ld vsHash=0x%08x/0x%08x draws=%ld/%ld imageSpaceRearms=%ld/%ld resolvedCopies=%ld/%ld leftOffset=(%.4f %.4f %.4f) rightOffset=(%.4f %.4f %.4f)",
+            "native same-frame stereo pair=%ld presentFrame=%ld poseSeq=%ld renderMs=%.3f camera=%p cameraMatrixOverrides=%ld/%ld/%ld cameraAfterValid=%d/%d cameraWorldDelta=%.7g cameraMatrixDelta=%.7g fixedViewCalls=%ld/%ld fixedViewDelta=%.7g fixedProjectionCalls=%ld/%ld fixedProjectionDelta=%.7g vsCalls=%ld/%ld vsDelta=%ld vsRatio=%.4f vsHash=0x%08x/0x%08x draws=%ld/%ld drawDelta=%ld drawRatio=%.4f equivalenceGuard=%d recovery=%ld/%ld imageSpaceRearms=%ld/%ld resolvedCopies=%ld/%ld targetCandidates=%ld seenAsymmetry=%ld snapshotAsymmetry=%ld leftOffset=(%.4f %.4f %.4f) rightOffset=(%.4f %.4f %.4f)",
             pairSequence,
             presentBefore,
             rig.poseSequence,
@@ -6149,14 +7739,24 @@ void __fastcall hookedDoRenderFrame(
             fixedProjectionDelta,
             static_cast<LONG>(gNativeVsConstantCalls[0]),
             static_cast<LONG>(gNativeVsConstantCalls[1]),
+            passEquivalence.vsCallDelta,
+            passEquivalence.vsCallDeltaRatio,
             gNativeVsConstantStreamHash[0],
             gNativeVsConstantStreamHash[1],
             static_cast<LONG>(gNativeDrawCalls[0]),
             static_cast<LONG>(gNativeDrawCalls[1]),
+            passEquivalence.drawDelta,
+            passEquivalence.drawDeltaRatio,
+            passEquivalence.guardEnabled ? 1 : 0,
+            static_cast<LONG>(gNativeEquivalentPairsInSequence),
+            passEquivalence.recoveryPairs,
             static_cast<LONG>(gNativeGeometryRearmsThisPair[0]),
             static_cast<LONG>(gNativeGeometryRearmsThisPair[1]),
             static_cast<LONG>(gNativeResolvedCopies[0]),
             static_cast<LONG>(gNativeResolvedCopies[1]),
+            passEquivalence.fullSizeCandidates,
+            passEquivalence.candidateSeenAsymmetry,
+            passEquivalence.candidateSnapshotAsymmetry,
             rig.eyeOffsetUnits[0].x,
             rig.eyeOffsetUnits[0].y,
             rig.eyeOffsetUnits[0].z,
@@ -6185,7 +7785,10 @@ bool writeNativeStereoJump(std::uintptr_t source, void* target)
 
 void installNativeStereoEngineHook(IDirect3DDevice9* device)
 {
-    if (!gNativeStereoEnabled || gNativeStereoHookInstalled || gNativeStereoRuntimeDisabled || !device)
+    if ((!gNativeStereoEnabled && !gNativeSingleTraversalReplayEnabled)
+        || gNativeStereoHookInstalled
+        || gNativeStereoRuntimeDisabled
+        || !device)
         return;
     gNativeStereoDevice = device;
 
@@ -6319,9 +7922,137 @@ void installNativeStereoEngineHook(IDirect3DDevice9* device)
     }
 
     gNativeStereoHookInstalled = true;
-    logLine(enableExperimentalImageSpaceRearm
-        ? "native same-frame stereo hooked Fallout DoRenderFrame at 0x008706B0, NiCamera matrix rebuild at 0x00A70BA0, and experimental image-space submit at 0x00A74600"
-        : "native same-frame stereo hooked Fallout DoRenderFrame at 0x008706B0 and NiCamera matrix rebuild at 0x00A70BA0; experimental image-space rearm is disabled");
+    const char* producerName = gNativeSingleTraversalReplayEnabled
+        ? "single-traversal stereo"
+        : "native same-frame stereo";
+    char installed[384] {};
+    sprintf_s(
+        installed,
+        enableExperimentalImageSpaceRearm
+            ? "%s hooked Fallout DoRenderFrame at 0x008706B0, NiCamera matrix rebuild at 0x00A70BA0, and experimental image-space submit at 0x00A74600"
+            : "%s hooked Fallout DoRenderFrame at 0x008706B0 and NiCamera matrix rebuild at 0x00A70BA0; experimental image-space rearm is disabled",
+        producerName);
+    logLine(installed);
+}
+
+struct NativeRenderHookIntegrity
+{
+    bool readable = false;
+    bool intact = false;
+    std::uint8_t bytes[6] {};
+    std::uintptr_t jumpTarget = 0;
+};
+
+NativeRenderHookIntegrity inspectNativeRenderHookIntegrity()
+{
+    NativeRenderHookIntegrity result {};
+    __try
+    {
+        const auto* target = reinterpret_cast<const std::uint8_t*>(FalloutDoRenderFrameAddress);
+        std::memcpy(result.bytes, target, sizeof(result.bytes));
+        result.readable = true;
+        if (result.bytes[0] == 0xE9)
+        {
+            std::int32_t displacement = 0;
+            std::memcpy(&displacement, result.bytes + 1, sizeof(displacement));
+            result.jumpTarget = static_cast<std::uintptr_t>(
+                static_cast<std::intptr_t>(FalloutDoRenderFrameAddress + 5)
+                + static_cast<std::intptr_t>(displacement));
+            result.intact = result.jumpTarget
+                == reinterpret_cast<std::uintptr_t>(&hookedDoRenderFrame);
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        result = {};
+    }
+    return result;
+}
+
+void observeNativeRenderHookContinuity(
+    LONG hookEntries,
+    LONG stereoAttempts,
+    LONG gateMask,
+    bool stereoSuppressed)
+{
+    if ((!gNativeStereoEnabled && !gNativeSingleTraversalReplayEnabled) || !gNativeStereoHookInstalled)
+        return;
+
+    updateSharedCameraState();
+    const bool firstPersonReady = gLatestSharedCameraSnapshotValid
+        && gSharedCameraActive
+        && gLatestSharedCameraSnapshot.active != 0
+        && gLatestSharedCameraSnapshot.thirdPerson == 0;
+    const bool shouldReachHook = !gNativeStereoRuntimeDisabled
+        && !stereoSuppressed
+        && firstPersonReady;
+    if (!shouldReachHook)
+    {
+        gNativeHookSilentGameplayFrames = 0;
+        return;
+    }
+
+    if (hookEntries > 0)
+    {
+        if (gNativeHookSilentGameplayFrames > 0)
+        {
+            char message[320] {};
+            sprintf_s(
+                message,
+                "native stereo render hook resumed presentFrame=%ld silentFrames=%ld hookEntries=%ld attempts=%ld gateMask=0x%lx lastHookFrame=%ld",
+                static_cast<LONG>(gPresentFrames),
+                static_cast<LONG>(gNativeHookSilentGameplayFrames),
+                hookEntries,
+                stereoAttempts,
+                static_cast<unsigned long>(gateMask),
+                static_cast<LONG>(gNativeLastDoRenderHookPresentFrame));
+            logLine(message);
+        }
+        gNativeHookSilentGameplayFrames = 0;
+        return;
+    }
+
+    const LONG silentFrames = InterlockedIncrement(&gNativeHookSilentGameplayFrames);
+    if (silentFrames != 1 && silentFrames != 30 && silentFrames % 120 != 0)
+        return;
+
+    const NativeRenderHookIntegrity integrity = inspectNativeRenderHookIntegrity();
+    const LONG logCount = InterlockedIncrement(&gLoggedNativeHookContinuity);
+    char message[640] {};
+    sprintf_s(
+        message,
+        "native stereo render hook silent count=%ld presentFrame=%ld silentFrames=%ld hookReadable=%d hookIntact=%d jumpTarget=%p expectedTarget=%p bytes=%02X-%02X-%02X-%02X-%02X-%02X attempts=%ld gateMask=0x%lx lastHookFrame=%ld cameraSeq=%ld cell=0x%08lx cellReady=%d screenProjection=%d screenView=%d",
+        logCount,
+        static_cast<LONG>(gPresentFrames),
+        silentFrames,
+        integrity.readable ? 1 : 0,
+        integrity.intact ? 1 : 0,
+        reinterpret_cast<void*>(integrity.jumpTarget),
+        reinterpret_cast<void*>(&hookedDoRenderFrame),
+        static_cast<unsigned>(integrity.bytes[0]),
+        static_cast<unsigned>(integrity.bytes[1]),
+        static_cast<unsigned>(integrity.bytes[2]),
+        static_cast<unsigned>(integrity.bytes[3]),
+        static_cast<unsigned>(integrity.bytes[4]),
+        static_cast<unsigned>(integrity.bytes[5]),
+        stereoAttempts,
+        static_cast<unsigned long>(gateMask),
+        static_cast<LONG>(gNativeLastDoRenderHookPresentFrame),
+        gLatestSharedCameraSnapshotSequence,
+        static_cast<unsigned long>(gNativeStableCellFormId),
+        gNativeCellTransitionReady ? 1 : 0,
+        currentProjectionLooksScreenSpace() ? 1 : 0,
+        currentViewLooksScreenSpace() ? 1 : 0);
+    logLine(message);
+
+    if (integrity.readable && !integrity.intact)
+    {
+        gNativeStereoRuntimeDisabled = true;
+        gNativeEquivalentPairsInSequence = 0;
+        gNativeEquivalentLastPresentFrame = -2;
+        gNativePassEquivalenceWasBlocked = true;
+        logLine("native stereo disabled fail-closed: Fallout DoRenderFrame hook was replaced");
+    }
 }
 
 bool ensureWideWorldTargets(IDirect3DDevice9* device)
@@ -6699,7 +8430,14 @@ SurfaceDifference compareReadbackSurfacesSized(
     if (!left || !right || width == 0 || height == 0)
         return difference;
 
-    const UINT safeBytesPerPixel = bytesPerPixel == 0 ? 4 : bytesPerPixel;
+    // Shared VR publication is canonical BGRA8. Other formats require an
+    // explicit conversion path; byte-wise comparisons of packed/float/XRGB
+    // surfaces are not semantic stereo evidence.
+    if (bytesPerPixel != 4)
+        return difference;
+    const UINT safeBytesPerPixel = 4;
+    const int meaningfulRgbDelta = static_cast<int>(
+        readEnvFloat("FNVXR_D3D9_STEREO_MIN_RGB_DELTA", 4.0f));
     D3DLOCKED_RECT leftLocked {};
     D3DLOCKED_RECT rightLocked {};
     if (FAILED(left->LockRect(&leftLocked, nullptr, D3DLOCK_READONLY)))
@@ -6724,8 +8462,8 @@ SurfaceDifference compareReadbackSurfacesSized(
         {
             const auto* leftPixel = leftRow + static_cast<size_t>(x) * safeBytesPerPixel;
             const auto* rightPixel = rightRow + static_cast<size_t>(x) * safeBytesPerPixel;
-            bool pixelDifferent = false;
-            for (UINT b = 0; b < safeBytesPerPixel; ++b)
+            int maxRgbDelta = 0;
+            for (UINT b = 0; b < 3; ++b)
             {
                 const std::uint8_t leftValue = leftPixel[b];
                 const std::uint8_t rightValue = rightPixel[b];
@@ -6733,12 +8471,12 @@ SurfaceDifference compareReadbackSurfacesSized(
                 difference.leftHash *= 16777619u;
                 difference.rightHash ^= rightValue;
                 difference.rightHash *= 16777619u;
-                if (leftValue != rightValue)
-                    pixelDifferent = true;
+                maxRgbDelta = (std::max)(maxRgbDelta, std::abs(
+                    static_cast<int>(leftValue) - static_cast<int>(rightValue)));
             }
 
             ++difference.samples;
-            if (pixelDifferent)
+            if (maxRgbDelta >= meaningfulRgbDelta)
                 ++difference.differentSamples;
         }
     }
@@ -7392,9 +9130,24 @@ void readbackStereoTargets(IDirect3DDevice9* device)
 
 bool copySurfaceToSharedPlane(IDirect3DSurface9* surface, std::uint8_t* dst, UINT width, UINT height, UINT pitchBytes)
 {
+    if (!surface || !dst || pitchBytes != width * 4)
+        return false;
+    D3DSURFACE_DESC desc {};
+    if (FAILED(surface->GetDesc(&desc))
+        || desc.Width != width
+        || desc.Height != height
+        || (desc.Format != D3DFMT_A8R8G8B8 && desc.Format != D3DFMT_X8R8G8B8))
+    {
+        return false;
+    }
     D3DLOCKED_RECT locked {};
     if (FAILED(surface->LockRect(&locked, nullptr, D3DLOCK_READONLY)))
         return false;
+    if (locked.Pitch < static_cast<INT>(pitchBytes))
+    {
+        surface->UnlockRect();
+        return false;
+    }
 
     const auto* src = static_cast<const std::uint8_t*>(locked.pBits);
     for (UINT y = 0; y < height; ++y)
@@ -7445,6 +9198,8 @@ void publishSharedStereoInvalid(bool uiActive, const char* reason)
     header->poseValid = 0;
     header->poseSequence = 0;
     header->renderedDisplayTime = 0;
+    header->referenceSpaceGeneration = 0;
+    header->producerEpoch = 0;
     header->producerMode = fnvxr::shared::StereoProducerUnknown;
     header->renderPairSequence = 0;
     InterlockedIncrement(&header->sequence);
@@ -7558,7 +9313,14 @@ void publishSharedStereoFrame(IDirect3DDevice9* device)
         auditNativeResolvedStereo(device);
     const bool nativePair = nativeRenderedPair
         && gNativePostprocessFinalWritesThisPresent > 0;
-    const bool producerEnabled = gNativeStereoEnabled || gStereoReplayEnabled;
+    const bool singleTraversalPair = gNativeSingleTraversalReplayEnabled
+        && gNativeSingleTraversalFramesThisPresent > 0
+        && gNativeStereoRenderedPoseValid
+        && gStereoReplayDrawsThisPresent > 0;
+    const bool coherentPair = nativePair || singleTraversalPair;
+    const bool producerEnabled = gNativeStereoEnabled
+        || gNativeSingleTraversalReplayEnabled
+        || gStereoReplayEnabled;
     if (!sharedStereoEnabled() || !producerEnabled || !gStereoReadbackEnabled)
     {
         const LONG logCount = InterlockedIncrement(&gLoggedStereoNoReplayDraws);
@@ -7581,7 +9343,7 @@ void publishSharedStereoFrame(IDirect3DDevice9* device)
         return;
     }
 
-    if (!nativePair && gStereoReplayDrawsThisPresent <= 0)
+    if (!coherentPair && gStereoReplayDrawsThisPresent <= 0)
     {
         const LONG logCount = InterlockedIncrement(&gLoggedStereoNoReplayDraws);
         if (logCount <= 5 || logCount % 300 == 0)
@@ -7595,6 +9357,7 @@ void publishSharedStereoFrame(IDirect3DDevice9* device)
         || !ensureReadbackTargets(device)
         || !ensureSharedStereo())
     {
+        publishSharedStereoInvalid(false, "target-setup");
         return;
     }
 
@@ -7603,6 +9366,7 @@ void publishSharedStereoFrame(IDirect3DDevice9* device)
         || gStereoTargetWidth > SharedVideoMaxWidth
         || gStereoTargetHeight > SharedVideoMaxHeight)
     {
+        publishSharedStereoInvalid(false, "invalid-dimensions");
         return;
     }
 
@@ -7621,6 +9385,7 @@ void publishSharedStereoFrame(IDirect3DDevice9* device)
     if (FAILED(leftReadbackResult) || FAILED(rightReadbackResult))
     {
         logLine("shared stereo GetRenderTargetData failed");
+        publishSharedStereoInvalid(false, "readback-failed");
         return;
     }
 
@@ -7649,20 +9414,23 @@ void publishSharedStereoFrame(IDirect3DDevice9* device)
         difference.differentSamples = gBestStereoDiffThisPresent;
     }
     const bool separated = difference.differentSamples >= requiredDifferentSamples;
-    const bool worldCandidate = nativePair ? true : haveWorldCameraCandidate();
+    const bool worldCandidate = coherentPair ? true : haveWorldCameraCandidate();
     const bool publishBestSnapshotAsWorld =
         publishBestSnapshot && readEnvBool("FNVXR_D3D9_STEREO_BEST_SNAPSHOT_AS_WORLD", false);
     const bool publishIsDiagnosticSnapshot = publishBestSnapshot && !publishBestSnapshotAsWorld;
     const bool visualCoverageGate = readEnvBool("FNVXR_D3D9_STEREO_VISUAL_COVERAGE_GATE", true);
     bool visualCoverageReady = !visualCoverageGate;
     LONG visualCoverageFrames = 0;
+    StereoVisualCoverage visualCoverage {};
+    bool visualCoverageMeasured = false;
     if (visualCoverageGate && separated && worldCandidate && !publishIsDiagnosticSnapshot)
     {
-        const StereoVisualCoverage coverage = analyzeStereoVisualCoverage(publishLeft, publishRight);
-        if (!stereoVisualCoverageAcceptable(coverage))
+        visualCoverage = analyzeStereoVisualCoverage(publishLeft, publishRight);
+        visualCoverageMeasured = true;
+        if (!stereoVisualCoverageAcceptable(visualCoverage))
         {
             InterlockedExchange(&gConsecutiveStereoVisualCoverageFrames, 0);
-            logStereoVisualCoverageRejected(coverage);
+            logStereoVisualCoverageRejected(visualCoverage);
             if (gHavePublishedValidStereoWorldFrame
                 && readEnvBool("FNVXR_D3D9_STEREO_RETAIN_LAST_VALID_ON_INVALID", false))
             {
@@ -7717,7 +9485,7 @@ void publishSharedStereoFrame(IDirect3DDevice9* device)
         && worldCandidate
         && !publishIsDiagnosticSnapshot
         && visualCoverageReady
-        && (nativePair ? gNativeStereoRenderedPoseValid : gLatestVrPoseSnapshotValid);
+        && (coherentPair ? gNativeStereoRenderedPoseValid : gLatestVrPoseSnapshotValid);
     if (!publishReady
         && gHavePublishedValidStereoWorldFrame
         && readEnvBool("FNVXR_D3D9_STEREO_RETAIN_LAST_VALID_ON_INVALID", false))
@@ -7747,11 +9515,20 @@ void publishSharedStereoFrame(IDirect3DDevice9* device)
 
     const UINT pitchBytes = gStereoTargetWidth * 4;
     auto* header = reinterpret_cast<SharedStereoHeader*>(gSharedStereoView);
-    auto* leftPixels = gSharedStereoView + sizeof(SharedStereoHeader);
-    auto* rightPixels = leftPixels + static_cast<size_t>(pitchBytes) * gStereoTargetHeight;
+    const std::uint32_t leftPayloadOffset = sizeof(SharedStereoHeader);
+    const std::uint32_t rightPayloadOffset = leftPayloadOffset + pitchBytes * gStereoTargetHeight;
+    auto* leftPixels = gSharedStereoView + leftPayloadOffset;
+    auto* rightPixels = gSharedStereoView + rightPayloadOffset;
 
     InterlockedExchange(&header->writing, 1);
     header->magic = SharedStereoMagic;
+    header->version = fnvxr::shared::D3D9StereoFrameSharedVersion;
+    header->headerBytes = sizeof(SharedStereoHeader);
+    header->leftPayloadOffset = leftPayloadOffset;
+    header->rightPayloadOffset = rightPayloadOffset;
+    header->totalMappingBytes = sizeof(SharedStereoHeader)
+        + SharedVideoMaxWidth * SharedVideoMaxHeight * 4 * 2;
+    header->reserved = 0;
     header->width = static_cast<LONG>(gStereoTargetWidth);
     header->height = static_cast<LONG>(gStereoTargetHeight);
     header->pitchBytes = static_cast<LONG>(pitchBytes);
@@ -7760,24 +9537,30 @@ void publishSharedStereoFrame(IDirect3DDevice9* device)
     header->poseValid = 0;
     header->poseSequence = 0;
     header->renderedDisplayTime = 0;
+    header->referenceSpaceGeneration = 0;
+    header->producerEpoch = 0;
     header->producerMode = nativePair
         ? fnvxr::shared::StereoProducerNativeSameFrame
-        : fnvxr::shared::StereoProducerDrawReplay;
-    header->renderPairSequence = nativePair ? gNativeStereoRenderPairSequence : 0;
-    const SharedVrPoseState& renderedPose = nativePair
+        : (singleTraversalPair
+            ? fnvxr::shared::StereoProducerSingleTraversal
+            : fnvxr::shared::StereoProducerDrawReplay);
+    header->renderPairSequence = coherentPair ? gNativeStereoRenderPairSequence : 0;
+    const SharedVrPoseState& renderedPose = coherentPair
         ? gNativeStereoRenderedPoseSnapshot
         : gLatestVrPoseSnapshot;
-    const LONG renderedPoseSequence = nativePair
+    const LONG renderedPoseSequence = coherentPair
         ? gNativeStereoRenderedPoseSequence
         : gLatestVrPoseSnapshotSequence;
-    const std::int64_t renderedDisplayTime = nativePair
+    const std::int64_t renderedDisplayTime = coherentPair
         ? gNativeStereoRenderedDisplayTime
         : gLatestVrPoseDisplayTime;
-    const bool renderedPoseValid = nativePair
+    const bool renderedPoseValid = coherentPair
         ? gNativeStereoRenderedPoseValid
         : gLatestVrPoseSnapshotValid;
     if (renderedPoseValid && renderedDisplayTime != 0)
     {
+        header->referenceSpaceGeneration = renderedPose.referenceSpaceGeneration;
+        header->producerEpoch = renderedPose.producerEpoch;
         std::memcpy(header->leftEyeRot, renderedPose.leftEyeRot, sizeof(header->leftEyeRot));
         std::memcpy(header->leftEyePos, renderedPose.leftEyePos, sizeof(header->leftEyePos));
         std::memcpy(header->rightEyeRot, renderedPose.rightEyeRot, sizeof(header->rightEyeRot));
@@ -7801,6 +9584,7 @@ void publishSharedStereoFrame(IDirect3DDevice9* device)
         header->uiActive = suppressStereoForUiMode() ? 1 : 0;
         InterlockedExchange(&header->writing, 0);
         logLine("shared stereo copy failed; not publishing frame");
+        publishSharedStereoInvalid(false, "copy-failed");
         return;
     }
     header->separated = separated ? 1 : 0;
@@ -7895,11 +9679,13 @@ void publishSharedStereoFrame(IDirect3DDevice9* device)
         char message[512] {};
         sprintf_s(
             message,
-            "shared stereo captured frame=%ld size=%ux%u seq=%ld worldCandidate=%d rawWorldCandidate=%d separated=%d uiActive=%d poseValid=%d rawPoseValid=%d visualGate=%d visualReady=%d visualFrames=%ld bestSnapshot=%d bestAsWorld=%d finalSeparated=%d poseSeq=%ld diff=%u/%u finalDiff=%u/%u baseViewT=(%.4f %.4f %.4f) leftHash=0x%08x rightHash=0x%08x",
+            "shared stereo captured frame=%ld size=%ux%u seq=%ld producerMode=%ld renderPair=%ld worldCandidate=%d rawWorldCandidate=%d separated=%d uiActive=%d poseValid=%d rawPoseValid=%d visualGate=%d visualReady=%d visualFrames=%ld bestSnapshot=%d bestAsWorld=%d finalSeparated=%d poseSeq=%ld diff=%u/%u finalDiff=%u/%u baseViewT=(%.4f %.4f %.4f) leftHash=0x%08x rightHash=0x%08x",
             static_cast<LONG>(gPresentFrames),
             gStereoTargetWidth,
             gStereoTargetHeight,
             static_cast<LONG>(header->sequence),
+            static_cast<LONG>(header->producerMode),
+            static_cast<LONG>(header->renderPairSequence),
             header->worldCandidate ? 1 : 0,
             worldCandidate ? 1 : 0,
             separated ? 1 : 0,
@@ -7927,10 +9713,26 @@ void publishSharedStereoFrame(IDirect3DDevice9* device)
     const LONG eyeTargetLogCount = InterlockedIncrement(&gLoggedD3d9EyeTarget);
     if (eyeTargetLogCount <= 20 || eyeTargetLogCount % 300 == 0)
     {
-        char proof[1280] {};
+        const float leftActiveFraction = visualCoverage.left.samples == 0
+            ? 0.0f
+            : static_cast<float>(visualCoverage.left.activeSamples)
+                / static_cast<float>(visualCoverage.left.samples);
+        const float rightActiveFraction = visualCoverage.right.samples == 0
+            ? 0.0f
+            : static_cast<float>(visualCoverage.right.activeSamples)
+                / static_cast<float>(visualCoverage.right.samples);
+        const float leftDominantFraction = visualCoverage.left.samples == 0
+            ? 0.0f
+            : static_cast<float>(visualCoverage.left.dominantSamples)
+                / static_cast<float>(visualCoverage.left.samples);
+        const float rightDominantFraction = visualCoverage.right.samples == 0
+            ? 0.0f
+            : static_cast<float>(visualCoverage.right.dominantSamples)
+                / static_cast<float>(visualCoverage.right.samples);
+        char proof[1792] {};
         sprintf_s(
             proof,
-            "{\"event\":\"fnvxrD3d9EyeTarget\",\"stage\":\"shared-stereo-publish\",\"frame\":%ld,\"ready\":%s,\"diagnosticSnapshot\":%s,\"bestSnapshot\":%s,\"bestSnapshotAsWorld\":%s,\"finalSeparated\":%s,\"leftRendered\":true,\"rightRendered\":true,\"width\":%u,\"height\":%u,\"format\":%lu,\"sequence\":%ld,\"worldCandidate\":%s,\"rawWorldCandidate\":%s,\"separated\":%s,\"uiActive\":%s,\"poseValid\":%s,\"rawPoseValid\":%s,\"visualCoverageGate\":%s,\"visualCoverageReady\":%s,\"visualCoverageFrames\":%ld,\"poseSequence\":%ld,\"diffSamples\":%u,\"samples\":%u,\"finalDiffSamples\":%u,\"finalSamples\":%u,\"leftHash\":\"0x%08x\",\"rightHash\":\"0x%08x\",\"finalLeftHash\":\"0x%08x\",\"finalRightHash\":\"0x%08x\"}",
+            "{\"event\":\"fnvxrD3d9EyeTarget\",\"stage\":\"shared-stereo-publish\",\"frame\":%ld,\"ready\":%s,\"diagnosticSnapshot\":%s,\"bestSnapshot\":%s,\"bestSnapshotAsWorld\":%s,\"finalSeparated\":%s,\"leftRendered\":true,\"rightRendered\":true,\"width\":%u,\"height\":%u,\"format\":%lu,\"sequence\":%ld,\"producerMode\":%ld,\"renderPairSequence\":%ld,\"worldCandidate\":%s,\"rawWorldCandidate\":%s,\"separated\":%s,\"uiActive\":%s,\"poseValid\":%s,\"rawPoseValid\":%s,\"visualCoverageGate\":%s,\"visualCoverageReady\":%s,\"visualCoverageMeasured\":%s,\"visualCoverageFrames\":%ld,\"leftActiveFraction\":%.6f,\"rightActiveFraction\":%.6f,\"leftDominantFraction\":%.6f,\"rightDominantFraction\":%.6f,\"leftDominantBucket\":%u,\"rightDominantBucket\":%u,\"poseSequence\":%ld,\"diffSamples\":%u,\"samples\":%u,\"finalDiffSamples\":%u,\"finalSamples\":%u,\"leftHash\":\"0x%08x\",\"rightHash\":\"0x%08x\",\"finalLeftHash\":\"0x%08x\",\"finalRightHash\":\"0x%08x\"}",
             static_cast<LONG>(gPresentFrames),
             (separated && header->worldCandidate && !header->uiActive && header->poseValid) ? "true" : "false",
             publishIsDiagnosticSnapshot ? "true" : "false",
@@ -7941,6 +9743,8 @@ void publishSharedStereoFrame(IDirect3DDevice9* device)
             gStereoTargetHeight,
             static_cast<unsigned long>(gStereoTargetFormat),
             static_cast<LONG>(header->sequence),
+            static_cast<LONG>(header->producerMode),
+            static_cast<LONG>(header->renderPairSequence),
             header->worldCandidate ? "true" : "false",
             worldCandidate ? "true" : "false",
             separated ? "true" : "false",
@@ -7949,7 +9753,14 @@ void publishSharedStereoFrame(IDirect3DDevice9* device)
             gLatestVrPoseSnapshotValid ? "true" : "false",
             visualCoverageGate ? "true" : "false",
             visualCoverageReady ? "true" : "false",
+            visualCoverageMeasured ? "true" : "false",
             visualCoverageFrames,
+            leftActiveFraction,
+            rightActiveFraction,
+            leftDominantFraction,
+            rightDominantFraction,
+            visualCoverage.left.dominantBucket,
+            visualCoverage.right.dominantBucket,
             static_cast<LONG>(header->poseSequence),
             difference.differentSamples,
             difference.samples,
@@ -8245,6 +10056,38 @@ bool patchVTableSlot(void** vtable, size_t index, void* replacement, void** orig
     return true;
 }
 
+bool sharedStereoPublishedCurrentNativePair()
+{
+    if (!gSharedStereoView)
+        return false;
+
+    __try
+    {
+        const auto* header = reinterpret_cast<const SharedStereoHeader*>(gSharedStereoView);
+        const LONG sequenceBefore = header->sequence;
+        if (header->writing != 0)
+            return false;
+        MemoryBarrier();
+        const bool ready = header->magic == SharedStereoMagic
+            && header->width > 0
+            && header->height > 0
+            && header->separated != 0
+            && header->worldCandidate != 0
+            && header->uiActive == 0
+            && header->poseValid != 0
+            && header->producerMode == static_cast<LONG>(fnvxr::shared::StereoProducerNativeSameFrame)
+            && header->renderPairSequence == gNativeStereoRenderPairSequence;
+        MemoryBarrier();
+        return ready
+            && header->writing == 0
+            && header->sequence == sequenceBefore;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
 HRESULT WINAPI hookedPresent(
     IDirect3DDevice9* device,
     const RECT* sourceRect,
@@ -8258,17 +10101,33 @@ HRESULT WINAPI hookedPresent(
     QueryPerformanceCounter(&presentHookStart);
     const LONG originalRenderCalls = gOriginalDoRenderCallsThisPresent;
     const LONGLONG originalRenderTicks = gOriginalDoRenderTicksThisPresent;
+    const LONG nativeHookEntries = InterlockedExchange(&gNativeDoRenderHookEntriesThisPresent, 0);
+    const LONG nativeStereoAttempts = InterlockedExchange(&gNativeDoRenderStereoAttemptsThisPresent, 0);
+    const LONG nativeGateMask = InterlockedExchange(&gNativeDoRenderGateMaskThisPresent, 0);
+    const LONG nativePassRejected = InterlockedExchange(&gNativePassRejectedThisPresent, 0);
+    const LONG nativePassMismatch = InterlockedExchange(&gNativePassMismatchThisPresent, 0);
     gOriginalDoRenderCallsThisPresent = 0;
     gOriginalDoRenderTicksThisPresent = 0;
     logFrameRate("IDirect3DDevice9::Present", gPresentFrames, gLastPresentSample, gLastPresentFrameSample);
     const bool stereoSuppressed = suppressStereoForUiMode();
+    observeNativeRenderHookContinuity(
+        nativeHookEntries,
+        nativeStereoAttempts,
+        nativeGateMask,
+        stereoSuppressed);
     const bool haveNativePair = gNativeStereoEnabled
         && gNativeStereoPairsThisPresent > 0
         && gNativeStereoRenderedPoseValid;
+    const bool havePublishableNativePair = haveNativePair
+        && gNativePostprocessFinalWritesThisPresent > 0;
+    const bool havePublishableSingleTraversalPair = gNativeSingleTraversalReplayEnabled
+        && gNativeSingleTraversalFramesThisPresent > 0
+        && gNativeStereoRenderedPoseValid
+        && gStereoReplayDrawsThisPresent > 0;
     // A complete native pair supersedes the mono gameplay plane.  Avoid a
     // third synchronous GPU readback on those frames; menu/UI frames still
     // publish the mono surface normally.
-    if (stereoSuppressed || !haveNativePair)
+    if (stereoSuppressed || (!havePublishableNativePair && !havePublishableSingleTraversalPair))
         captureSharedVideoFrame(device);
     if (!stereoSuppressed && gStereoReplayEnabled)
     {
@@ -8278,18 +10137,34 @@ HRESULT WINAPI hookedPresent(
     publishSharedWorldVideoFrame(device);
     auditNativeFullSizeTargetCandidates(device);
     publishSharedStereoFrame(device);
+    if (!stereoSuppressed
+        && havePublishableNativePair
+        && !sharedStereoPublishedCurrentNativePair())
+    {
+        restoreNativeLeftEyeAsMono(device);
+        captureSharedVideoFrame(device);
+    }
     logMatrixAuditFrame();
     const LONG presentStateLog = InterlockedIncrement(&gLoggedStereoPresentState);
-    if ((gNativeStereoEnabled || gStereoReplayEnabled || gWideWorldReplayEnabled)
+    if ((gNativeStereoEnabled || gNativeSingleTraversalReplayEnabled || gStereoReplayEnabled || gWideWorldReplayEnabled)
         && (presentStateLog <= 8 || presentStateLog % 300 == 0))
     {
-        char message[288] {};
+        char message[512] {};
         sprintf_s(
             message,
-            "stereo present state frame=%ld suppressedByUi=%d nativePairs=%ld nativeFanoutDraws=%ld nativeFanoutFinal=%ld replayDraws=%ld wideDraws=%ld haveView=%d haveProjection=%d sharedStereo=%d wideWorld=%d strictGateActive=%d strictGateReady=%d",
+            "stereo present state frame=%ld suppressedByUi=%d nativePairs=%ld singleTraversal=%ld nativeHookEntries=%ld nativeAttempts=%ld nativeGateMask=0x%lx nativeRejected=%ld nativeMismatch=%ld cell=0x%08lx cellReady=%d equivalenceRecovery=%ld nativeFanoutDraws=%ld nativeFanoutFinal=%ld replayDraws=%ld wideDraws=%ld haveView=%d haveProjection=%d sharedStereo=%d wideWorld=%d strictGateActive=%d strictGateReady=%d",
             static_cast<LONG>(gPresentFrames),
             stereoSuppressed ? 1 : 0,
             static_cast<LONG>(gNativeStereoPairsThisPresent),
+            static_cast<LONG>(gNativeSingleTraversalFramesThisPresent),
+            nativeHookEntries,
+            nativeStereoAttempts,
+            static_cast<unsigned long>(nativeGateMask),
+            nativePassRejected,
+            nativePassMismatch,
+            static_cast<unsigned long>(gNativeStableCellFormId),
+            gNativeCellTransitionReady ? 1 : 0,
+            static_cast<LONG>(gNativeEquivalentPairsInSequence),
             static_cast<LONG>(gNativePostprocessFanoutDrawsThisPresent),
             static_cast<LONG>(gNativePostprocessFinalWritesThisPresent),
             static_cast<LONG>(gStereoReplayDrawsThisPresent),
@@ -8303,6 +10178,7 @@ HRESULT WINAPI hookedPresent(
         logLine(message);
     }
     InterlockedExchange(&gNativeStereoPairsThisPresent, 0);
+    InterlockedExchange(&gNativeSingleTraversalFramesThisPresent, 0);
     InterlockedExchange(&gNativePostprocessFanoutDrawsThisPresent, 0);
     InterlockedExchange(&gNativePostprocessFinalWritesThisPresent, 0);
     gNativePostprocessFanoutActive = false;
@@ -8330,12 +10206,17 @@ HRESULT WINAPI hookedPresent(
         const LONG logCount = InterlockedIncrement(&gLoggedPresentPerf);
         if (logCount <= 24 || logCount % 120 == 0)
         {
-            char message[320] {};
+            char message[512] {};
             sprintf_s(
                 message,
-                "d3d9 present perf frame=%ld doRenderCalls=%ld doRenderMs=%.3f prePresentMs=%.3f realPresentMs=%.3f totalMs=%.3f result=0x%08lx",
+                "d3d9 present perf frame=%ld doRenderCalls=%ld hookEntries=%ld nativeAttempts=%ld nativeGateMask=0x%lx nativeRejected=%ld nativeMismatch=%ld doRenderMs=%.3f prePresentMs=%.3f realPresentMs=%.3f totalMs=%.3f result=0x%08lx",
                 static_cast<LONG>(gPresentFrames),
                 originalRenderCalls,
+                nativeHookEntries,
+                nativeStereoAttempts,
+                static_cast<unsigned long>(nativeGateMask),
+                nativePassRejected,
+                nativePassMismatch,
                 gPerfFrequency.QuadPart > 0
                     ? static_cast<double>(originalRenderTicks) * 1000.0 / static_cast<double>(gPerfFrequency.QuadPart)
                     : 0.0,
@@ -8351,6 +10232,15 @@ HRESULT WINAPI hookedPresent(
 
 HRESULT WINAPI hookedReset(IDirect3DDevice9* device, D3DPRESENT_PARAMETERS* presentationParameters)
 {
+    gNativeEquivalentPairsInSequence = 0;
+    gNativeEquivalentLastPresentFrame = -2;
+    gNativePassEquivalenceWasBlocked = true;
+    gNativeCellTransitionReady = false;
+    gNativeStableCellFormId = 0;
+    gNativeCellChangePlayerFrame = 0;
+    gNativeDoubleTraversalHoldUntilPlayerFrame = 0;
+    gNativeSharedPlayerReadMisses = 0;
+    gNativeHookSilentGameplayFrames = 0;
     resetNativePostprocessCommandStream();
     resetNativeFullSizeTargetCandidates();
     releaseStereoTargets();
@@ -8386,6 +10276,7 @@ HRESULT WINAPI hookedClear(
     const bool strictTargetAllowed =
         currentTargetPassesStrictStereoGate(device, originalTarget, originalDepth, "Clear");
     const bool replayStereo = gStereoReplayEnabled
+        && stereoReplayTransactionAllowed()
         && strictTargetAllowed
         && ensureStereoTargets(device);
     const bool replayWide = gWideWorldReplayEnabled
@@ -8519,8 +10410,18 @@ HRESULT WINAPI hookedSetTransform(IDirect3DDevice9* device, D3DTRANSFORMSTATETYP
 HRESULT WINAPI hookedSetVertexShader(IDirect3DDevice9* device, IDirect3DVertexShader9* shader)
 {
     const LONG call = InterlockedIncrement(&gSetVertexShaderCalls);
+    const HRESULT result = gRealSetVertexShader(device, shader);
+    if (FAILED(result))
+        return result;
+
+    const ShaderFingerprint fingerprint = fingerprintD3DShaderBytecode(shader, "vs", true);
     gActiveVertexShader = shader;
-    gActiveVertexShaderHash = hashD3DShaderBytecode(shader);
+    gActiveVertexShaderHash = fingerprint.fnv1a32;
+    gActiveVertexShaderByteCount = fingerprint.byteCount;
+    std::memcpy(
+        gActiveVertexShaderSha256,
+        fingerprint.sha256,
+        sizeof(gActiveVertexShaderSha256));
     if (InterlockedIncrement(&gLoggedVertexShaderChanges) <= 24 || call % 5000 == 0)
     {
         char message[192] {};
@@ -8533,14 +10434,19 @@ HRESULT WINAPI hookedSetVertexShader(IDirect3DDevice9* device, IDirect3DVertexSh
             gActiveVertexShaderHash);
         logLine(message);
     }
-    return gRealSetVertexShader(device, shader);
+    return result;
 }
 
 HRESULT WINAPI hookedSetPixelShader(IDirect3DDevice9* device, IDirect3DPixelShader9* shader)
 {
     const LONG call = InterlockedIncrement(&gSetPixelShaderCalls);
+    const HRESULT result = gRealSetPixelShader(device, shader);
+    if (FAILED(result))
+        return result;
+
+    const ShaderFingerprint fingerprint = fingerprintD3DShaderBytecode(shader, "ps", false);
     gActivePixelShader = shader;
-    gActivePixelShaderHash = hashD3DShaderBytecode(shader);
+    gActivePixelShaderHash = fingerprint.fnv1a32;
     if (InterlockedIncrement(&gLoggedPixelShaderChanges) <= 24 || call % 5000 == 0)
     {
         char message[192] {};
@@ -8553,12 +10459,29 @@ HRESULT WINAPI hookedSetPixelShader(IDirect3DDevice9* device, IDirect3DPixelShad
             gActivePixelShaderHash);
         logLine(message);
     }
-    return gRealSetPixelShader(device, shader);
+    return result;
 }
 
 template <typename DrawFn, typename... Args>
 HRESULT replayDrawToStereoTargets(IDirect3DDevice9* device, bool userPrimitiveDraw, DrawFn draw, Args... args)
 {
+    // Count candidate programmable world draws before every replay filter.
+    // A skipped UP/configured-pair/target draw must remain in the coverage
+    // denominator or partial geometry can masquerade as full stereo.
+    if (gInNativeStereoHook
+        && gNativeActiveEye == 2
+        && !gInStereoReplay
+        && !suppressStereoForUiMode()
+        && gActiveVertexShader
+        && gHaveView
+        && gHaveProjection
+        && !currentProjectionLooksScreenSpace()
+        && !currentViewLooksScreenSpace()
+        && haveWorldCameraCandidate())
+    {
+        InterlockedIncrement(&gShaderWorldDrawCandidates);
+    }
+
     const LONG nativeTraceEye = gNativeActiveEye;
     if (gNativePipelineTraceThisPair
         && gInNativeStereoHook
@@ -8652,7 +10575,9 @@ HRESULT replayDrawToStereoTargets(IDirect3DDevice9* device, bool userPrimitiveDr
 
     const bool nativePostprocessComposite = gNativePostprocessFanoutActive
         && currentDrawSamplesStereoTwin();
-    const bool stereoReplayRequested = gStereoReplayEnabled || nativePostprocessComposite;
+    const bool stereoReplayRequested =
+        (gStereoReplayEnabled && stereoReplayTransactionAllowed())
+        || nativePostprocessComposite;
     if ((!stereoReplayRequested && !gWideWorldReplayEnabled)
         || gInStereoReplay
         || suppressStereoForUiMode()
@@ -8744,7 +10669,8 @@ HRESULT replayDrawToStereoTargets(IDirect3DDevice9* device, bool userPrimitiveDr
 
     const D3DMATRIX leftView = toD3DMatrix(gEyeMatrices.leftView);
     const D3DMATRIX rightView = toD3DMatrix(gEyeMatrices.rightView);
-    const D3DMATRIX projection = toD3DMatrix(gBaseProjection);
+    const D3DMATRIX leftProjection = toD3DMatrix(gEyeMatrices.leftProjection);
+    const D3DMATRIX rightProjection = toD3DMatrix(gEyeMatrices.rightProjection);
     const D3DMATRIX wideWorldView = toD3DMatrix(baseViewForStereo());
     const fnvxr::stereo::Matrix4 wideWorldProjectionMatrix = makeWideWorldProjection();
     const D3DMATRIX wideWorldProjection = toD3DMatrix(wideWorldProjectionMatrix);
@@ -8752,9 +10678,15 @@ HRESULT replayDrawToStereoTargets(IDirect3DDevice9* device, bool userPrimitiveDr
         currentDrawSamplesStereoTwin()
         && haveOriginalView
         && haveOriginalProjection;
+    const bool programmableWorldDraw = gActiveVertexShader
+        && !screenSpaceTextureComposite
+        && !currentProjectionLooksScreenSpace()
+        && !currentViewLooksScreenSpace()
+        && haveWorldCameraCandidate();
     const D3DMATRIX& leftReplayView = screenSpaceTextureComposite ? originalView : leftView;
     const D3DMATRIX& rightReplayView = screenSpaceTextureComposite ? originalView : rightView;
-    const D3DMATRIX& stereoReplayProjection = screenSpaceTextureComposite ? originalProjection : projection;
+    const D3DMATRIX& leftReplayProjection = screenSpaceTextureComposite ? originalProjection : leftProjection;
+    const D3DMATRIX& rightReplayProjection = screenSpaceTextureComposite ? originalProjection : rightProjection;
 
     HRESULT result = D3DERR_INVALIDCALL;
     HRESULT wideResult = D3DERR_INVALIDCALL;
@@ -8788,13 +10720,19 @@ HRESULT replayDrawToStereoTargets(IDirect3DDevice9* device, bool userPrimitiveDr
         && (!haveViewport || SUCCEEDED(device->SetViewport(&originalViewport)))
         && (!haveScissor || SUCCEEDED(device->SetScissorRect(&originalScissor)))
         && SUCCEEDED(gRealSetTransform(device, D3DTS_VIEW, &leftReplayView))
-        && SUCCEEDED(gRealSetTransform(device, D3DTS_PROJECTION, &stereoReplayProjection)))
+        && SUCCEEDED(gRealSetTransform(device, D3DTS_PROJECTION, &leftReplayProjection)))
     {
         if (!screenSpaceTextureComposite)
         {
             setEyeShaderConstants(device, 1.0f);
             leftWvpPatched =
-                setEyeShaderWvpConstants(device, originalView, originalProjection, leftView, projection, "left");
+                setEyeShaderWvpConstants(
+                    device,
+                    originalView,
+                    originalProjection,
+                    leftView,
+                    leftProjection,
+                    "left");
         }
         bindStereoTextureTwins(device, true);
         leftReplayResult = draw(device, args...);
@@ -8804,14 +10742,20 @@ HRESULT replayDrawToStereoTargets(IDirect3DDevice9* device, bool userPrimitiveDr
             && (!haveViewport || SUCCEEDED(device->SetViewport(&originalViewport)))
             && (!haveScissor || SUCCEEDED(device->SetScissorRect(&originalScissor)))
             && SUCCEEDED(gRealSetTransform(device, D3DTS_VIEW, &rightReplayView))
-            && SUCCEEDED(gRealSetTransform(device, D3DTS_PROJECTION, &stereoReplayProjection)))
+            && SUCCEEDED(gRealSetTransform(device, D3DTS_PROJECTION, &rightReplayProjection)))
         {
             restoreShaderConstants(device);
             if (!screenSpaceTextureComposite)
             {
                 setEyeShaderConstants(device, -1.0f);
                 rightWvpPatched =
-                    setEyeShaderWvpConstants(device, originalView, originalProjection, rightView, projection, "right");
+                    setEyeShaderWvpConstants(
+                        device,
+                        originalView,
+                        originalProjection,
+                        rightView,
+                        rightProjection,
+                        "right");
             }
             bindStereoTextureTwins(device, false);
             result = draw(device, args...);
@@ -8832,6 +10776,13 @@ HRESULT replayDrawToStereoTargets(IDirect3DDevice9* device, bool userPrimitiveDr
     if (haveScissor)
         device->SetScissorRect(&originalScissor);
     gInStereoReplay = false;
+
+    if (programmableWorldDraw && SUCCEEDED(leftReplayResult) && SUCCEEDED(result))
+    {
+        InterlockedIncrement(&gShaderWorldDraws);
+        if (leftWvpPatched && rightWvpPatched)
+            InterlockedIncrement(&gShaderContractCoveredWorldDraws);
+    }
 
     const LONG replayResultLog = InterlockedIncrement(&gLoggedStereoReplayDrawResult);
     const bool replayResultHammer =
@@ -9560,7 +11511,7 @@ HRESULT WINAPI hookedStretchRect(
         : nullptr;
     const bool nativeFanoutMirror = nativeFanoutSourceTwin != nullptr;
     if (SUCCEEDED(result)
-        && (gStereoReplayEnabled || nativeFanoutMirror)
+        && ((gStereoReplayEnabled && stereoReplayTransactionAllowed()) || nativeFanoutMirror)
         && !gInStereoReplay
         && !suppressStereoForUiMode()
         && sourceSurface
@@ -10163,12 +12114,17 @@ void loadStereoConfig()
     if (gIpdGameUnits <= 0.0f || gIpdGameUnits > 12.0f)
         gIpdGameUnits = gIpdMeters * gGameUnitsPerMeter;
     const bool stereoWorldEnabled = stereoWorldRuntimeEnabled();
+    gNativeSingleTraversalReplayEnabled =
+        stereoWorldEnabled
+        && readEnvBool("FNVXR_D3D9_NATIVE_SINGLE_TRAVERSAL_REPLAY", true);
     gNativeStereoEnabled =
-        stereoWorldEnabled && readEnvBool("FNVXR_D3D9_NATIVE_MULTIPASS", false);
+        stereoWorldEnabled
+        && !gNativeSingleTraversalReplayEnabled
+        && readEnvBool("FNVXR_D3D9_NATIVE_MULTIPASS", false);
     gStereoReplayEnabled =
         stereoWorldEnabled
-        && !gNativeStereoEnabled
-        && readEnvBool("FNVXR_D3D9_STEREO_REPLAY", true);
+        && (gNativeSingleTraversalReplayEnabled
+            || (!gNativeStereoEnabled && readEnvBool("FNVXR_D3D9_STEREO_REPLAY", true)));
     gStereoReadbackEnabled =
         stereoWorldEnabled
         && (readEnvBool("FNVXR_D3D9_STEREO_READBACK", true) || sharedStereoEnabled());
@@ -10182,8 +12138,9 @@ void loadStereoConfig()
     char message[768] {};
     sprintf_s(
         message,
-        "stereo config runtime=%d nativeMultipass=%d ipdMeters=%.4f ipdGame=%.4f gameUnitsPerMeter=%.4f replay=%d readback=%d sharedStereo=%d shaderStereo=%d shaderWvpReplay=%d stateBlock=%d primeTargets=%d wideWorldReplay=%d telemetryHammer=%d hammerWarmup=%ld replayStride=%ld wvpStride=%ld clearStride=%ld",
+        "stereo config runtime=%d singleTraversal=%d nativeMultipass=%d ipdMeters=%.4f ipdGame=%.4f gameUnitsPerMeter=%.4f replay=%d readback=%d sharedStereo=%d shaderStereo=%d shaderWvpReplay=%d stateBlock=%d primeTargets=%d wideWorldReplay=%d telemetryHammer=%d hammerWarmup=%ld replayStride=%ld wvpStride=%ld clearStride=%ld",
         stereoWorldEnabled ? 1 : 0,
+        gNativeSingleTraversalReplayEnabled ? 1 : 0,
         gNativeStereoEnabled ? 1 : 0,
         gIpdMeters,
         gIpdGameUnits,
@@ -10587,9 +12544,11 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         releaseSharedVideo();
         releaseSharedStereo();
         releaseSharedWorldVideo();
+        releaseSharedVrOriginPublisher();
         releaseSharedVrPose();
         releaseSharedCamera();
         releaseSharedRuntime();
+        releaseSharedPlayer();
         logLine("fnvxr d3d9 proxy detached");
     }
     return TRUE;

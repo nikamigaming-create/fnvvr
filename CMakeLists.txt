@@ -48,18 +48,21 @@ if(FNVXR_OPENXR_INCLUDE_DIR AND CMAKE_SIZEOF_VOID_P EQUAL 8)
 
 endif()
 
-add_library(nvse_fnvxr MODULE plugin/fnvxr_nvse_plugin.cpp)
-target_link_libraries(nvse_fnvxr PRIVATE fnvxr_protocol dbghelp)
-set_target_properties(nvse_fnvxr PROPERTIES
-    PREFIX ""
-    OUTPUT_NAME "nvse_fnvxr"
-)
-
 if(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 4)
+    # FalloutNV.exe and NVSE are 32-bit. Building a same-named x64 plugin is a
+    # load-incompatible artifact hazard and makes x64 CI look more complete
+    # than the runtime pipeline really is.
+    add_library(nvse_fnvxr MODULE plugin/fnvxr_nvse_plugin.cpp)
+    target_link_libraries(nvse_fnvxr PRIVATE fnvxr_protocol dbghelp)
+    set_target_properties(nvse_fnvxr PROPERTIES
+        PREFIX ""
+        OUTPUT_NAME "nvse_fnvxr"
+    )
+
     add_library(fnvxr_d3d9_proxy MODULE renderhook/fnvxr_d3d9_proxy.cpp)
     target_include_directories(fnvxr_d3d9_proxy PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/renderhook)
     target_sources(fnvxr_d3d9_proxy PRIVATE renderhook/fnvxr_d3d9_proxy.def)
-    target_link_libraries(fnvxr_d3d9_proxy PRIVATE dxguid)
+    target_link_libraries(fnvxr_d3d9_proxy PRIVATE dxguid bcrypt)
     set_target_properties(fnvxr_d3d9_proxy PROPERTIES
         PREFIX ""
         OUTPUT_NAME "d3d9"
@@ -112,13 +115,15 @@ add_executable(fnvxr_fabrik_test tests/fnvxr_fabrik_test.cpp)
 target_include_directories(fnvxr_fabrik_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/plugin)
 add_test(NAME fnvxr_fabrik_test COMMAND fnvxr_fabrik_test)
 
-add_executable(fnvxr_plugin_exports_test tests/fnvxr_plugin_exports_test.cpp)
-add_test(NAME fnvxr_plugin_exports_test
-    COMMAND fnvxr_plugin_exports_test "$<TARGET_FILE:nvse_fnvxr>"
-)
+if(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 4)
+    add_executable(fnvxr_plugin_exports_test tests/fnvxr_plugin_exports_test.cpp)
+    add_test(NAME fnvxr_plugin_exports_test
+        COMMAND fnvxr_plugin_exports_test "$<TARGET_FILE:nvse_fnvxr>"
+    )
 
-add_executable(fnvxr_nvse_bridge_test tests/fnvxr_nvse_bridge_test.cpp)
-target_link_libraries(fnvxr_nvse_bridge_test PRIVATE fnvxr_protocol)
-add_test(NAME fnvxr_nvse_bridge_test
-    COMMAND fnvxr_nvse_bridge_test "$<TARGET_FILE:nvse_fnvxr>"
-)
+    add_executable(fnvxr_nvse_bridge_test tests/fnvxr_nvse_bridge_test.cpp)
+    target_link_libraries(fnvxr_nvse_bridge_test PRIVATE fnvxr_protocol)
+    add_test(NAME fnvxr_nvse_bridge_test
+        COMMAND fnvxr_nvse_bridge_test "$<TARGET_FILE:nvse_fnvxr>"
+    )
+endif()

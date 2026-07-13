@@ -1,51 +1,77 @@
 # FNVVR
 
 FNVVR is a source-only VR injection mod for the retail Windows version of
-Fallout: New Vegas. It keeps the original game executable authoritative and
-adds OpenXR presentation, controller input, retail UI interaction, and the
-in-process hooks needed for native stereo work.
+Fallout: New Vegas. The original `FalloutNV.exe` remains authoritative while a
+standalone OpenXR host supplies headset/controller tracking and VR
+presentation. An xNVSE plugin and retail proxy DLLs expose the engine state and
+rendering hooks needed to connect the two sides.
 
-This repository contains the complete FNVVR-owned C++ and PowerShell source.
-It does not contain Fallout: New Vegas files, Bethesda assets, xNVSE binaries,
-OpenXR binaries, generated build output, local logs, or private runtime data.
+This repository contains only FNVVR-owned C++ and PowerShell source. It does
+not contain Fallout: New Vegas files, Bethesda assets, xNVSE binaries, OpenXR
+binaries, generated build output, local logs, or private runtime data.
 
-FNVVR does not fork or patch xNVSE, OBSE, SKSE, F4SE, or SFSE. `nvse_fnvxr.dll`
-is a separate xNVSE plugin, and the D3D9/DirectInput/XInput proxies plus OpenXR
-host are FNVVR-owned components. Upstream dependencies are fetched unchanged
-into ignored directories.
+FNVVR does not fork or patch xNVSE. `nvse_fnvxr.dll` is a separate xNVSE
+plugin. The D3D9, DirectInput, and XInput proxies and the OpenXR host are also
+FNVVR-owned components. Upstream dependencies are fetched unchanged into
+ignored directories.
 
-## Architecture
+## Retail-Only Architecture
 
-- `FalloutNV.exe` remains the authoritative game and menu runtime.
-- `nvse_fnvxr.dll` owns retail-side state, input, menu clicks, camera/player telemetry, and shared-memory contracts.
-- `d3d9.dll` owns retail D3D9 frame capture, stereo replay/readback, and world/UI gating from retail runtime state.
-- The standalone OpenXR host owns headset/controller tracking, VR presentation, menu quad placement, and hand/pointer UI.
-- The live bridge nucleus is same-machine shared memory/shared texture state. It is not a network transport.
+- `FalloutNV.exe` owns simulation, saves, quests, collision, menus, weapons,
+  projectiles, hit tests, and animation state.
+- `nvse_fnvxr.dll` owns in-process engine discovery, guarded transform/input
+  changes, runtime/UI classification, and retail telemetry.
+- `d3d9.dll` owns retail frame capture and the work toward complete same-frame
+  left/right world rendering.
+- The standalone OpenXR host owns headset/controller actions, frame timing,
+  VR composition, the flat retail UI surface, and debug visualization.
+- Same-machine fixed-size shared mappings carry poses, input intent, retail
+  state, commands, and complete frame surfaces. There is no second game
+  runtime and no network transport.
 
-OpenMWVR is a donor/reference for proven hand, Pip-Boy, pointer, and IK design.
-It is not the runtime for this mod: retail `FalloutNV.exe` remains the game.
-The OpenMW comparison/harvest scripts are optional integration diagnostics and
-are not required by the CMake build or the standalone OpenXR retail launcher.
+The presentation contract has two modes:
+
+- Gameplay may enter native stereo only when retail reports an unobstructed
+  world state and the render hook publishes a valid complete eye pair.
+- Startup menus, pause/menu mode, inventory, Pip-Boy, dialogue, VATS, loading,
+  and any other retail UI state stay on a flat mono surface. Native stereo is
+  suppressed until retail proves it is safely back in gameplay.
 
 ## Current Status
 
-The source includes the playable retail big-screen/OpenXR baseline, xNVSE and
-input proxies, shared-state telemetry, pose hosting, hand/arm FABRIK work, and
-the current native-stereo D3D9 replay/readback path. Native stereo presentation
-is active development and is not represented here as finished.
+The repository includes the playable retail flat-screen-in-headset baseline,
+live OpenXR pose streaming, xNVSE state/input plumbing, controller mappings,
+flat retail UI presentation and input plumbing, D3D9 capture/replay
+diagnostics, FABRIK arm work, and retail skeleton/weapon-node discovery.
+
+Three headset-critical behaviors are not signed off yet:
+
+- The native camera now composes the fully recentered HMD transform on the
+  body-local side and renders one union-frustum Gamebryo traversal. This needs
+  one live headset acceptance run; the previous flat run is not 3D evidence.
+- The right OpenXR aim pose now reaches right-hand IK as a separate,
+  validity-flagged orientation source. It does not yet drive the weapon node,
+  muzzle, projectile, or hit ray.
+- Retained cell-transition telemetry proves that two stateful full-engine eye
+  traversals can submit materially different scene work. Production stereo no
+  longer uses that path: one exact D3D9 draw stream is replayed into both eyes,
+  with explicit single-traversal provenance and live acceptance gates.
+
+Native same-frame stereo world presentation also remains active development.
+See `docs/status.md` and `docs/next-steps.md` for the current proof boundary and
+acceptance gates.
 
 ## Layout
 
 - `protocol/` - fixed shared-memory ABI structs and validation helpers.
-- `plugin/` - xNVSE retail-side plugin.
-- `renderhook/` - D3D9, DirectInput, and XInput retail hooks.
-- `host/` - standalone OpenXR sidecar host and probes.
-- `scripts/` - build, staging, launch, probe, and audit entrypoints.
-- `docs/experiment-brief.md` - current shared-memory architecture notes.
-- `docs/playable-big-screen-vr-baseline.md` - pinned first playable big-screen VR checkpoint.
-- `docs/next-steps.md` - practical phases and integration checkpoints.
+- `plugin/` - retail xNVSE plugin.
+- `renderhook/` - retail D3D9, DirectInput, and XInput hooks.
+- `host/` - standalone OpenXR host and probes.
+- `scripts/` - build, staging, retail launch, probe, and audit entrypoints.
+- `docs/experiment-brief.md` - process split and authority boundary.
+- `docs/next-steps.md` - practical retail camera, weapon, UI, and stereo plan.
 - `docs/status.md` - current proof results and live-test blockers.
-- `docs/prop-layer-plan.md` - how hands/Pip-Boy props fit before true stereo/UI capture.
+- `docs/prop-layer-plan.md` - retail hands, weapon, pointer, and UI plan.
 
 ## Pinned Dependencies
 
@@ -56,46 +82,51 @@ xNVSE runtime archive SHA-256 before extracting anything:
 - OpenXR SDK `release-1.1.60` at `64f2b37c8c6da3d83c9b4d11865ba1fb752cb8ec`
 - OpenXR SDK Source `release-1.1.60` at `c07ad64839653712190e05dbd8cf460e1d239513`
 
-Fetch them into the ignored `deps/` directory:
+Fetch dependencies:
 
 ```powershell
 .\scripts\fetch-deps.ps1
 ```
 
-For the FNV-compatible 32-bit plugin and retail proxy DLLs:
+Build the FNV-compatible 32-bit plugin and retail proxy DLLs:
 
 ```powershell
 .\scripts\build-win32.ps1
 ```
 
-To verify the local OpenXR loader/runtime is visible:
+Verify the local OpenXR loader/runtime:
 
 ```powershell
 .\scripts\run-openxr-probe.ps1
 ```
 
-To stream real OpenXR poses into the bridge protocol:
-
-```powershell
-.\scripts\run-openxr-pose-host.ps1
-```
-
-Use `-Frames 10800` for roughly two minutes at 90 Hz.
-
-To stage the xNVSE plugin layout without modifying the live game install:
+Stage the xNVSE plugin without modifying the live game install:
 
 ```powershell
 .\scripts\stage-plugin.ps1
 ```
 
-To write a combined local preflight report:
+Write a combined local preflight report:
 
 ```powershell
 .\scripts\preflight-fnvxr.ps1
 ```
 
-## Design Rule
+Launch the retail/OpenXR path through the guarded launcher:
 
-FNV decides gameplay. The VR host may draw hands, menus, pointers, and debug aids, but actual activation, hits, firing, menus, and state changes must be confirmed by the in-game plugin.
+```powershell
+.\scripts\start-openxr-retail-sidecar.ps1
+```
+
+## Design Rules
+
+FNV decides gameplay. The host may compose retail frames, hands, pointers, and
+debug aids, but activation, firing, projectile direction, hits, menus, and
+state changes must be applied or confirmed inside retail FNV.
+
+The xNVSE plugin can be extended to inspect additional retail structures and
+publish versioned telemetry. Unknown engine offsets and hook points still need
+runtime-version guards and live proof; copying a value to the host does not by
+itself reproduce the corresponding engine behavior.
 
 See `docs/source-snapshot.md` for the publication boundary and exclusions.

@@ -58,8 +58,6 @@ namespace
     struct Options
     {
         bool requirePlayer = false;
-        bool requireOpenMwPlayer = false;
-        bool requirePlayerMatch = false;
         bool requireRuntime = false;
         bool requireVideo = false;
         bool requireStereo = false;
@@ -68,8 +66,6 @@ namespace
         bool requireCamera = false;
         bool requireAdvancing = false;
         int sampleDelayMs = 250;
-        float playerMatchTolerance = 1.0f;
-        float playerRotationTolerance = 0.01f;
     };
 
     struct PlayerStatus
@@ -102,20 +98,6 @@ namespace
         return false;
     }
 
-    float argFloat(const std::vector<std::string>& args, const char* name, float defaultValue)
-    {
-        for (std::size_t i = 0; i + 1 < args.size(); ++i)
-        {
-            if (args[i] != name)
-                continue;
-
-            char* end = nullptr;
-            const float parsed = std::strtof(args[i + 1].c_str(), &end);
-            return end != args[i + 1].c_str() ? parsed : defaultValue;
-        }
-        return defaultValue;
-    }
-
     int argInt(const std::vector<std::string>& args, const char* name, int defaultValue)
     {
         for (std::size_t i = 0; i + 1 < args.size(); ++i)
@@ -133,13 +115,10 @@ namespace
     void printUsage()
     {
         std::cout
-            << "usage: fnvxr_shared_state_probe [--require-player] [--require-openmw-player]\n"
-            << "                                [--require-player-match]\n"
-            << "                                [--require-runtime] [--require-video]\n"
+            << "usage: fnvxr_shared_state_probe [--require-player] [--require-runtime]\n"
+            << "                                [--require-video]\n"
             << "                                [--require-stereo] [--require-world-stereo]\n"
             << "                                [--require-pose] [--require-camera]\n"
-            << "                                [--match-position-tolerance <world-units>]\n"
-            << "                                [--rotation-tolerance <matrix-units>]\n"
             << "                                [--require-advancing] [--sample-delay-ms <ms>]\n";
     }
 
@@ -158,9 +137,30 @@ namespace
         return finiteArray(values, 3);
     }
 
-    bool finite9(const float values[9])
+    bool finite4(const float values[4])
     {
-        return finiteArray(values, 9);
+        return finiteArray(values, 4);
+    }
+
+    bool normalizedQuat(const float values[4])
+    {
+        if (!finite4(values))
+            return false;
+        const double normSquared = static_cast<double>(values[0]) * values[0]
+            + static_cast<double>(values[1]) * values[1]
+            + static_cast<double>(values[2]) * values[2]
+            + static_cast<double>(values[3]) * values[3];
+        return normSquared >= 0.98 * 0.98 && normSquared <= 1.02 * 1.02;
+    }
+
+    bool poseAimFieldsUsable(const fnvxr::shared::SharedVrPoseState& state)
+    {
+        const bool leftAimCurrent =
+            (state.trackingFlags & fnvxr::shared::VrPoseTrackingLeftAimCurrent) != 0;
+        const bool rightAimCurrent =
+            (state.trackingFlags & fnvxr::shared::VrPoseTrackingRightAimCurrent) != 0;
+        return (!leftAimCurrent || (normalizedQuat(state.leftAimRot) && finite3(state.leftAimPos)))
+            && (!rightAimCurrent || (normalizedQuat(state.rightAimRot) && finite3(state.rightAimPos)));
     }
 
     template <class T>
@@ -171,6 +171,22 @@ namespace
         std::memcpy(&out, typed, sizeof(T));
         sequenceAfter = typed->sequence;
         return (sequenceBefore & 1) == 0 && sequenceBefore == sequenceAfter;
+    }
+
+    template <class T>
+    bool copyFrameHeaderChecked(const void* source, T& out, LONG& sequenceBefore, LONG& sequenceAfter)
+    {
+        const auto* typed = static_cast<const T*>(source);
+        if (typed->writing != 0)
+            return false;
+        sequenceBefore = typed->sequence;
+        MemoryBarrier();
+        std::memcpy(&out, typed, sizeof(T));
+        MemoryBarrier();
+        sequenceAfter = typed->sequence;
+        return typed->writing == 0
+            && out.writing == 0
+            && sequenceBefore == sequenceAfter;
     }
 
     void jsonBool(const char* name, bool value, bool trailing = true)
@@ -215,30 +231,6 @@ namespace
     void jsonFloatArray3(const char* name, const float values[3], bool trailing = true)
     {
         jsonFloatArray(name, values, 3, trailing);
-    }
-
-    void jsonFloat(const char* name, float value, bool trailing = true)
-    {
-        std::cout << "\"" << name << "\":" << value;
-        if (trailing)
-            std::cout << ",";
-        std::cout << "\n";
-    }
-
-    float distanceSquaredN(const float* left, const float* right, int count)
-    {
-        float result = 0.f;
-        for (int i = 0; i < count; ++i)
-        {
-            const float delta = left[i] - right[i];
-            result += delta * delta;
-        }
-        return result;
-    }
-
-    float distanceSquared(const float left[3], const float right[3])
-    {
-        return distanceSquaredN(left, right, 3);
     }
 
     PlayerStatus printPlayer(
@@ -295,48 +287,9 @@ namespace
         jsonFloatArray3("playerWorldPos", state.playerWorldPos);
         jsonFloatArray("playerWorldRot", state.playerWorldRot, 9);
         jsonFloatArray3("cameraWorldPos", state.cameraWorldPos);
-        jsonBool("usableForOpenMwCellPositionSync", usable, false);
+        jsonBool("usable", usable, false);
         std::cout << "},\n";
         return status;
-    }
-
-    bool printPlayerMatch(const PlayerStatus& retail, const PlayerStatus& openMw, float positionTolerance,
-        float rotationTolerance)
-    {
-        const bool bothUsable = retail.usable && openMw.usable;
-        const bool sameCell = bothUsable && retail.state.currentCellFormId == openMw.state.currentCellFormId;
-        const float posDeltaSq = bothUsable ? distanceSquared(retail.state.playerWorldPos, openMw.state.playerWorldPos) : 0.f;
-        const bool rotationFinite = bothUsable && finite9(retail.state.playerWorldRot) && finite9(openMw.state.playerWorldRot);
-        const float rotDeltaSq = rotationFinite ? distanceSquaredN(retail.state.playerWorldRot, openMw.state.playerWorldRot, 9) : 0.f;
-        const float clampedPositionTolerance = positionTolerance < 0.f ? 0.f : positionTolerance;
-        const float clampedRotationTolerance = rotationTolerance < 0.f ? 0.f : rotationTolerance;
-        const bool positionWithinTolerance = bothUsable && posDeltaSq <= clampedPositionTolerance * clampedPositionTolerance;
-        const bool rotationWithinTolerance = rotationFinite
-            && rotDeltaSq <= clampedRotationTolerance * clampedRotationTolerance;
-        const bool cellPositionMatched = sameCell && positionWithinTolerance;
-        const bool matched = cellPositionMatched && rotationWithinTolerance;
-
-        std::cout << "\"playerMatch\":{\n";
-        jsonBool("retailUsable", retail.usable);
-        jsonBool("openMwUsable", openMw.usable);
-        jsonBool("sameCellFormId", sameCell);
-        jsonNumber("retailCellFormId", retail.state.currentCellFormId);
-        jsonNumber("openMwCellFormId", openMw.state.currentCellFormId);
-        jsonFloatArray3("retailPlayerWorldPos", retail.state.playerWorldPos);
-        jsonFloatArray3("openMwPlayerWorldPos", openMw.state.playerWorldPos);
-        jsonFloat("positionDeltaSquared", posDeltaSq);
-        jsonFloat("positionTolerance", clampedPositionTolerance);
-        jsonBool("positionWithinTolerance", positionWithinTolerance);
-        jsonFloatArray("retailPlayerWorldRot", retail.state.playerWorldRot, 9);
-        jsonFloatArray("openMwPlayerWorldRot", openMw.state.playerWorldRot, 9);
-        jsonBool("rotationFinite", rotationFinite);
-        jsonFloat("rotationDeltaSquared", rotDeltaSq);
-        jsonFloat("rotationTolerance", clampedRotationTolerance);
-        jsonBool("rotationWithinTolerance", rotationWithinTolerance);
-        jsonBool("cellPositionMatched", cellPositionMatched);
-        jsonBool("matched", matched, false);
-        std::cout << "},\n";
-        return matched;
     }
 
     bool counterAdvanced(const CounterStatus& before, const CounterStatus& after)
@@ -409,14 +362,17 @@ namespace
         if (!mapping.open("Local\\FNVXR_D3D9_Frame_v1", SharedVideoMappingBytes))
             return status;
 
-        auto* header = static_cast<const fnvxr::shared::SharedD3D9FrameHeader*>(mapping.view);
-        const bool dimensionsOk = header->width > 0 && header->height > 0
-            && header->width <= static_cast<LONG>(fnvxr::shared::D3D9SharedFrameMaxWidth)
-            && header->height <= static_cast<LONG>(fnvxr::shared::D3D9SharedFrameMaxHeight)
-            && header->pitchBytes >= header->width * 4;
+        fnvxr::shared::SharedD3D9FrameHeader header {};
+        LONG sequenceBefore = 0;
+        LONG sequenceAfter = 0;
+        const bool stable = copyFrameHeaderChecked(mapping.view, header, sequenceBefore, sequenceAfter);
+        const bool dimensionsOk = header.width > 0 && header.height > 0
+            && header.width <= static_cast<LONG>(fnvxr::shared::D3D9SharedFrameMaxWidth)
+            && header.height <= static_cast<LONG>(fnvxr::shared::D3D9SharedFrameMaxHeight)
+            && header.pitchBytes >= header.width * 4;
         status.present = true;
-        status.usable = header->magic == fnvxr::shared::D3D9FrameSharedMagic && header->writing == 0 && dimensionsOk;
-        status.value = static_cast<std::uint64_t>(header->sequence);
+        status.usable = stable && header.magic == fnvxr::shared::D3D9FrameSharedMagic && dimensionsOk;
+        status.value = static_cast<std::uint64_t>(header.sequence);
         return status;
     }
 
@@ -424,23 +380,35 @@ namespace
     {
         CounterStatus status;
         MappingView mapping;
-        if (!mapping.open("Local\\FNVXR_D3D9_StereoFrame_v1", SharedStereoMappingBytes))
+        if (!mapping.open(fnvxr::shared::D3D9StereoFrameSharedMappingName, SharedStereoMappingBytes))
             return status;
 
-        auto* header = static_cast<const fnvxr::shared::SharedD3D9StereoFrameHeader*>(mapping.view);
-        const bool dimensionsOk = header->width > 0 && header->height > 0
-            && header->width <= static_cast<LONG>(fnvxr::shared::D3D9SharedFrameMaxWidth)
-            && header->height <= static_cast<LONG>(fnvxr::shared::D3D9SharedFrameMaxHeight)
-            && header->pitchBytes >= header->width * 4;
-        const bool usable = header->magic == fnvxr::shared::D3D9StereoFrameSharedMagic && header->writing == 0
-            && dimensionsOk && header->poseValid != 0 && header->uiActive == 0;
-        const bool nativeSameFrame =
-            header->producerMode == static_cast<LONG>(fnvxr::shared::StereoProducerNativeSameFrame)
-            && header->renderPairSequence > 0;
-        const bool world = usable && nativeSameFrame && header->worldCandidate != 0 && header->separated != 0;
+        fnvxr::shared::SharedD3D9StereoFrameHeader header {};
+        LONG sequenceBefore = 0;
+        LONG sequenceAfter = 0;
+        const bool stable = copyFrameHeaderChecked(mapping.view, header, sequenceBefore, sequenceAfter);
+        const bool dimensionsOk = header.width > 0 && header.height > 0
+            && header.width <= static_cast<LONG>(fnvxr::shared::D3D9SharedFrameMaxWidth)
+            && header.height <= static_cast<LONG>(fnvxr::shared::D3D9SharedFrameMaxHeight)
+            && header.pitchBytes >= header.width * 4;
+        const bool protocolOk = header.magic == fnvxr::shared::D3D9StereoFrameSharedMagic
+            && header.version == fnvxr::shared::D3D9StereoFrameSharedVersion
+            && header.headerBytes == sizeof(header)
+            && header.leftPayloadOffset == sizeof(header)
+            && header.totalMappingBytes == SharedStereoMappingBytes;
+        const bool usable = stable && protocolOk
+            && dimensionsOk && header.poseValid != 0 && header.uiActive == 0;
+        const bool coherentSameTickProducer =
+            (header.producerMode == static_cast<LONG>(fnvxr::shared::StereoProducerNativeSameFrame)
+                || header.producerMode == static_cast<LONG>(fnvxr::shared::StereoProducerSingleTraversal))
+            && header.renderPairSequence > 0;
+        const bool world = usable
+            && coherentSameTickProducer
+            && header.worldCandidate != 0
+            && header.separated != 0;
         status.present = true;
         status.usable = requireWorld ? world : usable;
-        status.value = static_cast<std::uint64_t>(header->sequence);
+        status.value = static_cast<std::uint64_t>(header.sequence);
         return status;
     }
 
@@ -448,7 +416,7 @@ namespace
     {
         CounterStatus status;
         MappingView mapping;
-        if (!mapping.open("Local\\FNVXR_VR_Pose_State", sizeof(fnvxr::shared::SharedVrPoseState)))
+        if (!mapping.open(fnvxr::shared::VrPoseSharedMappingName, sizeof(fnvxr::shared::SharedVrPoseState)))
             return status;
 
         fnvxr::shared::SharedVrPoseState state {};
@@ -457,7 +425,17 @@ namespace
         const bool stable = copyTornChecked(mapping.view, state, sequenceBefore, sequenceAfter);
         status.present = true;
         status.usable = stable && state.magic == fnvxr::shared::VrPoseSharedMagic
-            && state.version == fnvxr::shared::VrPoseSharedVersion && finite3(state.hmdPos);
+            && state.version == fnvxr::shared::VrPoseSharedVersion
+            && state.referenceSpaceGeneration != 0
+            && state.producerEpoch != 0
+            && (state.trackingFlags & fnvxr::shared::VrPoseTrackingHmd) != 0
+            && normalizedQuat(state.hmdRot)
+            && finite3(state.hmdPos)
+            && normalizedQuat(state.leftEyeRot)
+            && normalizedQuat(state.rightEyeRot)
+            && finite3(state.leftEyePos)
+            && finite3(state.rightEyePos)
+            && poseAimFieldsUsable(state);
         status.value = state.frame;
         return status;
     }
@@ -482,8 +460,6 @@ namespace
     {
         const CounterStatus playerBefore = readPlayerCounter(
             "Local\\FNVXR_Player_State", fnvxr::shared::PlayerSharedMagic, fnvxr::shared::PlayerSharedVersion);
-        const CounterStatus openMwPlayerBefore = readPlayerCounter("Local\\FNVXR_OpenMW_Player_State",
-            fnvxr::shared::OpenMwPlayerSharedMagic, fnvxr::shared::OpenMwPlayerSharedVersion);
         const CounterStatus runtimeBefore = readRuntimeCounter();
         const CounterStatus cameraBefore = readCameraCounter();
         const CounterStatus videoBefore = readVideoCounter();
@@ -495,22 +471,18 @@ namespace
 
         const CounterStatus playerAfter = readPlayerCounter(
             "Local\\FNVXR_Player_State", fnvxr::shared::PlayerSharedMagic, fnvxr::shared::PlayerSharedVersion);
-        const CounterStatus openMwPlayerAfter = readPlayerCounter("Local\\FNVXR_OpenMW_Player_State",
-            fnvxr::shared::OpenMwPlayerSharedMagic, fnvxr::shared::OpenMwPlayerSharedVersion);
         const CounterStatus runtimeAfter = readRuntimeCounter();
         const CounterStatus cameraAfter = readCameraCounter();
         const CounterStatus videoAfter = readVideoCounter();
         const CounterStatus stereoAfter = readStereoCounter(options.requireWorldStereo);
         const CounterStatus poseAfter = readPoseCounter();
 
-        const bool anySpecificRequirement = options.requirePlayer || options.requireOpenMwPlayer
-            || options.requireRuntime || options.requireCamera || options.requireVideo || options.requireStereo
+        const bool anySpecificRequirement = options.requirePlayer || options.requireRuntime
+            || options.requireCamera || options.requireVideo || options.requireStereo
             || options.requireWorldStereo || options.requirePose;
         bool allRequiredAdvanced = true;
         if (!anySpecificRequirement || options.requirePlayer)
             allRequiredAdvanced = allRequiredAdvanced && counterAdvanced(playerBefore, playerAfter);
-        if (options.requireOpenMwPlayer)
-            allRequiredAdvanced = allRequiredAdvanced && counterAdvanced(openMwPlayerBefore, openMwPlayerAfter);
         if (!anySpecificRequirement || options.requireRuntime)
             allRequiredAdvanced = allRequiredAdvanced && counterAdvanced(runtimeBefore, runtimeAfter);
         if (!anySpecificRequirement || options.requireCamera)
@@ -525,7 +497,6 @@ namespace
         std::cout << "\"freshness\":{\n";
         jsonSigned("sampleDelayMs", sampleDelayMs);
         jsonFreshCounter("player", playerBefore, playerAfter);
-        jsonFreshCounter("openMwPlayer", openMwPlayerBefore, openMwPlayerAfter);
         jsonFreshCounter("runtime", runtimeBefore, runtimeAfter);
         jsonFreshCounter("camera", cameraBefore, cameraAfter);
         jsonFreshCounter("video", videoBefore, videoAfter);
@@ -616,23 +587,25 @@ namespace
             return false;
         }
 
-        auto* header = static_cast<const fnvxr::shared::SharedD3D9FrameHeader*>(mapping.view);
-        const bool magicOk = header->magic == fnvxr::shared::D3D9FrameSharedMagic;
-        const bool stable = header->writing == 0;
-        const bool dimensionsOk = header->width > 0 && header->height > 0
-            && header->width <= static_cast<LONG>(fnvxr::shared::D3D9SharedFrameMaxWidth)
-            && header->height <= static_cast<LONG>(fnvxr::shared::D3D9SharedFrameMaxHeight)
-            && header->pitchBytes >= header->width * 4;
+        fnvxr::shared::SharedD3D9FrameHeader header {};
+        LONG sequenceBefore = 0;
+        LONG sequenceAfter = 0;
+        const bool stable = copyFrameHeaderChecked(mapping.view, header, sequenceBefore, sequenceAfter);
+        const bool magicOk = header.magic == fnvxr::shared::D3D9FrameSharedMagic;
+        const bool dimensionsOk = header.width > 0 && header.height > 0
+            && header.width <= static_cast<LONG>(fnvxr::shared::D3D9SharedFrameMaxWidth)
+            && header.height <= static_cast<LONG>(fnvxr::shared::D3D9SharedFrameMaxHeight)
+            && header.pitchBytes >= header.width * 4;
         const bool usable = magicOk && stable && dimensionsOk;
 
         jsonBool("present", true);
         jsonBool("stable", stable);
         jsonBool("magicOk", magicOk);
-        jsonSigned("sequence", header->sequence);
-        jsonSigned("width", header->width);
-        jsonSigned("height", header->height);
-        jsonSigned("pitchBytes", header->pitchBytes);
-        jsonSigned("format", header->format);
+        jsonSigned("sequence", header.sequence);
+        jsonSigned("width", header.width);
+        jsonSigned("height", header.height);
+        jsonSigned("pitchBytes", header.pitchBytes);
+        jsonSigned("format", header.format);
         jsonBool("dimensionsOk", dimensionsOk);
         jsonBool("usable", usable, false);
         std::cout << "},\n";
@@ -643,43 +616,60 @@ namespace
     {
         MappingView mapping;
         std::cout << "\"stereo\":{\n";
-        if (!mapping.open("Local\\FNVXR_D3D9_StereoFrame_v1", SharedStereoMappingBytes))
+        if (!mapping.open(fnvxr::shared::D3D9StereoFrameSharedMappingName, SharedStereoMappingBytes))
         {
             jsonBool("present", false, false);
             std::cout << "},\n";
             return {};
         }
 
-        auto* header = static_cast<const fnvxr::shared::SharedD3D9StereoFrameHeader*>(mapping.view);
-        const bool magicOk = header->magic == fnvxr::shared::D3D9StereoFrameSharedMagic;
-        const bool stable = header->writing == 0;
-        const bool dimensionsOk = header->width > 0 && header->height > 0
-            && header->width <= static_cast<LONG>(fnvxr::shared::D3D9SharedFrameMaxWidth)
-            && header->height <= static_cast<LONG>(fnvxr::shared::D3D9SharedFrameMaxHeight)
-            && header->pitchBytes >= header->width * 4;
-        const bool usable = magicOk && stable && dimensionsOk && header->poseValid != 0 && header->uiActive == 0;
-        const bool nativeSameFrame =
-            header->producerMode == static_cast<LONG>(fnvxr::shared::StereoProducerNativeSameFrame)
-            && header->renderPairSequence > 0;
-        const bool worldStereo = usable && nativeSameFrame && header->worldCandidate != 0 && header->separated != 0;
+        fnvxr::shared::SharedD3D9StereoFrameHeader header {};
+        LONG sequenceBefore = 0;
+        LONG sequenceAfter = 0;
+        const bool stable = copyFrameHeaderChecked(mapping.view, header, sequenceBefore, sequenceAfter);
+        const bool magicOk = header.magic == fnvxr::shared::D3D9StereoFrameSharedMagic;
+        const bool protocolOk = magicOk
+            && header.version == fnvxr::shared::D3D9StereoFrameSharedVersion
+            && header.headerBytes == sizeof(header)
+            && header.leftPayloadOffset == sizeof(header)
+            && header.totalMappingBytes == SharedStereoMappingBytes;
+        const bool dimensionsOk = header.width > 0 && header.height > 0
+            && header.width <= static_cast<LONG>(fnvxr::shared::D3D9SharedFrameMaxWidth)
+            && header.height <= static_cast<LONG>(fnvxr::shared::D3D9SharedFrameMaxHeight)
+            && header.pitchBytes >= header.width * 4;
+        const bool usable = protocolOk && stable && dimensionsOk && header.poseValid != 0 && header.uiActive == 0;
+        const bool nativeSameFrame = header.producerMode
+            == static_cast<LONG>(fnvxr::shared::StereoProducerNativeSameFrame);
+        const bool singleTraversal = header.producerMode
+            == static_cast<LONG>(fnvxr::shared::StereoProducerSingleTraversal);
+        const bool coherentSameTickProducer =
+            (nativeSameFrame || singleTraversal)
+            && header.renderPairSequence > 0;
+        const bool worldStereo = usable
+            && coherentSameTickProducer
+            && header.worldCandidate != 0
+            && header.separated != 0;
 
         jsonBool("present", true);
         jsonBool("stable", stable);
         jsonBool("magicOk", magicOk);
-        jsonSigned("sequence", header->sequence);
-        jsonSigned("width", header->width);
-        jsonSigned("height", header->height);
-        jsonSigned("pitchBytes", header->pitchBytes);
-        jsonSigned("format", header->format);
+        jsonBool("protocolOk", protocolOk);
+        jsonSigned("sequence", header.sequence);
+        jsonSigned("width", header.width);
+        jsonSigned("height", header.height);
+        jsonSigned("pitchBytes", header.pitchBytes);
+        jsonSigned("format", header.format);
         jsonBool("dimensionsOk", dimensionsOk);
-        jsonBool("separated", header->separated != 0);
-        jsonBool("worldCandidate", header->worldCandidate != 0);
-        jsonBool("uiActive", header->uiActive != 0);
-        jsonBool("poseValid", header->poseValid != 0);
-        jsonSigned("poseSequence", header->poseSequence);
-        jsonSigned("producerMode", header->producerMode);
-        jsonSigned("renderPairSequence", header->renderPairSequence);
+        jsonBool("separated", header.separated != 0);
+        jsonBool("worldCandidate", header.worldCandidate != 0);
+        jsonBool("uiActive", header.uiActive != 0);
+        jsonBool("poseValid", header.poseValid != 0);
+        jsonSigned("poseSequence", header.poseSequence);
+        jsonSigned("producerMode", header.producerMode);
+        jsonSigned("renderPairSequence", header.renderPairSequence);
         jsonBool("nativeSameFrame", nativeSameFrame);
+        jsonBool("singleTraversal", singleTraversal);
+        jsonBool("coherentSameTickProducer", coherentSameTickProducer);
         jsonBool("usableForHostStereo", usable);
         jsonBool("usableWorldStereo", worldStereo, false);
         std::cout << "},\n";
@@ -690,7 +680,7 @@ namespace
     {
         MappingView mapping;
         std::cout << "\"pose\":{\n";
-        if (!mapping.open("Local\\FNVXR_VR_Pose_State", sizeof(fnvxr::shared::SharedVrPoseState)))
+        if (!mapping.open(fnvxr::shared::VrPoseSharedMappingName, sizeof(fnvxr::shared::SharedVrPoseState)))
         {
             jsonBool("present", false, false);
             std::cout << "}\n";
@@ -703,7 +693,28 @@ namespace
         const bool stable = copyTornChecked(mapping.view, state, sequenceBefore, sequenceAfter);
         const bool magicOk = state.magic == fnvxr::shared::VrPoseSharedMagic;
         const bool versionOk = state.version == fnvxr::shared::VrPoseSharedVersion;
-        const bool usable = stable && magicOk && versionOk && finite3(state.hmdPos);
+        const bool aimFieldsUsable = poseAimFieldsUsable(state);
+        const bool hmdTracked =
+            (state.trackingFlags & fnvxr::shared::VrPoseTrackingHmd) != 0;
+        const bool usable = stable && magicOk && versionOk
+            && state.referenceSpaceGeneration != 0
+            && state.producerEpoch != 0
+            && hmdTracked
+            && normalizedQuat(state.hmdRot)
+            && finite3(state.hmdPos)
+            && normalizedQuat(state.leftEyeRot)
+            && normalizedQuat(state.rightEyeRot)
+            && finite3(state.leftEyePos)
+            && finite3(state.rightEyePos)
+            && aimFieldsUsable;
+        const bool leftAimActive =
+            (state.trackingFlags & fnvxr::shared::VrPoseTrackingLeftAimActive) != 0;
+        const bool rightAimActive =
+            (state.trackingFlags & fnvxr::shared::VrPoseTrackingRightAimActive) != 0;
+        const bool leftAimCurrent =
+            (state.trackingFlags & fnvxr::shared::VrPoseTrackingLeftAimCurrent) != 0;
+        const bool rightAimCurrent =
+            (state.trackingFlags & fnvxr::shared::VrPoseTrackingRightAimCurrent) != 0;
 
         jsonBool("present", true);
         jsonBool("stable", stable);
@@ -712,10 +723,25 @@ namespace
         jsonSigned("sequenceBefore", sequenceBefore);
         jsonSigned("sequenceAfter", sequenceAfter);
         jsonNumber("frame", state.frame);
+        jsonNumber("referenceSpaceGeneration", state.referenceSpaceGeneration);
+        jsonNumber("producerEpoch", state.producerEpoch);
         jsonNumber("trackingFlags", state.trackingFlags);
+        jsonBool("hmdTracked", hmdTracked);
+        jsonBool("leftAimActive", leftAimActive);
+        jsonBool("rightAimActive", rightAimActive);
+        jsonBool("leftAimCurrent", leftAimCurrent);
+        jsonBool("rightAimCurrent", rightAimCurrent);
+        jsonBool("aimFieldsUsable", aimFieldsUsable);
+        jsonFloatArray("hmdRot", state.hmdRot, 4);
         jsonFloatArray3("hmdPos", state.hmdPos);
+        jsonFloatArray("leftGripRot", state.leftRot, 4);
         jsonFloatArray3("leftPos", state.leftPos);
+        jsonFloatArray("rightGripRot", state.rightRot, 4);
         jsonFloatArray3("rightPos", state.rightPos);
+        jsonFloatArray("leftAimRot", state.leftAimRot, 4);
+        jsonFloatArray3("leftAimPos", state.leftAimPos);
+        jsonFloatArray("rightAimRot", state.rightAimRot, 4);
+        jsonFloatArray3("rightAimPos", state.rightAimPos);
         jsonBool("usable", usable, false);
         std::cout << "}\n";
         return usable;
@@ -736,8 +762,6 @@ int main(int argc, char** argv)
 
     Options options;
     options.requirePlayer = hasArg(args, "--require-player");
-    options.requireOpenMwPlayer = hasArg(args, "--require-openmw-player");
-    options.requirePlayerMatch = hasArg(args, "--require-player-match");
     options.requireRuntime = hasArg(args, "--require-runtime");
     options.requireVideo = hasArg(args, "--require-video");
     options.requireStereo = hasArg(args, "--require-stereo");
@@ -745,8 +769,6 @@ int main(int argc, char** argv)
     options.requirePose = hasArg(args, "--require-pose");
     options.requireCamera = hasArg(args, "--require-camera");
     options.requireAdvancing = hasArg(args, "--require-advancing");
-    options.playerMatchTolerance = argFloat(args, "--match-position-tolerance", options.playerMatchTolerance);
-    options.playerRotationTolerance = argFloat(args, "--rotation-tolerance", options.playerRotationTolerance);
     options.sampleDelayMs = argInt(args, "--sample-delay-ms", options.sampleDelayMs);
 
     std::cout << "{\n";
@@ -755,13 +777,6 @@ int main(int argc, char** argv)
         "Local\\FNVXR_Player_State",
         fnvxr::shared::PlayerSharedMagic,
         fnvxr::shared::PlayerSharedVersion);
-    const PlayerStatus openMwPlayer = printPlayer(
-        "openMwPlayer",
-        "Local\\FNVXR_OpenMW_Player_State",
-        fnvxr::shared::OpenMwPlayerSharedMagic,
-        fnvxr::shared::OpenMwPlayerSharedVersion);
-    const bool playerMatch = printPlayerMatch(
-        player, openMwPlayer, options.playerMatchTolerance, options.playerRotationTolerance);
     const bool runtime = printRuntime();
     const bool camera = printCamera();
     const bool video = printVideo();
@@ -774,8 +789,6 @@ int main(int argc, char** argv)
 
     bool failed = false;
     failed = failed || (options.requirePlayer && !player.usable);
-    failed = failed || (options.requireOpenMwPlayer && !openMwPlayer.usable);
-    failed = failed || (options.requirePlayerMatch && !playerMatch);
     failed = failed || (options.requireRuntime && !runtime);
     failed = failed || (options.requireCamera && !camera);
     failed = failed || (options.requireVideo && !video);

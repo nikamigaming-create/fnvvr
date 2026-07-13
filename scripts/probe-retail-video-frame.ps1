@@ -10,7 +10,7 @@ $Root = Split-Path -Parent $PSScriptRoot
 if (-not $OutputRoot) {
     $OutputRoot = Join-Path $Root "local\retail-video-probes"
 }
-$Stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+$Stamp = Get-Date -Format "yyyyMMdd-HHmmss-fff"
 $RunDir = Join-Path $OutputRoot $Stamp
 New-Item -ItemType Directory -Force -Path $RunDir | Out-Null
 
@@ -90,6 +90,7 @@ public static class FnvxrRetailVideoFrameProbe {
         IntPtr mapping = IntPtr.Zero;
         IntPtr view = IntPtr.Zero;
         int lastSequence = 0;
+        int firstSequence = 0;
         try {
             while (DateTime.UtcNow < deadline) {
                 if (mapping == IntPtr.Zero) {
@@ -136,6 +137,26 @@ public static class FnvxrRetailVideoFrameProbe {
                     continue;
                 }
 
+                int samples = 0;
+                int nonBlack = 0;
+                for (int pixel = 0; pixel < pixels.Length / 4; pixel += 97) {
+                    int offset = pixel * 4;
+                    samples++;
+                    if (Math.Max(Math.Max(pixels[offset], pixels[offset + 1]), pixels[offset + 2]) > 8)
+                        nonBlack++;
+                }
+                if (nonBlack < 16) {
+                    lastSequence = sequence;
+                    Thread.Sleep(25);
+                    continue;
+                }
+                if (firstSequence == 0) {
+                    firstSequence = sequence;
+                    lastSequence = sequence;
+                    Thread.Sleep(25);
+                    continue;
+                }
+
                 byte[] hash;
                 using (SHA256 sha = SHA256.Create())
                     hash = sha.ComputeHash(pixels);
@@ -151,13 +172,18 @@ public static class FnvxrRetailVideoFrameProbe {
 
                 string json =
                     "{\n" +
+                    "  \"proof\": \"mono-transport-only\",\n" +
                     "  \"mapping\": \"Local\\\\FNVXR_D3D9_Frame_v1\",\n" +
                     "  \"magic\": \"0x" + magic.ToString("x8") + "\",\n" +
                     "  \"sequence\": " + sequence + ",\n" +
+                    "  \"firstSequence\": " + firstSequence + ",\n" +
+                    "  \"advanced\": true,\n" +
                     "  \"width\": " + width + ",\n" +
                     "  \"height\": " + height + ",\n" +
                     "  \"pitchBytes\": " + pitchBytes + ",\n" +
                     "  \"format\": " + format + ",\n" +
+                    "  \"samples\": " + samples + ",\n" +
+                    "  \"nonBlackSamples\": " + nonBlack + ",\n" +
                     "  \"sha256\": \"" + Hex(hash) + "\",\n" +
                     "  \"raw\": \"" + Path.GetFileName(raw) + "\",\n" +
                     "  \"preview\": \"" + (savePreview ? Path.GetFileName(preview) : "") + "\"\n" +

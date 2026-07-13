@@ -184,6 +184,7 @@ constexpr UInt32 kMenuTypeMax = 0x43C;
 using fnvxr::shared::SharedXInputState;
 using fnvxr::shared::SharedDInputState;
 using fnvxr::shared::SharedVrPoseState;
+using fnvxr::shared::SharedVrOriginState;
 using fnvxr::shared::SharedCameraState;
 using fnvxr::shared::SharedRuntimeState;
 using fnvxr::shared::SharedPlayerState;
@@ -355,13 +356,20 @@ struct VrRigPoseSnapshot
 {
     LONG sequence {};
     UInt64 frame {};
+    std::int64_t predictedDisplayTime {};
     UInt32 trackingFlags {};
+    UInt32 referenceSpaceGeneration {};
+    UInt32 producerEpoch {};
     Quat hmdRot { 0.0f, 0.0f, 0.0f, 1.0f };
     Vec3 hmdPos {};
     Quat leftRot { 0.0f, 0.0f, 0.0f, 1.0f };
     Vec3 leftPos {};
     Quat rightRot { 0.0f, 0.0f, 0.0f, 1.0f };
     Vec3 rightPos {};
+    Quat leftAimRot { 0.0f, 0.0f, 0.0f, 1.0f };
+    Vec3 leftAimPos {};
+    Quat rightAimRot { 0.0f, 0.0f, 0.0f, 1.0f };
+    Vec3 rightAimPos {};
 };
 
 struct RetailArmNodes
@@ -385,8 +393,15 @@ struct RetailRigNodes
 struct RetailHandCalibration
 {
     bool valid {};
+    bool usesAimOrientation {};
     Matrix33 controllerToHandRotation {};
     Vec3 controllerToWristLocal {};
+};
+
+struct RetailWeaponCalibration
+{
+    bool valid {};
+    Matrix33 controllerToWeaponRotation {};
 };
 
 struct ShowroomScene
@@ -419,6 +434,9 @@ NVSEConsoleInterface* g_console = nullptr;
 NVSEMessagingInterface* g_messaging = nullptr;
 NVSEPlayerControlsInterface* g_playerControls = nullptr;
 DirectInputHookControl* g_directInputHook = nullptr;
+bool g_publishedDirectInputHoldKnown[MaxDirectInputMacros] {};
+bool g_publishedDirectInputHoldState[MaxDirectInputMacros] {};
+bool g_publishedDirectInputHoldViaHook[MaxDirectInputMacros] {};
 using BufferedKeyTapFn = void (__thiscall*)(void*, UInt32);
 BufferedKeyTapFn g_bufferedKeyTap = nullptr;
 bool g_triedResolveBufferedKeyTap = false;
@@ -436,11 +454,22 @@ LONG g_lastExternalDInputPointerX = LONG_MIN;
 LONG g_lastExternalDInputPointerY = LONG_MIN;
 bool g_lastExternalDInputPointerActive = false;
 UInt32 g_loggedExternalDInputPointers = 0;
+SharedDInputState g_lastStableExternalDInput {};
+bool g_haveLastStableExternalDInput = false;
+UInt32 g_lastExternalDInputSourceFrame = 0;
+UInt64 g_lastExternalDInputAdvanceMs = 0;
 UInt32 g_lastExternalXInputPacket = 0;
 UInt16 g_lastExternalXInputButtons = 0;
 UInt32 g_lastExternalXInputNavMask = 0;
 UInt64 g_lastExternalXInputNavMs = 0;
 UInt32 g_loggedExternalXInput = 0;
+SharedXInputState g_lastStableExternalXInput {};
+bool g_haveLastStableExternalXInput = false;
+bool g_externalXInputNeutral = false;
+UInt32 g_lastExternalXInputSourcePacket = 0;
+UInt32 g_lastReturnedExternalXInputSourcePacket = 0;
+UInt32 g_effectiveExternalXInputPacket = 0;
+UInt64 g_lastExternalXInputAdvanceMs = 0;
 bool g_gameplayAutoRunEnabled = false;
 UInt64 g_lastGameplayAutoRunToggleMs = 0;
 UInt8 g_gameplayMovementMode = 0;
@@ -465,6 +494,8 @@ HANDLE g_dinputMapping = nullptr;
 SharedDInputState* g_dinputState = nullptr;
 HANDLE g_vrPoseMapping = nullptr;
 SharedVrPoseState* g_vrPoseState = nullptr;
+HANDLE g_vrOriginMapping = nullptr;
+SharedVrOriginState* g_vrOriginState = nullptr;
 HANDLE g_cameraMapping = nullptr;
 SharedCameraState* g_cameraState = nullptr;
 HANDLE g_runtimeMapping = nullptr;
@@ -495,16 +526,34 @@ bool g_retailRigHookInstalled = false;
 RetailRigNodes g_retailRigNodes {};
 RetailHandCalibration g_retailLeftCalibration {};
 RetailHandCalibration g_retailRightCalibration {};
+RetailWeaponCalibration g_retailWeaponCalibration {};
 bool g_haveRetailRigOrigin = false;
+Quat g_retailRigOriginHmdRot { 0.0f, 0.0f, 0.0f, 1.0f };
 Vec3 g_retailRigOriginHmdPos {};
-float g_retailRigWorldYawCos = 1.0f;
-float g_retailRigWorldYawSin = 0.0f;
-float g_retailRigWorldYawHalfCos = 1.0f;
-float g_retailRigWorldYawHalfSin = 0.0f;
+void* g_retailRigOriginBodyRoot = nullptr;
+Vec3 g_retailRigBodyAnchorLocal {};
+UInt32 g_retailRigReferenceSpaceGeneration = 0;
+UInt32 g_retailRigProducerEpoch = 0;
+UInt32 g_retailRigOriginPoseSequence = 0;
+LONG g_retailRigOriginAuthoritySequence = 0;
 LONG g_lastRetailRigPoseSequence = 0;
 UInt64 g_retailRigSolveCount = 0;
 UInt64 g_retailRigDiscoveryCount = 0;
 void* g_lastRetailRigAnimData = nullptr;
+bool g_haveRetailRigMotionSample = false;
+Vec3 g_previousRetailRigHeadLocalMeters {};
+Quat g_previousRetailRigHeadLocalRotation { 0.0f, 0.0f, 0.0f, 1.0f };
+Vec3 g_previousRetailRigRightLocalMeters {};
+Quat g_previousRetailRigRightLocalRotation { 0.0f, 0.0f, 0.0f, 1.0f };
+Vec3 g_previousRetailRigRightTargetLocalUnits {};
+Vec3 g_previousRetailRigRightHandLocalUnits {};
+Vec3 g_previousRetailRigWeaponWorld {};
+Matrix33 g_previousRetailRigWeaponWorldRotation {};
+Vec3 g_previousRetailRigBodyWorld {};
+Vec3 g_previousRetailRigBodyAnchorWorld {};
+Vec3 g_previousRetailRigCameraWorld {};
+UInt64 g_retailRigHeadOnlySamples = 0;
+UInt64 g_retailRigControllerOnlySamples = 0;
 bool g_haveVrOrigin = false;
 Quat g_vrOriginRot { 0.0f, 0.0f, 0.0f, 1.0f };
 Vec3 g_vrOriginPos {};
@@ -534,6 +583,7 @@ bool g_uiFavoriteAssignClickPending = false;
 bool g_previousUiFavoritePipBoyVisible = false;
 
 bool allowUiInput();
+UInt32 currentMenuBits();
 bool playerWeaponOut();
 UInt32 currentWeaponClass();
 bool weaponClassKnown(UInt32 weaponClass);
@@ -628,11 +678,29 @@ void appendTelemetry(const char* text)
 
 void logTelemetry(const char* format, ...)
 {
-    char line[512] {};
+    // Structured camera/rig proofs contain the full source and applied
+    // transforms.  A 512-byte buffer silently truncated those records into
+    // invalid JSON, making the telemetry look present while discarding the
+    // evidence needed to verify independence.
+    char line[16384] {};
     va_list args;
     va_start(args, format);
-    vsnprintf(line, sizeof(line), format, args);
+    const int required = vsnprintf(line, sizeof(line), format, args);
     va_end(args);
+    if (required < 0 || required >= static_cast<int>(sizeof(line)))
+    {
+        static volatile LONG truncations = 0;
+        const LONG count = InterlockedIncrement(&truncations);
+        char failure[256] {};
+        sprintf_s(
+            failure,
+            "{\"event\":\"fnvxrTelemetryTruncated\",\"count\":%ld,\"bufferBytes\":%zu,\"requiredBytes\":%d}\n",
+            count,
+            sizeof(line),
+            required);
+        appendTelemetry(failure);
+        return;
+    }
     appendTelemetry(line);
 }
 
@@ -1058,6 +1126,25 @@ Vec3 xrDeltaToGamebryoVector(Vec3 xrDelta)
     };
 }
 
+// Return an OpenXR position in the full gameplay-origin frame.  Applying only
+// the origin yaw leaves pitch/roll in the basis and makes horizontal physical
+// motion trace an ellipse.  Camera and controller consumers must use this
+// exact same origin-space operation.
+Vec3 xrPositionInOriginFrame(Quat originRotation, Vec3 originPosition, Vec3 currentPosition)
+{
+    const Matrix33 inverseOrigin = matrixFromQuat(conjugateQuat(normalizeQuat(originRotation)));
+    const Vec3 delta {
+        currentPosition.x - originPosition.x,
+        currentPosition.y - originPosition.y,
+        currentPosition.z - originPosition.z
+    };
+    return {
+        inverseOrigin.m[0][0] * delta.x + inverseOrigin.m[0][1] * delta.y + inverseOrigin.m[0][2] * delta.z,
+        inverseOrigin.m[1][0] * delta.x + inverseOrigin.m[1][1] * delta.y + inverseOrigin.m[1][2] * delta.z,
+        inverseOrigin.m[2][0] * delta.x + inverseOrigin.m[2][1] * delta.y + inverseOrigin.m[2][2] * delta.z
+    };
+}
+
 bool readLatestCameraPose(Quat& rotationDelta, Vec3& positionDelta)
 {
     if (!g_vrPoseState || g_vrPoseState->magic != VrPoseSharedMagic || g_vrPoseState->version != VrPoseSharedVersion)
@@ -1123,11 +1210,7 @@ bool readLatestCameraPose(Quat& rotationDelta, Vec3& positionDelta)
     }
 
     rotationDelta = multiplyQuat(conjugateQuat(g_vrOriginRot), currentRot);
-    positionDelta = {
-        currentPos.x - g_vrOriginPos.x,
-        currentPos.y - g_vrOriginPos.y,
-        currentPos.z - g_vrOriginPos.z
-    };
+    positionDelta = xrPositionInOriginFrame(g_vrOriginRot, g_vrOriginPos, currentPos);
     g_lastCameraPoseSequence = sequence;
     return true;
 }
@@ -1373,7 +1456,7 @@ void initSharedXInput()
         PAGE_READWRITE,
         0,
         sizeof(SharedXInputState),
-        "Local\\FNVXR_XInput_State");
+        fnvxr::shared::XInputSharedMappingName);
     if (!g_xinputMapping)
     {
         logTelemetry("xinput shared CreateFileMapping failed err=%lu\n", GetLastError());
@@ -1391,23 +1474,30 @@ void initSharedXInput()
         return;
     }
 
-    const bool existingValid = createError == ERROR_ALREADY_EXISTS
+    SharedXInputState existingSnapshot {};
+    const bool existingHeaderValid = createError == ERROR_ALREADY_EXISTS
         && g_xinputState->magic == XInputSharedMagic
         && g_xinputState->version == XInputSharedVersion;
+    const bool existingSnapshotValid = existingHeaderValid
+        && fnvxr::shared::readSequencedSharedSnapshot(g_xinputState, existingSnapshot, 16);
+    const bool existingValid = existingHeaderValid;
     if (!existingValid)
     {
         std::memset(g_xinputState, 0, sizeof(*g_xinputState));
         g_xinputState->magic = XInputSharedMagic;
         g_xinputState->version = XInputSharedVersion;
+        // Mapping existence is not producer liveness. The OpenXR host sets
+        // connected only when it publishes its first complete input frame.
+        g_xinputState->connected = 0;
+        g_xinputState->reserved[fnvxr::shared::XInputReservedRetailConsumed] = 0;
+        g_xinputState->reserved[fnvxr::shared::XInputReservedAutoRun] = 0;
+        g_xinputState->reserved[fnvxr::shared::XInputReservedMovementMode] = 0;
     }
-    g_xinputState->connected = 1;
-    g_xinputState->reserved[fnvxr::shared::XInputReservedRetailConsumed] = 0;
-    g_xinputState->reserved[fnvxr::shared::XInputReservedAutoRun] = 0;
-    g_xinputState->reserved[fnvxr::shared::XInputReservedMovementMode] = 0;
-    logTelemetry("xinput shared ready state=%p mapping=%p existing=%d\n",
+    logTelemetry("xinput shared ready state=%p mapping=%p existing=%d stable=%d\n",
         g_xinputState,
         g_xinputMapping,
-        static_cast<int>(existingValid));
+        static_cast<int>(existingValid),
+        static_cast<int>(existingSnapshotValid));
 }
 
 void initSharedDInput()
@@ -1421,7 +1511,7 @@ void initSharedDInput()
         PAGE_READWRITE,
         0,
         sizeof(SharedDInputState),
-        "Local\\FNVXR_DInput_State");
+        fnvxr::shared::DInputSharedMappingName);
     if (!g_dinputMapping)
     {
         logTelemetry("dinput shared CreateFileMapping failed err=%lu\n", GetLastError());
@@ -1439,23 +1529,139 @@ void initSharedDInput()
         return;
     }
 
-    const bool existingValid = createError == ERROR_ALREADY_EXISTS
+    SharedDInputState existingSnapshot {};
+    const bool existingHeaderValid = createError == ERROR_ALREADY_EXISTS
         && g_dinputState->magic == DInputSharedMagic
         && g_dinputState->version == DInputSharedVersion;
+    const bool existingSnapshotValid = existingHeaderValid
+        && fnvxr::shared::readSequencedSharedSnapshot(g_dinputState, existingSnapshot, 16);
+    const bool existingValid = existingHeaderValid;
     if (!existingValid)
     {
         std::memset(g_dinputState, 0, sizeof(*g_dinputState));
         g_dinputState->magic = DInputSharedMagic;
         g_dinputState->version = DInputSharedVersion;
     }
-    g_lastConsumedDInputMouseClickPacket = g_dinputState->mouseClickPacket;
-    g_lastPublishedDInputMouseClickPacket = g_dinputState->mouseClickPacket;
-    logTelemetry("dinput shared ready state=%p mapping=%p existing=%d packet=%lu frame=%lu\n",
+    const UInt32 initialMouseClickPacket = existingSnapshotValid ? existingSnapshot.mouseClickPacket : 0u;
+    const UInt32 initialFrame = existingSnapshotValid ? existingSnapshot.frame : 0u;
+    g_lastConsumedDInputMouseClickPacket = initialMouseClickPacket;
+    g_lastPublishedDInputMouseClickPacket = initialMouseClickPacket;
+    logTelemetry("dinput shared ready state=%p mapping=%p existing=%d stable=%d packet=%lu frame=%lu\n",
         g_dinputState,
         g_dinputMapping,
         static_cast<int>(existingValid),
-        static_cast<unsigned long>(g_dinputState->mouseClickPacket),
-        static_cast<unsigned long>(g_dinputState->frame));
+        static_cast<int>(existingSnapshotValid),
+        static_cast<unsigned long>(initialMouseClickPacket),
+        static_cast<unsigned long>(initialFrame));
+}
+
+bool readSharedXInputFrameSnapshot(SharedXInputState& snapshot)
+{
+    return fnvxr::shared::readSequencedSharedSnapshot(g_xinputState, snapshot)
+        && snapshot.magic == XInputSharedMagic
+        && snapshot.version == XInputSharedVersion;
+}
+
+bool readEffectiveExternalXInputSnapshot(SharedXInputState& snapshot)
+{
+    if (!g_xinputState)
+        return false;
+
+    SharedXInputState current {};
+    const bool currentValid = readSharedXInputFrameSnapshot(current);
+    const UInt64 nowMs = GetTickCount64();
+    if (currentValid)
+    {
+        if (!g_haveLastStableExternalXInput || current.packet != g_lastExternalXInputSourcePacket)
+        {
+            g_lastExternalXInputSourcePacket = current.packet;
+            g_lastExternalXInputAdvanceMs = nowMs;
+        }
+        g_lastStableExternalXInput = current;
+        g_haveLastStableExternalXInput = true;
+    }
+
+    const UInt64 staleMs = static_cast<UInt64>((std::max)(
+        50,
+        getIntFromEnv("FNVXR_XINPUT_STALE_PACKET_MS", 250)));
+    const bool fresh = g_haveLastStableExternalXInput
+        && g_lastExternalXInputAdvanceMs != 0
+        && nowMs - g_lastExternalXInputAdvanceMs <= staleMs
+        && g_lastStableExternalXInput.connected != 0;
+    if (fresh)
+    {
+        snapshot = g_lastStableExternalXInput;
+        if (g_externalXInputNeutral
+            || g_effectiveExternalXInputPacket == 0
+            || snapshot.packet != g_lastReturnedExternalXInputSourcePacket)
+        {
+            ++g_effectiveExternalXInputPacket;
+            g_lastReturnedExternalXInputSourcePacket = snapshot.packet;
+        }
+        snapshot.packet = g_effectiveExternalXInputPacket;
+        g_externalXInputNeutral = false;
+        return true;
+    }
+
+    if (!g_externalXInputNeutral)
+    {
+        ++g_effectiveExternalXInputPacket;
+        g_externalXInputNeutral = true;
+    }
+    snapshot = {};
+    snapshot.magic = XInputSharedMagic;
+    snapshot.version = XInputSharedVersion;
+    snapshot.packet = g_effectiveExternalXInputPacket;
+    snapshot.connected = 1;
+    return true;
+}
+
+bool readSharedDInputSnapshot(SharedDInputState& snapshot)
+{
+    if (!g_dinputState)
+        return false;
+
+    SharedDInputState current {};
+    const bool currentValid = fnvxr::shared::readSequencedSharedSnapshot(g_dinputState, current)
+        && current.magic == DInputSharedMagic
+        && current.version == DInputSharedVersion;
+    const UInt64 nowMs = GetTickCount64();
+    if (currentValid)
+    {
+        if (!g_haveLastStableExternalDInput || current.frame != g_lastExternalDInputSourceFrame)
+        {
+            g_lastExternalDInputSourceFrame = current.frame;
+            g_lastExternalDInputAdvanceMs = nowMs;
+        }
+        g_lastStableExternalDInput = current;
+        g_haveLastStableExternalDInput = true;
+    }
+
+    const UInt64 staleMs = static_cast<UInt64>((std::max)(
+        50,
+        getIntFromEnv("FNVXR_DINPUT_STALE_FRAME_MS", 250)));
+    if (g_haveLastStableExternalDInput
+        && g_lastExternalDInputAdvanceMs != 0
+        && nowMs - g_lastExternalDInputAdvanceMs <= staleMs)
+    {
+        snapshot = g_lastStableExternalDInput;
+        return true;
+    }
+
+    snapshot = {};
+    snapshot.magic = DInputSharedMagic;
+    snapshot.version = DInputSharedVersion;
+    if (g_haveLastStableExternalDInput)
+    {
+        snapshot.frame = g_lastStableExternalDInput.frame;
+        snapshot.mouseClickPacket = g_lastStableExternalDInput.mouseClickPacket;
+        snapshot.keyboardAcceptPacket = g_lastStableExternalDInput.keyboardAcceptPacket;
+        snapshot.headLookX = g_lastStableExternalDInput.headLookX;
+        snapshot.headLookY = g_lastStableExternalDInput.headLookY;
+        snapshot.gyroLookX = g_lastStableExternalDInput.gyroLookX;
+        snapshot.gyroLookY = g_lastStableExternalDInput.gyroLookY;
+    }
+    return true;
 }
 
 void initSharedVrPose()
@@ -1469,7 +1675,7 @@ void initSharedVrPose()
         PAGE_READWRITE,
         0,
         sizeof(SharedVrPoseState),
-        "Local\\FNVXR_VR_Pose_State");
+        fnvxr::shared::VrPoseSharedMappingName);
     if (!g_vrPoseMapping)
     {
         logTelemetry("vr pose shared CreateFileMapping failed err=%lu\n", GetLastError());
@@ -1498,6 +1704,8 @@ void initSharedVrPose()
         g_vrPoseState->hmdRot[3] = 1.0f;
         g_vrPoseState->leftRot[3] = 1.0f;
         g_vrPoseState->rightRot[3] = 1.0f;
+        g_vrPoseState->leftAimRot[3] = 1.0f;
+        g_vrPoseState->rightAimRot[3] = 1.0f;
         g_vrPoseState->leftEyeRot[3] = 1.0f;
         g_vrPoseState->rightEyeRot[3] = 1.0f;
     }
@@ -1792,10 +2000,15 @@ void updateSharedVrPose(const fnvxr::PoseFrame& pose)
     if (!envEnabled("FNVXR_NVSE_WRITES_VR_POSE", false))
         return;
 
-    InterlockedIncrement(&g_vrPoseState->sequence);
-    MemoryBarrier();
+    if (!fnvxr::shared::beginSequencedSharedWrite(g_vrPoseState->sequence))
+    {
+        logTelemetry("legacy VR pose writer skipped: shared sequence busy\n");
+        return;
+    }
     g_vrPoseState->magic = VrPoseSharedMagic;
     g_vrPoseState->version = VrPoseSharedVersion;
+    g_vrPoseState->referenceSpaceGeneration = 1;
+    g_vrPoseState->producerEpoch = 1;
     g_vrPoseState->trackingFlags =
         fnvxr::shared::VrPoseTrackingHmd
         | fnvxr::shared::VrPoseTrackingLeftGripActive
@@ -1825,6 +2038,13 @@ void updateSharedVrPose(const fnvxr::PoseFrame& pose)
     g_vrPoseState->rightPos[0] = pose.rightPos.x;
     g_vrPoseState->rightPos[1] = pose.rightPos.y;
     g_vrPoseState->rightPos[2] = pose.rightPos.z;
+    // Legacy PoseFrame input has only one pose per hand. Seed the aim fields
+    // from that grip pose, but leave the aim tracking bits clear so retail IK
+    // deliberately takes its safe grip-orientation fallback.
+    std::memcpy(g_vrPoseState->leftAimRot, g_vrPoseState->leftRot, sizeof(g_vrPoseState->leftAimRot));
+    std::memcpy(g_vrPoseState->leftAimPos, g_vrPoseState->leftPos, sizeof(g_vrPoseState->leftAimPos));
+    std::memcpy(g_vrPoseState->rightAimRot, g_vrPoseState->rightRot, sizeof(g_vrPoseState->rightAimRot));
+    std::memcpy(g_vrPoseState->rightAimPos, g_vrPoseState->rightPos, sizeof(g_vrPoseState->rightAimPos));
     g_vrPoseState->leftEyeRot[0] = 0.0f;
     g_vrPoseState->leftEyeRot[1] = 0.0f;
     g_vrPoseState->leftEyeRot[2] = 0.0f;
@@ -1833,13 +2053,14 @@ void updateSharedVrPose(const fnvxr::PoseFrame& pose)
     g_vrPoseState->rightEyeRot[1] = 0.0f;
     g_vrPoseState->rightEyeRot[2] = 0.0f;
     g_vrPoseState->rightEyeRot[3] = 1.0f;
-    MemoryBarrier();
-    InterlockedIncrement(&g_vrPoseState->sequence);
+    fnvxr::shared::endSequencedSharedWrite(g_vrPoseState->sequence);
 }
 
 void updateSharedXInput(const fnvxr::PoseFrame& pose)
 {
     if (!g_xinputState)
+        return;
+    if (retailSidecarProfile() && envEnabled("FNVXR_EXTERNAL_XINPUT_WRITER", true))
         return;
 
     constexpr float dpadDeadzone = 0.45f;
@@ -1927,6 +2148,8 @@ void updateSharedXInput(const fnvxr::PoseFrame& pose)
             suppressMenuAnalog ? "true" : "false");
     }
 
+    if (!fnvxr::shared::beginSequencedSharedWrite(g_xinputState->sequence))
+        return;
     g_xinputState->magic = XInputSharedMagic;
     g_xinputState->version = XInputSharedVersion;
     g_xinputState->connected = 1;
@@ -1938,6 +2161,7 @@ void updateSharedXInput(const fnvxr::PoseFrame& pose)
     g_xinputState->rightThumbX = (dpadMode || suppressMenuAnalog) ? 0 : thumbValue(pose.rightThumbstickX);
     g_xinputState->rightThumbY = (dpadMode || suppressMenuAnalog) ? 0 : thumbValue(pose.rightThumbstickY);
     g_xinputState->packet++;
+    fnvxr::shared::endSequencedSharedWrite(g_xinputState->sequence);
 }
 
 void updateSharedDInput(const fnvxr::PoseFrame& pose)
@@ -1948,6 +2172,19 @@ void updateSharedDInput(const fnvxr::PoseFrame& pose)
         return;
 
     const bool uiInputAllowed = allowUiInput();
+    const bool gameplayControlsActive = !uiInputAllowed;
+    const float aimThreshold = std::clamp(getFloatFromEnv("FNVXR_HEADSPACE_LOOK_AIM_TRIGGER", 0.35f), 0.0f, 1.0f);
+    UInt32 gameplayFlags = 0;
+    if (gameplayControlsActive && pose.leftTrigger >= aimThreshold)
+        gameplayFlags |= fnvxr::shared::DInputGameplayFlagAimHeld;
+    if (gameplayControlsActive && playerCombatWeaponReady())
+        gameplayFlags |= fnvxr::shared::DInputGameplayFlagWeaponOut;
+    if (gameplayControlsActive && currentWeaponClassMeleeOrUnarmed())
+        gameplayFlags |= fnvxr::shared::DInputGameplayFlagMeleeOrUnarmed;
+    if (gameplayControlsActive && (pose.buttons & fnvxr::LeftThumbstick) != 0)
+        gameplayFlags |= fnvxr::shared::DInputGameplayFlagThirdPersonZoomHeld;
+    if (!fnvxr::shared::beginSequencedSharedWrite(g_dinputState->sequence))
+        return;
     g_dinputState->magic = DInputSharedMagic;
     g_dinputState->version = DInputSharedVersion;
     g_dinputState->frame = static_cast<UInt32>(pose.frame);
@@ -1967,29 +2204,25 @@ void updateSharedDInput(const fnvxr::PoseFrame& pose)
     g_dinputState->leftGrip = sharedStickValue(std::clamp(pose.leftGrip, 0.0f, 1.0f));
     g_dinputState->rightGrip = sharedStickValue(std::clamp(pose.rightGrip, 0.0f, 1.0f));
     g_dinputState->aimTrigger = triggerValue(pose.leftTrigger);
-    const float aimThreshold = std::clamp(getFloatFromEnv("FNVXR_HEADSPACE_LOOK_AIM_TRIGGER", 0.35f), 0.0f, 1.0f);
-    UInt32 gameplayFlags = 0;
-    if (g_dinputState->gameplayControlsActive && pose.leftTrigger >= aimThreshold)
-        gameplayFlags |= fnvxr::shared::DInputGameplayFlagAimHeld;
-    if (g_dinputState->gameplayControlsActive && playerCombatWeaponReady())
-        gameplayFlags |= fnvxr::shared::DInputGameplayFlagWeaponOut;
-    if (g_dinputState->gameplayControlsActive && currentWeaponClassMeleeOrUnarmed())
-        gameplayFlags |= fnvxr::shared::DInputGameplayFlagMeleeOrUnarmed;
-    if (g_dinputState->gameplayControlsActive && (pose.buttons & fnvxr::LeftThumbstick) != 0)
-        gameplayFlags |= fnvxr::shared::DInputGameplayFlagThirdPersonZoomHeld;
     g_dinputState->gameplayFlags = gameplayFlags;
     g_dinputState->clientX = g_lastMenuPointerClient.x;
     g_dinputState->clientY = g_lastMenuPointerClient.y;
+    fnvxr::shared::endSequencedSharedWrite(g_dinputState->sequence);
 }
 
 void publishDInputMouseClick()
 {
     if (!g_dinputState)
         return;
+    if (retailSidecarProfile() && envEnabled("FNVXR_EXTERNAL_DINPUT_WRITER", true))
+        return;
 
+    if (!fnvxr::shared::beginSequencedSharedWrite(g_dinputState->sequence))
+        return;
     g_dinputState->mouseClickPacket++;
     g_lastPublishedDInputMouseClickPacket = g_dinputState->mouseClickPacket;
     g_lastConsumedDInputMouseClickPacket = g_dinputState->mouseClickPacket;
+    fnvxr::shared::endSequencedSharedWrite(g_dinputState->sequence);
 }
 
 BufferedKeyTapFn resolveBufferedKeyTap()
@@ -2080,12 +2313,23 @@ bool tapDirectInputKey(UInt32 keycode)
         published = publishInputEvent(fnvxr::shared::InputEventTypeKeyTap, keycode);
     }
 
+    // The shared input queue and the in-process DI hook are alternative
+    // delivery lanes. Publishing to both turns one buffered tap into two.
+    if (published)
+        return true;
+
+    // Return has a dedicated atomic fallback mailbox consumed by the retail
+    // DirectInput proxy. Once that lane is selected, do not also tap the
+    // in-process hook or the same accept action can arrive twice.
+    if (g_dinputState && keycode == DIK_RETURN)
+    {
+        InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_dinputState->keyboardAcceptPacket));
+        return true;
+    }
     if (!g_directInputHook)
-        return published;
+        return false;
 
     g_directInputHook->keys[keycode].tap = true;
-    if (g_dinputState && keycode == DIK_RETURN)
-        g_dinputState->keyboardAcceptPacket++;
     if (envEnabled("FNVXR_BUFFERED_DIRECTINPUT", true))
     {
         DirectInputDeviceObjectData data {};
@@ -2154,15 +2398,66 @@ bool isPipboyVisible()
         || menuVisibleWithTile(kMenuTypeMap);
 }
 
+UInt32 visibleGenericBlockingMenuType()
+{
+    for (UInt32 menuType = kMenuTypeMin; menuType <= kMenuTypeMax; ++menuType)
+    {
+        switch (menuType)
+        {
+            case kMenuTypeInventory:
+            case kMenuTypeStats:
+            case kMenuTypeHUDMain:
+            case kMenuTypeLoading:
+            case kMenuTypeDialog:
+            case kMenuTypeStart:
+            case kMenuTypeMap:
+            case kMenuTypeRaceSex:
+            case kMenuTypeVats:
+                continue;
+            default:
+                break;
+        }
+        if (menuVisibleWithTile(menuType))
+            return menuType;
+    }
+    return 0;
+}
+
+UInt32 activeInterfaceMenuType()
+{
+    void* interfaceManager = readPointer(InterfaceManagerAddress);
+    void* activeMenu = interfaceManager
+        ? readPointer(reinterpret_cast<std::uintptr_t>(interfaceManager) + 0x0D0)
+        : nullptr;
+    if (!activeMenu)
+        return 0;
+
+    const UInt32 menuType = readUInt32(reinterpret_cast<std::uintptr_t>(activeMenu) + 0x20);
+    // The HUD may remain the active interface object during ordinary gameplay.
+    return menuType == kMenuTypeHUDMain ? 0u : menuType;
+}
+
+bool explicitlyClassifiedMenuType(UInt32 menuType)
+{
+    switch (menuType)
+    {
+        case kMenuTypeInventory:
+        case kMenuTypeStats:
+        case kMenuTypeLoading:
+        case kMenuTypeDialog:
+        case kMenuTypeStart:
+        case kMenuTypeMap:
+        case kMenuTypeRaceSex:
+        case kMenuTypeVats:
+            return true;
+        default:
+            return false;
+    }
+}
+
 bool allowUiInput()
 {
-    const bool interactiveUi =
-        menuVisibleWithTile(kMenuTypeStart)
-        || menuVisibleWithTile(kMenuTypeRaceSex)
-        || isPipboyVisible()
-        || isMenuVisible(kMenuTypeDialog)
-        || isMenuVisible(kMenuTypeVats);
-    return interactiveUi;
+    return fnvxr::shared::runtimeUiInputAllowed(currentMenuBits());
 }
 
 UInt32 currentMenuBits()
@@ -2174,21 +2469,43 @@ UInt32 currentMenuBits()
     constexpr UInt32 vatsBit = 1u << 4;
     constexpr UInt32 loadingBit = 1u << 5;
     const bool menuMode = isMenuMode();
-    const bool startVisible = menuVisibleWithTile(kMenuTypeStart);
-    const bool raceSexVisible = menuVisibleWithTile(kMenuTypeRaceSex);
+    const UInt32 activeMenuType = activeInterfaceMenuType();
+    const bool startVisible = menuVisibleWithTile(kMenuTypeStart) || activeMenuType == kMenuTypeStart;
+    const bool raceSexVisible = menuVisibleWithTile(kMenuTypeRaceSex) || activeMenuType == kMenuTypeRaceSex;
     // The visibility byte is authoritative during the dialogue camera
     // transition; the TileMenu pointer may lag it by a frame.
-    const bool dialogVisible = isMenuVisible(kMenuTypeDialog);
-    const bool vatsVisible = isMenuVisible(kMenuTypeVats);
-    const bool loadingVisible = menuVisibleWithTile(kMenuTypeLoading);
-    const bool pipboyVisible = isPipboyVisible();
+    const bool dialogVisible = isMenuVisible(kMenuTypeDialog) || activeMenuType == kMenuTypeDialog;
+    const bool vatsVisible = isMenuVisible(kMenuTypeVats) || activeMenuType == kMenuTypeVats;
+    const bool loadingVisible = menuVisibleWithTile(kMenuTypeLoading) || activeMenuType == kMenuTypeLoading;
+    const bool pipboyVisible = isPipboyVisible()
+        || activeMenuType == kMenuTypeInventory
+        || activeMenuType == kMenuTypeStats
+        || activeMenuType == kMenuTypeMap;
+    const UInt32 visibleGenericMenuType = visibleGenericBlockingMenuType();
+    const UInt32 genericMenuType = visibleGenericMenuType != 0
+        ? visibleGenericMenuType
+        : (activeMenuType != 0 && !explicitlyClassifiedMenuType(activeMenuType) ? activeMenuType : 0u);
+    static UInt32 lastGenericMenuType = 0xffffffffu;
+    static UInt32 lastActiveMenuType = 0xffffffffu;
+    if (genericMenuType != lastGenericMenuType || activeMenuType != lastActiveMenuType)
+    {
+        lastGenericMenuType = genericMenuType;
+        lastActiveMenuType = activeMenuType;
+        logTelemetry(
+            "genericMenu type=0x%03lx activeType=0x%03lx visible=%d menuMode=%d\n",
+            static_cast<unsigned long>(genericMenuType),
+            static_cast<unsigned long>(activeMenuType),
+            genericMenuType != 0 ? 1 : 0,
+            menuMode ? 1 : 0);
+    }
     return (menuMode ? menuModeBit : 0)
         | (startVisible ? startBit : 0)
         | (raceSexVisible ? raceSexBit : 0)
         | (dialogVisible ? dialogBit : 0)
         | (vatsVisible ? vatsBit : 0)
         | (loadingVisible ? loadingBit : 0)
-        | (pipboyVisible ? 1u << 6 : 0);
+        | (pipboyVisible ? fnvxr::shared::RuntimePipBoyMenuBit : 0)
+        | (genericMenuType != 0 ? fnvxr::shared::RuntimeGenericMenuBit : 0);
 }
 
 RuntimePhase runtimePhaseFromMenuBits(UInt32 menuBits)
@@ -2202,15 +2519,7 @@ RuntimePhase runtimePhaseFromMenuBits(UInt32 menuBits)
 
 bool uiInputAllowedFromMenuBits(UInt32 menuBits)
 {
-    constexpr UInt32 menuModeBit = 1u << 0;
-    constexpr UInt32 startBit = 1u << 1;
-    constexpr UInt32 raceSexBit = 1u << 2;
-    constexpr UInt32 dialogBit = 1u << 3;
-    constexpr UInt32 vatsBit = 1u << 4;
-    constexpr UInt32 pipboyBit = 1u << 6;
-    constexpr UInt32 interactiveUiBits = menuModeBit | startBit | raceSexBit | dialogBit | vatsBit | pipboyBit;
-    return (menuBits & interactiveUiBits) != 0
-        && (menuBits & ~menuModeBit) != 0;
+    return fnvxr::shared::runtimeUiInputAllowed(menuBits);
 }
 
 bool pipBoyVisibleFromMenuBits(UInt32 menuBits)
@@ -2378,18 +2687,15 @@ bool externalDInputSharedReady();
 
 bool cameraAllowedForMenuBits(UInt32 menuBits)
 {
-    constexpr UInt32 startBit = 1u << 1;
     constexpr UInt32 raceSexBit = 1u << 2;
     constexpr UInt32 dialogBit = 1u << 3;
     constexpr UInt32 vatsBit = 1u << 4;
     constexpr UInt32 loadingBit = 1u << 5;
-    constexpr UInt32 pipboyBit = 1u << 6;
-    constexpr UInt32 blockingMenuBits = startBit | raceSexBit | dialogBit | vatsBit | loadingBit | pipboyBit;
 
     if (g_showroomActive && envEnabled("FNVXR_SHOWROOM_CAMERA_DURING_UI", true))
         return (menuBits & (raceSexBit | dialogBit | vatsBit | loadingBit)) == 0;
 
-    return (menuBits & blockingMenuBits) == 0;
+    return (menuBits & fnvxr::shared::RuntimeBlockingMenuBits) == 0;
 }
 
 bool directUiClickEnabled()
@@ -2412,7 +2718,7 @@ bool inCameraGameplay()
             && !isMenuVisible(kMenuTypeVats);
     }
 
-    return !(envEnabled("FNVXR_MENU_MODE_BLOCKS_CAMERA", false) && isMenuMode())
+    return visibleGenericBlockingMenuType() == 0
         && !menuVisibleWithTile(kMenuTypeStart)
         && !menuVisibleWithTile(kMenuTypeRaceSex)
         && !menuVisibleWithTile(kMenuTypeLoading)
@@ -2807,8 +3113,9 @@ int externalUiMapZoomDirection(const SharedXInputState& state)
 
     const int deadzone = (std::max)(1000, getIntFromEnv("FNVXR_UI_MAP_ZOOM_STICK_DEADZONE", 16000));
     int rightStickY = state.rightThumbY;
-    if (externalDInputSharedReady())
-        rightStickY = g_dinputState->rightStickY;
+    SharedDInputState dinput {};
+    if (readSharedDInputSnapshot(dinput))
+        rightStickY = dinput.rightStickY;
     if (rightStickY > deadzone)
         return 1;
     if (rightStickY < -deadzone)
@@ -3139,24 +3446,30 @@ void updateSharedPlayer(UInt64 frame, RuntimePhase phase)
 
 void updateNiAvObjectTransform(void* object)
 {
-    if (!object)
+    // Runtime evidence from the retail NiCamera path shows this vtable slot
+    // requires an additional stack argument. Calling it as void(this) corrupts
+    // the call frame, so this old diagnostic switch is permanently fail-closed
+    // until an exact signature/call-site contract is proven.
+    static LONG logged = 0;
+    if (object && InterlockedIncrement(&logged) == 1)
+        logTelemetry("camera UpdateTransform refused object=%p reason=unverified-vtable-signature\n", object);
+}
+
+void restoreVrPoseFromGameCamera()
+{
+    if (!g_haveCameraBase || !g_cameraBaseObject || g_lastAppliedCamera != g_cameraBaseObject)
         return;
 
-    __try
-    {
-        void** vtable = *reinterpret_cast<void***>(object);
-        if (!vtable)
-            return;
+    const auto base = reinterpret_cast<std::uintptr_t>(g_cameraBaseObject);
+    writeMatrix33(base + NiAvObjectLocalRotationOffset, g_cameraBaseLocalRotation);
+    writeVec3(base + NiAvObjectLocalTranslationOffset, g_cameraBaseLocalTranslation);
+    if (envEnabled("FNVXR_CAMERA_WRITE_WORLD", false))
+        writeMatrix33(base + NiAvObjectWorldRotationOffset, g_cameraBaseWorldRotation);
 
-        using UpdateTransformFn = void (__thiscall*)(void*);
-        auto updateTransform = reinterpret_cast<UpdateTransformFn>(vtable[0xB8 / 4]);
-        if (updateTransform)
-            updateTransform(object);
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
-        logTelemetry("camera UpdateTransform exception object=%p\n", object);
-    }
+    // The engine must always begin UpdateCamera from its own unmodified result.
+    // Otherwise the previous HMD delta becomes input to the next update and can
+    // leak head motion into the player/body frame or accumulate drift.
+    g_lastAppliedCamera = nullptr;
 }
 
 void applyVrPoseToGameCamera()
@@ -3180,16 +3493,17 @@ void applyVrPoseToGameCamera()
         return;
 
     const auto base = reinterpret_cast<std::uintptr_t>(camera);
-    if (!g_haveCameraBase
-        || g_cameraBaseObject != camera
-        || envEnabled("FNVXR_CAMERA_RESET_BASE", false))
+    const bool baseChanged = !g_haveCameraBase || g_cameraBaseObject != camera;
+    g_cameraBaseObject = camera;
+    // Capture the fresh engine-authored camera after UpdateCamera on every
+    // invocation. hookedUpdateCamera restores the previous unmodified base
+    // before calling the engine, keeping HMD motion camera-local.
+    g_cameraBaseLocalRotation = readMatrix33(base + NiAvObjectLocalRotationOffset);
+    g_cameraBaseLocalTranslation = readVec3(base + NiAvObjectLocalTranslationOffset);
+    g_cameraBaseWorldRotation = readMatrix33(base + NiAvObjectWorldRotationOffset);
+    g_haveCameraBase = true;
+    if (baseChanged || envEnabled("FNVXR_CAMERA_RESET_BASE", false))
     {
-        g_cameraBaseObject = camera;
-        g_cameraBaseLocalRotation = readMatrix33(base + NiAvObjectLocalRotationOffset);
-        g_cameraBaseLocalTranslation = readVec3(base + NiAvObjectLocalTranslationOffset);
-        g_cameraBaseWorldRotation = readMatrix33(base + NiAvObjectWorldRotationOffset);
-        g_haveCameraBase = true;
-        g_lastAppliedCamera = nullptr;
         g_lastAppliedCameraPoseSequence = 0;
         logTelemetry(
             "cameraHook base latched seq=%ld camera=%p localT=(%.4f %.4f %.4f)\n",
@@ -3233,9 +3547,6 @@ void applyVrPoseToGameCamera()
         }
         return;
     }
-    if (camera == g_lastAppliedCamera && g_lastCameraPoseSequence == g_lastAppliedCameraPoseSequence)
-        return;
-
     Matrix33 gameRotationDelta = xrDeltaToGamebryoMatrix(xrRotationDelta);
     const bool yawOnly = envEnabled("FNVXR_CAMERA_YAW_ONLY", false);
     if (yawOnly)
@@ -3320,6 +3631,8 @@ using UpdateCameraFn = void (__thiscall*)(void*, UInt8, UInt8);
 
 void __fastcall hookedUpdateCamera(void* player, void*, UInt8 isCalledFromFunc21, UInt8 zeroSkipUpdateLod)
 {
+    restoreVrPoseFromGameCamera();
+
     auto original = reinterpret_cast<UpdateCameraFn>(g_updateCameraTrampoline);
     if (original)
         original(player, isCalledFromFunc21, zeroSkipUpdateLod);
@@ -3453,9 +3766,42 @@ float lengthVec3(Vec3 value)
     return std::sqrt(dotVec3(value, value));
 }
 
+float quaternionAngularDistance(Quat left, Quat right)
+{
+    left = normalizeQuat(left);
+    right = normalizeQuat(right);
+    const float dot = std::clamp(
+        std::fabs(left.x * right.x + left.y * right.y + left.z * right.z + left.w * right.w),
+        0.0f,
+        1.0f);
+    return 2.0f * std::acos(dot);
+}
+
+float matrixAngularDistance(const Matrix33& left, const Matrix33& right)
+{
+    const Matrix33 delta = multiplyMatrix33(transposeMatrix33(left), right);
+    const float cosine = std::clamp(
+        (delta.m[0][0] + delta.m[1][1] + delta.m[2][2] - 1.0f) * 0.5f,
+        -1.0f,
+        1.0f);
+    return std::acos(cosine);
+}
+
 bool finiteVec3(Vec3 value)
 {
     return std::isfinite(value.x) && std::isfinite(value.y) && std::isfinite(value.z);
+}
+
+bool finiteUsableQuat(Quat value)
+{
+    if (!std::isfinite(value.x) || !std::isfinite(value.y)
+        || !std::isfinite(value.z) || !std::isfinite(value.w))
+    {
+        return false;
+    }
+    const float lengthSquared = value.x * value.x + value.y * value.y
+        + value.z * value.z + value.w * value.w;
+    return lengthSquared >= 0.25f && lengthSquared <= 4.0f;
 }
 
 bool finiteMatrix33(const Matrix33& matrix)
@@ -3760,7 +4106,10 @@ bool readLatestRetailRigPose(VrRigPoseSnapshot& pose)
         {
             pose.sequence = sequenceBefore;
             pose.frame = g_vrPoseState->frame;
+            pose.predictedDisplayTime = g_vrPoseState->predictedDisplayTime;
             pose.trackingFlags = g_vrPoseState->trackingFlags;
+            pose.referenceSpaceGeneration = g_vrPoseState->referenceSpaceGeneration;
+            pose.producerEpoch = g_vrPoseState->producerEpoch;
             pose.hmdRot = normalizeQuat({
                 g_vrPoseState->hmdRot[0], g_vrPoseState->hmdRot[1],
                 g_vrPoseState->hmdRot[2], g_vrPoseState->hmdRot[3] });
@@ -3776,6 +4125,16 @@ bool readLatestRetailRigPose(VrRigPoseSnapshot& pose)
                 g_vrPoseState->rightRot[2], g_vrPoseState->rightRot[3] });
             pose.rightPos = {
                 g_vrPoseState->rightPos[0], g_vrPoseState->rightPos[1], g_vrPoseState->rightPos[2] };
+            pose.leftAimRot = normalizeQuat({
+                g_vrPoseState->leftAimRot[0], g_vrPoseState->leftAimRot[1],
+                g_vrPoseState->leftAimRot[2], g_vrPoseState->leftAimRot[3] });
+            pose.leftAimPos = {
+                g_vrPoseState->leftAimPos[0], g_vrPoseState->leftAimPos[1], g_vrPoseState->leftAimPos[2] };
+            pose.rightAimRot = normalizeQuat({
+                g_vrPoseState->rightAimRot[0], g_vrPoseState->rightAimRot[1],
+                g_vrPoseState->rightAimRot[2], g_vrPoseState->rightAimRot[3] });
+            pose.rightAimPos = {
+                g_vrPoseState->rightAimPos[0], g_vrPoseState->rightAimPos[1], g_vrPoseState->rightAimPos[2] };
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
@@ -3784,9 +4143,18 @@ bool readLatestRetailRigPose(VrRigPoseSnapshot& pose)
         MemoryBarrier();
         if (sequenceBefore == g_vrPoseState->sequence
             && (g_vrPoseState->sequence & 1) == 0
+            && pose.referenceSpaceGeneration != 0
+            && pose.producerEpoch != 0
             && finiteVec3(pose.hmdPos)
             && finiteVec3(pose.leftPos)
-            && finiteVec3(pose.rightPos))
+            && finiteVec3(pose.rightPos)
+            && finiteVec3(pose.leftAimPos)
+            && finiteVec3(pose.rightAimPos)
+            && finiteUsableQuat(pose.hmdRot)
+            && finiteUsableQuat(pose.leftRot)
+            && finiteUsableQuat(pose.rightRot)
+            && finiteUsableQuat(pose.leftAimRot)
+            && finiteUsableQuat(pose.rightAimRot))
         {
             return true;
         }
@@ -3794,49 +4162,212 @@ bool readLatestRetailRigPose(VrRigPoseSnapshot& pose)
     return false;
 }
 
-void captureRetailRigOrigin(const VrRigPoseSnapshot& pose)
+bool readAuthoritativeRetailVrOrigin(SharedVrOriginState& origin)
 {
-    g_retailRigOriginHmdPos = pose.hmdPos;
-    const Matrix33 hmdRotation = matrixFromQuat(pose.hmdRot);
-    const Vec3 forward {
-        -hmdRotation.m[0][2],
-        -hmdRotation.m[1][2],
-        -hmdRotation.m[2][2]
+    if (!g_vrOriginState)
+    {
+        g_vrOriginMapping = OpenFileMappingA(
+            FILE_MAP_READ,
+            FALSE,
+            fnvxr::shared::VrOriginSharedMappingName);
+        if (!g_vrOriginMapping)
+            return false;
+        g_vrOriginState = static_cast<SharedVrOriginState*>(MapViewOfFile(
+            g_vrOriginMapping,
+            FILE_MAP_READ,
+            0,
+            0,
+            sizeof(SharedVrOriginState)));
+        if (!g_vrOriginState)
+        {
+            CloseHandle(g_vrOriginMapping);
+            g_vrOriginMapping = nullptr;
+            return false;
+        }
+        logTelemetry("retailRig authoritative VR origin mapped state=%p\n", g_vrOriginState);
+    }
+
+    for (int attempt = 0; attempt < 4; ++attempt)
+    {
+        const LONG sequenceBefore = g_vrOriginState->sequence;
+        if ((sequenceBefore & 1) != 0)
+            continue;
+        MemoryBarrier();
+        __try
+        {
+            std::memcpy(&origin, g_vrOriginState, sizeof(origin));
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            continue;
+        }
+        MemoryBarrier();
+        if (sequenceBefore == g_vrOriginState->sequence
+            && (g_vrOriginState->sequence & 1) == 0
+            && origin.magic == fnvxr::shared::VrOriginSharedMagic
+            && origin.version == fnvxr::shared::VrOriginSharedVersion
+            && origin.active != 0
+            && origin.generation != 0
+            && origin.poseSequence != 0
+            && origin.producerEpoch != 0
+            && origin.renderPoseSequence != 0
+            && origin.renderPoseFrame != 0
+            && origin.renderedDisplayTime != 0
+            && finiteUsableQuat({
+                origin.originRot[0],
+                origin.originRot[1],
+                origin.originRot[2],
+                origin.originRot[3] })
+            && finiteVec3({
+                origin.originPos[0],
+                origin.originPos[1],
+                origin.originPos[2] }))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool readCoherentRetailRigPoseAndOrigin(
+    VrRigPoseSnapshot& pose,
+    SharedVrOriginState& origin)
+{
+    SharedVrOriginState originBefore {};
+    SharedVrOriginState originAfter {};
+    if (!readAuthoritativeRetailVrOrigin(originBefore)
+        || !readLatestRetailRigPose(pose)
+        || !readAuthoritativeRetailVrOrigin(originAfter))
+    {
+        return false;
+    }
+
+    const std::uint32_t poseSequence = static_cast<std::uint32_t>(pose.sequence);
+    if (originBefore.sequence != originAfter.sequence
+        || originBefore.generation != originAfter.generation
+        || originBefore.poseSequence != originAfter.poseSequence
+        || originBefore.poseFrame != originAfter.poseFrame
+        || originBefore.renderPoseSequence != originAfter.renderPoseSequence
+        || originBefore.renderPoseFrame != originAfter.renderPoseFrame
+        || originBefore.renderedDisplayTime != originAfter.renderedDisplayTime
+        || pose.referenceSpaceGeneration != originBefore.generation
+        || pose.producerEpoch != originBefore.producerEpoch
+        || poseSequence != originBefore.renderPoseSequence
+        || pose.frame != originBefore.renderPoseFrame
+        || pose.predictedDisplayTime != originBefore.renderedDisplayTime)
+    {
+        return false;
+    }
+
+    origin = originBefore;
+    return true;
+}
+
+bool readPublishedRetailCameraWorld(Vec3& cameraWorld)
+{
+    if (!g_cameraState
+        || g_cameraState->magic != CameraSharedMagic
+        || g_cameraState->version != CameraSharedVersion)
+    {
+        return false;
+    }
+
+    for (int attempt = 0; attempt < 4; ++attempt)
+    {
+        const LONG sequenceBefore = g_cameraState->sequence;
+        if ((sequenceBefore & 1) != 0)
+            continue;
+        MemoryBarrier();
+        UInt32 active = 0;
+        __try
+        {
+            active = g_cameraState->active;
+            cameraWorld = {
+                g_cameraState->worldPos[0],
+                g_cameraState->worldPos[1],
+                g_cameraState->worldPos[2]
+            };
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            continue;
+        }
+        MemoryBarrier();
+        if (sequenceBefore == g_cameraState->sequence
+            && (g_cameraState->sequence & 1) == 0
+            && active != 0
+            && finiteVec3(cameraWorld))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool captureRetailRigOrigin(
+    const VrRigPoseSnapshot& pose,
+    const SharedVrOriginState& authoritativeOrigin,
+    void* bodyRoot,
+    const Matrix33& bodyWorldRotation,
+    Vec3 bodyWorldPosition,
+    Vec3 stableCameraWorld)
+{
+    if (!bodyRoot
+        || !finiteMatrix33(bodyWorldRotation)
+        || !finiteVec3(bodyWorldPosition)
+        || !finiteVec3(stableCameraWorld))
+    {
+        return false;
+    }
+
+    if (authoritativeOrigin.generation != pose.referenceSpaceGeneration
+        || authoritativeOrigin.producerEpoch != pose.producerEpoch
+        || static_cast<std::uint32_t>(pose.sequence) != authoritativeOrigin.renderPoseSequence
+        || pose.frame != authoritativeOrigin.renderPoseFrame)
+    {
+        return false;
+    }
+    g_retailRigOriginHmdRot = normalizeQuat({
+        authoritativeOrigin.originRot[0],
+        authoritativeOrigin.originRot[1],
+        authoritativeOrigin.originRot[2],
+        authoritativeOrigin.originRot[3]
+    });
+    g_retailRigOriginHmdPos = {
+        authoritativeOrigin.originPos[0],
+        authoritativeOrigin.originPos[1],
+        authoritativeOrigin.originPos[2]
     };
-    const float capturedYaw = std::atan2(-forward.x, -forward.z);
-    const float correctionYaw = -capturedYaw;
-    g_retailRigWorldYawCos = std::cos(correctionYaw);
-    g_retailRigWorldYawSin = std::sin(correctionYaw);
-    g_retailRigWorldYawHalfCos = std::cos(correctionYaw * 0.5f);
-    g_retailRigWorldYawHalfSin = std::sin(correctionYaw * 0.5f);
+    g_retailRigReferenceSpaceGeneration = authoritativeOrigin.generation;
+    g_retailRigProducerEpoch = authoritativeOrigin.producerEpoch;
+    g_retailRigOriginPoseSequence = authoritativeOrigin.poseSequence;
+    g_retailRigOriginAuthoritySequence = authoritativeOrigin.sequence;
+    g_retailRigOriginBodyRoot = bodyRoot;
+    g_retailRigBodyAnchorLocal = transformVec3(
+        transposeMatrix33(bodyWorldRotation),
+        subtractVec3(stableCameraWorld, bodyWorldPosition));
+    if (!finiteVec3(g_retailRigBodyAnchorLocal))
+        return false;
     g_haveRetailRigOrigin = true;
     logTelemetry(
-        "retailRig origin latched seq=%ld frame=%llu hmd=(%.4f %.4f %.4f) yawCorrection=%.4f\n",
+        "retailRig origin latched seq=%ld frame=%llu authorityPoseSeq=%lu authorityPoseFrame=%llu referenceGeneration=%lu hmdPos=(%.4f %.4f %.4f) yawOriginRot=(%.5f %.5f %.5f %.5f) bodyRoot=%p bodyAnchorLocal=(%.3f %.3f %.3f) anchorSource=published-engine-camera originSource=d3d9-native-camera gravityAlignedOrigin=1\n",
         pose.sequence,
         static_cast<unsigned long long>(pose.frame),
-        pose.hmdPos.x,
-        pose.hmdPos.y,
-        pose.hmdPos.z,
-        correctionYaw);
-}
-
-Vec3 rotateRetailRigWorldYaw(Vec3 xrVector)
-{
-    return {
-        g_retailRigWorldYawCos * xrVector.x - g_retailRigWorldYawSin * xrVector.z,
-        xrVector.y,
-        g_retailRigWorldYawSin * xrVector.x + g_retailRigWorldYawCos * xrVector.z
-    };
-}
-
-Quat correctRetailRigWorldYaw(Quat xrRotation)
-{
-    return normalizeQuat({
-        g_retailRigWorldYawHalfCos * xrRotation.x + g_retailRigWorldYawHalfSin * xrRotation.z,
-        g_retailRigWorldYawHalfCos * xrRotation.y + g_retailRigWorldYawHalfSin * xrRotation.w,
-        g_retailRigWorldYawHalfCos * xrRotation.z - g_retailRigWorldYawHalfSin * xrRotation.x,
-        g_retailRigWorldYawHalfCos * xrRotation.w - g_retailRigWorldYawHalfSin * xrRotation.y
-    });
+        static_cast<unsigned long>(authoritativeOrigin.poseSequence),
+        static_cast<unsigned long long>(authoritativeOrigin.poseFrame),
+        static_cast<unsigned long>(authoritativeOrigin.generation),
+        g_retailRigOriginHmdPos.x,
+        g_retailRigOriginHmdPos.y,
+        g_retailRigOriginHmdPos.z,
+        g_retailRigOriginHmdRot.x,
+        g_retailRigOriginHmdRot.y,
+        g_retailRigOriginHmdRot.z,
+        g_retailRigOriginHmdRot.w,
+        bodyRoot,
+        g_retailRigBodyAnchorLocal.x,
+        g_retailRigBodyAnchorLocal.y,
+        g_retailRigBodyAnchorLocal.z);
+    return true;
 }
 
 bool retailRigNodesComplete(const RetailRigNodes& rig)
@@ -3876,6 +4407,7 @@ bool discoverRetailRigNodes(void* root)
     g_retailRigNodes = discovered;
     g_retailLeftCalibration = {};
     g_retailRightCalibration = {};
+    g_retailWeaponCalibration = {};
     ++g_retailRigDiscoveryCount;
 
     logTelemetry(
@@ -3909,7 +4441,16 @@ void refreshRetailWeaponNodes()
 {
     if (!g_retailRigNodes.root)
         return;
+    void* previousWeapon = g_retailRigNodes.weapon;
     g_retailRigNodes.weapon = findNiNode(g_retailRigNodes.root, "Weapon");
+    if (g_retailRigNodes.weapon != previousWeapon)
+    {
+        g_retailWeaponCalibration = {};
+        logTelemetry(
+            "retailWeapon node changed previous=%p current=%p calibrationReset=1\n",
+            previousWeapon,
+            g_retailRigNodes.weapon);
+    }
     void* player = readPointer(PlayerCharacterAddress);
     void* process = player
         ? readPointer(reinterpret_cast<std::uintptr_t>(player) + MobileObjectBaseProcessOffset)
@@ -4016,33 +4557,61 @@ bool alignBoneToDirection(void* bone, void* child, Vec3 desiredDirection)
 struct RetailControllerWorldPose
 {
     Vec3 position {};
+    Vec3 originLocalMeters {};
+    Vec3 bodyLocalGameUnits {};
+    Quat originLocalWristRotation { 0.0f, 0.0f, 0.0f, 1.0f };
+    Quat originLocalRotation { 0.0f, 0.0f, 0.0f, 1.0f };
+    Matrix33 wristRotation {};
     Matrix33 rotation {};
+    bool usesAimOrientation {};
 };
 
 RetailControllerWorldPose retailControllerWorldPose(
     const VrRigPoseSnapshot& pose,
     bool left,
-    Vec3 cameraWorld,
+    Vec3 bodyAnchorWorld,
     const Matrix33& bodyWorldRotation)
 {
     const Vec3 controllerPosition = left ? pose.leftPos : pose.rightPos;
-    const Quat controllerRotation = left ? pose.leftRot : pose.rightRot;
-    Vec3 localMeters = rotateRetailRigWorldYaw(
-        subtractVec3(controllerPosition, g_retailRigOriginHmdPos));
+    const bool rightAimTracked = !left
+        && (pose.trackingFlags & fnvxr::shared::VrPoseTrackingRightAimActive) != 0
+        && (pose.trackingFlags & fnvxr::shared::VrPoseTrackingRightAimCurrent) != 0;
+    const Quat gripRotation = left ? pose.leftRot : pose.rightRot;
+    const Quat controllerRotation = left
+        ? pose.leftRot
+        : (rightAimTracked ? pose.rightAimRot : pose.rightRot);
+    const Vec3 localMeters = xrPositionInOriginFrame(
+        g_retailRigOriginHmdRot,
+        g_retailRigOriginHmdPos,
+        controllerPosition);
     Vec3 localGame = xrDeltaToGamebryoVector(localMeters);
     localGame.x *= getFloatFromEnv("FNVXR_D3D9_POSE_X_SIGN", 1.0f);
     localGame.y *= getFloatFromEnv("FNVXR_D3D9_POSE_Y_SIGN", 1.0f);
     localGame.z *= getFloatFromEnv("FNVXR_D3D9_POSE_Z_SIGN", 1.0f);
     const float unitsPerMeter = getFloatFromEnv("FNVXR_D3D9_GAME_UNITS_PER_METER", 39.3701f);
     const float positionScale = getFloatFromEnv("FNVXR_RETAIL_RIG_POSITION_SCALE", 1.0f);
+    const Quat recenteredGripRotation = multiplyQuat(
+        conjugateQuat(g_retailRigOriginHmdRot),
+        gripRotation);
+    const Quat recenteredControllerRotation = multiplyQuat(
+        conjugateQuat(g_retailRigOriginHmdRot),
+        controllerRotation);
 
     RetailControllerWorldPose result {};
+    result.originLocalMeters = localMeters;
+    result.bodyLocalGameUnits = scaleVec3(localGame, unitsPerMeter * positionScale);
+    result.originLocalWristRotation = recenteredGripRotation;
+    result.originLocalRotation = recenteredControllerRotation;
     result.position = addVec3(
-        cameraWorld,
-        transformVec3(bodyWorldRotation, scaleVec3(localGame, unitsPerMeter * positionScale)));
+        bodyAnchorWorld,
+        transformVec3(bodyWorldRotation, result.bodyLocalGameUnits));
+    result.wristRotation = multiplyMatrix33(
+        bodyWorldRotation,
+        xrDeltaToGamebryoMatrix(recenteredGripRotation));
     result.rotation = multiplyMatrix33(
         bodyWorldRotation,
-        xrDeltaToGamebryoMatrix(correctRetailRigWorldYaw(controllerRotation)));
+        xrDeltaToGamebryoMatrix(recenteredControllerRotation));
+    result.usesAimOrientation = rightAimTracked;
     return result;
 }
 
@@ -4065,19 +4634,23 @@ void ensureRetailHandCalibration(
     const RetailControllerWorldPose& controller,
     bool left)
 {
-    if (calibration.valid || !arm.hand)
+    if (calibration.valid)
         return;
+    if (!arm.hand)
+        return;
+    calibration = {};
     const auto handBase = reinterpret_cast<std::uintptr_t>(arm.hand);
     const Matrix33 handWorldRotation = readMatrix33(handBase + NiAvObjectWorldRotationOffset);
     const Vec3 handWorldPosition = readVec3(handBase + NiAvObjectWorldTranslationOffset);
     calibration.controllerToHandRotation = multiplyMatrix33(
-        transposeMatrix33(controller.rotation),
+        transposeMatrix33(controller.wristRotation),
         handWorldRotation);
+    calibration.usesAimOrientation = false;
     calibration.controllerToWristLocal = configuredControllerToWristOffset(left);
     if (envEnabled("FNVXR_RETAIL_RIG_AUTO_CALIBRATE_POSITION", false))
     {
         const Vec3 measured = transformVec3(
-            transposeMatrix33(controller.rotation),
+            transposeMatrix33(controller.wristRotation),
             subtractVec3(handWorldPosition, controller.position));
         const float maxOffset = getFloatFromEnv("FNVXR_RETAIL_RIG_MAX_AUTO_CALIBRATION_UNITS", 12.0f);
         if (lengthVec3(measured) <= maxOffset)
@@ -4086,9 +4659,10 @@ void ensureRetailHandCalibration(
     calibration.valid = finiteMatrix33(calibration.controllerToHandRotation)
         && finiteVec3(calibration.controllerToWristLocal);
     logTelemetry(
-        "retailRig calibration side=%s valid=%d wristLocal=(%.3f %.3f %.3f) autoPosition=%d\n",
+        "retailRig calibration side=%s valid=%d orientationSource=%s wristLocal=(%.3f %.3f %.3f) autoPosition=%d\n",
         left ? "left" : "right",
         calibration.valid ? 1 : 0,
+        calibration.usesAimOrientation ? "aim" : "grip",
         calibration.controllerToWristLocal.x,
         calibration.controllerToWristLocal.y,
         calibration.controllerToWristLocal.z,
@@ -4130,7 +4704,7 @@ bool applyRetailArmFabrik(
 
     const Vec3 target = addVec3(
         controller.position,
-        transformVec3(controller.rotation, calibration.controllerToWristLocal));
+        transformVec3(controller.wristRotation, calibration.controllerToWristLocal));
     const float poleOut = getFloatFromEnv("FNVXR_RETAIL_RIG_ELBOW_POLE_OUT", 20.0f) * (left ? -1.0f : 1.0f);
     const Vec3 poleLocal {
         poleOut,
@@ -4176,7 +4750,7 @@ bool applyRetailArmFabrik(
         ? readMatrix33(reinterpret_cast<std::uintptr_t>(handParent) + NiAvObjectWorldRotationOffset)
         : Matrix33 { { { 1.0f, 0.0f, 0.0f }, { 0.0f, 1.0f, 0.0f }, { 0.0f, 0.0f, 1.0f } } };
     const Matrix33 desiredHandWorldRotation = multiplyMatrix33(
-        controller.rotation,
+        controller.wristRotation,
         calibration.controllerToHandRotation);
     const Matrix33 desiredHandLocalRotation = multiplyMatrix33(
         transposeMatrix33(parentWorldRotation),
@@ -4192,6 +4766,83 @@ bool applyRetailArmFabrik(
         reinterpret_cast<std::uintptr_t>(arm.hand) + NiAvObjectWorldTranslationOffset);
     finalError = lengthVec3(subtractVec3(appliedWrist, target));
     return std::isfinite(finalError);
+}
+
+struct RetailWeaponApplyResult
+{
+    bool targetValid {};
+    bool writeRequested {};
+    bool writeAttempted {};
+    bool writeVerified {};
+    float angularResidualRadians {};
+    Matrix33 desiredWorldRotation {};
+    Matrix33 actualWorldRotation {};
+};
+
+RetailWeaponApplyResult applyRetailWeaponAim(
+    const RetailControllerWorldPose& controller,
+    bool applyWrites)
+{
+    RetailWeaponApplyResult result {};
+    void* weapon = g_retailRigNodes.weapon;
+    if (!weapon || !controller.usesAimOrientation || niObjectKind(weapon) == 0)
+        return result;
+
+    const auto weaponBase = reinterpret_cast<std::uintptr_t>(weapon);
+    const Matrix33 weaponWorldRotation = readMatrix33(weaponBase + NiAvObjectWorldRotationOffset);
+    if (!finiteMatrix33(weaponWorldRotation) || !finiteMatrix33(controller.rotation))
+        return result;
+
+    if (!g_retailWeaponCalibration.valid)
+    {
+        g_retailWeaponCalibration.controllerToWeaponRotation = multiplyMatrix33(
+            transposeMatrix33(controller.rotation),
+            weaponWorldRotation);
+        g_retailWeaponCalibration.valid = finiteMatrix33(
+            g_retailWeaponCalibration.controllerToWeaponRotation);
+        logTelemetry(
+            "retailWeapon calibration valid=%d source=right-aim weapon=%p\n",
+            g_retailWeaponCalibration.valid ? 1 : 0,
+            weapon);
+    }
+    if (!g_retailWeaponCalibration.valid)
+        return result;
+
+    const Matrix33 desiredWorldRotation = multiplyMatrix33(
+        controller.rotation,
+        g_retailWeaponCalibration.controllerToWeaponRotation);
+    void* parent = readPointer(weaponBase + NiAvObjectParentOffset);
+    if (!parent || !finiteMatrix33(desiredWorldRotation))
+        return result;
+    const Matrix33 parentWorldRotation = readMatrix33(
+        reinterpret_cast<std::uintptr_t>(parent) + NiAvObjectWorldRotationOffset);
+    if (!finiteMatrix33(parentWorldRotation))
+        return result;
+    const Matrix33 desiredLocalRotation = multiplyMatrix33(
+        transposeMatrix33(parentWorldRotation),
+        desiredWorldRotation);
+    if (!finiteMatrix33(desiredLocalRotation))
+        return result;
+
+    result.targetValid = true;
+    result.desiredWorldRotation = desiredWorldRotation;
+    result.writeRequested = applyWrites && envEnabled("FNVXR_RETAIL_WEAPON_APPLY", false);
+    if (result.writeRequested)
+    {
+        result.writeAttempted = true;
+        writeMatrix33(weaponBase + NiAvObjectLocalRotationOffset, desiredLocalRotation);
+        forwardKinematics(weapon);
+    }
+    result.actualWorldRotation = readMatrix33(weaponBase + NiAvObjectWorldRotationOffset);
+    result.angularResidualRadians = finiteMatrix33(result.actualWorldRotation)
+        ? matrixAngularDistance(result.desiredWorldRotation, result.actualWorldRotation)
+        : 3.14159265f;
+    result.writeVerified = result.writeRequested
+        && std::isfinite(result.angularResidualRadians)
+        && result.angularResidualRadians <= getFloatFromEnv(
+            "FNVXR_RETAIL_WEAPON_MAX_WRITE_RESIDUAL_RADIANS",
+            0.01f);
+    return result;
 }
 
 bool retailRigGameplayAllowed()
@@ -4212,11 +4863,18 @@ void resetRetailRigOrigin(const char* reason)
     if (g_haveRetailRigOrigin)
         logTelemetry("retailRig origin reset reason=%s\n", reason ? reason : "unknown");
     g_haveRetailRigOrigin = false;
-    g_retailRigWorldYawCos = 1.0f;
-    g_retailRigWorldYawSin = 0.0f;
-    g_retailRigWorldYawHalfCos = 1.0f;
-    g_retailRigWorldYawHalfSin = 0.0f;
+    g_retailRigOriginHmdRot = { 0.0f, 0.0f, 0.0f, 1.0f };
+    g_retailRigOriginHmdPos = {};
+    g_retailRigOriginBodyRoot = nullptr;
+    g_retailRigBodyAnchorLocal = {};
+    g_retailRigReferenceSpaceGeneration = 0;
+    g_retailRigProducerEpoch = 0;
+    g_retailRigOriginPoseSequence = 0;
+    g_retailRigOriginAuthoritySequence = 0;
     g_lastRetailRigPoseSequence = 0;
+    g_haveRetailRigMotionSample = false;
+    g_retailRigHeadOnlySamples = 0;
+    g_retailRigControllerOnlySamples = 0;
 }
 
 void onRetailPostAnimation(void* animData)
@@ -4244,22 +4902,38 @@ void onRetailPostAnimation(void* animData)
         return;
 
     VrRigPoseSnapshot pose {};
-    if (!readLatestRetailRigPose(pose))
+    SharedVrOriginState authoritativeOrigin {};
+    if (!readCoherentRetailRigPoseAndOrigin(pose, authoritativeOrigin))
+        return;
+    if (pose.referenceSpaceGeneration == 0)
+        return;
+    if (g_haveRetailRigOrigin
+        && (pose.referenceSpaceGeneration != g_retailRigReferenceSpaceGeneration
+            || pose.producerEpoch != g_retailRigProducerEpoch))
+    {
+        resetRetailRigOrigin("reference-space-generation-changed");
+    }
+    if (g_haveRetailRigOrigin
+        && (authoritativeOrigin.generation != g_retailRigReferenceSpaceGeneration
+            || authoritativeOrigin.producerEpoch != g_retailRigProducerEpoch
+            || authoritativeOrigin.poseSequence != g_retailRigOriginPoseSequence))
+    {
+        resetRetailRigOrigin("authoritative-origin-changed");
+    }
+    // The animation call site runs several times for one OpenXR frame. The
+    // first-person rig has one owner and is solved once per stable pose.
+    if (pose.sequence == g_lastRetailRigPoseSequence)
         return;
     if ((pose.trackingFlags & fnvxr::shared::VrPoseTrackingHmd) == 0)
         return;
     const bool leftControllerUsable =
         (pose.trackingFlags & fnvxr::shared::VrPoseTrackingLeftGripActive) != 0
-        && (g_retailLeftCalibration.valid
-            || (pose.trackingFlags & fnvxr::shared::VrPoseTrackingLeftGripCurrent) != 0);
+        && (pose.trackingFlags & fnvxr::shared::VrPoseTrackingLeftGripCurrent) != 0;
     const bool rightControllerUsable =
         (pose.trackingFlags & fnvxr::shared::VrPoseTrackingRightGripActive) != 0
-        && (g_retailRightCalibration.valid
-            || (pose.trackingFlags & fnvxr::shared::VrPoseTrackingRightGripCurrent) != 0);
+        && (pose.trackingFlags & fnvxr::shared::VrPoseTrackingRightGripCurrent) != 0;
     if (!leftControllerUsable && !rightControllerUsable)
         return;
-    if (!g_haveRetailRigOrigin)
-        captureRetailRigOrigin(pose);
 
     void* root = retrievePlayerRootNode(true);
     if (!root)
@@ -4273,20 +4947,58 @@ void onRetailPostAnimation(void* animData)
         refreshRetailWeaponNodes();
 
     void* bodyRoot = retrievePlayerRootNode(false);
-    void* camera = activeGameCameraObject();
-    if (!bodyRoot || !camera)
+    if (!bodyRoot)
         return;
     const Matrix33 bodyWorldRotation = readMatrix33(
         reinterpret_cast<std::uintptr_t>(bodyRoot) + NiAvObjectWorldRotationOffset);
-    const Vec3 cameraWorld = readVec3(
-        reinterpret_cast<std::uintptr_t>(camera) + NiAvObjectWorldTranslationOffset);
-    if (!finiteMatrix33(bodyWorldRotation) || !finiteVec3(cameraWorld))
+    const Vec3 bodyWorldPosition = readVec3(
+        reinterpret_cast<std::uintptr_t>(bodyRoot) + NiAvObjectWorldTranslationOffset);
+    Vec3 stableCameraWorld {};
+    if (!finiteMatrix33(bodyWorldRotation)
+        || !finiteVec3(bodyWorldPosition)
+        || !readPublishedRetailCameraWorld(stableCameraWorld))
+    {
+        static LONG loggedAnchorUnavailable = 0;
+        const LONG count = InterlockedIncrement(&loggedAnchorUnavailable);
+        if (count <= 12 || count % 300 == 0)
+        {
+            logTelemetry(
+                "retailRig skipped count=%ld reason=stable-body-anchor-unavailable bodyRoot=%p cameraShared=%p cameraActive=%lu\n",
+                count,
+                bodyRoot,
+                g_cameraState,
+                g_cameraState ? static_cast<unsigned long>(g_cameraState->active) : 0ul);
+        }
+        return;
+    }
+
+    if (g_haveRetailRigOrigin && g_retailRigOriginBodyRoot != bodyRoot)
+        resetRetailRigOrigin("body-root-changed");
+    if (!g_haveRetailRigOrigin
+        && !captureRetailRigOrigin(
+            pose,
+            authoritativeOrigin,
+            bodyRoot,
+            bodyWorldRotation,
+            bodyWorldPosition,
+            stableCameraWorld))
+    {
+        return;
+    }
+
+    // The hand/controller origin follows only the engine-authored body frame.
+    // It must never use the current render camera because that camera can
+    // already contain the HMD overlay during the Gamebryo render traversal.
+    const Vec3 bodyAnchorWorld = addVec3(
+        bodyWorldPosition,
+        transformVec3(bodyWorldRotation, g_retailRigBodyAnchorLocal));
+    if (!finiteVec3(bodyAnchorWorld))
         return;
 
     const RetailControllerWorldPose leftController = retailControllerWorldPose(
-        pose, true, cameraWorld, bodyWorldRotation);
+        pose, true, bodyAnchorWorld, bodyWorldRotation);
     const RetailControllerWorldPose rightController = retailControllerWorldPose(
-        pose, false, cameraWorld, bodyWorldRotation);
+        pose, false, bodyAnchorWorld, bodyWorldRotation);
     const bool applyWrites = envEnabled("FNVXR_RETAIL_RIG_APPLY", false);
     float leftError = 0.0f;
     float rightError = 0.0f;
@@ -4306,24 +5018,275 @@ void onRetailPostAnimation(void* animData)
         true,
         applyWrites,
         leftError);
+    const RetailWeaponApplyResult weaponResult = rightSolved
+        ? applyRetailWeaponAim(rightController, applyWrites)
+        : RetailWeaponApplyResult {};
+    const bool weaponAligned = weaponResult.writeVerified;
 
     g_lastRetailRigPoseSequence = pose.sequence;
     g_lastRetailRigAnimData = animData;
     ++g_retailRigSolveCount;
+
+    if (rightControllerUsable && g_retailRigNodes.right.hand)
+    {
+        const Vec3 headLocalMeters = xrPositionInOriginFrame(
+            g_retailRigOriginHmdRot,
+            g_retailRigOriginHmdPos,
+            pose.hmdPos);
+        const Quat headLocalRotation = multiplyQuat(
+            conjugateQuat(g_retailRigOriginHmdRot),
+            pose.hmdRot);
+        const Matrix33 inverseBodyRotation = transposeMatrix33(bodyWorldRotation);
+        const Vec3 rightHandWorld = readVec3(
+            reinterpret_cast<std::uintptr_t>(g_retailRigNodes.right.hand)
+                + NiAvObjectWorldTranslationOffset);
+        const Vec3 rightHandLocalUnits = transformVec3(
+            inverseBodyRotation,
+            subtractVec3(rightHandWorld, bodyAnchorWorld));
+        const Vec3 weaponWorld = g_retailRigNodes.weapon
+            ? readVec3(
+                reinterpret_cast<std::uintptr_t>(g_retailRigNodes.weapon)
+                    + NiAvObjectWorldTranslationOffset)
+            : Vec3 {};
+        const Matrix33 weaponWorldRotation = g_retailRigNodes.weapon
+            ? readMatrix33(
+                reinterpret_cast<std::uintptr_t>(g_retailRigNodes.weapon)
+                    + NiAvObjectWorldRotationOffset)
+            : Matrix33 {};
+        const UInt32 firstPersonRootFlags = readUInt32(
+            reinterpret_cast<std::uintptr_t>(g_retailRigNodes.root) + NiAvObjectFlagsOffset);
+        const UInt32 rightHandFlags = readUInt32(
+            reinterpret_cast<std::uintptr_t>(g_retailRigNodes.right.hand) + NiAvObjectFlagsOffset);
+        const UInt32 weaponFlags = g_retailRigNodes.weapon
+            ? readUInt32(
+                reinterpret_cast<std::uintptr_t>(g_retailRigNodes.weapon) + NiAvObjectFlagsOffset)
+            : 0xffffffffu;
+
+        Vec3 headPositionDeltaVector {};
+        Vec3 controllerPositionDeltaVector {};
+        Vec3 targetLocalDeltaVector {};
+        Vec3 handLocalDeltaVector {};
+        Vec3 weaponWorldDeltaVector {};
+        Vec3 bodyWorldDeltaVector {};
+        Vec3 bodyAnchorDeltaVector {};
+        Vec3 cameraWorldDeltaVector {};
+        float headPositionDeltaMeters = 0.0f;
+        float headAngularDeltaRadians = 0.0f;
+        float controllerPositionDeltaMeters = 0.0f;
+        float controllerAngularDeltaRadians = 0.0f;
+        float targetLocalDeltaUnits = 0.0f;
+        float handLocalDeltaUnits = 0.0f;
+        float weaponPositionDeltaUnits = 0.0f;
+        float weaponAngularDeltaRadians = 0.0f;
+        float bodyPositionDeltaUnits = 0.0f;
+        float bodyAnchorDeltaUnits = 0.0f;
+        float cameraPositionDeltaUnits = 0.0f;
+        if (g_haveRetailRigMotionSample)
+        {
+            headPositionDeltaVector = subtractVec3(
+                headLocalMeters,
+                g_previousRetailRigHeadLocalMeters);
+            headPositionDeltaMeters = lengthVec3(headPositionDeltaVector);
+            headAngularDeltaRadians = quaternionAngularDistance(
+                headLocalRotation,
+                g_previousRetailRigHeadLocalRotation);
+            controllerPositionDeltaVector = subtractVec3(
+                rightController.originLocalMeters,
+                g_previousRetailRigRightLocalMeters);
+            controllerPositionDeltaMeters = lengthVec3(controllerPositionDeltaVector);
+            controllerAngularDeltaRadians = quaternionAngularDistance(
+                rightController.originLocalRotation,
+                g_previousRetailRigRightLocalRotation);
+            targetLocalDeltaVector = subtractVec3(
+                rightController.bodyLocalGameUnits,
+                g_previousRetailRigRightTargetLocalUnits);
+            targetLocalDeltaUnits = lengthVec3(targetLocalDeltaVector);
+            handLocalDeltaVector = subtractVec3(
+                rightHandLocalUnits,
+                g_previousRetailRigRightHandLocalUnits);
+            handLocalDeltaUnits = lengthVec3(handLocalDeltaVector);
+            if (g_retailRigNodes.weapon)
+            {
+                weaponWorldDeltaVector = subtractVec3(
+                    weaponWorld,
+                    g_previousRetailRigWeaponWorld);
+                weaponPositionDeltaUnits = lengthVec3(weaponWorldDeltaVector);
+                weaponAngularDeltaRadians = matrixAngularDistance(
+                    g_previousRetailRigWeaponWorldRotation,
+                    weaponWorldRotation);
+            }
+            bodyWorldDeltaVector = subtractVec3(bodyWorldPosition, g_previousRetailRigBodyWorld);
+            bodyPositionDeltaUnits = lengthVec3(bodyWorldDeltaVector);
+            bodyAnchorDeltaVector = subtractVec3(bodyAnchorWorld, g_previousRetailRigBodyAnchorWorld);
+            bodyAnchorDeltaUnits = lengthVec3(bodyAnchorDeltaVector);
+            cameraWorldDeltaVector = subtractVec3(stableCameraWorld, g_previousRetailRigCameraWorld);
+            cameraPositionDeltaUnits = lengthVec3(cameraWorldDeltaVector);
+        }
+
+        const float positionMotionMeters = 0.005f;
+        const float angularMotionRadians = 0.03f;
+        const bool headMoved = headPositionDeltaMeters >= positionMotionMeters
+            || headAngularDeltaRadians >= angularMotionRadians;
+        const bool controllerMoved = controllerPositionDeltaMeters >= positionMotionMeters
+            || controllerAngularDeltaRadians >= angularMotionRadians;
+        const bool headOnly = g_haveRetailRigMotionSample && headMoved && !controllerMoved;
+        const bool controllerOnly = g_haveRetailRigMotionSample && controllerMoved && !headMoved;
+        if (headOnly)
+            ++g_retailRigHeadOnlySamples;
+        if (controllerOnly)
+            ++g_retailRigControllerOnlySamples;
+
+        if (g_retailRigSolveCount <= 24
+            || (g_retailRigSolveCount % 15) == 0
+            || headOnly
+            || controllerOnly)
+        {
+            logTelemetry(
+                "{\"event\":\"fnvxrRigIndependence\",\"solve\":%llu,\"poseFrame\":%llu,\"poseSeq\":%ld,"
+                "\"referenceGeneration\":%lu,\"originPoseSeq\":%lu,\"originAuthoritySeq\":%ld,"
+                "\"renderPoseSeq\":%lu,\"gravityAlignedOrigin\":true,\"originUpDotWorldUp\":%.8f,"
+                "\"originSource\":\"d3d9-native-camera\","
+                "\"anchorSource\":\"published-engine-camera\","
+                "\"cameraInput\":\"hmd-only\",\"rigInput\":\"controller-only\","
+                "\"apply\":%s,\"rightSolved\":%s,\"weaponAligned\":%s,"
+                "\"weaponWriteRequested\":%s,\"weaponWriteAttempted\":%s,\"weaponWriteApplied\":%s,"
+                "\"headLocalMeters\":[%.6f,%.6f,%.6f],"
+                "\"controllerLocalMeters\":[%.6f,%.6f,%.6f],"
+                "\"targetLocalUnits\":[%.5f,%.5f,%.5f],"
+                "\"handLocalUnits\":[%.5f,%.5f,%.5f],"
+                "\"bodyAnchorWorld\":[%.4f,%.4f,%.4f],"
+                "\"weaponWorld\":[%.4f,%.4f,%.4f],"
+                "\"delta\":{\"headMeters\":%.7f,\"headRadians\":%.7f,"
+                "\"controllerMeters\":%.7f,\"controllerRadians\":%.7f,"
+                "\"targetUnits\":%.6f,\"handUnits\":%.6f,\"weaponUnits\":%.6f,\"weaponRadians\":%.7f,"
+                "\"bodyUnits\":%.6f,\"bodyAnchorUnits\":%.6f,\"cameraUnits\":%.6f},"
+                "\"deltaVectors\":{\"headMeters\":[%.7f,%.7f,%.7f],"
+                "\"controllerMeters\":[%.7f,%.7f,%.7f],\"targetUnits\":[%.6f,%.6f,%.6f],"
+                "\"handUnits\":[%.6f,%.6f,%.6f],\"weaponUnits\":[%.6f,%.6f,%.6f],"
+                "\"bodyUnits\":[%.6f,%.6f,%.6f],\"cameraUnits\":[%.6f,%.6f,%.6f]},"
+                "\"classification\":{\"headMoved\":%s,\"controllerMoved\":%s,"
+                "\"headOnly\":%s,\"controllerOnly\":%s},"
+                "\"samples\":{\"headOnly\":%llu,\"controllerOnly\":%llu},"
+                "\"handTargetErrorUnits\":%.6f,\"weaponAngularResidualRadians\":%.7f,"
+                "\"culling\":{\"rootFlags\":%lu,\"rightHandFlags\":%lu,\"weaponFlags\":%lu,"
+                "\"rootAppCulled\":%s,\"rightHandAppCulled\":%s,\"weaponAppCulled\":%s},"
+                "\"headTermInRigTransform\":0}\n",
+                static_cast<unsigned long long>(g_retailRigSolveCount),
+                static_cast<unsigned long long>(pose.frame),
+                pose.sequence,
+                static_cast<unsigned long>(g_retailRigReferenceSpaceGeneration),
+                static_cast<unsigned long>(g_retailRigOriginPoseSequence),
+                g_retailRigOriginAuthoritySequence,
+                static_cast<unsigned long>(authoritativeOrigin.renderPoseSequence),
+                1.0f - 2.0f * (
+                    g_retailRigOriginHmdRot.x * g_retailRigOriginHmdRot.x
+                    + g_retailRigOriginHmdRot.z * g_retailRigOriginHmdRot.z),
+                applyWrites ? "true" : "false",
+                rightSolved ? "true" : "false",
+                weaponAligned ? "true" : "false",
+                weaponResult.writeRequested ? "true" : "false",
+                weaponResult.writeAttempted ? "true" : "false",
+                weaponResult.writeVerified ? "true" : "false",
+                headLocalMeters.x,
+                headLocalMeters.y,
+                headLocalMeters.z,
+                rightController.originLocalMeters.x,
+                rightController.originLocalMeters.y,
+                rightController.originLocalMeters.z,
+                rightController.bodyLocalGameUnits.x,
+                rightController.bodyLocalGameUnits.y,
+                rightController.bodyLocalGameUnits.z,
+                rightHandLocalUnits.x,
+                rightHandLocalUnits.y,
+                rightHandLocalUnits.z,
+                bodyAnchorWorld.x,
+                bodyAnchorWorld.y,
+                bodyAnchorWorld.z,
+                weaponWorld.x,
+                weaponWorld.y,
+                weaponWorld.z,
+                headPositionDeltaMeters,
+                headAngularDeltaRadians,
+                controllerPositionDeltaMeters,
+                controllerAngularDeltaRadians,
+                targetLocalDeltaUnits,
+                handLocalDeltaUnits,
+                weaponPositionDeltaUnits,
+                weaponAngularDeltaRadians,
+                bodyPositionDeltaUnits,
+                bodyAnchorDeltaUnits,
+                cameraPositionDeltaUnits,
+                headPositionDeltaVector.x,
+                headPositionDeltaVector.y,
+                headPositionDeltaVector.z,
+                controllerPositionDeltaVector.x,
+                controllerPositionDeltaVector.y,
+                controllerPositionDeltaVector.z,
+                targetLocalDeltaVector.x,
+                targetLocalDeltaVector.y,
+                targetLocalDeltaVector.z,
+                handLocalDeltaVector.x,
+                handLocalDeltaVector.y,
+                handLocalDeltaVector.z,
+                weaponWorldDeltaVector.x,
+                weaponWorldDeltaVector.y,
+                weaponWorldDeltaVector.z,
+                bodyWorldDeltaVector.x,
+                bodyWorldDeltaVector.y,
+                bodyWorldDeltaVector.z,
+                cameraWorldDeltaVector.x,
+                cameraWorldDeltaVector.y,
+                cameraWorldDeltaVector.z,
+                headMoved ? "true" : "false",
+                controllerMoved ? "true" : "false",
+                headOnly ? "true" : "false",
+                controllerOnly ? "true" : "false",
+                static_cast<unsigned long long>(g_retailRigHeadOnlySamples),
+                static_cast<unsigned long long>(g_retailRigControllerOnlySamples),
+                lengthVec3(subtractVec3(rightHandWorld, rightController.position)),
+                weaponResult.angularResidualRadians,
+                static_cast<unsigned long>(firstPersonRootFlags),
+                static_cast<unsigned long>(rightHandFlags),
+                static_cast<unsigned long>(weaponFlags),
+                (firstPersonRootFlags & 1u) != 0 ? "true" : "false",
+                (rightHandFlags & 1u) != 0 ? "true" : "false",
+                g_retailRigNodes.weapon && (weaponFlags & 1u) != 0 ? "true" : "false");
+        }
+
+        g_previousRetailRigHeadLocalMeters = headLocalMeters;
+        g_previousRetailRigHeadLocalRotation = headLocalRotation;
+        g_previousRetailRigRightLocalMeters = rightController.originLocalMeters;
+        g_previousRetailRigRightLocalRotation = rightController.originLocalRotation;
+        g_previousRetailRigRightTargetLocalUnits = rightController.bodyLocalGameUnits;
+        g_previousRetailRigRightHandLocalUnits = rightHandLocalUnits;
+        g_previousRetailRigWeaponWorld = weaponWorld;
+        g_previousRetailRigWeaponWorldRotation = weaponWorldRotation;
+        g_previousRetailRigBodyWorld = bodyWorldPosition;
+        g_previousRetailRigBodyAnchorWorld = bodyAnchorWorld;
+        g_previousRetailRigCameraWorld = stableCameraWorld;
+        g_haveRetailRigMotionSample = true;
+    }
+
     if (g_retailRigSolveCount <= 24 || (g_retailRigSolveCount % 120) == 0)
     {
         logTelemetry(
-            "retailRig solve count=%llu seq=%ld poseFrame=%llu tracking=0x%02lX anim=%p thirdAnim=%p root=%p apply=%d leftSolved=%d rightSolved=%d error=(%.3f %.3f) leftTarget=(%.3f %.3f %.3f) rightTarget=(%.3f %.3f %.3f)\n",
+            "retailRig solve count=%llu seq=%ld poseFrame=%llu tracking=0x%03lX rightAimCurrent=%d orientationSource=%s anim=%p thirdAnim=%p root=%p apply=%d leftSolved=%d rightSolved=%d weaponAligned=%d weaponApply=%d error=(%.3f %.3f) leftTarget=(%.3f %.3f %.3f) rightTarget=(%.3f %.3f %.3f) rightAimWorldR=[%.4f %.4f %.4f | %.4f %.4f %.4f | %.4f %.4f %.4f]\n",
             static_cast<unsigned long long>(g_retailRigSolveCount),
             pose.sequence,
             static_cast<unsigned long long>(pose.frame),
             static_cast<unsigned long>(pose.trackingFlags),
+            static_cast<int>(
+                (pose.trackingFlags & fnvxr::shared::VrPoseTrackingRightAimActive) != 0
+                && (pose.trackingFlags & fnvxr::shared::VrPoseTrackingRightAimCurrent) != 0),
+            rightController.usesAimOrientation ? "aim" : "grip",
             animData,
             thirdPersonAnimData,
             root,
             applyWrites ? 1 : 0,
             leftSolved ? 1 : 0,
             rightSolved ? 1 : 0,
+            weaponAligned ? 1 : 0,
+            envEnabled("FNVXR_RETAIL_WEAPON_APPLY", false) ? 1 : 0,
             leftError,
             rightError,
             leftController.position.x,
@@ -4331,7 +5294,16 @@ void onRetailPostAnimation(void* animData)
             leftController.position.z,
             rightController.position.x,
             rightController.position.y,
-            rightController.position.z);
+            rightController.position.z,
+            rightController.rotation.m[0][0],
+            rightController.rotation.m[0][1],
+            rightController.rotation.m[0][2],
+            rightController.rotation.m[1][0],
+            rightController.rotation.m[1][1],
+            rightController.rotation.m[1][2],
+            rightController.rotation.m[2][0],
+            rightController.rotation.m[2][1],
+            rightController.rotation.m[2][2]);
         logNiAvObjectTransform("retailRig.weapon", g_retailRigNodes.weapon);
         logNiAvObjectTransform("retailRig.projectile", g_retailRigNodes.projectileNode);
         logNiAvObjectTransform("retailRig.muzzleFlash", g_retailRigNodes.muzzleFlash);
@@ -5276,6 +6248,31 @@ bool holdDirectInputKey(UInt32 keycode, bool held)
     if (keycode >= MaxDirectInputMacros)
         return false;
 
+    if (g_publishedDirectInputHoldKnown[keycode]
+        && g_publishedDirectInputHoldState[keycode] == held)
+    {
+        return true;
+    }
+    if (!g_publishedDirectInputHoldKnown[keycode] && !held)
+    {
+        g_publishedDirectInputHoldKnown[keycode] = true;
+        g_publishedDirectInputHoldState[keycode] = false;
+        return true;
+    }
+    if (g_publishedDirectInputHoldViaHook[keycode])
+    {
+        if (!g_directInputHook)
+            return false;
+        g_directInputHook->keys[keycode].hold = held;
+        g_publishedDirectInputHoldState[keycode] = held;
+        g_publishedDirectInputHoldViaHook[keycode] = held;
+        return true;
+    }
+    const bool releasingQueuedHold =
+        g_publishedDirectInputHoldKnown[keycode]
+        && g_publishedDirectInputHoldState[keycode]
+        && !held;
+
     bool published = false;
     if (keycode >= MouseButtonOffset && keycode < MouseButtonOffset + 8)
     {
@@ -5290,10 +6287,22 @@ bool holdDirectInputKey(UInt32 keycode, bool held)
             keycode);
     }
 
+    if (published)
+    {
+        g_publishedDirectInputHoldKnown[keycode] = true;
+        g_publishedDirectInputHoldState[keycode] = held;
+        g_publishedDirectInputHoldViaHook[keycode] = false;
+        return true;
+    }
+    if (releasingQueuedHold)
+        return false;
     if (!g_directInputHook)
-        return published;
+        return false;
 
     g_directInputHook->keys[keycode].hold = held;
+    g_publishedDirectInputHoldKnown[keycode] = true;
+    g_publishedDirectInputHoldState[keycode] = held;
+    g_publishedDirectInputHoldViaHook[keycode] = held;
     return true;
 }
 
@@ -5677,8 +6686,14 @@ void publishGameplayMovementFlags()
         && g_xinputState->magic == XInputSharedMagic
         && g_xinputState->version == XInputSharedVersion)
     {
-        g_xinputState->reserved[fnvxr::shared::XInputReservedAutoRun] = g_gameplayAutoRunEnabled ? 1u : 0u;
-        g_xinputState->reserved[fnvxr::shared::XInputReservedMovementMode] = g_gameplayMovementMode;
+        // These bytes are plugin-owned status metadata; the input producer and
+        // its sequence guard intentionally do not mutate them after startup.
+        InterlockedExchange8(
+            reinterpret_cast<volatile char*>(&g_xinputState->reserved[fnvxr::shared::XInputReservedAutoRun]),
+            g_gameplayAutoRunEnabled ? 1 : 0);
+        InterlockedExchange8(
+            reinterpret_cast<volatile char*>(&g_xinputState->reserved[fnvxr::shared::XInputReservedMovementMode]),
+            static_cast<char>(g_gameplayMovementMode));
     }
 }
 
@@ -6667,14 +7682,11 @@ void processShowroomCarousel()
 
 void consumeExternalDInputBridge()
 {
-    if (!g_dinputState
-        || g_dinputState->magic != DInputSharedMagic
-        || g_dinputState->version != DInputSharedVersion)
-    {
+    SharedDInputState state {};
+    if (!readSharedDInputSnapshot(state))
         return;
-    }
 
-    const UInt32 packet = g_dinputState->mouseClickPacket;
+    const UInt32 packet = state.mouseClickPacket;
     if (packet == g_lastConsumedDInputMouseClickPacket)
         return;
 
@@ -6682,14 +7694,14 @@ void consumeExternalDInputBridge()
     if (packet == g_lastPublishedDInputMouseClickPacket)
         return;
 
-    const bool active = g_dinputState->pointerActive != 0;
+    const bool active = state.pointerActive != 0;
     g_hasMenuPointer = active;
-    g_lastMenuPointerClient.x = g_dinputState->clientX;
-    g_lastMenuPointerClient.y = g_dinputState->clientY;
+    g_lastMenuPointerClient.x = state.clientX;
+    g_lastMenuPointerClient.y = state.clientY;
     g_latestPointerX.store(g_lastMenuPointerClient.x);
     g_latestPointerY.store(g_lastMenuPointerClient.y);
     g_latestPointerValid.store(active);
-    g_latestPointerFrame.store(g_dinputState->frame);
+    g_latestPointerFrame.store(state.frame);
 
     if (g_loggedExternalDInputClicks < 24)
     {
@@ -6700,7 +7712,7 @@ void consumeExternalDInputBridge()
             static_cast<int>(active),
             g_lastMenuPointerClient.x,
             g_lastMenuPointerClient.y,
-            static_cast<unsigned long>(g_dinputState->frame),
+            static_cast<unsigned long>(state.frame),
             static_cast<int>(envEnabled("FNVXR_PLUGIN_ACCEPT_ON_EXTERNAL_DINPUT_CLICK", false)));
     }
 
@@ -6710,17 +7722,14 @@ void consumeExternalDInputBridge()
 
 void syncExternalDInputPointer()
 {
-    if (!g_dinputState
-        || g_dinputState->magic != DInputSharedMagic
-        || g_dinputState->version != DInputSharedVersion)
-    {
+    SharedDInputState state {};
+    if (!readSharedDInputSnapshot(state))
         return;
-    }
 
-    const bool active = g_dinputState->pointerActive != 0;
-    const UInt32 frame = g_dinputState->frame;
-    const LONG clientX = g_dinputState->clientX;
-    const LONG clientY = g_dinputState->clientY;
+    const bool active = state.pointerActive != 0;
+    const UInt32 frame = state.frame;
+    const LONG clientX = state.clientX;
+    const LONG clientY = state.clientY;
     if (active == g_lastExternalDInputPointerActive
         && frame == g_lastExternalDInputPointerFrame
         && clientX == g_lastExternalDInputPointerX
@@ -6784,16 +7793,17 @@ void syncExternalDInputPointer()
 UInt32 externalXInputNavMask(const SharedXInputState& state, UInt32 menuBits)
 {
     SharedXInputState navState = state;
-    if (externalDInputSharedReady())
+    SharedDInputState dinput {};
+    if (readSharedDInputSnapshot(dinput))
     {
         navState.leftThumbX = static_cast<std::int16_t>(
-            std::clamp(g_dinputState->leftStickX, static_cast<std::int32_t>(-32767), static_cast<std::int32_t>(32767)));
+            std::clamp(dinput.leftStickX, static_cast<std::int32_t>(-32767), static_cast<std::int32_t>(32767)));
         navState.leftThumbY = static_cast<std::int16_t>(
-            std::clamp(g_dinputState->leftStickY, static_cast<std::int32_t>(-32767), static_cast<std::int32_t>(32767)));
+            std::clamp(dinput.leftStickY, static_cast<std::int32_t>(-32767), static_cast<std::int32_t>(32767)));
         navState.rightThumbX = static_cast<std::int16_t>(
-            std::clamp(g_dinputState->rightStickX, static_cast<std::int32_t>(-32767), static_cast<std::int32_t>(32767)));
+            std::clamp(dinput.rightStickX, static_cast<std::int32_t>(-32767), static_cast<std::int32_t>(32767)));
         navState.rightThumbY = static_cast<std::int16_t>(
-            std::clamp(g_dinputState->rightStickY, static_cast<std::int32_t>(-32767), static_cast<std::int32_t>(32767)));
+            std::clamp(dinput.rightStickY, static_cast<std::int32_t>(-32767), static_cast<std::int32_t>(32767)));
     }
 
     UInt32 mask = 0;
@@ -7100,9 +8110,26 @@ bool tapCombatYKey(const char* source, UInt64 frame)
 
 bool externalDInputSharedReady()
 {
-    return g_dinputState
-        && g_dinputState->magic == DInputSharedMagic
-        && g_dinputState->version == DInputSharedVersion;
+    SharedDInputState snapshot {};
+    return readSharedDInputSnapshot(snapshot);
+}
+
+UInt32 externalDInputFrame()
+{
+    SharedDInputState snapshot {};
+    return readSharedDInputSnapshot(snapshot) ? snapshot.frame : 0u;
+}
+
+LONG externalDInputLeftGrip()
+{
+    SharedDInputState snapshot {};
+    return readSharedDInputSnapshot(snapshot) ? static_cast<LONG>(snapshot.leftGrip) : 0;
+}
+
+LONG externalDInputRightGrip()
+{
+    SharedDInputState snapshot {};
+    return readSharedDInputSnapshot(snapshot) ? static_cast<LONG>(snapshot.rightGrip) : 0;
 }
 
 bool externalLeftGripPipBoyHeld()
@@ -7111,7 +8138,7 @@ bool externalLeftGripPipBoyHeld()
         return false;
 
     const float threshold = std::clamp(getFloatFromEnv("FNVXR_PIPBOY_GRIP_THRESHOLD", 0.55f), 0.0f, 1.0f);
-    return g_dinputState->leftGrip > sharedStickValue(threshold);
+    return externalDInputLeftGrip() > sharedStickValue(threshold);
 }
 
 float rightGripMenuThreshold()
@@ -7125,7 +8152,7 @@ bool externalRightGripHeld()
     if (!externalDInputSharedReady())
         return false;
 
-    return g_dinputState->rightGrip > sharedStickValue(rightGripMenuThreshold());
+    return externalDInputRightGrip() > sharedStickValue(rightGripMenuThreshold());
 }
 
 bool externalRightGripMenuHeld()
@@ -7157,7 +8184,7 @@ void updateExternalPipBoyGripMode(bool held, bool& previousHeld)
             static_cast<unsigned long>(menuBits),
             static_cast<int>(pipBoyVisible),
             static_cast<int>(tappedTab),
-            externalDInputSharedReady() ? static_cast<LONG>(g_dinputState->leftGrip) : 0,
+            externalDInputLeftGrip(),
             getFloatFromEnv("FNVXR_PIPBOY_GRIP_THRESHOLD", 0.55f));
     }
     else
@@ -7167,7 +8194,7 @@ void updateExternalPipBoyGripMode(bool held, bool& previousHeld)
             static_cast<unsigned long>(menuBits),
             static_cast<int>(pipBoyVisible),
             static_cast<int>(tappedTab),
-            externalDInputSharedReady() ? static_cast<LONG>(g_dinputState->leftGrip) : 0,
+            externalDInputLeftGrip(),
             getFloatFromEnv("FNVXR_PIPBOY_GRIP_THRESHOLD", 0.55f));
     }
 
@@ -7200,7 +8227,7 @@ void updateExternalRightGripMenuMode(bool held, bool& previousHeld)
             static_cast<int>(startMenuVisible),
             static_cast<int>(otherUiVisible),
             static_cast<int>(tappedEscape),
-            externalDInputSharedReady() ? static_cast<LONG>(g_dinputState->rightGrip) : 0,
+            externalDInputRightGrip(),
             rightGripMenuThreshold());
     }
     else
@@ -7211,7 +8238,7 @@ void updateExternalRightGripMenuMode(bool held, bool& previousHeld)
             static_cast<int>(startMenuVisible),
             static_cast<int>(otherUiVisible),
             static_cast<int>(tappedEscape),
-            externalDInputSharedReady() ? static_cast<LONG>(g_dinputState->rightGrip) : 0,
+            externalDInputRightGrip(),
             rightGripMenuThreshold());
     }
 
@@ -7231,7 +8258,7 @@ void consumeExternalXInputGameplayControls(
     static bool previousThirdPersonChordHeld = false;
     static bool previousVatsChordHeld = false;
     static PrimaryAttackState primaryAttackState {};
-    const UInt64 frame = externalDInputSharedReady() ? g_dinputState->frame : 0;
+    const UInt64 frame = externalDInputFrame();
     const bool rightTriggerHeld = state.rightTrigger > triggerThreshold;
     const bool leftTriggerHeld = state.leftTrigger > triggerThreshold;
     const bool analogRun = gameplayAnalogRunHeld(state.leftThumbY);
@@ -7422,10 +8449,8 @@ void consumeExternalXInputBridge()
     static UInt32 previousUiFavoriteAssignChordState = 0;
     static UInt64 lastUiMapZoomMs = 0;
 
-    if (!g_xinputState
-        || g_xinputState->magic != XInputSharedMagic
-        || g_xinputState->version != XInputSharedVersion
-        || !g_xinputState->connected)
+    SharedXInputState state {};
+    if (!readEffectiveExternalXInputSnapshot(state))
     {
         updateExternalPipBoyGripMode(false, previousPipBoyGripHeld);
         updateExternalRightGripMenuMode(false, previousRightGripMenuHeld);
@@ -7441,7 +8466,6 @@ void consumeExternalXInputBridge()
         return;
     }
 
-    SharedXInputState state = *g_xinputState;
     const UInt32 menuBits = currentMenuBits();
     const RuntimePhase phase = runtimePhaseFromMenuBits(menuBits);
     const bool uiInputAllowed = uiInputAllowedFromMenuBits(menuBits);
@@ -7512,7 +8536,7 @@ void consumeExternalXInputBridge()
             lastUiMapZoomMs = nowMs;
             publishUiMapZoom(
                 mapZoomDirection,
-                externalDInputSharedReady() ? g_dinputState->frame : state.packet,
+                externalDInputSharedReady() ? externalDInputFrame() : state.packet,
                 "externalXInput:mapZoom");
         }
     }
@@ -7535,7 +8559,7 @@ void consumeExternalXInputBridge()
             ? (previousUiFavoriteAssignChordState & (XInputA | XInputB | XInputX | XInputY))
             : 0u;
         uiFavoriteAssignPressed = static_cast<UInt16>(faceButtons & ~previousFaceButtons);
-        const UInt64 frame = externalDInputSharedReady() ? g_dinputState->frame : 0;
+        const UInt64 frame = externalDInputFrame();
         if (uiFavoriteAssignPressed & XInputA)
         {
             assignUiFavoriteSlotKey(
@@ -7656,7 +8680,7 @@ void consumeExternalXInputBridge()
             const bool utilityFavorite = state.leftTrigger > 64;
             assignUiFavoriteSlot(
                 utilityFavorite ? "externalXInput:pipboy:LT+Y" : "externalXInput:pipboy:Y",
-                externalDInputSharedReady() ? g_dinputState->frame : 0,
+                externalDInputFrame(),
                 utilityFavorite);
             logTelemetry(
                 "uiButton fire source=Y action=favoriteAssign utility=%d pipBoy=%d menuBits=0x%02lx\n",
@@ -8293,6 +9317,16 @@ BOOL APIENTRY DllMain(HMODULE, DWORD reason, LPVOID)
         {
             CloseHandle(g_vrPoseMapping);
             g_vrPoseMapping = nullptr;
+        }
+        if (g_vrOriginState)
+        {
+            UnmapViewOfFile(g_vrOriginState);
+            g_vrOriginState = nullptr;
+        }
+        if (g_vrOriginMapping)
+        {
+            CloseHandle(g_vrOriginMapping);
+            g_vrOriginMapping = nullptr;
         }
         if (g_cameraState)
         {

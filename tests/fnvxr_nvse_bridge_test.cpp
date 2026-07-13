@@ -109,11 +109,11 @@ int main(int argc, char** argv)
         if (!load(&nvse))
             return fail("load failed");
 
-        if (!validateSharedHeader<SharedXInputState>("Local\\FNVXR_XInput_State", fnvxr::shared::XInputSharedMagic, fnvxr::shared::XInputSharedVersion))
+        if (!validateSharedHeader<SharedXInputState>(fnvxr::shared::XInputSharedMappingName, fnvxr::shared::XInputSharedMagic, fnvxr::shared::XInputSharedVersion))
             return fail("xinput shared map missing or invalid");
-        if (!validateSharedHeader<SharedDInputState>("Local\\FNVXR_DInput_State", fnvxr::shared::DInputSharedMagic, fnvxr::shared::DInputSharedVersion))
+        if (!validateSharedHeader<SharedDInputState>(fnvxr::shared::DInputSharedMappingName, fnvxr::shared::DInputSharedMagic, fnvxr::shared::DInputSharedVersion))
             return fail("dinput shared map missing or invalid");
-        if (!validateSharedHeader<SharedVrPoseState>("Local\\FNVXR_VR_Pose_State", fnvxr::shared::VrPoseSharedMagic, fnvxr::shared::VrPoseSharedVersion))
+        if (!validateSharedHeader<SharedVrPoseState>(fnvxr::shared::VrPoseSharedMappingName, fnvxr::shared::VrPoseSharedMagic, fnvxr::shared::VrPoseSharedVersion))
             return fail("vr pose shared map missing or invalid");
         if (!validateSharedHeader<SharedCameraState>("Local\\FNVXR_Camera_State", fnvxr::shared::CameraSharedMagic, fnvxr::shared::CameraSharedVersion))
             return fail("camera shared map missing or invalid");

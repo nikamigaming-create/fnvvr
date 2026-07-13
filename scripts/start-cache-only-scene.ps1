@@ -12,7 +12,7 @@ if ($Frames -gt 0 -and -not $AllowFiniteHostRun) {
     throw "Unsafe cache-only host run refused: finite runs (-Frames $Frames) require -AllowFiniteHostRun."
 }
 if (-not $SceneCacheDir) {
-    $SceneCacheDir = Join-Path $Root "local\scene-cache-openmw"
+    $SceneCacheDir = Join-Path $Root "local\scene-cache"
 }
 
 $hostExe = Join-Path $Root "build\$Configuration\fnvxr_openxr_pose_host.exe"
@@ -23,7 +23,7 @@ if (-not (Test-Path -LiteralPath $hostExe)) {
 Get-Process FalloutNV,nvse_loader,fnvxr_openxr_pose_host -ErrorAction SilentlyContinue |
     Stop-Process -Force -ErrorAction SilentlyContinue
 
-$runStamp = Get-Date -Format "yyyyMMdd-HHmmss"
+$runStamp = Get-Date -Format "yyyyMMdd-HHmmss-fff"
 $runDir = Join-Path $Root "local\cache-only-runs\$runStamp"
 New-Item -ItemType Directory -Force -Path $runDir | Out-Null
 

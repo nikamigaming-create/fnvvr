@@ -6,24 +6,6 @@ New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 
 $candidates = New-Object System.Collections.Generic.List[string]
 
-$configPath = if ($env:FNVXR_OPENMW_CONFIG) {
-    $env:FNVXR_OPENMW_CONFIG
-} elseif ($env:FNVXR_MODLIST_ROOT) {
-    Join-Path $env:FNVXR_MODLIST_ROOT "openmw-config\openmw.cfg"
-} else {
-    ""
-}
-if ($configPath -and (Test-Path -LiteralPath $configPath)) {
-    Get-Content -LiteralPath $configPath | ForEach-Object {
-        if ($_ -match '^data=(.+)$') {
-            $dataPath = $Matches[1] -replace '/', '\'
-            if ($dataPath.EndsWith('\Data', [System.StringComparison]::OrdinalIgnoreCase)) {
-                $candidates.Add((Split-Path -Parent $dataPath))
-            }
-        }
-    }
-}
-
 $commonRoots = @(
     $env:FNVXR_GAME_ROOT,
     "C:\Program Files (x86)\Steam\steamapps\common\Fallout New Vegas",

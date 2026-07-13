@@ -80,26 +80,40 @@ function Resolve-FnvxrGameRoot {
         Add-Candidate (Join-Path $root "Fallout New Vegas")
     }
 
-    Add-Candidate "C:\Program Files (x86)\Steam\steamapps\common\Fallout New Vegas"
-    Add-Candidate "C:\GOG Games\Fallout New Vegas"
-
-    $configPath = if ($env:FNVXR_OPENMW_CONFIG) {
-        $env:FNVXR_OPENMW_CONFIG
-    } elseif ($env:FNVXR_MODLIST_ROOT) {
-        Join-Path $env:FNVXR_MODLIST_ROOT "openmw-config\openmw.cfg"
-    } else {
-        ""
+    $steamRoots = New-Object System.Collections.Generic.List[string]
+    $steamRoots.Add("C:\Program Files (x86)\Steam")
+    foreach ($registryPath in @(
+        "HKCU:\Software\Valve\Steam",
+        "HKLM:\SOFTWARE\WOW6432Node\Valve\Steam"
+    )) {
+        try {
+            $steamPath = (Get-ItemProperty -LiteralPath $registryPath -ErrorAction Stop).SteamPath
+            if (-not $steamPath) {
+                $steamPath = (Get-ItemProperty -LiteralPath $registryPath -ErrorAction Stop).InstallPath
+            }
+            if ($steamPath) {
+                $steamRoots.Add($steamPath)
+            }
+        } catch {
+        }
     }
-    if ($configPath -and (Test-Path -LiteralPath $configPath)) {
-        Get-Content -LiteralPath $configPath | ForEach-Object {
-            if ($_ -match '^data=(.+)$') {
-                $dataPath = $Matches[1] -replace '/', '\'
-                if ($dataPath.EndsWith('\Data', [System.StringComparison]::OrdinalIgnoreCase)) {
-                    Add-Candidate (Split-Path -Parent $dataPath)
-                }
+
+    foreach ($steamRoot in ($steamRoots | Select-Object -Unique)) {
+        Add-Candidate (Join-Path $steamRoot "steamapps\common\Fallout New Vegas")
+        $libraryFile = Join-Path $steamRoot "steamapps\libraryfolders.vdf"
+        if (-not (Test-Path -LiteralPath $libraryFile)) {
+            continue
+        }
+        foreach ($line in (Get-Content -LiteralPath $libraryFile -ErrorAction SilentlyContinue)) {
+            if ($line -match '^\s*"path"\s+"(.+)"\s*$') {
+                $libraryRoot = $Matches[1] -replace '\\\\', '\'
+                Add-Candidate (Join-Path $libraryRoot "steamapps\common\Fallout New Vegas")
             }
         }
     }
+
+    Add-Candidate "C:\Program Files (x86)\Steam\steamapps\common\Fallout New Vegas"
+    Add-Candidate "C:\GOG Games\Fallout New Vegas"
 
     $checked = New-Object System.Collections.Generic.List[string]
     foreach ($candidate in ($candidates | Select-Object -Unique)) {
@@ -207,7 +221,7 @@ function Assert-FnvxrDimensions {
         throw "Invalid host game texture size: ${HostGameTextureWidth}x${HostGameTextureHeight}"
     }
     if ($UiWidth -ne 1280 -or $UiHeight -ne 720) {
-        throw "Sidecar UI grid must stay 1280x720. Retail menu tiles, OpenMW pointer packets, and NVSE click dispatch all use this canonical grid."
+        throw "Sidecar UI grid must stay 1280x720. Retail menu tiles, host pointer packets, and NVSE click dispatch all use this canonical grid."
     }
 
     $retailAspect = [double]$GameBackbufferWidth / [double]$GameBackbufferHeight
@@ -268,6 +282,16 @@ function Set-FnvxrIniSectionValue {
 
     $sectionPattern = "^\s*\[$([regex]::Escape($Section))\]\s*$"
     $keyPattern = "^\s*$([regex]::Escape($Key))\s*="
+
+    # Fallout accepts duplicate keys in surprising ways. Remove every old
+    # occurrence first, including values a previous section-blind launcher may
+    # have appended under an unrelated final section.
+    for ($i = $lines.Count - 1; $i -ge 0; --$i) {
+        if ($lines[$i] -match $keyPattern) {
+            $lines.RemoveAt($i)
+        }
+    }
+
     $sectionStart = -1
     $sectionEnd = $lines.Count
     for ($i = 0; $i -lt $lines.Count; ++$i) {
@@ -290,19 +314,33 @@ function Set-FnvxrIniSectionValue {
         $lines.Add("[$Section]")
         $lines.Add("$Key=$Value")
     } else {
-        $updated = $false
-        for ($i = $sectionStart + 1; $i -lt $sectionEnd; ++$i) {
-            if ($lines[$i] -match $keyPattern) {
-                $lines[$i] = "$Key=$Value"
-                $updated = $true
-            }
-        }
-        if (-not $updated) {
-            $lines.Insert($sectionEnd, "$Key=$Value")
-        }
+        $lines.Insert($sectionEnd, "$Key=$Value")
     }
 
-    Set-Content -LiteralPath $Path -Value $lines -Encoding ASCII
+    $temporaryPath = "$Path.fnvxr.tmp"
+    Set-Content -LiteralPath $temporaryPath -Value $lines -Encoding ASCII
+    Move-Item -LiteralPath $temporaryPath -Destination $Path -Force
+
+    $verifySection = ""
+    $matchingValues = @()
+    foreach ($line in (Get-Content -LiteralPath $Path -ErrorAction Stop)) {
+        if ($line -match '^\s*\[(.+)\]\s*$') {
+            $verifySection = $Matches[1]
+            continue
+        }
+        if ($line -match $keyPattern) {
+            $matchingValues += [pscustomobject]@{
+                Section = $verifySection
+                Value = (($line -split '=', 2)[1]).Trim()
+            }
+        }
+    }
+    $verified = ($matchingValues.Count -eq 1) -and
+        ($matchingValues[0].Section -ieq $Section) -and
+        ($matchingValues[0].Value -eq $Value)
+    if (-not $verified) {
+        throw "Failed to verify unique INI value $Path [$Section] $Key=$Value"
+    }
     if ($DebugLog) {
         Write-FnvxrCheckpoint -Path $DebugLog -Message ("ini {0} [{1}] {2}={3}" -f $Path, $Section, $Key, $Value)
     }
@@ -331,34 +369,34 @@ function Set-FnvxrFalloutIni {
         foreach ($iniName in @("Fallout.ini", "FalloutPrefs.ini")) {
             $iniPath = Join-Path $root $iniName
             Set-FnvxrIniSectionValue -Path $iniPath -Section "General" -Key "bDisableAutoVanityMode" -Value "1" -DebugLog $DebugLog
-            Set-FnvxrIniValue -Path $iniPath -Key "bAlwaysActive" -Value "1" -DebugLog $DebugLog
-            Set-FnvxrIniValue -Path $iniPath -Key "bBackground Mouse" -Value "1" -DebugLog $DebugLog
-            Set-FnvxrIniValue -Path $iniPath -Key "bBackground Keyboard" -Value "1" -DebugLog $DebugLog
-            Set-FnvxrIniValue -Path $iniPath -Key "bDisable360Controller" -Value "0" -DebugLog $DebugLog
-            Set-FnvxrIniValue -Path $iniPath -Key "bGamepadEnable" -Value "1" -DebugLog $DebugLog
-            Set-FnvxrIniValue -Path $iniPath -Key "bFull Screen" -Value "0" -DebugLog $DebugLog
-            Set-FnvxrIniValue -Path $iniPath -Key "bBorderless" -Value "1" -DebugLog $DebugLog
-            Set-FnvxrIniValue -Path $iniPath -Key "iPresentInterval" -Value "0" -DebugLog $DebugLog
-            Set-FnvxrIniValue -Path $iniPath -Key "iSize W" -Value ([string]$Width) -DebugLog $DebugLog
-            Set-FnvxrIniValue -Path $iniPath -Key "iSize H" -Value ([string]$Height) -DebugLog $DebugLog
+            Set-FnvxrIniSectionValue -Path $iniPath -Section "General" -Key "bAlwaysActive" -Value "1" -DebugLog $DebugLog
+            Set-FnvxrIniSectionValue -Path $iniPath -Section "Controls" -Key "bBackground Mouse" -Value "1" -DebugLog $DebugLog
+            Set-FnvxrIniSectionValue -Path $iniPath -Section "Controls" -Key "bBackground Keyboard" -Value "1" -DebugLog $DebugLog
+            Set-FnvxrIniSectionValue -Path $iniPath -Section "Controls" -Key "bDisable360Controller" -Value "0" -DebugLog $DebugLog
+            Set-FnvxrIniSectionValue -Path $iniPath -Section "Controls" -Key "bGamepadEnable" -Value "1" -DebugLog $DebugLog
+            Set-FnvxrIniSectionValue -Path $iniPath -Section "Display" -Key "bFull Screen" -Value "0" -DebugLog $DebugLog
+            Set-FnvxrIniSectionValue -Path $iniPath -Section "Display" -Key "bBorderless" -Value "1" -DebugLog $DebugLog
+            Set-FnvxrIniSectionValue -Path $iniPath -Section "Display" -Key "iPresentInterval" -Value "0" -DebugLog $DebugLog
+            Set-FnvxrIniSectionValue -Path $iniPath -Section "Display" -Key "iSize W" -Value ([string]$Width) -DebugLog $DebugLog
+            Set-FnvxrIniSectionValue -Path $iniPath -Section "Display" -Key "iSize H" -Value ([string]$Height) -DebugLog $DebugLog
             if ($DisableMultisampling) {
-                Set-FnvxrIniValue -Path $iniPath -Key "iMultiSample" -Value "0" -DebugLog $DebugLog
-                Set-FnvxrIniValue -Path $iniPath -Key "bTransparencyMultisampling" -Value "0" -DebugLog $DebugLog
+                Set-FnvxrIniSectionValue -Path $iniPath -Section "Display" -Key "iMultiSample" -Value "0" -DebugLog $DebugLog
+                Set-FnvxrIniSectionValue -Path $iniPath -Section "Display" -Key "bTransparencyMultisampling" -Value "0" -DebugLog $DebugLog
             }
-            Set-FnvxrIniValue -Path $iniPath -Key "iSystemColorHUDMainRed" -Value "255" -DebugLog $DebugLog
-            Set-FnvxrIniValue -Path $iniPath -Key "iSystemColorHUDMainGreen" -Value "182" -DebugLog $DebugLog
-            Set-FnvxrIniValue -Path $iniPath -Key "iSystemColorHUDMainBlue" -Value "0" -DebugLog $DebugLog
-            Set-FnvxrIniValue -Path $iniPath -Key "iSystemColorHUDAltRed" -Value "255" -DebugLog $DebugLog
-            Set-FnvxrIniValue -Path $iniPath -Key "iSystemColorHUDAltGreen" -Value "182" -DebugLog $DebugLog
-            Set-FnvxrIniValue -Path $iniPath -Key "iSystemColorHUDAltBlue" -Value "0" -DebugLog $DebugLog
+            Set-FnvxrIniSectionValue -Path $iniPath -Section "Interface" -Key "iSystemColorHUDMainRed" -Value "255" -DebugLog $DebugLog
+            Set-FnvxrIniSectionValue -Path $iniPath -Section "Interface" -Key "iSystemColorHUDMainGreen" -Value "182" -DebugLog $DebugLog
+            Set-FnvxrIniSectionValue -Path $iniPath -Section "Interface" -Key "iSystemColorHUDMainBlue" -Value "0" -DebugLog $DebugLog
+            Set-FnvxrIniSectionValue -Path $iniPath -Section "Interface" -Key "iSystemColorHUDAltRed" -Value "255" -DebugLog $DebugLog
+            Set-FnvxrIniSectionValue -Path $iniPath -Section "Interface" -Key "iSystemColorHUDAltGreen" -Value "182" -DebugLog $DebugLog
+            Set-FnvxrIniSectionValue -Path $iniPath -Section "Interface" -Key "iSystemColorHUDAltBlue" -Value "0" -DebugLog $DebugLog
             if ($DefaultFov -gt 0) {
-                Set-FnvxrIniValue -Path $iniPath -Key "fDefaultFOV" -Value ($DefaultFov.ToString("0.0000", [Globalization.CultureInfo]::InvariantCulture)) -DebugLog $DebugLog
+                Set-FnvxrIniSectionValue -Path $iniPath -Section "Display" -Key "fDefaultFOV" -Value ($DefaultFov.ToString("0.0000", [Globalization.CultureInfo]::InvariantCulture)) -DebugLog $DebugLog
             }
             if ($FirstPersonFov -gt 0) {
-                Set-FnvxrIniValue -Path $iniPath -Key "fDefault1stPersonFOV" -Value ($FirstPersonFov.ToString("0.0000", [Globalization.CultureInfo]::InvariantCulture)) -DebugLog $DebugLog
+                Set-FnvxrIniSectionValue -Path $iniPath -Section "Display" -Key "fDefault1stPersonFOV" -Value ($FirstPersonFov.ToString("0.0000", [Globalization.CultureInfo]::InvariantCulture)) -DebugLog $DebugLog
             }
             if ($PipboyFov -gt 0) {
-                Set-FnvxrIniValue -Path $iniPath -Key "fPipboy1stPersonFOV" -Value ($PipboyFov.ToString("0.0000", [Globalization.CultureInfo]::InvariantCulture)) -DebugLog $DebugLog
+                Set-FnvxrIniSectionValue -Path $iniPath -Section "Display" -Key "fPipboy1stPersonFOV" -Value ($PipboyFov.ToString("0.0000", [Globalization.CultureInfo]::InvariantCulture)) -DebugLog $DebugLog
             }
         }
     }
@@ -487,13 +525,21 @@ function Copy-FnvxrStageArtifact {
     $sourceInfo = Get-FnvxrArtifactInfo -Path $Item.Source
     if (-not $sourceInfo.exists) {
         if ($optional) {
+            $removedStaleDestination = $false
+            if ($Copy -and (Test-Path -LiteralPath $Item.Destination)) {
+                # Optional artifacts are FNVVR-owned symbols from the same
+                # build configuration. Keeping an older PDB beside a newly
+                # staged DLL gives debuggers a confidently wrong symbol file.
+                Remove-Item -LiteralPath $Item.Destination -Force
+                $removedStaleDestination = $true
+            }
             return [ordered]@{
                 source = $sourceInfo
                 destination = Get-FnvxrArtifactInfo -Path $Item.Destination
                 optional = $true
                 copied = $false
                 verified = $false
-                skipped = "missing optional source"
+                skipped = if ($removedStaleDestination) { "removed stale optional destination" } else { "missing optional source" }
             }
         }
         throw "Missing build output: $($Item.Source)"
@@ -573,9 +619,7 @@ function Set-FnvxrSidecarEnvironment {
     )
 
     Clear-FnvxrEnvironment
-    # The retail oracle is an intentionally expensive animation/environment
-    # scanner for offline OpenMW capture work.  A cooperating oracle build
-    # treats this as a clean no-op so VR launches do not scan every game loop.
+    # Disable the unrelated offline retail animation scanner during live VR.
     $env:NIKAMI_ORACLE_ENABLE = "0"
     $env:FNVXR_RUN_PROFILE = $Profile
     if ($RunDir) {
@@ -604,10 +648,8 @@ function Set-FnvxrSidecarEnvironment {
     $env:FNVXR_GAME_PLANE_WIDTH = "3.15"
     $env:FNVXR_GAME_PLANE_HEIGHT = "2.15"
     $env:FNVXR_GAME_PLANE_OFFSET_Z = "-3.35"
-    $env:FNVXR_GAMEPLAY_PLANE_WIDTH = "5.60"
-    $env:FNVXR_GAMEPLAY_PLANE_HEIGHT = "3.50"
-    $env:FNVXR_GAMEPLAY_PLANE_OFFSET_Z = "-3.55"
     $env:FNVXR_GAME_PLANE_CURVE_ENABLE = "1"
+    $env:FNVXR_GAME_PLANE_REMOVE_PITCH = "1"
     $env:FNVXR_GAME_PLANE_CURVE_SEGMENTS_X = "32"
     $env:FNVXR_GAME_PLANE_CURVE_SEGMENTS_Y = "18"
     $env:FNVXR_GAME_PLANE_CURVE_DEPTH_X = "0.22"
@@ -627,7 +669,6 @@ function Set-FnvxrSidecarEnvironment {
     $env:FNVXR_MENU_GRIP_THRESHOLD = "0.55"
     $env:FNVXR_XINPUT_LEFT_GRIP_PIPBOY_ENABLE = "0"
     $env:FNVXR_XINPUT_RIGHT_GRIP_MENU_ENABLE = "0"
-    $env:FNVXR_XINPUT_RIGHT_GRIP_MENU_CLOSE_ON_RELEASE = "0"
     $env:FNVXR_XINPUT_GRIP_MENU_THRESHOLD = "0.55"
     $env:FNVXR_XINPUT_PHYSICAL_MENU_BUTTONS_ENABLE = "1"
     $env:FNVXR_XINPUT_MASK_X = "1"
@@ -736,6 +777,9 @@ function Set-FnvxrSidecarEnvironment {
     $env:FNVXR_UI_FAVORITE_ASSIGN_HOLD_MS = "900"
     $env:FNVXR_UI_FAVORITE_ASSIGN_CLICK_DELAY_MS = "75"
     $env:FNVXR_EXTERNAL_DINPUT_WRITER = "1"
+    $env:FNVXR_EXTERNAL_XINPUT_WRITER = "1"
+    $env:FNVXR_XINPUT_STALE_PACKET_MS = "250"
+    $env:FNVXR_DINPUT_STALE_FRAME_MS = "250"
     $env:FNVXR_HEADSPACE_LOOK_ENABLE = "1"
     $env:FNVXR_HEADSPACE_LOOK_DEADZONE_DEGREES = "0.08"
     $env:FNVXR_HEADSPACE_LOOK_NORMAL_DEADZONE_DEGREES = "0.08"
@@ -785,8 +829,10 @@ function Set-FnvxrSidecarEnvironment {
     $env:FNVXR_STEREO_FALLBACK_MONO_FULLSCREEN = "0"
     $env:FNVXR_SHOW_GAME_PLANE_ON_STEREO_LOSS = "0"
     $env:FNVXR_SHOW_WORLD_PROPS = "0"
+    $env:FNVXR_OVERLAY_PROPS_ON_FULLSCREEN = "0"
     $env:FNVXR_SHOW_BODY_RIG = "0"
     $env:FNVXR_SHOW_HAND_FINGERS = "0"
+    $env:FNVXR_SHOW_PIPBOY_RIG = "0"
     $env:FNVXR_SHOW_LEFT_AIM_RAY = "0"
     $env:FNVXR_SHOW_RIGHT_AIM_RAY = "0"
     $env:FNVXR_D3D9_CAPTURE_WORLD_DURING_UI = "0"
@@ -801,6 +847,7 @@ function Set-FnvxrSidecarEnvironment {
     # for ordinary quad launches; focused stereo tests opt in below.
     $env:FNVXR_RETAIL_RIG_ENABLE = "0"
     $env:FNVXR_RETAIL_RIG_APPLY = "0"
+    $env:FNVXR_RETAIL_WEAPON_APPLY = "0"
     $env:FNVXR_RETAIL_RIG_DUMP_NODES = "1"
     $env:FNVXR_RETAIL_RIG_POSITION_SCALE = "1"
     $env:FNVXR_RETAIL_RIG_FABRIK_ITERATIONS = "12"
@@ -818,6 +865,7 @@ function Set-FnvxrSidecarEnvironment {
     $env:FNVXR_D3D9_SHADER_STEREO_ALLOW_VERTEX_HASHES = ""
     $env:FNVXR_D3D9_SHADER_MATRIX_MAX_ABS = "1000000000"
     $env:FNVXR_D3D9_SHARED_STEREO = "1"
+    $env:FNVXR_D3D9_NATIVE_SINGLE_TRAVERSAL_REPLAY = "0"
     $env:FNVXR_D3D9_NATIVE_MULTIPASS = "0"
     $env:FNVXR_D3D9_STEREO_REPLAY = "1"
     $env:FNVXR_D3D9_RESOURCE_GRAPH_TELEMETRY = "0"
@@ -850,28 +898,98 @@ function Set-FnvxrSidecarEnvironment {
 
 function Set-FnvxrStereoWorldRuntimeEnvironment {
     $env:FNVXR_DISABLE_STEREO_WORLD = "0"
-    $env:FNVXR_TELEMETRY_HAMMER = "0"
-    $env:FNVXR_D3D9_TELEMETRY_HAMMER = "0"
-    $env:FNVXR_D3D9_NATIVE_MULTIPASS = "1"
+    # Keep the semantic oracle live, but sample high-frequency draw telemetry
+    # so instrumentation itself does not destabilize headset frame timing.
+    $env:FNVXR_TELEMETRY_HAMMER = "1"
+    $env:FNVXR_D3D9_TELEMETRY_HAMMER = "1"
+    $env:FNVXR_D3D9_TELEMETRY_HAMMER_WARMUP = "12"
+    $env:FNVXR_D3D9_REPLAY_DRAW_TELEMETRY_STRIDE = "120"
+    $env:FNVXR_D3D9_WVP_TELEMETRY_STRIDE = "120"
+    $env:FNVXR_D3D9_CLEAR_TELEMETRY_STRIDE = "60"
+    $env:FNVXR_D3D9_REPLAY_TARGET_TELEMETRY_STRIDE = "60"
+    $env:FNVXR_D3D9_STATEBLOCK_TELEMETRY_STRIDE = "120"
+    # Cull the HMD-centered world once, then replay the exact submitted D3D9
+    # draw stream into both eyes. Two full Gamebryo traversals diverge and are
+    # not a valid stereo pair.
+    $env:FNVXR_D3D9_NATIVE_SINGLE_TRAVERSAL_REPLAY = "1"
+    $env:FNVXR_D3D9_NATIVE_MULTIPASS = "0"
     $env:FNVXR_D3D9_NATIVE_PIPELINE_TRACE = "0"
     $env:FNVXR_D3D9_NATIVE_TRACE_ALL_DRAWS = "0"
     $env:FNVXR_D3D9_NATIVE_REQUIRE_FIRST_PERSON = "1"
+    $env:FNVXR_D3D9_NATIVE_REQUIRE_STABLE_CELL = "1"
+    $env:FNVXR_D3D9_NATIVE_CELL_SETTLE_PLAYER_FRAMES = "45"
+    $env:FNVXR_D3D9_NATIVE_PLAYER_READ_GRACE_HOOKS = "4"
+    $env:FNVXR_D3D9_NATIVE_EQUIVALENCE_GUARD = "1"
+    $env:FNVXR_D3D9_NATIVE_EQUIVALENCE_REQUIRE_MATCHED_RESOLVED_TARGETS = "1"
+    $env:FNVXR_D3D9_NATIVE_EQUIVALENCE_MIN_EYE_DRAWS = "64"
+    $env:FNVXR_D3D9_NATIVE_EQUIVALENCE_MIN_EYE_VS_CALLS = "64"
+    $env:FNVXR_D3D9_NATIVE_EQUIVALENCE_MAX_DRAW_DELTA = "96"
+    $env:FNVXR_D3D9_NATIVE_EQUIVALENCE_MAX_DRAW_RATIO = "0.20"
+    $env:FNVXR_D3D9_NATIVE_EQUIVALENCE_MAX_VS_CALL_DELTA = "192"
+    $env:FNVXR_D3D9_NATIVE_EQUIVALENCE_MAX_VS_CALL_RATIO = "0.20"
+    $env:FNVXR_D3D9_NATIVE_EQUIVALENCE_RECOVERY_PAIRS = "3"
+    $env:FNVXR_D3D9_NATIVE_MISMATCH_HOLD_PLAYER_FRAMES = "45"
     $env:FNVXR_D3D9_NATIVE_RECENTER_ON_FIRST_GAMEPLAY = "1"
     $env:FNVXR_D3D9_ALLOW_THIRD_PERSON_STEREO = "0"
     $env:FNVXR_D3D9_NATIVE_APPLY_HEAD_ROTATION = "1"
-    $env:FNVXR_D3D9_NATIVE_HEAD_AXIS_MODE = "retail-camera"
+    # Keep orientation and position in the same OpenXR -> Gamebryo basis.
+    # The rejected retail-camera permutation made horizontal yaw drive a
+    # native pitch/roll axis and produced an uncomfortable orbital pivot.
+    $env:FNVXR_D3D9_NATIVE_HEAD_AXIS_MODE = "gamebryo"
     $env:FNVXR_D3D9_NATIVE_ASYMMETRIC_FOV = "1"
+    $env:FNVXR_D3D9_NATIVE_CENTER_CAMERA_MAX_DELTA = "0.05"
     $env:FNVXR_REQUIRE_NATIVE_STEREO = "1"
+    # The engine camera hook already owns HMD rotation/translation. D3D replay
+    # starts from that observed center view and adds only per-eye view/FOV.
+    $env:FNVXR_D3D9_USE_SHARED_CAMERA_VIEW = "0"
     $env:FNVXR_D3D9_APPLY_HMD_POSE = "0"
     $env:FNVXR_HEADSPACE_LOOK_ENABLE = "0"
     $env:FNVXR_HANDSPACE_LOOK_ENABLE = "0"
+    $env:FNVXR_GYRO_AIM_ENABLE = "0"
+    # XInput owns optional body yaw. HMD owns view pitch/roll; the DInput mouse
+    # lane must not duplicate the same right-stick sample or steer the camera.
+    $env:FNVXR_XINPUT_RIGHT_STICK_Y_ENABLE = "0"
+    $env:FNVXR_DINPUT_RIGHT_STICK_LOOK_ENABLE = "0"
+    $env:FNVXR_DINPUT_RIGHT_STICK_PITCH_ENABLE = "0"
     $env:FNVXR_DINPUT_HEAD_LOOK_ENABLE = "0"
     $env:FNVXR_DINPUT_HANDSPACE_LOOK_ENABLE = "0"
+    $env:FNVXR_DINPUT_GYRO_AIM_ENABLE = "0"
     $env:FNVXR_D3D9_SHADER_STEREO = "0"
     $env:FNVXR_D3D9_SHADER_MATRIX_DELTA = "0"
     $env:FNVXR_D3D9_SHADER_MATRIX_ORDER = "column"
     $env:FNVXR_D3D9_SHADER_MATRIX_REQUIRE_SHARED_CAMERA = "1"
+    # Fixed-function draws consume the replayed view/projection directly.
+    # Shader constants are fail-closed until a per-bytecode-hash/register
+    # contract has been proven. c0-c3 is not universally WVP in FNV and the
+    # previous allow-all path corrupted screen/post-process geometry.
     $env:FNVXR_D3D9_SHADER_WVP_REPLAY = "0"
+    $env:FNVXR_D3D9_SHADER_WVP_CONTRACTS = ""
+    $env:FNVXR_D3D9_SHADER_MIN_CONTRACT_COVERAGE = "1.0"
+    $env:FNVXR_D3D9_POSE_X_SIGN = "1"
+    $env:FNVXR_D3D9_POSE_Y_SIGN = "1"
+    $env:FNVXR_D3D9_POSE_Z_SIGN = "1"
+    $env:FNVXR_RETAIL_RIG_POSITION_SCALE = "1.0"
+    $env:FNVXR_RETAIL_RIG_AUTO_CALIBRATE_POSITION = "0"
+    $env:FNVXR_RETAIL_RIG_MAX_AUTO_CALIBRATION_UNITS = "12.0"
+    $env:FNVXR_RETAIL_RIG_MAX_SEGMENT_UNITS = "80.0"
+    $env:FNVXR_RETAIL_RIG_FABRIK_ITERATIONS = "12"
+    $env:FNVXR_RETAIL_RIG_FABRIK_TOLERANCE = "0.05"
+    $env:FNVXR_RETAIL_RIG_ELBOW_POLE_OUT = "20.0"
+    $env:FNVXR_RETAIL_RIG_ELBOW_POLE_FORWARD = "-15.0"
+    $env:FNVXR_RETAIL_RIG_ELBOW_POLE_UP = "-25.0"
+    $env:FNVXR_RETAIL_RIG_ELBOW_POLE_WEIGHT = "1.0"
+    $env:FNVXR_RETAIL_RIG_LEFT_WRIST_OFFSET_X = "0"
+    $env:FNVXR_RETAIL_RIG_LEFT_WRIST_OFFSET_Y = "0"
+    $env:FNVXR_RETAIL_RIG_LEFT_WRIST_OFFSET_Z = "0"
+    $env:FNVXR_RETAIL_RIG_RIGHT_WRIST_OFFSET_X = "0"
+    $env:FNVXR_RETAIL_RIG_RIGHT_WRIST_OFFSET_Y = "0"
+    $env:FNVXR_RETAIL_RIG_RIGHT_WRIST_OFFSET_Z = "0"
+    $env:FNVXR_RETAIL_WEAPON_MAX_WRITE_RESIDUAL_RADIANS = "0.01"
+    $env:FNVXR_D3D9_SHADER_ALLOW_UNVERIFIED_PATCHES = "0"
+    # Exact shader binaries are retained once per hash so register ownership
+    # can be disassembled and reviewed offline. This is read-only diagnostics;
+    # unknown shaders remain unpatched.
+    $env:FNVXR_D3D9_DUMP_SHADER_BYTECODE = "0"
     $env:FNVXR_D3D9_SHADER_MATRIX_MAX_CANDIDATES = "1"
     $env:FNVXR_D3D9_SHADER_PATCH_START_REGISTER = "0"
     $env:FNVXR_D3D9_SHADER_STEREO_ALLOW_VERTEX_HASHES = ""
@@ -886,14 +1004,17 @@ function Set-FnvxrStereoWorldRuntimeEnvironment {
     $env:FNVXR_D3D9_STEREO_BEST_SNAPSHOT_AS_WORLD = "0"
     $env:FNVXR_D3D9_STEREO_COLLAPSE_AUDIT = "0"
     $env:FNVXR_D3D9_STEREO_AUTO_SKIP_COLLAPSE_SHADER_PAIRS = "0"
-    $env:FNVXR_D3D9_STEREO_SKIP_SHADER_HASH_PAIRS = ""
+    $env:FNVXR_D3D9_STEREO_SKIP_SHADER_HASH_PAIRS = "e7106f46/323e1098;5dbbefdc/0a008802;0187cba7/79ed2742;5f8e2513/d2b33434"
     $env:FNVXR_D3D9_STEREO_TARGET_DIFF_PROBE = "0"
-    $env:FNVXR_D3D9_STEREO_VISUAL_COVERAGE_GATE = "0"
-    $env:FNVXR_D3D9_STEREO_VISUAL_STABLE_FRAMES = "1"
-    $env:FNVXR_D3D9_STEREO_MIN_ACTIVE_FRACTION = "0.12"
+    $env:FNVXR_D3D9_STEREO_VISUAL_COVERAGE_GATE = "1"
+    $env:FNVXR_D3D9_STEREO_VISUAL_STABLE_FRAMES = "12"
+    # The failed headset frame was 53.5% one quantized dark bucket when measured
+    # with the producer's sampler. Reject any frame without a majority of
+    # spatially distributed, non-dominant scene samples before handoff.
+    $env:FNVXR_D3D9_STEREO_MIN_ACTIVE_FRACTION = "0.50"
     $env:FNVXR_D3D9_STEREO_MIN_ACTIVE_SPAN_X = "0.35"
     $env:FNVXR_D3D9_STEREO_MIN_ACTIVE_SPAN_Y = "0.35"
-    $env:FNVXR_D3D9_STEREO_RETAIN_LAST_VALID_ON_INVALID = "0"
+    $env:FNVXR_D3D9_STEREO_RETAIN_LAST_VALID_ON_INVALID = "1"
     $env:FNVXR_D3D9_STEREO_CLEAR_ON_UI_INVALID = "0"
     $env:FNVXR_D3D9_STEREO_STRICT_TARGET_GATE = "1"
     $env:FNVXR_D3D9_STEREO_AUTO_ACTIVATE_TARGET_ON_DRAW = "1"
@@ -903,18 +1024,31 @@ function Set-FnvxrStereoWorldRuntimeEnvironment {
     $env:FNVXR_D3D9_STEREO_SNAPSHOT_DRAW_STRIDE = "16"
     $env:FNVXR_D3D9_RESOURCE_GRAPH_TELEMETRY = "0"
     $env:FNVXR_D3D9_SHARED_STEREO = "1"
-    $env:FNVXR_D3D9_STEREO_REPLAY = "0"
+    $env:FNVXR_D3D9_STEREO_REPLAY = "1"
     $env:FNVXR_D3D9_STEREO_READBACK = "1"
     $env:FNVXR_D3D9_STEREO_IDENTICAL_DISARM_FRAMES = "120"
-    $env:FNVXR_REQUIRE_WORLD_STEREO = "0"
+    $env:FNVXR_REQUIRE_WORLD_STEREO = "1"
+    $env:FNVXR_REQUIRE_WORLD_STEREO_BEFORE_GAMEPLAY_UI = "0"
     $env:FNVXR_GAME_FULLSCREEN_IN_XR = "1"
     $env:FNVXR_USE_STEREO_GAME_TEXTURES = "1"
     $env:FNVXR_STEREO_FALLBACK_MONO_FULLSCREEN = "0"
-    $env:FNVXR_STEREO_STABLE_HANDOFF_FRAMES = "2"
-    $env:FNVXR_STEREO_STALE_FRAME_LIMIT = "180"
-    # OpenXR polls faster than the retail producer.  Hold the last complete
-    # pair across ordinary no-new-sequence polls, but only for the short stale
-    # window above so ordinary retail hitches do not flash the compositor.
+    # Never change dimensional presentation during gameplay. A transient
+    # producer miss retains the last coherent stereo frame; a sustained fault
+    # goes dark instead of snapping the user back to a head-locked 2D plane.
+    $env:FNVXR_ALLOW_STEREO_WORLD_2D_FALLBACK = "0"
+    $env:FNVXR_SHOW_GAME_PLANE_ON_STEREO_LOSS = "0"
+    $env:FNVXR_SHOW_GAME_PLANE_IN_GAME = "0"
+    $env:FNVXR_STEREO_STABLE_HANDOFF_FRAMES = "12"
+    $env:FNVXR_STEREO_MIN_RGB_DELTA = "4"
+    $env:FNVXR_STEREO_HOST_MIN_DIFF_SAMPLES = "64"
+    $env:FNVXR_STEREO_CELL_STABLE_FRAMES = "60"
+    $env:FNVXR_PLAYER_STATE_READ_GRACE_FRAMES = "4"
+    $env:FNVXR_STEREO_TRANSIENT_READ_GRACE_POLLS = "4"
+    $env:FNVXR_STEREO_MAX_SAME_SEQUENCE_MS = "250"
+    $env:FNVXR_STEREO_STALE_FRAME_LIMIT = "2"
+    # The host distinguishes an ordinary faster-consumer poll from a producer
+    # rejection. Keep a coherent unchanged sequence, but never retain a pair
+    # after the producer invalidates it; use the live retail quad instead.
     $env:FNVXR_STEREO_RETAIN_LAST_VALID_ON_REJECT = "1"
 }
 
@@ -935,7 +1069,7 @@ function Get-FnvxrControlProcess {
     $all = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
     $exclude = Get-FnvxrCurrentProcessExclusionIds
     $rootIds = New-Object 'System.Collections.Generic.HashSet[int]'
-    $scriptPattern = '(?i)(start-openxr-retail-sidecar|start-retail-surface-producer|start-rock-solid|start-retail-pcvr-max|start-openmw-fnv-sidecar|watch-openmw-left-grip-launch-retail|probe-shared-state)\.ps1'
+    $scriptPattern = '(?i)(start-openxr-retail-sidecar|start-retail-surface-producer|start-rock-solid|start-retail-pcvr-max|probe-shared-state)\.ps1'
 
     foreach ($process in $all) {
         $id = [int]$process.ProcessId
@@ -1014,6 +1148,15 @@ function Stop-FnvxrLaunchProcess {
             }
         }
         Start-Sleep -Seconds 1
+    }
+
+    $remaining = @(Get-FnvxrLaunchProcess)
+    if ($remaining.Count -gt 0) {
+        $summary = @($remaining | ForEach-Object { "{0}:{1}" -f $_.ProcessName,$_.Id }) -join ", "
+        if ($DebugLog) {
+            Write-FnvxrCheckpoint -Path $DebugLog -Message ("unable to stop existing launch processes remaining={0}" -f $summary)
+        }
+        throw "Refusing to launch over live FNVXR processes: $summary"
     }
 }
 

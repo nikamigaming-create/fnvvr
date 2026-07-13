@@ -1,52 +1,129 @@
 # Next Steps
 
-For today's work, `docs/today-rock-solid-direction.md` is the active direction. The north star is performance, accuracy, UI/UX, and retail parity.
+The active target is a crisp retail-only headset path: independent 6DoF head
+tracking, flat retail UI, right-hand weapon aim, and then complete native stereo
+world presentation.
 
-Pinned checkpoint: `docs/playable-big-screen-vr-baseline.md` is the current first playable baseline. Treat the big-screen OpenXR retail sidecar as working for its scoped contract before changing interaction or stereo-world code.
+## Non-Negotiable Runtime Contract
 
-Use `docs/openmw-swg-fnvxr-convergence.md` as the current reference contract:
+- Retail Fallout: New Vegas remains authoritative for gameplay, UI, weapons,
+  projectiles, animation, collision, saves, quests, and mod behavior.
+- The standalone OpenXR host supplies predicted HMD/controller poses, input
+  intent, composition, and diagnostics.
+- Engine-sensitive work stays in xNVSE. Every shared mapping must have a
+  fixed/versioned layout, a stable-snapshot rule, and one declared producer per
+  mutable field before it is trusted.
+- Startup, menus, pause, Pip-Boy, inventory, dialogue, VATS, loading, and
+  unknown/non-gameplay states use the flat mono retail surface.
+- Native stereo appears only for proven gameplay eye pairs and drops back to
+  the flat retail surface immediately when UI or invalid stereo is reported.
 
-- OpenMWVR is the primary behavior reference for action binding, tracking gates, hands, pointer, and Xbox-style controller semantics.
-- OG SWG is the secondary bridge reference for D3D11/OpenXR ownership, runtime staging, and proof logging.
-- Retail Fallout New Vegas remains authoritative for gameplay, UI, favorites, weapons, projectiles, inventory, perks, and mod behavior.
-- FNVXR outputs only vanilla-supported input surfaces: Xbox/XInput, mouse, keyboard, and DirectInput.
+## Phase 0: Lock the Baseline
 
-The first menu experience must already be a stereo 3D VR scene with a pointer and clickable surfaced FNV menu quad. The menu quad remains the normal retail FNV menu capture. The surrounding scene is a separate VR render layer and must not be created by `coc`, `cow`, player movement, or any other mutation of the live retail game state. Then live FNV D3D stereo takes over when a real world camera is proven. Do not mix loose environment flags by hand; use an explicit sidecar run profile.
+- Run the launch-safety audit, x64 tests, and Win32 build.
+- Capture one known-save baseline with no camera/weapon transform injection.
+- Record HMD, eye, controller, retail camera, player, and rig-node state in one
+  time-correlated log.
+- Walk exterior to interior and back while keeping an NPC in view; record cell
+  changes, hook continuity, resolved-target parity, and per-eye draw work.
+- Keep a one-switch fail-closed path back to the flat retail presentation.
+- During input telemetry, require advancing XInput packet and DirectInput frame
+  heartbeats; a stopped producer must visibly neutralize controls within
+  250 ms without falling through to an unrelated physical-controller path.
 
-## Phase 0: Shared-Memory Nucleus
+## Phase 1: Decouple Head and Body
 
-- Keep every live stream fixed-size, versioned, and sequence-guarded.
-- Use shared memory or shared textures for same-machine state.
-- Validate magic/version/size before consuming state.
+- Define the retail player/body transform as the locomotion frame.
+- Apply headset yaw/pitch/roll to the eye camera locally; do not rotate the
+  actor every time the player looks around.
+- Convert local HMD translation through the recentered body frame before it
+  reaches the camera.
+- Make snap/smooth turn or explicit recenter the only operations that
+  intentionally change body heading.
+- Add telemetry for desired head transform, pre-apply camera transform,
+  post-apply camera transform, player transform, and the reason any write was
+  rejected.
 
-## Phase 1: OpenXR Host
+Head acceptance gate: look around and lean in place while the player actor and
+movement heading stay stable, then turn/recenter deliberately and verify no
+jump, drift, or stale offset.
 
-- Publish OpenXR HMD/controller actions into the shared pose/input mappings.
-- Keep menu pointer coordinates tied to the rendered quad hit.
-- Add haptic output as an explicit retail-to-host shared stream when needed.
+## Phase 2: Calibrate Right-Hand Weapon Aim
 
-## Phase 2: xNVSE Receiver
+- Publish the current right aim pose with tracking-valid/current flags.
+- Log the retail first-person weapon root, hand chain, muzzle/projectile nodes,
+  camera, and player/body transforms in the same frame.
+- Solve one explicit OpenXR-to-retail coordinate conversion and configurable
+  grip-to-weapon offset; do not scatter sign flips through hooks.
+- First drive only the visual weapon/arm rig and verify handedness, scale,
+  roll, and two-handed/FABRIK constraints.
+- Then route the desired muzzle forward direction to the engine-side firing or
+  hit-ray hook, keeping retail responsible for ammunition, recoil, spread,
+  projectile creation, and damage.
+- Compare controller ray, muzzle ray, projectile/hit ray, and impact point at
+  near, medium, and long range.
 
-- Keep the xNVSE plugin as the retail-side owner of menu state and direct UI clicks.
-- Publish runtime phase, menu bits, camera state, and player state from the main loop.
-- Log pose/input frames through xNVSE/FNV logging first.
+Weapon acceptance gate: where the physical controller points, the visible
+barrel, retail projectile/hit result, and impact marker agree within a logged
+tolerance, including after recoil and reload.
 
-## Phase 3: Input Mapping
+## Phase 3: Keep UI Deliberately Flat
 
-- Map buttons to retail movement, activate, fire, menu, favorites/hotkeys, and recenter test actions.
-- Keep the hand ray as the mouse pointer for surfaced FNV UI quads.
-- Use left grip as the practical modifier that turns left stick into virtual Xbox D-pad for favorites/hotkeys outside menus.
-- Keep gameplay authority inside FNV.
-- Publish menu/loading/dialogue state from FNV back to the host through runtime shared state.
+- Treat runtime UI classification as authoritative, not pixel heuristics.
+- Suppress world stereo for every blocking/interactive UI state and present the
+  retail mono frame on the stable headset surface.
+- Keep pointer ray, click, scroll, back, and controller navigation mapped to
+  retail input only.
+- Require a short stable-gameplay debounce plus a fresh complete eye pair
+  before removing the flat surface.
+- On stale/invalid stereo or any UI transition, restore the flat surface before
+  discarding the last world pair.
 
-## Phase 4: Camera and Aim
+UI acceptance gate: open and close pause, Pip-Boy/inventory, dialogue, VATS,
+loading transitions, and nested menus without blank frames, stereo menus,
+double input, or a lost pointer.
 
-- Inject HMD rotation into first-person camera orientation.
-- Add local HMD translation after recenter/origin handling is solid.
-- Add right-hand aim ray tests and compare against FNV raycasts.
+## Phase 4: Native Retail Stereo
 
-## Phase 5: Rendering
+- Capture two complete retail world eyes from the same simulation tick.
+- Suspend the second engine traversal while the player cell/camera origin is
+  unknown or settling, and reset all eye-pair continuity on a cell epoch.
+- Use the OpenXR per-eye poses and asymmetric FOV values that correspond to the
+  submitted frame.
+- Exclude retail UI from the world eye pair; UI remains the mono surface.
+- Validate depth clears, state restoration, culling, transparencies, first-
+  person geometry, particles, and performance in several cells.
+- Reject incomplete, stale, identical, UI-contaminated, pose-mismatched,
+  one-target-only, underfilled, or structurally divergent pairs and fall back
+  to the live flat retail frame.
+- First isolate culling: during `AccumulateScene`, use the center/union camera
+  only while visibility is built, restore the selected eye camera before
+  `RenderScene`, and compare registered geometry IDs, resolved targets, draw
+  counts, shader-call counts, and hashes.
+- For the final prototype, scope the world accumulator/culler, run
+  `ProcessAlt` once in list mode to produce one conservative `NiVisibleArray`,
+  then restart/register/finish the world accumulator and render left and right
+  separately from that same list.
+- Begin center/center and require identical registered geometry and draw
+  structure. Only then enable distinct eye cameras/projections and require the
+  expected pixel separation without structural divergence.
+- Install no address- or vtable-based hook until the loaded `1.4.0.525` module,
+  function prologues, call signatures, singleton pointers, and object
+  ownership validate. Failed validation keeps the live mono fallback.
 
-- Prototype a D3D9 hook only after pose, input, menus, and recentering are predictable.
-- Start with depth or frame capture diagnostics.
-- Move toward per-eye camera passes only when the flat game remains stable.
+## Extending xNVSE Safely
+
+Yes, the plugin can be expanded to extract additional retail details, but each
+new field needs a concrete consumer and proof:
+
+1. identify the authoritative engine object or hook;
+2. validate executable version, pointer chain, and scene/runtime phase;
+3. log the value before mutating anything;
+4. add a fixed protocol field or a versioned mapping;
+5. consume it in the host only if magic/version/sequence checks pass;
+6. keep gameplay-critical application inside the retail process;
+7. fail closed when the structure or timing is not proven.
+
+The goal is not to reproduce FNV outside FNV. The goal is to give the retail
+engine precise VR intent, read back authoritative results, and present those
+results correctly in OpenXR.

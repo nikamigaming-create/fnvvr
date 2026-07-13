@@ -1,50 +1,65 @@
-# Prop Layer Plan
+# Retail Hands and Weapon Plan
 
-The playable target is not a new placeholder renderer. It is the smallest glue layer that lets the existing OpenMWVR FNV hand, Pip-Boy, pointer, and GUI systems operate beside retail `FalloutNV.exe`.
+The playable prop path uses the standalone OpenXR host for desired tracked
+poses and the retail FNV scene graph for authoritative hands, weapon,
+animation, muzzle, and gameplay results.
 
-The current bridge already proves:
+## Current Foundation
 
-- retail FNV can load the xNVSE DLL;
-- the OpenXR host can send headset/controller packets;
-- FNV can answer with `GameFrame` packets.
+- The host samples grip and aim poses plus trigger, squeeze, touch/button, and
+  thumbstick actions.
+- The xNVSE plugin receives those poses in-process.
+- Retail rig discovery searches for and logs first-person arm chains, hands,
+  weapon, projectile, and muzzle-flash nodes; retained runs have not proved a
+  complete non-null weapon/projectile/muzzle chain.
+- A FABRIK solver and tests provide the arm-chain math foundation.
+- The normal retail UI frame and pointer remain available as a flat headset
+  surface.
 
-The next step is reuse, not reinvention.
+These pieces are diagnostic until a live transform and firing proof passes.
 
-## Product Path
+## Transform Ownership
 
-- FNV keeps running normally and remains authoritative for game state.
-- The xNVSE DLL receives pose/action frames and injects normal FNV input/mouse/activate events.
-- The OpenXR side reuses the OpenMWVR hand/Pip-Boy/pointer implementation documented in `openmwvr-reuse-map.md`.
-- The D3D9/depth/stereo hook is added only after hands/Pip-Boy/pointer behave correctly.
+- HMD local motion must drive the eye cameras without continuous player/body
+  rotation.
+- Grip poses drive hand/wrist targets.
+- The right aim pose is intended to drive weapon/barrel direction through one
+  calibrated transform. Currently it supplies only right-hand IK orientation.
+- Retail FNV remains responsible for animations, recoil, spread, ammunition,
+  projectile creation, hit tests, and damage.
+- The plugin validates scene/runtime state before touching any retail node and
+  restores or declines writes during UI, loading, third-person, invalid
+  tracking, or rig rebuilds.
 
-## Visual Target
+## Weapon Proof Order
 
-First acceptable headset behavior:
+1. Log controller, camera, player/body, hand, weapon, and muzzle transforms in
+   one coordinate space without applying changes.
+2. Establish a configurable controller-grip-to-weapon offset and validate axes,
+   handedness, scale, and roll.
+3. Move the visual weapon and arm target while firing remains unmodified.
+4. Compare the controller/weapon ray with the retail muzzle and hit ray.
+5. Route firing direction through the smallest guarded in-process hook that
+   preserves retail recoil, spread, projectile, and damage logic.
+6. Verify alignment after recoil, reload, weapon swaps, crouch, movement, turn,
+   recenter, and tracking loss.
 
-- left and right hands use the existing FNV hand meshes, bones, and finger curl mapping;
-- trigger moves the index finger;
-- squeeze/grip curls the other fingers;
-- thumb/touch values use the existing OpenMWVR thumb source choices;
-- Pip-Boy uses the existing wrist/socket alignment;
-- pointer uses the existing ray/focus/click model.
+## Flat UI Rule
 
-The old colored quads and colored cubes are diagnostics only. They are not the playable prop layer.
+No spatial Pip-Boy or native stereo menu is required for this milestone.
+Startup, pause, inventory, Pip-Boy, dialogue, VATS, loading, and any unknown UI
+state use the retail mono surface. The right-hand ray may point and click that
+surface, but the host does not recreate menu behavior.
 
-## UI Target
+## Acceptance
 
-The first UI target is mouse-equivalent behavior:
+The prop layer is ready when:
 
-- if the pointer is over a VR GUI layer, the existing `VRGUIManager::injectMouseClick` pattern is the model;
-- if the pointer is over the retail game, the xNVSE side should inject a normal mouse/activate action;
-- the normal FNV Pip-Boy can open first, while the wrist Pip-Boy mesh proves hand attachment and spatial alignment.
-
-Later, the D3D9 hook can capture or mirror the FNV Pip-Boy texture onto the wrist surface.
-
-## Implementation Notes
-
-Use `openmwvr-reuse-map.md` as the source-of-truth file list. In particular:
-
-- OpenXR input comes from `mwvr/openxrinput.*`;
-- hands/finger curl/Pip-Boy attachment come from `mwvr/vranimation.*`;
-- pointer/click behavior comes from `mwvr/vrpointer.*` and `mwvr/vrgui.*`;
-- FNV-specific hand/Pip-Boy calibration comes from the local FNV VR run profile.
+- head motion is independent of the player/body frame;
+- hands remain stable in the recentered tracking space;
+- the visible barrel follows the right aim pose with a documented calibration;
+- muzzle/projectile or hit-ray direction and impact agree with the controller
+  ray at several distances;
+- UI transitions hide/suspend world props as intended and always restore the
+  flat retail surface;
+- tracking loss and rig rebuilds fail closed without corrupting retail state.

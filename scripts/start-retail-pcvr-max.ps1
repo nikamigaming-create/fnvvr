@@ -1,5 +1,5 @@
 param(
-    [string]$Configuration = "Debug",
+    [string]$Configuration = "Release",
     [string]$GameRoot = $(if ($env:FNVXR_GAME_ROOT) { $env:FNVXR_GAME_ROOT } else { "C:\Program Files (x86)\Steam\steamapps\common\Fallout New Vegas" }),
     [int]$GameBackbufferWidth = 2048,
     [int]$GameBackbufferHeight = 1280,
@@ -10,12 +10,17 @@ param(
     [int]$HostReadyTimeoutSeconds = 45,
     [int]$RetailReadyTimeoutSeconds = 60,
     [int]$WorldEntryTimeoutSeconds = 300,
-    [int]$WorldProofTimeoutSeconds = 0,
+    [int]$WorldProofTimeoutSeconds = 30,
     [switch]$StopExisting,
     [switch]$FocusOnLaunch,
     [switch]$DisableStereoWorld,
+    [switch]$EnableStereoWorld,
     [switch]$EnableRetailRig,
     [switch]$ApplyRetailRig,
+    [switch]$DisableRetailRig,
+    [switch]$ApplyTestLoadout,
+    [string]$D3D9ShaderWvpContracts = "",
+    [string]$D3D9ShaderAllowVertexHashes = "",
     [switch]$StageOnly,
     [switch]$ValidateOnly
 )
@@ -54,14 +59,33 @@ if ($StopExisting) {
 if ($FocusOnLaunch) {
     $launchArgs.FocusRetailWindow = $true
 }
+if ($EnableStereoWorld -and $DisableStereoWorld) {
+    throw "-EnableStereoWorld and -DisableStereoWorld are mutually exclusive."
+}
 if (-not $DisableStereoWorld) {
+    if ([string]::IsNullOrWhiteSpace($D3D9ShaderWvpContracts) -and -not ($StageOnly -or $ValidateOnly)) {
+        throw "Full VR is fail-closed until -D3D9ShaderWvpContracts supplies reviewed fnv8/sha256/byteCount@register@column-or-row contracts. Run the producer-only shader discovery profile first."
+    }
     $launchArgs.EnableStereoWorld = $true
+    if (-not [string]::IsNullOrWhiteSpace($D3D9ShaderWvpContracts)) {
+        $launchArgs.EnableD3D9ShaderStereo = $true
+        $launchArgs.D3D9ShaderWvpContracts = $D3D9ShaderWvpContracts
+        if (-not [string]::IsNullOrWhiteSpace($D3D9ShaderAllowVertexHashes)) {
+            $launchArgs.D3D9ShaderAllowVertexHashes = $D3D9ShaderAllowVertexHashes
+        }
+    }
 }
 if ($EnableRetailRig -or $ApplyRetailRig) {
     $launchArgs.EnableRetailRig = $true
 }
 if ($ApplyRetailRig) {
     $launchArgs.ApplyRetailRig = $true
+}
+if ($DisableRetailRig) {
+    $launchArgs.DisableRetailRig = $true
+}
+if ($ApplyTestLoadout) {
+    $launchArgs.ApplyTestLoadout = $true
 }
 if ($StageOnly) {
     $launchArgs.StageOnly = $true

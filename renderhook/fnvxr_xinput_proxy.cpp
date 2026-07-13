@@ -77,6 +77,14 @@ LONG g_loggedGetStateVirtual = 0;
 LONG g_loggedGetCapabilities = 0;
 LONG g_loggedGetKeystroke = 0;
 LONG g_loggedGetKeystrokeEvent = 0;
+SRWLOCK g_sharedSnapshotLock = SRWLOCK_INIT;
+SharedXInputState g_lastStableShared {};
+bool g_haveLastStableShared = false;
+bool g_returningNeutralShared = false;
+std::uint32_t g_lastAdvancingPacket = 0;
+std::uint32_t g_lastReturnedSourcePacket = 0;
+std::uint32_t g_effectivePacket = 0;
+ULONGLONG g_lastPacketAdvanceMs = 0;
 
 bool envEnabled(const char* name, bool fallback)
 {
@@ -193,7 +201,10 @@ SharedXInputState* sharedState()
     if (g_shared)
         return g_shared;
 
-    g_mapping = OpenFileMappingA(FILE_MAP_READ | FILE_MAP_WRITE, FALSE, "Local\\FNVXR_XInput_State");
+    g_mapping = OpenFileMappingA(
+        FILE_MAP_READ | FILE_MAP_WRITE,
+        FALSE,
+        fnvxr::shared::XInputSharedMappingName);
     if (!g_mapping)
     {
         if (InterlockedCompareExchange(&g_loggedSharedOpenFailed, 1, 0) == 0)
@@ -203,18 +214,98 @@ SharedXInputState* sharedState()
 
     g_shared = static_cast<SharedXInputState*>(
         MapViewOfFile(g_mapping, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, sizeof(SharedXInputState)));
+    if (!g_shared)
+    {
+        const DWORD error = GetLastError();
+        CloseHandle(g_mapping);
+        g_mapping = nullptr;
+        logLine("shared map failed err=%lu\n", error);
+        return nullptr;
+    }
     if (g_shared && InterlockedCompareExchange(&g_loggedSharedOpen, 1, 0) == 0)
     {
+        SharedXInputState snapshot {};
+        const bool stable = fnvxr::shared::readSequencedSharedSnapshot(g_shared, snapshot);
         logLine(
-            "shared mapped state=%p magic=0x%08lx version=%lu connected=%lu packet=%lu buttons=0x%04x\n",
+            "shared mapped state=%p stable=%d magic=0x%08lx version=%lu connected=%lu packet=%lu buttons=0x%04x\n",
             g_shared,
-            g_shared->magic,
-            g_shared->version,
-            static_cast<unsigned long>(g_shared->connected),
-            g_shared->packet,
-            static_cast<unsigned>(g_shared->buttons));
+            stable ? 1 : 0,
+            stable ? snapshot.magic : 0,
+            stable ? snapshot.version : 0,
+            stable ? static_cast<unsigned long>(snapshot.connected) : 0,
+            stable ? snapshot.packet : 0,
+            stable ? static_cast<unsigned>(snapshot.buttons) : 0);
     }
     return g_shared;
+}
+
+bool readEffectiveSharedState(SharedXInputState& effective)
+{
+    SharedXInputState* mapped = sharedState();
+    if (!mapped)
+        return false;
+
+    const ULONGLONG nowMs = GetTickCount64();
+    const ULONGLONG staleMs = static_cast<ULONGLONG>(
+        std::max(50, envInt("FNVXR_XINPUT_STALE_PACKET_MS", 250)));
+
+    AcquireSRWLockExclusive(&g_sharedSnapshotLock);
+    SharedXInputState current {};
+    const bool currentValid = fnvxr::shared::readSequencedSharedSnapshot(mapped, current)
+        && current.magic == XInputSharedMagic
+        && current.version == XInputSharedVersion;
+    if (currentValid)
+    {
+        if (!g_haveLastStableShared || current.packet != g_lastAdvancingPacket)
+        {
+            g_lastAdvancingPacket = current.packet;
+            g_lastPacketAdvanceMs = nowMs;
+        }
+        g_lastStableShared = current;
+        g_haveLastStableShared = true;
+    }
+
+    const bool fresh = g_haveLastStableShared
+        && g_lastPacketAdvanceMs != 0
+        && nowMs - g_lastPacketAdvanceMs <= staleMs
+        && g_lastStableShared.connected != 0;
+    if (fresh)
+    {
+        effective = g_lastStableShared;
+        if (g_returningNeutralShared
+            || g_effectivePacket == 0
+            || g_lastReturnedSourcePacket != g_lastStableShared.packet)
+        {
+            ++g_effectivePacket;
+            g_lastReturnedSourcePacket = g_lastStableShared.packet;
+        }
+        effective.packet = g_effectivePacket;
+        g_returningNeutralShared = false;
+        ReleaseSRWLockExclusive(&g_sharedSnapshotLock);
+        return true;
+    }
+
+    if (!g_returningNeutralShared)
+    {
+        ++g_effectivePacket;
+        g_returningNeutralShared = true;
+    }
+    effective = {};
+    effective.magic = XInputSharedMagic;
+    effective.version = XInputSharedVersion;
+    effective.packet = g_effectivePacket;
+    // Keep the virtual device owned by this proxy while neutral. Falling
+    // through to a physical controller would create an unrelated input source.
+    effective.connected = 1;
+    if (g_haveLastStableShared)
+    {
+        // Preserve only the proxy-owned acknowledgement. Auto-run and movement
+        // mode must be neutral or a dead host could synthesize full-forward LY.
+        effective.reserved[XInputReservedRetailConsumed] =
+            g_lastStableShared.reserved[XInputReservedRetailConsumed];
+    }
+    ReleaseSRWLockExclusive(&g_sharedSnapshotLock);
+    return true;
 }
 
 bool fillVirtualState(DWORD userIndex, XINPUT_STATE* state)
@@ -222,14 +313,12 @@ bool fillVirtualState(DWORD userIndex, XINPUT_STATE* state)
     if (userIndex != 0 || !state)
         return false;
 
-    SharedXInputState* shared = sharedState();
-    if (!shared
-        || shared->magic != XInputSharedMagic
-        || shared->version != XInputSharedVersion
-        || !shared->connected)
+    SharedXInputState snapshot {};
+    if (!readEffectiveSharedState(snapshot))
     {
         return false;
     }
+    const SharedXInputState* shared = &snapshot;
 
     std::memset(state, 0, sizeof(*state));
     state->dwPacketNumber = shared->packet;
@@ -296,7 +385,12 @@ bool fillVirtualState(DWORD userIndex, XINPUT_STATE* state)
     {
         state->Gamepad.sThumbLY = 32767;
     }
-    shared->reserved[XInputReservedRetailConsumed] = 1;
+    // This byte is consumer-owned acknowledgement metadata. Producers never
+    // include it in their sequenced frame mutation after initialization.
+    if (g_shared)
+        InterlockedExchange8(
+            reinterpret_cast<volatile char*>(&g_shared->reserved[XInputReservedRetailConsumed]),
+            1);
     return true;
 }
 
@@ -373,9 +467,11 @@ bool synthesizeKeystrokesFromShared(DWORD userIndex)
     if (userIndex != 0)
         return false;
 
-    SharedXInputState* shared = sharedState();
-    if (!sharedConnected(shared))
+    SharedXInputState snapshot {};
+    if (!readEffectiveSharedState(snapshot)
+        || !sharedConnected(&snapshot))
         return false;
+    const SharedXInputState* shared = &snapshot;
 
     if (shared->packet == g_lastKeystrokePacket)
         return true;
@@ -438,6 +534,15 @@ void cleanup()
     }
     g_keystrokeHead = 0;
     g_keystrokeTail = 0;
+    AcquireSRWLockExclusive(&g_sharedSnapshotLock);
+    g_lastStableShared = {};
+    g_haveLastStableShared = false;
+    g_returningNeutralShared = false;
+    g_lastAdvancingPacket = 0;
+    g_lastReturnedSourcePacket = 0;
+    g_effectivePacket = 0;
+    g_lastPacketAdvanceMs = 0;
+    ReleaseSRWLockExclusive(&g_sharedSnapshotLock);
 }
 }
 
@@ -599,11 +704,14 @@ extern "C" DWORD WINAPI FNVXR_XInputPowerOffController(DWORD dwUserIndex)
     return ERROR_SUCCESS;
 }
 
-BOOL APIENTRY DllMain(HMODULE, DWORD reason, LPVOID)
+BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
 {
     if (reason == DLL_PROCESS_ATTACH)
+    {
+        DisableThreadLibraryCalls(module);
         logLine("DllMain attach xinput proxy pid=%lu\n", GetCurrentProcessId());
-    if (reason == DLL_PROCESS_DETACH)
-        cleanup();
+    }
+    // Process teardown releases mappings/modules. Blocking on SRW locks or
+    // calling FreeLibrary from DllMain would run under the loader lock.
     return TRUE;
 }

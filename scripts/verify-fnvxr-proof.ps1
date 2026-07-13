@@ -240,7 +240,7 @@ if ($RequireSharedState) {
             ($state.runtime.usable -eq $true) `
             "requires Local\FNVXR_Runtime_State"
         Add-Check "shared retail player state is usable" `
-            ($state.player.usableForOpenMwCellPositionSync -eq $true) `
+            ($state.player.usable -eq $true) `
             "requires player node, cell, and finite position"
         Add-Check "shared camera state is active" `
             ($state.camera.usable -eq $true) `
@@ -256,7 +256,7 @@ if ($RequireSharedState) {
             "requires worldCandidate=true and separated=true"
         Add-Check "shared OpenXR pose state is usable" `
             ($state.pose.usable -eq $true) `
-            "requires Local\FNVXR_VR_Pose_State"
+            "requires Local\FNVXR_VR_Pose_State_v7"
         Add-Check "shared state is advancing" `
             ($state.freshness.allRequiredAdvanced -eq $true) `
             "requires player/runtime/camera/video/stereo/pose counters to advance over ${SharedStateSampleDelayMs}ms"

@@ -10,7 +10,7 @@
 
 namespace
 {
-constexpr const char* MappingName = "Local\\FNVXR_VR_Pose_State";
+constexpr const char* MappingName = fnvxr::shared::VrPoseSharedMappingName;
 constexpr float Pi = 3.14159265358979323846f;
 
 struct Options
@@ -166,6 +166,13 @@ int main(int argc, char** argv)
         std::memset(state, 0, sizeof(*state));
         state->magic = fnvxr::shared::VrPoseSharedMagic;
         state->version = fnvxr::shared::VrPoseSharedVersion;
+        state->hmdRot[3] = 1.0f;
+        state->leftRot[3] = 1.0f;
+        state->rightRot[3] = 1.0f;
+        state->leftAimRot[3] = 1.0f;
+        state->rightAimRot[3] = 1.0f;
+        state->leftEyeRot[3] = 1.0f;
+        state->rightEyeRot[3] = 1.0f;
     }
     else if ((state->sequence & 1) != 0)
     {
@@ -196,17 +203,25 @@ int main(int argc, char** argv)
         MemoryBarrier();
         state->magic = fnvxr::shared::VrPoseSharedMagic;
         state->version = fnvxr::shared::VrPoseSharedVersion;
+        state->referenceSpaceGeneration = 1;
+        state->producerEpoch = 1;
         state->trackingFlags =
             fnvxr::shared::VrPoseTrackingHmd
             | fnvxr::shared::VrPoseTrackingLeftGripActive
             | fnvxr::shared::VrPoseTrackingRightGripActive
             | fnvxr::shared::VrPoseTrackingLeftGripCurrent
-            | fnvxr::shared::VrPoseTrackingRightGripCurrent;
+            | fnvxr::shared::VrPoseTrackingRightGripCurrent
+            | fnvxr::shared::VrPoseTrackingLeftAimActive
+            | fnvxr::shared::VrPoseTrackingRightAimActive
+            | fnvxr::shared::VrPoseTrackingLeftAimCurrent
+            | fnvxr::shared::VrPoseTrackingRightAimCurrent;
         state->frame = ++frame;
         state->predictedDisplayTime = static_cast<std::int64_t>(GetTickCount64()) * 1000000ll + 11000000ll;
         copyQuat(state->hmdRot, rotation);
         copyQuat(state->leftRot, rotation);
         copyQuat(state->rightRot, rotation);
+        copyQuat(state->leftAimRot, rotation);
+        copyQuat(state->rightAimRot, rotation);
         copyQuat(state->leftEyeRot, rotation);
         copyQuat(state->rightEyeRot, rotation);
         state->hmdPos[0] = 0.0f;
@@ -218,6 +233,8 @@ int main(int argc, char** argv)
         state->rightPos[0] = state->rightEyePos[0] = halfIpd;
         state->rightPos[1] = state->rightEyePos[1] = 1.65f;
         state->rightPos[2] = state->rightEyePos[2] = 0.0f;
+        std::memcpy(state->leftAimPos, state->leftPos, sizeof(state->leftAimPos));
+        std::memcpy(state->rightAimPos, state->rightPos, sizeof(state->rightAimPos));
         const float fov[4] { -0.9f, 0.9f, 0.9f, -0.9f };
         std::memcpy(state->leftFov, fov, sizeof(fov));
         std::memcpy(state->rightFov, fov, sizeof(fov));

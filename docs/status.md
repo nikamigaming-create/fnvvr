@@ -1,117 +1,163 @@
-# FNVXR Bridge Status
+# FNVVR Retail Status
 
-Last updated: 2026-07-04
+Last updated: 2026-07-12
 
-## Pinned Baseline
+## Direction Locked
 
-The first passable in-headset retail FNV baseline is pinned in `docs/playable-big-screen-vr-baseline.md`.
+The product path is one retail `FalloutNV.exe`, one standalone OpenXR host, the
+FNVVR xNVSE plugin, and the retail proxy DLLs. There is no alternate game
+runtime or world handoff in the shipping architecture.
 
-Scope: retail Fallout New Vegas is playable in VR on the OpenXR sidecar's large curved screen. Menu/gameplay entry, basic controller routing, runtime state gating, L3 run/stamina mode, R3 auto-forward, B jump, Y favorites, and Pip-Boy/inventory UI lane handling have live proof from `local\openxr-retail-sidecar-runs\20260704-122203`.
+Retail UI is intentionally flat for this phase. Startup/menu mode, inventory,
+Pip-Boy, dialogue, VATS, loading, pause, and unknown/non-gameplay states must
+present the normal retail mono frame on the OpenXR UI surface. Stereo world
+presentation may resume only after runtime state and a valid retail eye pair
+both prove unobstructed gameplay.
 
-This is the first-cut big-screen VR baseline, not the final native stereo world presentation.
+## Proven Foundation
 
-## Proven
+- xNVSE `6.4.8` and OpenXR SDK `release-1.1.60` are pinned and fetched into
+  ignored dependency directories.
+- The 32-bit xNVSE plugin and D3D9/DirectInput/XInput proxies build for retail
+  FNV `1.4.0.525`.
+- Retail FNV loads the plugin and proxy DLLs through the normal xNVSE/game
+  process.
+- The standalone host creates a real OpenXR session and samples HMD, grip, aim,
+  buttons, triggers, squeeze, and thumbsticks.
+- Shared pose ABI v5 carries independent left/right grip and aim poses with
+  active/current tracking flags. The retail right-hand rig uses grip position
+  and current aim orientation, with a guarded grip-orientation fallback.
+- Pose/input shared state reaches the live retail process; retail publishes
+  runtime, camera, player, menu, and weapon-class telemetry back to the host.
+- XInput v2 and DirectInput v9 use versioned mapping names and stable
+  odd/even snapshots. DirectInput look uses cumulative angle counters consumed
+  once across state/buffered polling; 250 ms producer staleness neutralizes
+  held buttons, triggers, sticks, grip, pointer, and look state.
+- The flat retail frame can be presented and the shared pointer/click path has
+  worked in tested menus. Generic close/back semantics and exhaustive nested or
+  mod-added menu coverage are not signed off.
+- The plugin distinguishes gameplay from menu, Pip-Boy, dialogue, VATS,
+  loading, other visible TileMenu states, and an active non-HUD interface menu
+  even when its ID is mod-added or its TileMenu pointer lags. The raw engine
+  MenuMode bit is retained as a diagnostic because live gameplay can report it
+  continuously.
+- The retail D3D9 proxy captures mono frames and contains replay/readback and
+  complete-eye-pair diagnostics.
+- Retail player rig discovery searches for and logs arm-chain, hand, weapon,
+  projectile, and muzzle-flash nodes; retained runs have not proved a complete
+  non-null weapon/projectile/muzzle chain. FABRIK solver tests cover the arm
+  math foundation.
 
-- Dependencies are cached locally under `deps/`.
-- Latest fetched xNVSE release: `6.4.8`.
-- Latest fetched Khronos OpenXR SDK and SDK-Source release: `release-1.1.60`.
-- Retail FNV is detected through the local probe script; the exact install path is intentionally local-only.
-- `FalloutNV.exe` is present and is x86 / 32-bit.
-- Installed retail FNV version is `1.4.0.525`.
-- Installed xNVSE runtime files are present in the game root:
-  - `nvse_loader.exe`
-  - `nvse_1_4.dll`
-  - `nvse_steam_loader.dll`
-- Existing live xNVSE plugins include JIP LN NVSE and ShowOffNVSE.
-- `nvse_fnvxr.dll` builds as both x64 test DLL and Win32 FNV-compatible DLL.
-- The Win32 DLL exports `NVSEPlugin_Query` and `NVSEPlugin_Load`.
-- The Win32 DLL creates the shared-memory bridge mappings when `NVSEPlugin_Load` is called.
-- The loaded DLL test validates the exported xNVSE entry points and shared-state ABI.
-- The local OpenXR loader is visible when using the vcpkg loader path.
-- A local OpenXR runtime is active and visible to the probe.
-- OpenXR instance creation succeeds.
-- With the headset awake, `xrGetSystem(XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY)` succeeds.
-- `nvse_fnvxr.dll` was installed into the live FNV xNVSE plugin folder.
-- Retail `FalloutNV.exe` launched through `nvse_loader.exe` and loaded the bridge DLL.
-- Live bridge smoke passed against the actual game process through shared memory:
-  - OpenXR/OpenMW-side state is consumed by `FalloutNV.exe`.
-  - The xNVSE-loaded DLL publishes runtime, camera, player, and input telemetry.
-- Real OpenXR pose host passed against the live game process:
-  - OpenXR D3D11 session creation succeeds.
-  - HMD and controller action spaces are created.
-  - Host sent real headset/controller pose state into FNV through the shared mappings.
-  - Live FNV bridge published runtime/game state during the prop-layer smoke.
-- OpenXR diagnostic prop runs proved that external layers can render while the live FNV bridge responds.
-- The diagnostic prop runs are not the playable hand/Pip-Boy path.
-- The exact OpenMWVR reuse points for hands, finger curl, Pip-Boy wrist attachment, pointer ray, and GUI/mouse click injection are recorded in `docs/openmwvr-reuse-map.md`.
-- The OpenXR pose host now creates controller actions for trigger, squeeze, A/B/X/Y, menu, and thumbstick clicks.
-- The pose host drains lifecycle events until the session reaches focused state; controller action bindings become active (`activeMask=0x7ff`).
-- The pose protocol now carries an optional normalized menu pointer hit from the right aim ray to the game quad.
-- The OpenXR host can draw a visible yellow pointer marker on the game quad when `FNVXR_SHOW_GAME_PLANE=1`.
-- The live xNVSE DLL can map that menu pointer hit into the FNV client window cursor, so Button A clicks the aimed point instead of relying on desktop automation.
-- The live xNVSE DLL consumes rising-edge input intent:
-  - A -> left mouse click
-  - X -> activate key (`E`)
-  - left menu -> Pip-Boy/menu key (`Tab`)
-- OpenXR prop calibration now separates grip pose from aim pose:
-  - grip pose drives left/right hand markers and the temporary wrist/Pip-Boy rig
-  - right aim pose drives the temporary pointer ray
-- The temporary OpenXR renderer now uses a D3D11 depth buffer for the prop pass.
-- Local-only retail FNV source meshes were inspected for calibration. Extracted game assets stay ignored and must not be published.
-- A Win32 `d3d9.dll` proxy now builds for the retail game render hook path.
-- Live FNV loads the staged D3D9 proxy from the game root.
-- The proxy forwards the full public D3D9 export set and wraps `IDirect3D9`.
-- The proxy intercepts the live `CreateDevice` call:
-  - windowed: `1`
-  - backbuffer: `2048x1280`
-  - format: `22` (`D3DFMT_X8R8G8B8`)
-- The proxy hooks live `IDirect3DDevice9::Reset`, `Present`, `EndScene`, `Clear`, `SetTransform`, `SetVertexShaderConstantF`, `DrawPrimitive`, and `DrawIndexedPrimitive`.
-- Live FNV submits fixed-function `D3DTS_VIEW` / `D3DTS_PROJECTION` matrices at roughly 120 transform calls/sec in the menu path.
-- The hook derives left/right eye view matrices from the live FNV view matrix with a default 0.064m IPD:
-  - left eye: +0.032m on FNV view-space X
-  - right eye: -0.032m on FNV view-space X
-- `fnvxr_stereo_math_test` locks the eye-split sign and verifies projection pass-through until asymmetric OpenXR frusta are wired.
-- Offscreen stereo replay is implemented behind `FNVXR_D3D9_STEREO_REPLAY=1`:
-  - creates left/right 2048x1280 render target textures plus depth surfaces
-  - replays draw calls into those targets with derived left/right view matrices
-  - restores FNV's original render target, depth surface, and transforms
-- Optional stereo readback is implemented behind `FNVXR_D3D9_STEREO_READBACK=1`:
-  - creates system-memory readback surfaces
-  - logs left/right hashes, `worldCandidate`, and `separated`
-  - menu/UI hashes are expected to match and must not be counted as in-world stereo proof
-- Short live replay smoke passed without crashing:
-  - created stereo replay targets: `2048x1280`, format `22`
-  - replayed over 2500 draw calls
-  - Present recovered to about 60 FPS in the menu path
+## Current Headset Boundary
 
-## Current Blockers
+### Head tracking
 
-- The current standalone sidecar path has a passing in-headset big-screen gameplay proof. It still needs polish for UI/UX, inventory/Pip-Boy ergonomics, and final interaction mapping.
-- The OpenXR diagnostic prop layer is still using boxes/rays, not the extracted NIF meshes or the existing OpenMWVR hand/Pip-Boy renderer.
-- The headset/runtime occasionally drops OpenXR focus during long passes; render poses are smoothed/held, but action active masks can still fall to zero until focus returns.
-- The captured game panel is hidden by default during prop calibration (`FNVXR_SHOW_GAME_PLANE=0`) because desktop/window capture can introduce black occluder artifacts.
-- The current pinned playable view is a large curved flat-FNV screen in OpenXR. Offscreen stereo replay is not yet the final in-headset world presentation.
-- The offscreen replay/readback path has only been smoke-tested in the menu/windowed path. It still needs a user-in-character stress pass, depth/clear validation, and a transfer/share path into the OpenXR host.
-- Menu/UI replay is not a valid stereo proof. A stereo proof requires an in-world/player-camera frame with `worldCandidate=1` and eventually `separated=1`.
+HMD orientation is available on both sides of the bridge and the retail camera
+apply path exists. The last observed behavior was not an acceptable 6DoF
+camera: looking around pivoted too much of the player/body frame with the head.
+Until a live test proves otherwise, head/body decoupling is the first blocker.
+
+Acceptance requires:
+
+- ordinary head yaw/pitch/roll changes the eye cameras without continuously
+  rewriting the player actor transform;
+- local headset translation is applied in the correct camera/body frame and
+  returns cleanly after recenter;
+- movement/turn controls retain a deliberate body heading independent of
+  moment-to-moment head look;
+- entering or leaving any UI mode cannot leave a stale camera transform behind.
+
+### Weapon aim
+
+The OpenXR right aim pose is consumed only as the orientation source for the
+right-hand IK target; grip position still anchors the wrist. The weapon node is
+discovered and logged but is not directly solved, and no muzzle,
+projectile-launch, or hit-ray hook currently consumes the aim pose.
+Controller-to-weapon calibration and authoritative firing alignment are not
+yet proven; visual hand motion alone is insufficient.
+
+Acceptance requires one transform chain to agree on:
+
+- right-controller aim pose;
+- retail weapon and arm pose;
+- muzzle position and forward direction;
+- projectile launch or engine hit ray;
+- crosshair/impact diagnostics;
+- recoil and animation recovery.
+
+The first proof should use a known ranged weapon in a controlled save, log the
+controller ray and retail muzzle/raycast in the same coordinate space, and
+compare both direction and impact point over several distances.
+
+### Rendering
+
+The retained July 11 run identifies a concrete scene-consistency failure. At
+the exterior-to-interior transition, retail cell `896697` changed to `1073541`
+without a loading gate. A published pair then had only one resolved target
+path (`0/1`), and a later interior pair submitted `1107/1629` draws and
+`3978/5714` vertex-shader constant calls. Pixel separation alone incorrectly
+allowed this work to look like successful stereo.
+
+The legacy native hook invoked the full Gamebryo render boundary once per eye.
+It could not restore every culling, portal, occlusion, visibility, effect, and
+render-list side effect consumed by the first traversal. That path remains
+disabled in the production stereo environment.
+
+The working tree now implements a coherent single-traversal producer:
+
+- the verified `DoRenderFrame` boundary at `0x008706B0` receives one
+  body-local HMD camera and the union of both OpenXR eye frusta;
+- Gamebryo culls and submits one scene exactly once;
+- each exact submitted D3D9 draw is replayed to left and right eye targets,
+  with fixed-function view/projection updates and validated shader WVP deltas;
+- shared stereo provenance is `StereoProducerSingleTraversal`, with the
+  rendered pose sequence and display time attached to the pixels;
+- runtime telemetry rejects camera drift, invalid rotation matrices, missing
+  eye replay, non-separated images, legacy double traversal, head/body
+  coupling, and gameplay flat-plane transitions.
+
+The union frustum prevents ordinary left/right eye culling loss, although D3D9
+replay cannot recover geometry that Gamebryo omitted before submission. A live
+headset run is still required to prove the new boundary visually.
+
+Loaded-process inspection verified `AccumulateScene` at `0x00B6BEE0`,
+`RenderScene` at `0x00B6C0D0`, the SceneGraph camera at `+0xAC`, and the world
+culler at `+0xB4`. It did not verify the previously proposed TESMain `+0x88`
+accumulator pointer; that claim is withdrawn, and no guessed accumulator
+virtual methods are called by the production path.
+
+## xNVSE Extraction Boundary
+
+Extending `nvse_fnvxr.dll` is the right way to expose more retail-side detail.
+The plugin runs in-process and can inspect known engine objects, scene-graph
+nodes, menu/runtime state, and guarded hook points, then publish compact
+versioned telemetry to the host.
+
+That is not a blanket promise that every engine behavior can be copied out and
+replayed externally. Gameplay-critical changes should remain in-process:
+weapon transforms, muzzle/projectile direction, hit tests, activation, and
+animation state must be applied or confirmed by retail FNV. The standalone
+host should publish desired poses/input and compose the returned retail frames.
+Unknown layouts need executable-version checks, pointer validation, logging,
+and a fail-closed fallback.
+
+## Immediate Blockers
+
+1. Run one guarded exterior/interior/head-turn headset test and require the live
+   analyzer to pass single traversal, camera matrix, WVP, provenance,
+   separation, head/body decoupling, and no-gameplay-2D-transition checks.
+2. Keep retail IK, synthetic hands, and weapon writes disabled during that
+   camera/stereo acceptance run.
+3. Equip the deterministic ranged-weapon loadout, prove right-arm/weapon/muzzle
+   discovery, and calibrate controller-to-weapon visual alignment.
+4. Align the retail muzzle/projectile/hit ray to the same controller transform
+   and verify impacts while retail retains combat authority.
 
 ## Safe Local Artifacts
 
-- Staged plugin layout:
-  `local/fnv-plugin-stage/Data/NVSE/Plugins/nvse_fnvxr.dll`
-- Dependency manifest:
-  `deps/manifest.json`
-- FNV probe:
-  `local/fnv-probe.json`
-- Combined preflight:
-  `local/preflight-fnvxr.json`
-- Live D3D9 proxy log in the local retail FNV game root.
-
-## Next Live Steps
-
-1. Add DLL-side logging to `Data\NVSE\Plugins\Logs\` or a local lab log file.
-2. Run a headset pass with deliberate trigger/squeeze/A/X/menu input and confirm nonzero `PoseFrame` values.
-3. Use the in-headset game quad pointer to click Continue/Load without desktop mouse automation.
-4. Wire the D3D9 left/right render target textures into an OpenXR-visible submission path.
-5. Stress `FNVXR_D3D9_STEREO_REPLAY=1` in an in-world save and validate clears, depth, UI passes, and frame time.
-6. Replace projection pass-through with asymmetric per-eye OpenXR frusta.
-7. Port the existing OpenMWVR hand/Pip-Boy/pointer systems listed in `docs/openmwvr-reuse-map.md`.
+- staged plugin layout under `local/fnv-plugin-stage/`;
+- dependency manifest at `deps/manifest.json`;
+- retail probe at `local/fnv-probe.json`;
+- combined preflight at `local/preflight-fnvxr.json`;
+- run manifests and telemetry under ignored `local/` directories or the local
+  retail game root.

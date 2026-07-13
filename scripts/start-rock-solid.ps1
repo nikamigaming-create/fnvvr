@@ -1,5 +1,5 @@
 param(
-    [string]$Configuration = "Debug",
+    [string]$Configuration = "Release",
     [int]$Frames = 0,
     [int]$HostStartupDelaySeconds = 0,
     [string]$GameRoot = $(if ($env:FNVXR_GAME_ROOT) { $env:FNVXR_GAME_ROOT } else { "C:\Program Files (x86)\Steam\steamapps\common\Fallout New Vegas" }),
@@ -17,6 +17,7 @@ param(
     [switch]$EnableHostWatchdog,
     [int]$MaxHostRestarts = 0,
     [switch]$AllowFiniteHostRun,
+    [switch]$DisableStereoWorld,
     [switch]$StageOnly,
     [switch]$ValidateOnly
 )
@@ -48,6 +49,11 @@ $launchArgs = @{
     HostGameTextureHeight = $HostGameTextureHeight
     UiWidth = $UiSharedWidth
     UiHeight = $UiSharedHeight
+    EnableStereoWorld = $true
+}
+
+if ($DisableStereoWorld) {
+    [void]$launchArgs.Remove("EnableStereoWorld")
 }
 
 if ($StopExisting) {

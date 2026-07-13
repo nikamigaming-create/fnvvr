@@ -10,6 +10,9 @@ param(
     [int]$CommandWaitMs = 10000,
     [int]$GameExitTimeoutSeconds = 20,
     [int]$HostExitGraceSeconds = 3,
+    [string]$LiveAnalyzer = "",
+    [string]$StereoCaptureScript = "",
+    [int]$StereoCaptureIntervalSeconds = 15,
     [switch]$SaveQuitOnHostExit
 )
 
@@ -56,11 +59,43 @@ function Invoke-SaveQuit {
     }
 }
 
+function Invoke-LiveAcceptanceAnalysis {
+    if (-not $LiveAnalyzer -or -not (Test-Path -LiteralPath $LiveAnalyzer)) {
+        return
+    }
+    $analysisLog = Join-Path $RunDir "live-acceptance.log"
+    & powershell.exe `
+        -NoProfile `
+        -ExecutionPolicy Bypass `
+        -File $LiveAnalyzer `
+        -RunDir $RunDir 2>&1 |
+        Set-Content -LiteralPath $analysisLog -Encoding UTF8
+    Write-WatcherLog ("live acceptance analysis exitCode={0}" -f $LASTEXITCODE)
+}
+
+function Invoke-IndependentStereoCapture {
+    if (-not $StereoCaptureScript -or -not (Test-Path -LiteralPath $StereoCaptureScript)) {
+        return
+    }
+    $captureRoot = Join-Path $RunDir "live-stereo-captures"
+    $sceneName = "eye-" + (Get-Date -Format "yyyyMMdd-HHmmss-fff")
+    & powershell.exe `
+        -NoProfile `
+        -ExecutionPolicy Bypass `
+        -File $StereoCaptureScript `
+        -OutputRoot $captureRoot `
+        -SceneName $sceneName `
+        -TimeoutSeconds 2 2>&1 |
+        ForEach-Object { Write-WatcherLog ("stereo capture " + $_) }
+    Write-WatcherLog ("independent stereo capture exitCode={0} scene={1}" -f $LASTEXITCODE,$sceneName)
+}
+
 try {
     New-Item -ItemType Directory -Force -Path $RunDir | Out-Null
     Write-WatcherLog ("watch start falloutPid={0} hostPid={1} commandExe='{2}' saveQuitOnHostExit={3}" -f $FalloutPid, $HostPid, $CommandExe, [bool]$SaveQuitOnHostExit)
 
     $lastHeartbeat = Get-Date
+    $lastStereoCapture = [DateTime]::MinValue
     while ($true) {
         $fallout = Get-Process -Id $FalloutPid -ErrorAction SilentlyContinue
         $hostProcess = Get-Process -Id $HostPid -ErrorAction SilentlyContinue
@@ -89,6 +124,11 @@ try {
 
         if (((Get-Date) - $lastHeartbeat).TotalSeconds -ge 5) {
             $lastHeartbeat = Get-Date
+            Invoke-LiveAcceptanceAnalysis
+            if (((Get-Date) - $lastStereoCapture).TotalSeconds -ge $StereoCaptureIntervalSeconds) {
+                $lastStereoCapture = Get-Date
+                Invoke-IndependentStereoCapture
+            }
             if ($env:FNVXR_TELEMETRY_HAMMER -ne "0") {
                 Write-WatcherLog ("heartbeat falloutPid={0} hostPid={1} hostAlive={2}" -f $FalloutPid, $HostPid, [bool]$hostProcess)
             }
@@ -111,6 +151,8 @@ try {
         Write-WatcherLog ("stopping host after retail exit pid={0}" -f $HostPid)
         Stop-Process -Id $HostPid -Force -ErrorAction SilentlyContinue
     }
+    Invoke-LiveAcceptanceAnalysis
+    Invoke-IndependentStereoCapture
 } catch {
     try {
         Write-WatcherLog ("ERROR " + $_.Exception.Message)
