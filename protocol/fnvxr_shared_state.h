@@ -19,8 +19,11 @@ constexpr std::uint32_t VrPoseSharedMagic = 0x52505646; // FVPR
 constexpr std::uint32_t VrPoseSharedVersion = 7;
 inline constexpr char VrPoseSharedMappingName[] = "Local\\FNVXR_VR_Pose_State_v7";
 constexpr std::uint32_t VrOriginSharedMagic = 0x4f565846; // FXVO
-constexpr std::uint32_t VrOriginSharedVersion = 3;
-inline constexpr char VrOriginSharedMappingName[] = "Local\\FNVXR_VR_Origin_State_v3";
+constexpr std::uint32_t VrOriginSharedVersion = 5;
+inline constexpr char VrOriginSharedMappingName[] = "Local\\FNVXR_VR_Origin_State_v5";
+constexpr std::uint32_t VrOriginStateInvalid = 0;
+constexpr std::uint32_t VrOriginStateRenderLease = 1;
+constexpr std::uint32_t VrOriginStateCommitted = 2;
 constexpr std::uint32_t CameraSharedMagic = 0x43585646; // FNXC
 constexpr std::uint32_t CameraSharedVersion = 1;
 constexpr std::uint32_t RuntimeSharedMagic = 0x53585646; // FNVS
@@ -76,6 +79,11 @@ constexpr std::uint32_t RuntimeBlockingMenuBits =
     | RuntimeLoadingMenuBit
     | RuntimePipBoyMenuBit
     | RuntimeGenericMenuBit;
+
+inline bool runtimeLoadingMenuBlocksInput(bool rawLoadingVisible, bool actionableMenuVisible)
+{
+    return rawLoadingVisible && !actionableMenuVisible;
+}
 
 inline bool runtimeUiInputAllowed(std::uint32_t menuBits)
 {
@@ -145,6 +153,7 @@ constexpr std::uint32_t VrPoseTrackingLeftAimActive = 1u << 5;
 constexpr std::uint32_t VrPoseTrackingRightAimActive = 1u << 6;
 constexpr std::uint32_t VrPoseTrackingLeftAimCurrent = 1u << 7;
 constexpr std::uint32_t VrPoseTrackingRightAimCurrent = 1u << 8;
+constexpr std::uint32_t VrPoseTrackingRecenterRequested = 1u << 9;
 
 struct SharedXInputState
 {
@@ -323,6 +332,11 @@ struct SharedVrOriginState
     std::uint32_t magic;
     std::uint32_t version;
     volatile LONG sequence;
+    // VrOriginStateRenderLease while the native camera traversal is active,
+    // VrOriginStateCommitted after a verified traversal completed, otherwise
+    // VrOriginStateInvalid. The committed state lets animation consume the
+    // exact prior render origin even though animation and rendering are not
+    // nested in Fallout's frame schedule.
     std::uint32_t active;
     std::uint32_t generation;
     std::uint32_t poseSequence;
@@ -334,6 +348,13 @@ struct SharedVrOriginState
     std::uint32_t reserved;
     std::uint64_t renderPoseFrame;
     std::int64_t renderedDisplayTime;
+    // Exact SceneGraph NiCamera and engine-authored world transform captured
+    // before the HMD overlay for this render transaction. The retail arm
+    // solver anchors against this record instead of a different camera hook.
+    std::uint32_t renderCameraAddress;
+    std::uint32_t renderCameraWorldValid;
+    float renderCameraWorldRot[9];
+    float renderCameraWorldPos[3];
 };
 
 struct SharedCameraState
@@ -469,7 +490,7 @@ struct SharedInputEventQueue
 static_assert(sizeof(SharedXInputState) == 32, "SharedXInputState layout changed");
 static_assert(sizeof(SharedDInputState) == 100, "SharedDInputState layout changed unexpectedly");
 static_assert(sizeof(SharedVrPoseState) == 272, "SharedVrPoseState layout changed unexpectedly");
-static_assert(sizeof(SharedVrOriginState) == 88, "SharedVrOriginState layout changed unexpectedly");
+static_assert(sizeof(SharedVrOriginState) == 144, "SharedVrOriginState layout changed unexpectedly");
 static_assert(sizeof(SharedCameraState) == 80, "SharedCameraState layout changed");
 static_assert(sizeof(SharedRuntimeState) == 88, "SharedRuntimeState layout changed");
 static_assert(sizeof(SharedD3D9FrameHeader) == 28, "SharedD3D9FrameHeader layout changed");
@@ -514,6 +535,9 @@ static_assert(offsetof(SharedVrOriginState, poseFrame) == 24, "SharedVrOriginSta
 static_assert(offsetof(SharedVrOriginState, originRot) == 32, "SharedVrOriginState rotation offset changed");
 static_assert(offsetof(SharedVrOriginState, renderPoseSequence) == 64, "SharedVrOriginState render pose sequence offset changed");
 static_assert(offsetof(SharedVrOriginState, renderPoseFrame) == 72, "SharedVrOriginState render pose frame offset changed");
+static_assert(offsetof(SharedVrOriginState, renderCameraAddress) == 88, "SharedVrOriginState render camera offset changed");
+static_assert(offsetof(SharedVrOriginState, renderCameraWorldRot) == 96, "SharedVrOriginState render camera rotation offset changed");
+static_assert(offsetof(SharedVrOriginState, renderCameraWorldPos) == 132, "SharedVrOriginState render camera position offset changed");
 static_assert(offsetof(SharedD3D9StereoFrameHeader, writing) == 12, "SharedD3D9StereoFrameHeader writing offset changed");
 static_assert(offsetof(SharedD3D9StereoFrameHeader, sequence) == 16, "SharedD3D9StereoFrameHeader sequence offset changed");
 static_assert(offsetof(SharedD3D9StereoFrameHeader, renderedDisplayTime) == 56, "SharedD3D9StereoFrameHeader renderedDisplayTime offset changed");

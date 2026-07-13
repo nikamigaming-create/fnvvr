@@ -262,6 +262,18 @@ function Set-FnvxrIniValue {
     }
 }
 
+function Write-FnvxrJsonAtomic {
+    param(
+        [Parameter(Mandatory = $true)]$Value,
+        [Parameter(Mandatory = $true)][string]$Path,
+        [int]$Depth = 8
+    )
+
+    $temporaryPath = "$Path.$PID.tmp"
+    $Value | ConvertTo-Json -Depth $Depth | Set-Content -LiteralPath $temporaryPath -Encoding UTF8
+    Move-Item -LiteralPath $temporaryPath -Destination $Path -Force
+}
+
 function Set-FnvxrIniSectionValue {
     param(
         [string]$Path,
@@ -506,11 +518,31 @@ function Get-FnvxrArtifactInfo {
         exists = $exists
         length = 0
         sha256 = $null
+        peMachine = $null
     }
     if ($exists) {
         $item = Get-Item -LiteralPath $Path
         $info.length = $item.Length
         $info.sha256 = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($item.Extension -in @(".dll", ".exe")) {
+            try {
+                $stream = [System.IO.File]::Open($Path, 'Open', 'Read', 'ReadWrite')
+                try {
+                    $reader = [System.IO.BinaryReader]::new($stream)
+                    if ($reader.ReadUInt16() -ne 0x5A4D) { throw "missing MZ signature" }
+                    $stream.Position = 0x3C
+                    $peOffset = $reader.ReadUInt32()
+                    if ($peOffset -gt ($stream.Length - 6)) { throw "invalid PE offset" }
+                    $stream.Position = $peOffset
+                    if ($reader.ReadUInt32() -ne 0x00004550) { throw "missing PE signature" }
+                    $info.peMachine = ('0x{0:X4}' -f $reader.ReadUInt16())
+                } finally {
+                    $stream.Dispose()
+                }
+            } catch {
+                throw "Unable to verify PE architecture for $Path`: $($_.Exception.Message)"
+            }
+        }
     }
     return $info
 }
@@ -523,6 +555,9 @@ function Copy-FnvxrStageArtifact {
 
     $optional = [bool]$Item.Optional
     $sourceInfo = Get-FnvxrArtifactInfo -Path $Item.Source
+    if ($Item.Machine -and $sourceInfo.exists -and $sourceInfo.peMachine -ne $Item.Machine) {
+        throw "Build output has wrong PE architecture: $($Item.Source) expected=$($Item.Machine) actual=$($sourceInfo.peMachine)"
+    }
     if (-not $sourceInfo.exists) {
         if ($optional) {
             $removedStaleDestination = $false
@@ -551,7 +586,9 @@ function Copy-FnvxrStageArtifact {
     }
 
     $destinationInfo = Get-FnvxrArtifactInfo -Path $Item.Destination
-    $verified = $destinationInfo.exists -and $sourceInfo.sha256 -and ($sourceInfo.sha256 -eq $destinationInfo.sha256)
+    $verified = $destinationInfo.exists -and $sourceInfo.sha256 -and
+        ($sourceInfo.sha256 -eq $destinationInfo.sha256) -and
+        (-not $Item.Machine -or $destinationInfo.peMachine -eq $Item.Machine)
     if ($Copy -and -not $verified) {
         throw "Staged artifact hash mismatch: $($Item.Source) -> $($Item.Destination)"
     }
@@ -577,17 +614,17 @@ function Copy-FnvxrRetailArtifacts {
     $buildWin32 = Join-Path $Root "build-win32\$Configuration"
     $pluginDir = Join-Path $GameRoot "Data\NVSE\Plugins"
     $stageMap = @(
-        @{ Source = Join-Path $buildWin32 "nvse_fnvxr.dll"; Destination = Join-Path $pluginDir "nvse_fnvxr.dll" },
+        @{ Source = Join-Path $buildWin32 "nvse_fnvxr.dll"; Destination = Join-Path $pluginDir "nvse_fnvxr.dll"; Machine = "0x014C" },
         @{ Source = Join-Path $buildWin32 "nvse_fnvxr.pdb"; Destination = Join-Path $pluginDir "nvse_fnvxr.pdb"; Optional = $true },
-        @{ Source = Join-Path $buildWin32 "d3d9.dll"; Destination = Join-Path $GameRoot "d3d9.dll" },
+        @{ Source = Join-Path $buildWin32 "d3d9.dll"; Destination = Join-Path $GameRoot "d3d9.dll"; Machine = "0x014C" },
         @{ Source = Join-Path $buildWin32 "d3d9.pdb"; Destination = Join-Path $GameRoot "d3d9.pdb"; Optional = $true },
-        @{ Source = Join-Path $buildWin32 "dinput8.dll"; Destination = Join-Path $GameRoot "dinput8.dll" },
+        @{ Source = Join-Path $buildWin32 "dinput8.dll"; Destination = Join-Path $GameRoot "dinput8.dll"; Machine = "0x014C" },
         @{ Source = Join-Path $buildWin32 "dinput8.pdb"; Destination = Join-Path $GameRoot "dinput8.pdb"; Optional = $true },
-        @{ Source = Join-Path $buildWin32 "xinput1_3.dll"; Destination = Join-Path $GameRoot "xinput1_3.dll" },
-        @{ Source = Join-Path $buildWin32 "xinput1_3.dll"; Destination = Join-Path $GameRoot "xinput9_1_0.dll" },
-        @{ Source = Join-Path $buildWin32 "xinput1_3.dll"; Destination = Join-Path $GameRoot "xinput1_4.dll" },
-        @{ Source = Join-Path $buildWin32 "xinput1_3.dll"; Destination = Join-Path $GameRoot "xinput1_2.dll" },
-        @{ Source = Join-Path $buildWin32 "xinput1_3.dll"; Destination = Join-Path $GameRoot "xinput1_1.dll" },
+        @{ Source = Join-Path $buildWin32 "xinput1_3.dll"; Destination = Join-Path $GameRoot "xinput1_3.dll"; Machine = "0x014C" },
+        @{ Source = Join-Path $buildWin32 "xinput1_3.dll"; Destination = Join-Path $GameRoot "xinput9_1_0.dll"; Machine = "0x014C" },
+        @{ Source = Join-Path $buildWin32 "xinput1_3.dll"; Destination = Join-Path $GameRoot "xinput1_4.dll"; Machine = "0x014C" },
+        @{ Source = Join-Path $buildWin32 "xinput1_3.dll"; Destination = Join-Path $GameRoot "xinput1_2.dll"; Machine = "0x014C" },
+        @{ Source = Join-Path $buildWin32 "xinput1_3.dll"; Destination = Join-Path $GameRoot "xinput1_1.dll"; Machine = "0x014C" },
         @{ Source = Join-Path $buildWin32 "xinput1_3.pdb"; Destination = Join-Path $GameRoot "xinput1_3.pdb"; Optional = $true }
     )
 
@@ -671,6 +708,10 @@ function Set-FnvxrSidecarEnvironment {
     $env:FNVXR_XINPUT_RIGHT_GRIP_MENU_ENABLE = "0"
     $env:FNVXR_XINPUT_GRIP_MENU_THRESHOLD = "0.55"
     $env:FNVXR_XINPUT_PHYSICAL_MENU_BUTTONS_ENABLE = "1"
+    # Meta's left menu/click remains the primary pause button. L3 is an
+    # independent emergency Escape edge because the runtime can expose the
+    # Touch Plus path as active while never reporting a value transition.
+    $env:FNVXR_L3_MENU_FALLBACK = "1"
     $env:FNVXR_XINPUT_MASK_X = "1"
     $env:FNVXR_XINPUT_MASK_B = "1"
     $env:FNVXR_XINPUT_MASK_Y = "1"
@@ -699,6 +740,11 @@ function Set-FnvxrSidecarEnvironment {
     $env:FNVXR_HOST_SENDINPUT_CLICK = "0"
     $env:FNVXR_HOST_CURSOR_CLICK_FALLBACK = "0"
     $env:FNVXR_DINPUT_FORCE_BACKGROUND = "1"
+    $env:FNVXR_DINPUT_VIRTUAL_OWNER = "1"
+    # A host trigger is an edge packet, while Fallout samples mouse state.
+    # Hold the synthetic button across several engine polls so a click cannot
+    # fall between two menu samples.
+    $env:FNVXR_DINPUT_MENU_CLICK_HOLD_POLLS = "6"
     $env:FNVXR_DINPUT_KEYBOARD_MOVEMENT_ENABLE = "auto"
     $env:FNVXR_PLUGIN_KEYBOARD_MOVEMENT_ENABLE = "0"
     $env:FNVXR_PLUGIN_MENU_KEYBOARD_FALLBACK = "1"
@@ -737,6 +783,8 @@ function Set-FnvxrSidecarEnvironment {
     $env:FNVXR_GAMEPLAY_COMBAT_X_DIK = "8"
     $env:FNVXR_GAMEPLAY_COMBAT_Y_DIK = "9"
     $env:FNVXR_XINPUT_MASK_THUMBSTICK_CLICKS = "1"
+    $env:FNVXR_XINPUT_MASK_PLUGIN_OWNED_BUTTONS = "1"
+    $env:FNVXR_XINPUT_MASK_PLUGIN_OWNED_TRIGGERS = "1"
     $env:FNVXR_XINPUT_RIGHT_STICK_Y_ENABLE = "1"
     $env:FNVXR_XINPUT_RIGHT_STICK_SCALE = "1.12"
     $env:FNVXR_XINPUT_AUTO_RUN_LEFT_THUMB_ENABLE = "1"
@@ -879,6 +927,8 @@ function Set-FnvxrSidecarEnvironment {
     $env:FNVXR_D3D9_STEREO_MIN_ACTIVE_FRACTION = "0.12"
     $env:FNVXR_D3D9_STEREO_MIN_ACTIVE_SPAN_X = "0.35"
     $env:FNVXR_D3D9_STEREO_MIN_ACTIVE_SPAN_Y = "0.35"
+    $env:FNVXR_D3D9_STEREO_MIN_ACTIVE_TILES = "12"
+    $env:FNVXR_D3D9_STEREO_MIN_DIFFERENT_TILES = "8"
     $env:FNVXR_D3D9_STEREO_RETAIN_LAST_VALID_ON_INVALID = "0"
     $env:FNVXR_D3D9_STEREO_CLEAR_ON_UI_INVALID = "0"
     $env:FNVXR_D3D9_STEREO_STRICT_TARGET_GATE = "1"
@@ -898,6 +948,10 @@ function Set-FnvxrSidecarEnvironment {
 
 function Set-FnvxrStereoWorldRuntimeEnvironment {
     $env:FNVXR_DISABLE_STEREO_WORLD = "0"
+    # The host consumes this only for the first OpenXR focus regain. Later
+    # overlay/Alt-Tab focus bounces keep the menu surface fixed; the explicit
+    # controller chord remains available at all times.
+    $env:FNVXR_GAME_PLANE_RECENTER_ON_FOCUS = "1"
     # Keep the semantic oracle live, but sample high-frequency draw telemetry
     # so instrumentation itself does not destabilize headset frame timing.
     $env:FNVXR_TELEMETRY_HAMMER = "1"
@@ -932,10 +986,10 @@ function Set-FnvxrStereoWorldRuntimeEnvironment {
     $env:FNVXR_D3D9_NATIVE_RECENTER_ON_FIRST_GAMEPLAY = "1"
     $env:FNVXR_D3D9_ALLOW_THIRD_PERSON_STEREO = "0"
     $env:FNVXR_D3D9_NATIVE_APPLY_HEAD_ROTATION = "1"
-    # Keep orientation and position in the same OpenXR -> Gamebryo basis.
-    # The rejected retail-camera permutation made horizontal yaw drive a
-    # native pitch/roll axis and produced an uncomfortable orbital pivot.
-    $env:FNVXR_D3D9_NATIVE_HEAD_AXIS_MODE = "gamebryo"
+    # NiCamera local axes are right/up/back, the same local convention used by
+    # OpenXR poses.  The native hook composes this camera-local delta directly;
+    # actor/world-axis permutations are intentionally not selectable here.
+    $env:FNVXR_D3D9_NATIVE_HEAD_AXIS_MODE = "openxr-camera-local"
     $env:FNVXR_D3D9_NATIVE_ASYMMETRIC_FOV = "1"
     $env:FNVXR_D3D9_NATIVE_CENTER_CAMERA_MAX_DELTA = "0.05"
     $env:FNVXR_REQUIRE_NATIVE_STEREO = "1"
@@ -972,6 +1026,8 @@ function Set-FnvxrStereoWorldRuntimeEnvironment {
     $env:FNVXR_RETAIL_RIG_AUTO_CALIBRATE_POSITION = "0"
     $env:FNVXR_RETAIL_RIG_MAX_AUTO_CALIBRATION_UNITS = "12.0"
     $env:FNVXR_RETAIL_RIG_MAX_SEGMENT_UNITS = "80.0"
+    $env:FNVXR_RETAIL_RIG_REACH_TOLERANCE = "0.10"
+    $env:FNVXR_RETAIL_RIG_MAX_FINAL_ERROR_UNITS = "0.25"
     $env:FNVXR_RETAIL_RIG_FABRIK_ITERATIONS = "12"
     $env:FNVXR_RETAIL_RIG_FABRIK_TOLERANCE = "0.05"
     $env:FNVXR_RETAIL_RIG_ELBOW_POLE_OUT = "20.0"
@@ -985,6 +1041,11 @@ function Set-FnvxrStereoWorldRuntimeEnvironment {
     $env:FNVXR_RETAIL_RIG_RIGHT_WRIST_OFFSET_Y = "0"
     $env:FNVXR_RETAIL_RIG_RIGHT_WRIST_OFFSET_Z = "0"
     $env:FNVXR_RETAIL_WEAPON_MAX_WRITE_RESIDUAL_RADIANS = "0.01"
+    $env:FNVXR_RETAIL_WEAPON_MAX_WRITE_RESIDUAL_UNITS = "0.25"
+    $env:FNVXR_RETAIL_WEAPON_MAX_CALIBRATION_UNITS = "48.0"
+    $env:FNVXR_RETAIL_WEAPON_REFRESH_SOLVES = "15"
+    $env:FNVXR_RETAIL_MUZZLE_MAX_AIM_RESIDUAL_RADIANS = "0.08"
+    $env:FNVXR_RETAIL_PROJECTILE_NODE_HOOK = "1"
     $env:FNVXR_D3D9_SHADER_ALLOW_UNVERIFIED_PATCHES = "0"
     # Exact shader binaries are retained once per hash so register ownership
     # can be disassembled and reviewed offline. This is read-only diagnostics;
@@ -1041,6 +1102,8 @@ function Set-FnvxrStereoWorldRuntimeEnvironment {
     $env:FNVXR_STEREO_STABLE_HANDOFF_FRAMES = "12"
     $env:FNVXR_STEREO_MIN_RGB_DELTA = "4"
     $env:FNVXR_STEREO_HOST_MIN_DIFF_SAMPLES = "64"
+    $env:FNVXR_STEREO_HOST_MIN_ACTIVE_TILES = "12"
+    $env:FNVXR_STEREO_HOST_MIN_DIFFERENT_TILES = "8"
     $env:FNVXR_STEREO_CELL_STABLE_FRAMES = "60"
     $env:FNVXR_PLAYER_STATE_READ_GRACE_FRAMES = "4"
     $env:FNVXR_STEREO_TRANSIENT_READ_GRACE_POLLS = "4"

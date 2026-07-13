@@ -25,6 +25,32 @@ function Write-WatcherLog {
     Add-Content -LiteralPath $LogPath -Value ("{0:o} {1}" -f (Get-Date), $Message) -Encoding UTF8
 }
 
+function Set-ManifestAcceptance {
+    param(
+        [string]$State,
+        [bool]$Accepted,
+        [string]$Reason
+    )
+    $manifestPath = Join-Path $RunDir "manifest.json"
+    if (-not (Test-Path -LiteralPath $manifestPath)) { return }
+    try {
+        $source = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json -ErrorAction Stop
+        $updated = [ordered]@{}
+        foreach ($property in $source.PSObject.Properties) {
+            $updated[$property.Name] = $property.Value
+        }
+        $updated["acceptanceState"] = $State
+        $updated["accepted"] = $Accepted
+        $updated["acceptanceUpdatedAt"] = (Get-Date).ToString("o")
+        $updated["acceptanceReason"] = $Reason
+        $temporaryPath = "$manifestPath.$PID.tmp"
+        $updated | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $temporaryPath -Encoding UTF8
+        Move-Item -LiteralPath $temporaryPath -Destination $manifestPath -Force
+    } catch {
+        Write-WatcherLog ("manifest acceptance update failed state={0} error={1}" -f $State,$_.Exception.Message)
+    }
+}
+
 function Get-ExitCodeText {
     param([int]$ProcessId)
     try {
@@ -60,6 +86,7 @@ function Invoke-SaveQuit {
 }
 
 function Invoke-LiveAcceptanceAnalysis {
+    param([switch]$Final)
     if (-not $LiveAnalyzer -or -not (Test-Path -LiteralPath $LiveAnalyzer)) {
         return
     }
@@ -70,7 +97,23 @@ function Invoke-LiveAcceptanceAnalysis {
         -File $LiveAnalyzer `
         -RunDir $RunDir 2>&1 |
         Set-Content -LiteralPath $analysisLog -Encoding UTF8
-    Write-WatcherLog ("live acceptance analysis exitCode={0}" -f $LASTEXITCODE)
+    $analysisExitCode = $LASTEXITCODE
+    Write-WatcherLog ("live acceptance analysis exitCode={0} final={1}" -f $analysisExitCode,[bool]$Final)
+    $verdictPath = Join-Path $RunDir "live-acceptance.json"
+    if ($analysisExitCode -eq 0 -and (Test-Path -LiteralPath $verdictPath)) {
+        try {
+            $verdict = Get-Content -LiteralPath $verdictPath -Raw | ConvertFrom-Json -ErrorAction Stop
+            if ([bool]$verdict.passed) {
+                Set-ManifestAcceptance -State "accepted" -Accepted $true -Reason "live analyzer and independent capture passed"
+                return
+            }
+        } catch {
+            Write-WatcherLog ("live verdict read failed error={0}" -f $_.Exception.Message)
+        }
+    }
+    if ($Final) {
+        Set-ManifestAcceptance -State "rejected" -Accepted $false -Reason ("final live analyzer exitCode={0}" -f $analysisExitCode)
+    }
 }
 
 function Invoke-IndependentStereoCapture {
@@ -124,11 +167,11 @@ try {
 
         if (((Get-Date) - $lastHeartbeat).TotalSeconds -ge 5) {
             $lastHeartbeat = Get-Date
-            Invoke-LiveAcceptanceAnalysis
             if (((Get-Date) - $lastStereoCapture).TotalSeconds -ge $StereoCaptureIntervalSeconds) {
                 $lastStereoCapture = Get-Date
                 Invoke-IndependentStereoCapture
             }
+            Invoke-LiveAcceptanceAnalysis
             if ($env:FNVXR_TELEMETRY_HAMMER -ne "0") {
                 Write-WatcherLog ("heartbeat falloutPid={0} hostPid={1} hostAlive={2}" -f $FalloutPid, $HostPid, [bool]$hostProcess)
             }
@@ -141,6 +184,7 @@ try {
         $hostProcess = Get-Process -Id $HostPid -ErrorAction SilentlyContinue
         if (-not $hostProcess) {
             Write-WatcherLog ("host already exited pid={0}" -f $HostPid)
+            Invoke-LiveAcceptanceAnalysis -Final
             exit 0
         }
         Start-Sleep -Milliseconds 250
@@ -151,8 +195,7 @@ try {
         Write-WatcherLog ("stopping host after retail exit pid={0}" -f $HostPid)
         Stop-Process -Id $HostPid -Force -ErrorAction SilentlyContinue
     }
-    Invoke-LiveAcceptanceAnalysis
-    Invoke-IndependentStereoCapture
+    Invoke-LiveAcceptanceAnalysis -Final
 } catch {
     try {
         Write-WatcherLog ("ERROR " + $_.Exception.Message)

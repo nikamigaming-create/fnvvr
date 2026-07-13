@@ -17,6 +17,12 @@ int fail(const char* message)
 
 int main()
 {
+    if (fnvxr::shared::runtimeLoadingMenuBlocksInput(true, true)
+        || !fnvxr::shared::runtimeLoadingMenuBlocksInput(true, false)
+        || fnvxr::shared::runtimeLoadingMenuBlocksInput(false, false))
+    {
+        return fail("actionable retail menus must outrank a stale LoadingMenu lifecycle record");
+    }
     if (sizeof(fnvxr::PoseFrame) != 164)
         return fail("PoseFrame size mismatch");
 
@@ -132,8 +138,8 @@ int main()
     if (fnvxr::shared::VrPoseSharedVersion != 7)
         return fail("SharedVrPoseState reference-generation contract version mismatch");
 
-    if (sizeof(fnvxr::shared::SharedVrOriginState) != 88
-        || fnvxr::shared::VrOriginSharedVersion != 3
+    if (sizeof(fnvxr::shared::SharedVrOriginState) != 144
+        || fnvxr::shared::VrOriginSharedVersion != 5
         || offsetof(fnvxr::shared::SharedVrOriginState, sequence) != 8
         || offsetof(fnvxr::shared::SharedVrOriginState, active) != 12
         || offsetof(fnvxr::shared::SharedVrOriginState, generation) != 16
@@ -143,7 +149,10 @@ int main()
         || offsetof(fnvxr::shared::SharedVrOriginState, originPos) != 48
         || offsetof(fnvxr::shared::SharedVrOriginState, renderPoseSequence) != 64
         || offsetof(fnvxr::shared::SharedVrOriginState, renderPoseFrame) != 72
-        || offsetof(fnvxr::shared::SharedVrOriginState, renderedDisplayTime) != 80)
+        || offsetof(fnvxr::shared::SharedVrOriginState, renderedDisplayTime) != 80
+        || offsetof(fnvxr::shared::SharedVrOriginState, renderCameraAddress) != 88
+        || offsetof(fnvxr::shared::SharedVrOriginState, renderCameraWorldRot) != 96
+        || offsetof(fnvxr::shared::SharedVrOriginState, renderCameraWorldPos) != 132)
     {
         return fail("SharedVrOriginState authoritative recenter layout mismatch");
     }

@@ -12,6 +12,22 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# This legacy verifier used to maintain a second, weaker definition of VR
+# success. Keep the command name for callers, but make the manifest-authority
+# live analyzer the only acceptance implementation.
+if (-not $RunManifestPath) {
+    throw "-RunManifestPath is required. Acceptance may only evaluate one manifest-owned live run."
+}
+if (-not (Test-Path -LiteralPath $RunManifestPath)) {
+    throw "Missing run manifest: $RunManifestPath"
+}
+$authoritativeManifest = Get-Content -LiteralPath $RunManifestPath -Raw | ConvertFrom-Json -ErrorAction Stop
+if (-not $authoritativeManifest.runDir) {
+    throw "Run manifest does not identify runDir: $RunManifestPath"
+}
+& (Join-Path $PSScriptRoot "analyze-fnvxr-live-run.ps1") -RunDir ([string]$authoritativeManifest.runDir)
+exit $LASTEXITCODE
+
 function Read-TextOrEmpty {
     param([string]$Path)
     if ($Path -and (Test-Path -LiteralPath $Path)) {

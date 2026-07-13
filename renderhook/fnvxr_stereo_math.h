@@ -157,6 +157,15 @@ inline Matrix3 gamebryoHeadRotation(const Quaternion& relativeXrOrientation)
     return xrRotationToGamebryoColumn(columnRotationFromQuaternion(relativeXrOrientation));
 }
 
+// NiCamera's local frame is already the OpenXR camera convention: +X is
+// right, +Y is up, and -Z is forward.  It is not the Gamebryo actor frame
+// (+X right, +Y forward, +Z up).  Applying the actor-basis permutation to a
+// camera-local delta swaps headset yaw and pitch.
+inline Matrix3 cameraLocalHeadRotation(const Quaternion& relativeXrOrientation)
+{
+    return columnRotationFromQuaternion(relativeXrOrientation);
+}
+
 inline Matrix3 multiply(const Matrix3& lhs, const Matrix3& rhs)
 {
     Matrix3 result {};
@@ -178,6 +187,50 @@ inline Vector3 transform(const Matrix3& matrix, const Vector3& value)
         matrix.m[1][0] * value.x + matrix.m[1][1] * value.y + matrix.m[1][2] * value.z,
         matrix.m[2][0] * value.x + matrix.m[2][1] * value.y + matrix.m[2][2] * value.z
     };
+}
+
+// Preserve the retail NiCamera column layout (right, up, back) while removing
+// engine-authored pitch/roll from the body frame.  A generic Z-up yaw matrix
+// has columns (right, forward, up); feeding that to NiCamera puts world-up in
+// its back/right pipeline and turns the rendered scene sideways.
+inline Matrix3 gravityLevelCameraWorldRotation(const Matrix3& cameraWorld)
+{
+    float rightX = cameraWorld.m[0][0];
+    float rightY = cameraWorld.m[1][0];
+    float horizontalLength = std::sqrt(rightX * rightX + rightY * rightY);
+    if (!std::isfinite(horizontalLength) || horizontalLength < 0.000001f)
+    {
+        // A valid camera normally has a horizontal right column.  If it does
+        // not, recover it from the projected +Z/back column without changing
+        // the handedness: right x up = back.
+        float backX = cameraWorld.m[0][2];
+        float backY = cameraWorld.m[1][2];
+        horizontalLength = std::sqrt(backX * backX + backY * backY);
+        if (!std::isfinite(horizontalLength) || horizontalLength < 0.000001f)
+            return cameraWorld;
+        backX /= horizontalLength;
+        backY /= horizontalLength;
+        rightX = -backY;
+        rightY = backX;
+    }
+    else
+    {
+        rightX /= horizontalLength;
+        rightY /= horizontalLength;
+    }
+
+    Matrix3 result {};
+    // Column 0: camera right. Column 1: camera up. Column 2: camera back.
+    result.m[0][0] = rightX;
+    result.m[1][0] = rightY;
+    result.m[2][0] = 0.0f;
+    result.m[0][1] = 0.0f;
+    result.m[1][1] = 0.0f;
+    result.m[2][1] = 1.0f;
+    result.m[0][2] = rightY;
+    result.m[1][2] = -rightX;
+    result.m[2][2] = 0.0f;
+    return result;
 }
 
 inline Vector3 vectorInOriginFrame(const Quaternion& originOrientation, const Vector3& worldVector)
@@ -233,6 +286,41 @@ inline EyeMatrices makeEyeMatrices(const Matrix4& baseView, const Matrix4& baseP
     result.leftProjection = baseProjection;
     result.rightProjection = baseProjection;
     return result;
+}
+
+inline Matrix4 multiply(const Matrix4& lhs, const Matrix4& rhs)
+{
+    Matrix4 result {};
+    for (int row = 0; row < 4; ++row)
+    {
+        for (int column = 0; column < 4; ++column)
+        {
+            for (int inner = 0; inner < 4; ++inner)
+                result.m[row][column] += lhs.m[row][inner] * rhs.m[inner][column];
+        }
+    }
+    return result;
+}
+
+// A shader MVP already contains its draw-local model transform. Replace only
+// the camera's exact world-to-clip factor, so the model cancels algebraically:
+//   column vectors: eyeVP * inverse(centerVP) * centerVP * model
+//   row vectors:    model * centerVP * inverse(centerVP) * eyeVP
+inline Matrix4 applyViewProjectionDelta(
+    const Matrix4& originalMvp,
+    const Matrix4& inverseCenterViewProjection,
+    const Matrix4& eyeViewProjection,
+    bool columnVector)
+{
+    if (columnVector)
+    {
+        return multiply(
+            multiply(eyeViewProjection, inverseCenterViewProjection),
+            originalMvp);
+    }
+    return multiply(
+        multiply(originalMvp, inverseCenterViewProjection),
+        eyeViewProjection);
 }
 
 // Preserve the engine projection's depth convention while replacing its X/Y

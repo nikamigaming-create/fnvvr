@@ -103,7 +103,7 @@ trap {
         $failureManifest["failedAt"] = (Get-Date).ToString("o")
         $failureManifest["profile"] = "openxr-sidecar"
         $failureManifest["role"] = "openxr-host-retail-fnv-sidecar"
-        $failureManifest["acceptanceProfile"] = $(if ($EnableStereoWorld) { "full-vr" } else { "quad-2d-transport" })
+        $failureManifest["acceptanceProfile"] = $(if ($StereoProducerProofOnly) { "diagnostic-producer" } elseif ($EnableStereoWorld -or $EnableD3D9ShaderStereo) { "full-vr" } else { "quad-2d-transport" })
         $failureManifest["accepted"] = $false
         $failureManifest["failed"] = $true
         $failureManifest["error"] = $caught.Exception.Message
@@ -118,7 +118,7 @@ trap {
         $failureManifest["runtimeStoppedAfterFailure"] = -not [bool](
             ($falloutPid -and (Get-Process -Id $falloutPid -ErrorAction SilentlyContinue)) -or
             ($hostProcess -and (Get-Process -Id $hostProcess.Id -ErrorAction SilentlyContinue)))
-        $failureManifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $ManifestPath -Encoding UTF8
+        Write-FnvxrJsonAtomic -Value $failureManifest -Path $ManifestPath -Depth 8
     } catch {
     }
     [Console]::Error.WriteLine($caught.ToString())
@@ -201,6 +201,13 @@ switch ($Source2DPreset) {
 }
 
 $StereoWorldActive = [bool]($EnableStereoWorld -or $EnableD3D9ShaderStereo -or $StereoProducerProofOnly)
+$AcceptanceProfile = if ($StereoProducerProofOnly) {
+    "diagnostic-producer"
+} elseif ($StereoWorldActive) {
+    "full-vr"
+} else {
+    "quad-2d-transport"
+}
 $BakedGamePlaneMode = if ($EnableCompositeShield -or $EnableAtlasShield -or $EnablePeripheralShield) { "shield2d" } else { "center2d" }
 if ($StereoWorldActive) {
     $BakedGamePlaneMode = "stereo3d"
@@ -238,13 +245,13 @@ if ($StopExisting) {
     }
 }
 
-if (-not $NoBuild) {
+if (-not $NoBuild -and -not $ValidateOnly) {
     & (Join-Path $PSScriptRoot "build-win32.ps1") -Configuration $Configuration
     if ($LASTEXITCODE -ne 0) {
         throw "Win32 build failed with exit code $LASTEXITCODE"
     }
 
-    cmake -S $Root -B $BuildDir
+    cmake -S $Root -B $BuildDir -A x64
     if ($LASTEXITCODE -ne 0) {
         throw "CMake configure failed with exit code $LASTEXITCODE"
     }
@@ -264,7 +271,7 @@ if (-not $NoBuild) {
     )
     $missingArtifacts = @($runtimeArtifacts | Where-Object { -not (Test-Path -LiteralPath $_) })
     if ($missingArtifacts.Count -gt 0) {
-        throw "-NoBuild refused because runtime artifacts are missing: $($missingArtifacts -join ', ')"
+        throw "Artifact validation refused because runtime artifacts are missing: $($missingArtifacts -join ', ')"
     }
     $runtimeSources = @(
         Get-ChildItem -LiteralPath (Join-Path $Root "host"),(Join-Path $Root "plugin"),(Join-Path $Root "protocol"),(Join-Path $Root "renderhook") -Recurse -File |
@@ -276,7 +283,7 @@ if (-not $NoBuild) {
         (Get-Item -LiteralPath $_).LastWriteTimeUtc -lt $newestSource.LastWriteTimeUtc
     })
     if ($staleArtifacts.Count -gt 0) {
-        throw "-NoBuild refused because artifacts are older than $($newestSource.FullName): $($staleArtifacts -join ', ')"
+        throw "Artifact validation refused because artifacts are older than $($newestSource.FullName): $($staleArtifacts -join ', ')"
     }
 }
 
@@ -284,7 +291,20 @@ if (-not (Test-Path -LiteralPath $HostExe)) {
     throw "Missing OpenXR pose host: $HostExe"
 }
 
-$OpenXrLoader = Copy-FnvxrOpenXrLoader -HostExe $HostExe -DebugLog $DebugLog
+$OpenXrLoader = if ($ValidateOnly) {
+    $loaderSource = Resolve-FnvxrOpenXrLoader -DebugLog $DebugLog
+    $loaderDestination = Join-Path (Split-Path -Parent $HostExe) "openxr_loader.dll"
+    if (-not (Test-Path -LiteralPath $loaderDestination)) {
+        throw "Validate-only artifact check found no staged OpenXR loader: $loaderDestination"
+    }
+    if ((Get-FileHash -LiteralPath $loaderSource -Algorithm SHA256).Hash -ne
+        (Get-FileHash -LiteralPath $loaderDestination -Algorithm SHA256).Hash) {
+        throw "Validate-only artifact check found a stale OpenXR loader: $loaderDestination"
+    }
+    $loaderDestination
+} else {
+    Copy-FnvxrOpenXrLoader -HostExe $HostExe -DebugLog $DebugLog
+}
 
 $staged = Copy-FnvxrRetailArtifacts `
     -Root $Root `
@@ -458,6 +478,26 @@ foreach ($log in @(
 
 $hostOut = Join-Path $RunDir "fnvxr_openxr_pose_host.out.log"
 $hostErr = Join-Path $RunDir "fnvxr_openxr_pose_host.err.log"
+$initialManifest = [ordered]@{
+    startedAt = $StartedAt
+    profile = "openxr-sidecar"
+    role = "openxr-host-retail-fnv-sidecar"
+    acceptanceProfile = $AcceptanceProfile
+    acceptanceState = "pending"
+    accepted = $false
+    failed = $false
+    runDir = $RunDir
+    gameRoot = $GameRoot
+    enableRetailRig = [bool]($env:FNVXR_RETAIL_RIG_ENABLE -eq "1")
+    applyRetailRig = [bool]($env:FNVXR_RETAIL_RIG_APPLY -eq "1")
+    stereoPipeline = [ordered]@{
+        shaderWvpReplay = $env:FNVXR_D3D9_SHADER_WVP_REPLAY
+        shaderWvpContracts = $env:FNVXR_D3D9_SHADER_WVP_CONTRACTS
+        syntheticBodyRig = $env:FNVXR_SHOW_BODY_RIG
+        syntheticHandFingers = $env:FNVXR_SHOW_HAND_FINGERS
+    }
+}
+Write-FnvxrJsonAtomic -Value $initialManifest -Path $ManifestPath -Depth 8
 $hostProcess = Start-Process `
     -FilePath $HostExe `
     -ArgumentList $Frames `
@@ -603,7 +643,7 @@ if (-not $NoRetail) {
         }
     }
 
-    if ($WorldProofTimeoutSeconds -gt 0) {
+    if ($StereoWorldActive -and $WorldProofTimeoutSeconds -gt 0) {
         Write-FnvxrCheckpoint -Path $DebugLog -Message ("waiting for gameplay/world camera before stereo proof; timeout={0}s" -f $WorldEntryTimeoutSeconds)
         $entryDeadline = (Get-Date).AddSeconds($WorldEntryTimeoutSeconds)
         do {
@@ -654,7 +694,8 @@ $manifest = [ordered]@{
     startedAt = $StartedAt
     profile = "openxr-sidecar"
     role = "openxr-host-retail-fnv-sidecar"
-    acceptanceProfile = $(if ($StereoWorldActive) { "full-vr" } else { "quad-2d-transport" })
+    acceptanceProfile = $AcceptanceProfile
+    acceptanceState = "pending"
     accepted = $false
     failed = $false
     runDir = $RunDir
@@ -734,7 +775,7 @@ $manifest = [ordered]@{
     forcedMenuAction = $false
     staged = $staged
 }
-$manifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $ManifestPath -Encoding UTF8
+Write-FnvxrJsonAtomic -Value $manifest -Path $ManifestPath -Depth 8
 $manifest | ConvertTo-Json -Depth 8
 if ($StereoWorldActive -and $WorldProofTimeoutSeconds -gt 0 -and $null -eq $worldProof) {
     throw "Stereo world proof failed. The launch is rejected and all started runtime processes will be stopped; evidence is preserved in $ManifestPath"

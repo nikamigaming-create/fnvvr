@@ -162,8 +162,12 @@ LONG gNativeStereoRenderPairSequence = 0;
 volatile LONG gNativeActiveEye = -1;
 float gNativeSingleTraversalIpdUnits = 0.0f;
 float gNativeSingleTraversalFov[2][4] {};
+bool gNativeSingleTraversalViewProjectionValid = false;
+fnvxr::stereo::Matrix4 gNativeSingleTraversalCenterViewProjection {};
+fnvxr::stereo::Matrix4 gNativeSingleTraversalEyeViewProjection[2] {};
 LONG gLoggedNativeStereoPair = 0;
 LONG gLoggedNativeStereoFailure = 0;
+LONG gLoggedNativeCenterCamera = 0;
 LONG gLoggedPresentPerf = 0;
 LONG gOriginalDoRenderCallsThisPresent = 0;
 LONGLONG gOriginalDoRenderTicksThisPresent = 0;
@@ -291,6 +295,15 @@ LONG gShaderWvpContractsLoaded = 0;
 LONG gShaderWorldDrawCandidates = 0;
 LONG gShaderWorldDraws = 0;
 LONG gShaderContractCoveredWorldDraws = 0;
+struct ShaderWvpDiscoveryIdentity
+{
+    std::uint32_t vertexHash = 0;
+    std::uint8_t vertexSha256[32] {};
+    UINT byteCount = 0;
+};
+constexpr UINT MaxShaderWvpDiscoveryIdentities = 128;
+ShaderWvpDiscoveryIdentity gShaderWvpDiscoveryIdentities[MaxShaderWvpDiscoveryIdentities] {};
+LONG gShaderWvpDiscoveryIdentityCount = 0;
 LONG gLoggedShaderStereoRejectedByHash = 0;
 LONG gLoggedStereoVisualCoverageRejected = 0;
 LONG gConsecutiveStereoVisualCoverageFrames = 0;
@@ -462,6 +475,9 @@ bool gSharedCameraRawActive = false;
 bool gSharedCameraMatrixUsable = false;
 bool gHaveVrPoseOrigin = false;
 bool gNativeGameplayPoseOriginLatched = false;
+bool gNativeViewOriginValid = false;
+bool gNativeViewRecenterHeld = false;
+float gNativeViewOriginRot[4] { 0.0f, 0.0f, 0.0f, 1.0f };
 float gVrPoseOrigin[3] {};
 float gVrPoseOriginRot[4] { 0.0f, 0.0f, 0.0f, 1.0f };
 LONG gVrPoseOriginPoseSequence = 0;
@@ -494,6 +510,7 @@ std::uint32_t gLastVrReferenceSpaceGeneration = 0;
 std::uint32_t gLastVrProducerEpoch = 0;
 std::uint32_t gPublishedVrOriginGeneration = 0;
 bool gPublishedVrOriginActive = false;
+bool gPublishedVrOriginCommitted = false;
 std::uint64_t gLastHeadBodyInvariantPoseFrame = 0;
 LONG gLastCameraSequence = 0;
 LONG gLastRuntimeSequence = 0;
@@ -2137,7 +2154,15 @@ SharedVrOriginState* sharedVrOriginState()
     return gSharedVrOrigin;
 }
 
-void publishSharedVrOrigin(bool active, const SharedVrPoseState* pose = nullptr, LONG poseSequence = 0)
+bool finiteArray(const float* values, int count);
+
+void publishSharedVrOrigin(
+    bool active,
+    const SharedVrPoseState* pose = nullptr,
+    LONG poseSequence = 0,
+    std::uintptr_t renderCameraAddress = 0,
+    const float* renderCameraWorldRot = nullptr,
+    const float* renderCameraWorldPos = nullptr)
 {
     SharedVrOriginState* origin = sharedVrOriginState();
     if (!origin)
@@ -2147,7 +2172,9 @@ void publishSharedVrOrigin(bool active, const SharedVrPoseState* pose = nullptr,
     MemoryBarrier();
     origin->magic = fnvxr::shared::VrOriginSharedMagic;
     origin->version = fnvxr::shared::VrOriginSharedVersion;
-    origin->active = active ? 1u : 0u;
+    origin->active = active
+        ? fnvxr::shared::VrOriginStateRenderLease
+        : fnvxr::shared::VrOriginStateInvalid;
     origin->generation = active ? gVrPoseOriginGeneration
                                 : (pose ? pose->referenceSpaceGeneration : gLastVrReferenceSpaceGeneration);
     origin->poseSequence = active && gVrPoseOriginPoseSequence > 0
@@ -2166,16 +2193,54 @@ void publishSharedVrOrigin(bool active, const SharedVrPoseState* pose = nullptr,
     origin->reserved = 0;
     origin->renderPoseFrame = active && pose ? pose->frame : 0u;
     origin->renderedDisplayTime = active && pose ? pose->predictedDisplayTime : 0;
+    const bool cameraWorldValid = active
+        && renderCameraAddress != 0
+        && renderCameraWorldRot
+        && renderCameraWorldPos
+        && finiteArray(renderCameraWorldRot, 9)
+        && finiteArray(renderCameraWorldPos, 3);
+    origin->renderCameraAddress = cameraWorldValid
+        ? static_cast<std::uint32_t>(renderCameraAddress)
+        : 0u;
+    origin->renderCameraWorldValid = cameraWorldValid ? 1u : 0u;
+    for (int i = 0; i < 9; ++i)
+        origin->renderCameraWorldRot[i] = cameraWorldValid ? renderCameraWorldRot[i] : 0.0f;
+    for (int i = 0; i < 3; ++i)
+        origin->renderCameraWorldPos[i] = cameraWorldValid ? renderCameraWorldPos[i] : 0.0f;
     MemoryBarrier();
     InterlockedIncrement(&origin->sequence);
 
     gPublishedVrOriginActive = active;
+    gPublishedVrOriginCommitted = false;
     gPublishedVrOriginGeneration = active && pose ? pose->referenceSpaceGeneration : 0u;
+}
+
+void commitNativeStereoOriginLease()
+{
+    if (!gPublishedVrOriginActive)
+        return;
+    SharedVrOriginState* origin = sharedVrOriginState();
+    if (!origin)
+        return;
+
+    InterlockedIncrement(&origin->sequence);
+    MemoryBarrier();
+    origin->active = fnvxr::shared::VrOriginStateCommitted;
+    MemoryBarrier();
+    InterlockedIncrement(&origin->sequence);
+    gPublishedVrOriginActive = false;
+    gPublishedVrOriginCommitted = true;
+    logLine("native stereo origin committed for animation handoff");
 }
 
 void closeNativeStereoOriginLease(const char* reason)
 {
-    if (!gPublishedVrOriginActive)
+    if (reason && std::strcmp(reason, "traversal-complete") == 0)
+    {
+        commitNativeStereoOriginLease();
+        return;
+    }
+    if (!gPublishedVrOriginActive && !gPublishedVrOriginCommitted)
         return;
     publishSharedVrOrigin(false);
     char message[224] {};
@@ -2183,13 +2248,23 @@ void closeNativeStereoOriginLease(const char* reason)
     logLine(message);
 }
 
-void openNativeStereoOriginLease(const SharedVrPoseState& pose)
+void openNativeStereoOriginLease(
+    const SharedVrPoseState& pose,
+    std::uintptr_t renderCameraAddress,
+    const float* renderCameraWorldRot,
+    const float* renderCameraWorldPos)
 {
-    publishSharedVrOrigin(true, &pose, gLatestVrPoseSnapshotSequence);
-    char message[384] {};
+    publishSharedVrOrigin(
+        true,
+        &pose,
+        gLatestVrPoseSnapshotSequence,
+        renderCameraAddress,
+        renderCameraWorldRot,
+        renderCameraWorldPos);
+    char message[512] {};
     sprintf_s(
         message,
-        "native stereo origin lease opened epoch=%lu generation=%lu originPoseSeq=%ld originPoseFrame=%llu renderPoseSeq=%ld renderPoseFrame=%llu originPos=(%.5f %.5f %.5f) originYawQuat=(%.6f %.6f %.6f %.6f)",
+        "native stereo origin lease opened epoch=%lu generation=%lu originPoseSeq=%ld originPoseFrame=%llu renderPoseSeq=%ld renderPoseFrame=%llu originPos=(%.5f %.5f %.5f) originYawQuat=(%.6f %.6f %.6f %.6f) renderCamera=0x%08lx renderCameraWorld=(%.4f %.4f %.4f)",
         static_cast<unsigned long>(gVrPoseOriginProducerEpoch),
         static_cast<unsigned long>(gVrPoseOriginGeneration),
         gVrPoseOriginPoseSequence,
@@ -2197,7 +2272,11 @@ void openNativeStereoOriginLease(const SharedVrPoseState& pose)
         gLatestVrPoseSnapshotSequence,
         static_cast<unsigned long long>(pose.frame),
         gVrPoseOrigin[0], gVrPoseOrigin[1], gVrPoseOrigin[2],
-        gVrPoseOriginRot[0], gVrPoseOriginRot[1], gVrPoseOriginRot[2], gVrPoseOriginRot[3]);
+        gVrPoseOriginRot[0], gVrPoseOriginRot[1], gVrPoseOriginRot[2], gVrPoseOriginRot[3],
+        static_cast<unsigned long>(renderCameraAddress),
+        renderCameraWorldPos ? renderCameraWorldPos[0] : 0.0f,
+        renderCameraWorldPos ? renderCameraWorldPos[1] : 0.0f,
+        renderCameraWorldPos ? renderCameraWorldPos[2] : 0.0f);
     logLine(message);
 }
 
@@ -2741,7 +2820,7 @@ void updateSharedVrPose()
         // Preserve the last authoritative body origin across a transient
         // seqlock overlap. Rendering and the public rig lease close now; the
         // next fresh pose resumes in the same frame instead of recentering.
-        if (gPublishedVrOriginActive)
+        if (gPublishedVrOriginActive || gPublishedVrOriginCommitted)
             publishSharedVrOrigin(false);
         return;
     }
@@ -2754,6 +2833,8 @@ void updateSharedVrPose()
         gHaveVrPoseOrigin = false;
         gHaveVrBodyFrame = false;
         gNativeGameplayPoseOriginLatched = false;
+        gNativeViewOriginValid = false;
+        gNativeViewRecenterHeld = false;
         publishSharedVrOrigin(false, &pose, sequence);
         char message[192] {};
         sprintf_s(
@@ -2773,6 +2854,8 @@ void updateSharedVrPose()
         gHaveVrPoseOrigin = false;
         gHaveVrBodyFrame = false;
         gNativeGameplayPoseOriginLatched = false;
+        gNativeViewOriginValid = false;
+        gNativeViewRecenterHeld = false;
         publishSharedVrOrigin(false, &pose, sequence);
         logLine("shared VR pose frame regressed; resetting origin");
     }
@@ -3324,6 +3407,7 @@ bool setEyeShaderWvpConstants(
     const D3DMATRIX& originalProjection,
     const D3DMATRIX& eyeViewD3d,
     const D3DMATRIX& eyeProjectionD3d,
+    int eye,
     const char* eyeName)
 {
     if (!device || !gRealSetVertexShaderConstantF)
@@ -3368,17 +3452,30 @@ bool setEyeShaderWvpConstants(
     const fnvxr::stereo::Matrix4 eyeView = toStereoMatrix(eyeViewD3d);
     const fnvxr::stereo::Matrix4 eyeProjection = toStereoMatrix(eyeProjectionD3d);
     fnvxr::stereo::Matrix4 inverseBaseViewProjection {};
-    const fnvxr::stereo::Matrix4 baseViewProjection =
-        multiplyMatrix(originalViewMatrix, originalProjectionMatrix);
+    const bool nativeExactViewProjection =
+        gInNativeStereoHook
+        && gNativeActiveEye == 2
+        && gNativeSingleTraversalViewProjectionValid
+        && eye >= 0
+        && eye <= 1;
+    const fnvxr::stereo::Matrix4 baseViewProjection = nativeExactViewProjection
+        ? gNativeSingleTraversalCenterViewProjection
+        : multiplyMatrix(originalViewMatrix, originalProjectionMatrix);
     if (!invertMatrix(baseViewProjection, inverseBaseViewProjection))
     {
         logShaderStereoSkip("wvp_base_view_projection_singular");
         return false;
     }
 
-    const fnvxr::stereo::Matrix4 eyeViewProjection = multiplyMatrix(eyeView, eyeProjection);
+    const fnvxr::stereo::Matrix4 eyeViewProjection = nativeExactViewProjection
+        ? gNativeSingleTraversalEyeViewProjection[eye]
+        : multiplyMatrix(eyeView, eyeProjection);
     const fnvxr::stereo::Matrix4 patchedWvp =
-        applyShaderMatrixDelta(originalWvp, inverseBaseViewProjection, eyeViewProjection);
+        fnvxr::stereo::applyViewProjectionDelta(
+            originalWvp,
+            inverseBaseViewProjection,
+            eyeViewProjection,
+            contract ? contract->columnVector : true);
     if (!fnvxr::stereo::isFinite(patchedWvp))
     {
         logShaderStereoSkip("wvp_nonfinite");
@@ -3397,12 +3494,13 @@ bool setEyeShaderWvpConstants(
         char message[768] {};
         sprintf_s(
             message,
-            "shader WVP replay count=%ld eye=%s start=%u result=0x%08lx order=%s vsHash=0x%08x psHash=0x%08x delta=%.6f baseT=(%.4f %.4f %.4f) eyeT=(%.4f %.4f %.4f) old03=%.5f old30=%.5f new03=%.5f new30=%.5f",
+            "shader WVP replay count=%ld eye=%s start=%u result=0x%08lx order=%s exactNativeVp=%d vsHash=0x%08x psHash=0x%08x delta=%.6f baseT=(%.4f %.4f %.4f) eyeT=(%.4f %.4f %.4f) old03=%.5f old30=%.5f new03=%.5f new30=%.5f",
             logCount,
             eyeName ? eyeName : "unknown",
             start,
             static_cast<unsigned long>(result),
             order,
+            nativeExactViewProjection ? 1 : 0,
             gActiveVertexShaderHash,
             gActivePixelShaderHash,
             matrixMaxAbsDifference(originalWvp, patchedWvp),
@@ -3906,7 +4004,21 @@ bool setWideWorldShaderConstants(
 
 void restoreShaderConstants(IDirect3DDevice9* device)
 {
-    if (!device)
+    if (!device || !gRealSetVertexShaderConstantF)
+        return;
+
+    // A verified contract patches one exact four-register range. Restore that
+    // exact range; scanning from c0 can restore a different matrix and leave
+    // the contracted WVP contaminated by the previous eye.
+    if (const ShaderWvpContract* contract = currentShaderWvpContract())
+    {
+        const UINT start = contract->startRegister;
+        if (haveTrackedShaderMatrixAt(start))
+            gRealSetVertexShaderConstantF(device, start, &gVsConstants[start][0], 4);
+        return;
+    }
+
+    if (!readEnvBool("FNVXR_D3D9_SHADER_ALLOW_UNVERIFIED_PATCHES", false))
         return;
 
     const UINT maxCandidates = static_cast<UINT>(readEnvFloat("FNVXR_D3D9_SHADER_MATRIX_MAX_CANDIDATES", 12.0f));
@@ -4322,6 +4434,79 @@ void logShaderMatrixAuditCandidates(LONG frame)
     }
 }
 
+void logWorldShaderWvpDiscovery()
+{
+    if (!readEnvBool("FNVXR_D3D9_DUMP_SHADER_BYTECODE", false)
+        || !gActiveVertexShader
+        || gActiveVertexShaderHash == 0
+        || gActiveVertexShaderByteCount == 0)
+    {
+        return;
+    }
+
+    for (LONG index = 0; index < gShaderWvpDiscoveryIdentityCount; ++index)
+    {
+        const ShaderWvpDiscoveryIdentity& known = gShaderWvpDiscoveryIdentities[index];
+        if (known.vertexHash == gActiveVertexShaderHash
+            && known.byteCount == gActiveVertexShaderByteCount
+            && std::memcmp(known.vertexSha256, gActiveVertexShaderSha256, 32) == 0)
+        {
+            return;
+        }
+    }
+
+    if (gShaderWvpDiscoveryIdentityCount >= static_cast<LONG>(MaxShaderWvpDiscoveryIdentities))
+    {
+        logLine("shader WVP discovery capacity exhausted; diagnostic run is incomplete");
+        return;
+    }
+    ShaderWvpDiscoveryIdentity& identity =
+        gShaderWvpDiscoveryIdentities[gShaderWvpDiscoveryIdentityCount++];
+    identity.vertexHash = gActiveVertexShaderHash;
+    identity.byteCount = gActiveVertexShaderByteCount;
+    std::memcpy(identity.vertexSha256, gActiveVertexShaderSha256, 32);
+
+    char shaHex[65] {};
+    for (UINT index = 0; index < 32; ++index)
+        sprintf_s(shaHex + index * 2, sizeof(shaHex) - index * 2, "%02x", identity.vertexSha256[index]);
+
+    char event[4096] {};
+    int offset = sprintf_s(
+        event,
+        "{\"event\":\"fnvxrShaderWvpDiscovery\",\"fnv1a32\":\"%08x\",\"sha256\":\"%s\",\"bytes\":%u,\"candidateMatrices\":[",
+        identity.vertexHash,
+        shaHex,
+        identity.byteCount);
+    const UINT alignment = shaderMatrixAlignment();
+    UINT candidateCount = 0;
+    for (UINT start = 0; start + 3 < MaxTrackedVsConstants && candidateCount < 12; start += alignment)
+    {
+        if (!haveTrackedShaderMatrixAt(start))
+            continue;
+        const fnvxr::stereo::Matrix4 matrix = trackedShaderMatrixAt(start);
+        const char* rejectReason = nullptr;
+        if (!shaderMatrixLooksTransform(matrix, rejectReason))
+            continue;
+        offset += sprintf_s(
+            event + offset,
+            sizeof(event) - static_cast<size_t>(offset),
+            "%s{\"start\":%u,\"maxAbs\":%.8g}",
+            candidateCount == 0 ? "" : ",",
+            start,
+            matrixMaxAbs(matrix));
+        ++candidateCount;
+    }
+    if (offset > 0 && static_cast<size_t>(offset) < sizeof(event) - 64)
+    {
+        sprintf_s(
+            event + offset,
+            sizeof(event) - static_cast<size_t>(offset),
+            "],\"candidateCount\":%u,\"diagnosticOnly\":true}",
+            candidateCount);
+    }
+    logLine(event);
+}
+
 void logMatrixAuditFrame()
 {
     const LONG frame = static_cast<LONG>(gPresentFrames);
@@ -4496,6 +4681,8 @@ void releaseSharedVrPose()
     }
     gHaveVrPoseOrigin = false;
     gNativeGameplayPoseOriginLatched = false;
+    gNativeViewOriginValid = false;
+    gNativeViewRecenterHeld = false;
     gLatestVrPoseSnapshotValid = false;
     gNativeStereoRenderedPoseValid = false;
     gLatestVrPoseSnapshotSequence = 0;
@@ -4586,6 +4773,7 @@ void releaseSharedVrOriginPublisher()
         gSharedVrOriginMapping = nullptr;
     }
     gPublishedVrOriginActive = false;
+    gPublishedVrOriginCommitted = false;
     gPublishedVrOriginGeneration = 0;
 }
 
@@ -6292,52 +6480,6 @@ float orthonormalErrorNativeMatrix3(const NativeMatrix3& matrix)
     return maxError;
 }
 
-void readNativeHeadAxisMode(char* buffer, size_t bufferSize)
-{
-    if (!buffer || bufferSize == 0)
-        return;
-
-    buffer[0] = '\0';
-    if (GetEnvironmentVariableA("FNVXR_D3D9_NATIVE_HEAD_AXIS_MODE", buffer, static_cast<DWORD>(bufferSize)) == 0)
-        strcpy_s(buffer, bufferSize, "retail-camera");
-}
-
-fnvxr::stereo::Matrix4 retailCameraRotationFromXrRotation(const fnvxr::stereo::Matrix4& xr)
-{
-    fnvxr::stereo::Matrix4 result = identityMatrix();
-    // This delta is multiplied on the right of the retail NiCamera world
-    // transform, so its axes are camera-local rather than Gamebryo world XYZ.
-    // At this hook point the effective native slots are X=yaw, Y=roll,
-    // Z=pitch. OpenXR rotation axes are X=pitch, Y=yaw, Z=roll. Retail's
-    // temporary-camera yaw has the opposite positive direction, so negate
-    // yaw and roll together to keep the converted basis right-handed while
-    // leaving pitch unchanged.
-    const int xrAxisForCameraAxis[3] { 1, 2, 0 };
-    const float signForCameraAxis[3] { -1.0f, -1.0f, 1.0f };
-    for (int row = 0; row < 3; ++row)
-    {
-        for (int column = 0; column < 3; ++column)
-        {
-            result.m[row][column] =
-                signForCameraAxis[row]
-                * signForCameraAxis[column]
-                * xr.m[xrAxisForCameraAxis[row]][xrAxisForCameraAxis[column]];
-        }
-    }
-    return result;
-}
-
-fnvxr::stereo::Matrix4 nativeHeadRotationFromXrRotation(const fnvxr::stereo::Matrix4& xr)
-{
-    char mode[32] {};
-    readNativeHeadAxisMode(mode, sizeof(mode));
-    if (_stricmp(mode, "legacy-signs") == 0 || _stricmp(mode, "legacy") == 0)
-        return xr;
-    if (_stricmp(mode, "gamebryo") == 0 || _stricmp(mode, "gamebryo-world") == 0)
-        return gamebryoRotationFromXrRotation(xr);
-    return retailCameraRotationFromXrRotation(xr);
-}
-
 NativeMatrix3 transposeNativeMatrix3(const NativeMatrix3& matrix)
 {
     NativeMatrix3 result {};
@@ -6347,6 +6489,37 @@ NativeMatrix3 transposeNativeMatrix3(const NativeMatrix3& matrix)
             result.m[row][column] = matrix.m[column][row];
     }
     return result;
+}
+
+NativeMatrix3 gravityLevelNativeCameraRotation(const NativeMatrix3& matrix)
+{
+    fnvxr::stereo::Matrix3 cameraWorld {};
+    for (int row = 0; row < 3; ++row)
+        for (int column = 0; column < 3; ++column)
+            cameraWorld.m[row][column] = matrix.m[row][column];
+    const fnvxr::stereo::Matrix3 leveled =
+        fnvxr::stereo::gravityLevelCameraWorldRotation(cameraWorld);
+    NativeMatrix3 result {};
+    for (int row = 0; row < 3; ++row)
+        for (int column = 0; column < 3; ++column)
+            result.m[row][column] = leveled.m[row][column];
+    return result;
+}
+
+void captureNativeViewOrigin(const SharedVrPoseState& pose, const char* reason)
+{
+    std::memcpy(gNativeViewOriginRot, pose.hmdRot, sizeof(gNativeViewOriginRot));
+    gNativeViewOriginValid = true;
+    char message[256] {};
+    sprintf_s(
+        message,
+        "native view recentered reason=%s hmdRot=(%.6f %.6f %.6f %.6f)",
+        reason ? reason : "unknown",
+        gNativeViewOriginRot[0],
+        gNativeViewOriginRot[1],
+        gNativeViewOriginRot[2],
+        gNativeViewOriginRot[3]);
+    logLine(message);
 }
 
 NativeVector3 transformNativeVector(const NativeMatrix3& matrix, const NativeVector3& value)
@@ -6515,6 +6688,7 @@ bool prepareNativeStereoRig(NativeStereoRig& rig)
         if (gHaveVrPoseOrigin && gHaveVrBodyFrame)
         {
             gNativeGameplayPoseOriginLatched = true;
+            captureNativeViewOrigin(gLatestVrPoseSnapshot, "first-gameplay");
             logLine("native stereo gameplay pose origin latched");
         }
     }
@@ -6531,21 +6705,32 @@ bool prepareNativeStereoRig(NativeStereoRig& rig)
     rig.poseSequence = gLatestVrPoseSnapshotSequence;
     rig.displayTime = gLatestVrPoseDisplayTime;
 
-    const fnvxr::stereo::Quaternion relativeHead {
-        gLatestHmdRotDelta[0],
-        gLatestHmdRotDelta[1],
-        gLatestHmdRotDelta[2],
-        gLatestHmdRotDelta[3]
+    const bool recenterRequested =
+        (rig.pose.trackingFlags & fnvxr::shared::VrPoseTrackingRecenterRequested) != 0;
+    if (recenterRequested && !gNativeViewRecenterHeld)
+        captureNativeViewOrigin(rig.pose, "controller-chord");
+    gNativeViewRecenterHeld = recenterRequested;
+
+    const fnvxr::stereo::Quaternion currentHead {
+        rig.pose.hmdRot[0], rig.pose.hmdRot[1], rig.pose.hmdRot[2], rig.pose.hmdRot[3]
     };
-    const fnvxr::stereo::Matrix3 gameHeadRotation =
-        fnvxr::stereo::gamebryoHeadRotation(relativeHead);
+    const fnvxr::stereo::Quaternion relativeHead = gNativeViewOriginValid
+        ? fnvxr::stereo::relativeOrientation(
+            { gNativeViewOriginRot[0], gNativeViewOriginRot[1], gNativeViewOriginRot[2], gNativeViewOriginRot[3] },
+            currentHead)
+        : fnvxr::stereo::Quaternion {
+            gLatestHmdRotDelta[0],
+            gLatestHmdRotDelta[1],
+            gLatestHmdRotDelta[2],
+            gLatestHmdRotDelta[3]
+        };
+    const fnvxr::stereo::Matrix3 nativeHeadRotation =
+        fnvxr::stereo::cameraLocalHeadRotation(relativeHead);
     for (int row = 0; row < 3; ++row)
     {
         for (int column = 0; column < 3; ++column)
         {
-            // The native helper returns Gamebryo's column-vector basis
-            // directly, avoiding an easy-to-invert row/column transpose.
-            rig.headRotation.m[row][column] = gameHeadRotation.m[row][column];
+            rig.headRotation.m[row][column] = nativeHeadRotation.m[row][column];
         }
     }
 
@@ -6555,24 +6740,31 @@ bool prepareNativeStereoRig(NativeStereoRig& rig)
     for (int eye = 0; eye < 2; ++eye)
     {
         const fnvxr::stereo::Quaternion relativeEye = fnvxr::stereo::relativeOrientation(
-            {
-                gVrPoseOriginRot[0],
-                gVrPoseOriginRot[1],
-                gVrPoseOriginRot[2],
-                gVrPoseOriginRot[3]
-            },
+            gNativeViewOriginValid
+                ? fnvxr::stereo::Quaternion {
+                    gNativeViewOriginRot[0],
+                    gNativeViewOriginRot[1],
+                    gNativeViewOriginRot[2],
+                    gNativeViewOriginRot[3]
+                }
+                : fnvxr::stereo::Quaternion {
+                    gVrPoseOriginRot[0],
+                    gVrPoseOriginRot[1],
+                    gVrPoseOriginRot[2],
+                    gVrPoseOriginRot[3]
+                },
             {
                 sourceEyeRotations[eye][0],
                 sourceEyeRotations[eye][1],
                 sourceEyeRotations[eye][2],
                 sourceEyeRotations[eye][3]
             });
-        const fnvxr::stereo::Matrix3 gameEyeRotation =
-            fnvxr::stereo::gamebryoHeadRotation(relativeEye);
+        const fnvxr::stereo::Matrix3 nativeEyeRotation =
+            fnvxr::stereo::cameraLocalHeadRotation(relativeEye);
         for (int row = 0; row < 3; ++row)
         {
             for (int column = 0; column < 3; ++column)
-                rig.eyeRotation[eye].m[row][column] = gameEyeRotation.m[row][column];
+                rig.eyeRotation[eye].m[row][column] = nativeEyeRotation.m[row][column];
         }
         if (absFloat(determinantNativeMatrix3(rig.eyeRotation[eye]) - 1.0f) > 0.002f
             || orthonormalErrorNativeMatrix3(rig.eyeRotation[eye]) > 0.002f)
@@ -6600,15 +6792,18 @@ bool writeNativeEyeCameraState(const NativeCameraSnapshot& base, const NativeSte
         return false;
 
     NativeNiTransform desiredWorld = base.world;
+    const NativeMatrix3 bodyWorldRotation = gravityLevelNativeCameraRotation(base.world.rotation);
     if (readEnvBool("FNVXR_D3D9_NATIVE_APPLY_HEAD_ROTATION", true))
     {
         // The exact per-eye OpenXR pose is body-local and belongs to the same
         // immutable transaction as this eye's pixels. Preserve the retail
         // camera/player basis and apply that eye delta on its local side.
-        desiredWorld.rotation = multiplyNativeMatrix3(base.world.rotation, rig.eyeRotation[eye]);
+        desiredWorld.rotation = multiplyNativeMatrix3(bodyWorldRotation, rig.eyeRotation[eye]);
     }
+    else
+        desiredWorld.rotation = bodyWorldRotation;
 
-    const NativeVector3 worldOffset = transformNativeVector(base.world.rotation, rig.eyeOffsetUnits[eye]);
+    const NativeVector3 worldOffset = transformNativeVector(bodyWorldRotation, rig.eyeOffsetUnits[eye]);
     desiredWorld.translation.x += worldOffset.x;
     desiredWorld.translation.y += worldOffset.y;
     desiredWorld.translation.z += worldOffset.z;
@@ -6649,15 +6844,18 @@ NativeNiTransform nativeCenterWorldTransform(
     const NativeStereoRig& rig)
 {
     NativeNiTransform desiredWorld = base.world;
+    const NativeMatrix3 bodyWorldRotation = gravityLevelNativeCameraRotation(base.world.rotation);
     if (readEnvBool("FNVXR_D3D9_NATIVE_APPLY_HEAD_ROTATION", true))
-        desiredWorld.rotation = multiplyNativeMatrix3(base.world.rotation, rig.headRotation);
+        desiredWorld.rotation = multiplyNativeMatrix3(bodyWorldRotation, rig.headRotation);
+    else
+        desiredWorld.rotation = bodyWorldRotation;
 
     const NativeVector3 centerOffsetUnits {
         (rig.eyeOffsetUnits[0].x + rig.eyeOffsetUnits[1].x) * 0.5f,
         (rig.eyeOffsetUnits[0].y + rig.eyeOffsetUnits[1].y) * 0.5f,
         (rig.eyeOffsetUnits[0].z + rig.eyeOffsetUnits[1].z) * 0.5f
     };
-    const NativeVector3 worldOffset = transformNativeVector(base.world.rotation, centerOffsetUnits);
+    const NativeVector3 worldOffset = transformNativeVector(bodyWorldRotation, centerOffsetUnits);
     desiredWorld.translation.x += worldOffset.x;
     desiredWorld.translation.y += worldOffset.y;
     desiredWorld.translation.z += worldOffset.z;
@@ -6720,6 +6918,57 @@ bool applyNativeEyeCamera(const NativeCameraSnapshot& base, const NativeStereoRi
     // frustum, so commit the complete eye state first and rebuild last.
     return writeNativeEyeCameraState(base, rig, eye)
         && updateNativeCameraWorldToCamera(base.camera);
+}
+
+fnvxr::stereo::Matrix4 nativeWorldToClipMatrix(const NativeCameraSnapshot& camera)
+{
+    fnvxr::stereo::Matrix4 result {};
+    for (int row = 0; row < 4; ++row)
+        for (int column = 0; column < 4; ++column)
+            result.m[row][column] = camera.worldToCamera[row][column];
+    return result;
+}
+
+// Build the exact center and per-eye NiCamera world-to-clip factors before
+// the one Gamebryo traversal starts.  Fallout's programmable world shaders do
+// not consume the stale fixed-function VIEW matrix seen by the D3D9 hook; they
+// consume ModelViewProj constants derived from NiCamera::worldToCamera.
+bool prepareNativeSingleTraversalViewProjections(
+    const NativeCameraSnapshot& base,
+    const NativeStereoRig& rig,
+    NativeCameraSnapshot& centerCamera)
+{
+    gNativeSingleTraversalViewProjectionValid = false;
+    gNativeSingleTraversalCenterViewProjection = {};
+    gNativeSingleTraversalEyeViewProjection[0] = {};
+    gNativeSingleTraversalEyeViewProjection[1] = {};
+
+    NativeCameraSnapshot initialCenter {};
+    if (!applyNativeCenterCamera(base, rig) || !readNativeWorldCamera(initialCenter))
+        return false;
+
+    NativeCameraSnapshot eyeCamera[2] {};
+    for (int eye = 0; eye < 2; ++eye)
+    {
+        if (!applyNativeEyeCamera(base, rig, eye) || !readNativeWorldCamera(eyeCamera[eye]))
+            return false;
+    }
+
+    // Leave the live camera centered for the only Gamebryo traversal and
+    // capture that final factor, not an assumed reconstruction of it.
+    if (!applyNativeCenterCamera(base, rig) || !readNativeWorldCamera(centerCamera))
+        return false;
+
+    const fnvxr::stereo::Matrix4 firstCenter = nativeWorldToClipMatrix(initialCenter);
+    const fnvxr::stereo::Matrix4 finalCenter = nativeWorldToClipMatrix(centerCamera);
+    if (matrixMaxAbsDifference(firstCenter, finalCenter) > 0.0001f)
+        return false;
+
+    gNativeSingleTraversalCenterViewProjection = finalCenter;
+    gNativeSingleTraversalEyeViewProjection[0] = nativeWorldToClipMatrix(eyeCamera[0]);
+    gNativeSingleTraversalEyeViewProjection[1] = nativeWorldToClipMatrix(eyeCamera[1]);
+    gNativeSingleTraversalViewProjectionValid = true;
+    return true;
 }
 
 void __fastcall hookedNativeCameraUpdateWorldToCamera(void* camera, void*)
@@ -7356,8 +7605,46 @@ void __fastcall hookedDoRenderFrame(
         gInNativeStereoHook = true;
         InterlockedExchange(&gNativeActiveEye, 2);
         const NativeNiTransform expectedCenterWorld = nativeCenterWorldTransform(camera, rig);
-        openNativeStereoOriginLease(rig.pose);
-        const bool centerApplied = applyNativeCenterCamera(camera, rig);
+        openNativeStereoOriginLease(
+            rig.pose,
+            reinterpret_cast<std::uintptr_t>(camera.camera),
+            &camera.world.rotation.m[0][0],
+            &camera.world.translation.x);
+        NativeCameraSnapshot centerCamera {};
+        const bool centerApplied = prepareNativeSingleTraversalViewProjections(camera, rig, centerCamera);
+        const bool centerCameraCaptured = centerApplied;
+        if (centerCameraCaptured)
+        {
+            const LONG centerLog = InterlockedIncrement(&gLoggedNativeCenterCamera);
+            if (centerLog <= 12 || centerLog % 120 == 0)
+            {
+                fnvxr::stereo::Matrix4 worldToCamera {};
+                for (int row = 0; row < 4; ++row)
+                {
+                    for (int column = 0; column < 4; ++column)
+                        worldToCamera.m[row][column] = centerCamera.worldToCamera[row][column];
+                }
+                char event[2048] {};
+                int offset = sprintf_s(
+                    event,
+                    "{\"event\":\"fnvxrNativeCenterCamera\",\"frame\":%ld,\"poseSeq\":%ld,"
+                    "\"frustum\":{\"left\":%.9g,\"right\":%.9g,\"top\":%.9g,\"bottom\":%.9g,"
+                    "\"near\":%.9g,\"far\":%.9g,\"orthographic\":%u}",
+                    presentBefore,
+                    rig.poseSequence,
+                    centerCamera.frustum.left,
+                    centerCamera.frustum.right,
+                    centerCamera.frustum.top,
+                    centerCamera.frustum.bottom,
+                    centerCamera.frustum.nearDistance,
+                    centerCamera.frustum.farDistance,
+                    static_cast<unsigned>(centerCamera.frustum.orthographic));
+                appendMatrixJson(event, sizeof(event), offset, "worldToCamera", worldToCamera);
+                if (offset > 0 && static_cast<size_t>(offset) < sizeof(event) - 2)
+                    sprintf_s(event + offset, sizeof(event) - static_cast<size_t>(offset), "}");
+                logLine(event);
+            }
+        }
         if (centerApplied)
             callOriginalDoRenderFrame(osGlobals, renderer, arg1, arg2);
         closeNativeStereoOriginLease(centerApplied ? "traversal-complete" : "center-camera-apply-failed");
@@ -7384,6 +7671,10 @@ void __fastcall hookedDoRenderFrame(
         gNativeActiveRig = {};
         gNativeSingleTraversalIpdUnits = 0.0f;
         std::memset(gNativeSingleTraversalFov, 0, sizeof(gNativeSingleTraversalFov));
+        gNativeSingleTraversalViewProjectionValid = false;
+        gNativeSingleTraversalCenterViewProjection = {};
+        gNativeSingleTraversalEyeViewProjection[0] = {};
+        gNativeSingleTraversalEyeViewProjection[1] = {};
         QueryPerformanceCounter(&end);
 
         if (!centerApplied)
@@ -8417,7 +8708,21 @@ struct SurfaceDifference
     std::uint32_t rightHash = 2166136261u;
     UINT samples = 0;
     UINT differentSamples = 0;
+    UINT differentTileMask = 0;
+    UINT differentTiles = 0;
 };
+
+UINT countSetBits16(UINT value)
+{
+    value &= 0xffffu;
+    UINT count = 0;
+    while (value)
+    {
+        value &= value - 1u;
+        ++count;
+    }
+    return count;
+}
 
 SurfaceDifference compareReadbackSurfacesSized(
     IDirect3DSurface9* left,
@@ -8477,13 +8782,29 @@ SurfaceDifference compareReadbackSurfacesSized(
 
             ++difference.samples;
             if (maxRgbDelta >= meaningfulRgbDelta)
+            {
                 ++difference.differentSamples;
+                const UINT tileX = (std::min)(3u, x * 4u / width);
+                const UINT tileY = (std::min)(3u, y * 4u / height);
+                difference.differentTileMask |= 1u << (tileY * 4u + tileX);
+            }
         }
     }
 
     right->UnlockRect();
     left->UnlockRect();
+    difference.differentTiles = countSetBits16(difference.differentTileMask);
     return difference;
+}
+
+bool spatialStereoDifferenceAcceptable(
+    const SurfaceDifference& difference,
+    UINT requiredDifferentSamples)
+{
+    const UINT minDifferentTiles = static_cast<UINT>(readEnvFloat(
+        "FNVXR_D3D9_STEREO_MIN_DIFFERENT_TILES", 8.0f));
+    return difference.differentSamples >= requiredDifferentSamples
+        && difference.differentTiles >= minDifferentTiles;
 }
 
 struct EyeVisualCoverage
@@ -8496,6 +8817,8 @@ struct EyeVisualCoverage
     UINT maxX = 0;
     UINT minY = 0;
     UINT maxY = 0;
+    UINT activeTileMask = 0;
+    UINT activeTiles = 0;
 };
 
 struct StereoVisualCoverage
@@ -8567,6 +8890,9 @@ EyeVisualCoverage analyzeEyeVisualCoverage(IDirect3DSurface9* surface)
                 continue;
 
             ++coverage.activeSamples;
+            const UINT tileX = (std::min)(3u, x * 4u / gStereoTargetWidth);
+            const UINT tileY = (std::min)(3u, y * 4u / gStereoTargetHeight);
+            coverage.activeTileMask |= 1u << (tileY * 4u + tileX);
             if (x < coverage.minX)
                 coverage.minX = x;
             if (x > coverage.maxX)
@@ -8586,6 +8912,7 @@ EyeVisualCoverage analyzeEyeVisualCoverage(IDirect3DSurface9* surface)
         coverage.maxX = 0;
         coverage.maxY = 0;
     }
+    coverage.activeTiles = countSetBits16(coverage.activeTileMask);
     return coverage;
 }
 
@@ -8597,7 +8924,12 @@ StereoVisualCoverage analyzeStereoVisualCoverage(IDirect3DSurface9* left, IDirec
     return coverage;
 }
 
-bool eyeVisualCoverageAcceptable(const EyeVisualCoverage& coverage, float minActiveFraction, float minSpanX, float minSpanY)
+bool eyeVisualCoverageAcceptable(
+    const EyeVisualCoverage& coverage,
+    float minActiveFraction,
+    float minSpanX,
+    float minSpanY,
+    UINT minActiveTiles)
 {
     if (coverage.samples == 0 || gStereoTargetWidth == 0 || gStereoTargetHeight == 0)
         return false;
@@ -8608,7 +8940,10 @@ bool eyeVisualCoverageAcceptable(const EyeVisualCoverage& coverage, float minAct
     const UINT spanY = coverage.activeSamples == 0 ? 0 : (coverage.maxY - coverage.minY + 1);
     const float spanXF = static_cast<float>(spanX) / static_cast<float>(gStereoTargetWidth);
     const float spanYF = static_cast<float>(spanY) / static_cast<float>(gStereoTargetHeight);
-    return activeFraction >= minActiveFraction && spanXF >= minSpanX && spanYF >= minSpanY;
+    return activeFraction >= minActiveFraction
+        && spanXF >= minSpanX
+        && spanYF >= minSpanY
+        && coverage.activeTiles >= minActiveTiles;
 }
 
 bool stereoVisualCoverageAcceptable(const StereoVisualCoverage& coverage)
@@ -8616,8 +8951,12 @@ bool stereoVisualCoverageAcceptable(const StereoVisualCoverage& coverage)
     const float minActiveFraction = readEnvFloat("FNVXR_D3D9_STEREO_MIN_ACTIVE_FRACTION", 0.12f);
     const float minSpanX = readEnvFloat("FNVXR_D3D9_STEREO_MIN_ACTIVE_SPAN_X", 0.35f);
     const float minSpanY = readEnvFloat("FNVXR_D3D9_STEREO_MIN_ACTIVE_SPAN_Y", 0.35f);
-    return eyeVisualCoverageAcceptable(coverage.left, minActiveFraction, minSpanX, minSpanY)
-        && eyeVisualCoverageAcceptable(coverage.right, minActiveFraction, minSpanX, minSpanY);
+    const UINT minActiveTiles = static_cast<UINT>(readEnvFloat(
+        "FNVXR_D3D9_STEREO_MIN_ACTIVE_TILES", 12.0f));
+    return eyeVisualCoverageAcceptable(
+            coverage.left, minActiveFraction, minSpanX, minSpanY, minActiveTiles)
+        && eyeVisualCoverageAcceptable(
+            coverage.right, minActiveFraction, minSpanX, minSpanY, minActiveTiles);
 }
 
 void logStereoVisualCoverageRejected(const StereoVisualCoverage& coverage)
@@ -8628,11 +8967,12 @@ void logStereoVisualCoverageRejected(const StereoVisualCoverage& coverage)
         char message[512] {};
         sprintf_s(
             message,
-            "shared stereo visual coverage rejected count=%ld frame=%ld leftActive=%u/%u leftDominant=%u bucket=0x%03x leftBox=(%u,%u)-(%u,%u) rightActive=%u/%u rightDominant=%u bucket=0x%03x rightBox=(%u,%u)-(%u,%u)",
+            "shared stereo visual coverage rejected count=%ld frame=%ld leftActive=%u/%u leftTiles=%u/16 leftDominant=%u bucket=0x%03x leftBox=(%u,%u)-(%u,%u) rightActive=%u/%u rightTiles=%u/16 rightDominant=%u bucket=0x%03x rightBox=(%u,%u)-(%u,%u)",
             count,
             static_cast<LONG>(gPresentFrames),
             coverage.left.activeSamples,
             coverage.left.samples,
+            coverage.left.activeTiles,
             coverage.left.dominantSamples,
             coverage.left.dominantBucket,
             coverage.left.minX,
@@ -8641,6 +8981,7 @@ void logStereoVisualCoverageRejected(const StereoVisualCoverage& coverage)
             coverage.left.maxY,
             coverage.right.activeSamples,
             coverage.right.samples,
+            coverage.right.activeTiles,
             coverage.right.dominantSamples,
             coverage.right.dominantBucket,
             coverage.right.minX,
@@ -9040,7 +9381,7 @@ void auditStereoCollapseAfterDraw(
     const UINT minDifferentSamples = static_cast<UINT>(readEnvFloat("FNVXR_D3D9_STEREO_MIN_DIFF_SAMPLES", 1.0f));
     const UINT requiredDifferentSamples = minDifferentSamples == 0 ? 1 : minDifferentSamples;
     const bool wasSeparated = gStereoCollapseAuditPrevDiff >= requiredDifferentSamples;
-    const bool isSeparated = difference.differentSamples >= requiredDifferentSamples;
+    const bool isSeparated = spatialStereoDifferenceAcceptable(difference, requiredDifferentSamples);
 
     const LONG sampleStride =
         static_cast<LONG>(readEnvFloat("FNVXR_D3D9_STEREO_COLLAPSE_AUDIT_LOG_STRIDE", 128.0f));
@@ -9108,7 +9449,9 @@ void readbackStereoTargets(IDirect3DDevice9* device)
 
     const SurfaceDifference difference = compareReadbackSurfaces(gLeftEyeReadback, gRightEyeReadback);
     const UINT minDifferentSamples = static_cast<UINT>(readEnvFloat("FNVXR_D3D9_STEREO_MIN_DIFF_SAMPLES", 1.0f));
-    const bool separated = difference.differentSamples >= (minDifferentSamples == 0 ? 1 : minDifferentSamples);
+    const bool separated = spatialStereoDifferenceAcceptable(
+        difference,
+        minDifferentSamples == 0 ? 1 : minDifferentSamples);
     const bool worldCandidate = haveWorldCameraCandidate();
     const fnvxr::stereo::Matrix4& stereoBaseView = baseViewForStereo();
     char message[256] {};
@@ -9302,6 +9645,7 @@ void publishSharedStereoFrame(IDirect3DDevice9* device)
 {
     if (suppressStereoForUiMode())
     {
+        InterlockedExchange(&gConsecutiveStereoVisualCoverageFrames, 0);
         publishSharedStereoInvalid(true, "ui");
         return;
     }
@@ -9392,7 +9736,9 @@ void publishSharedStereoFrame(IDirect3DDevice9* device)
     const SurfaceDifference finalDifference = compareReadbackSurfaces(gLeftEyeReadback, gRightEyeReadback);
     const UINT minDifferentSamples = static_cast<UINT>(readEnvFloat("FNVXR_D3D9_STEREO_MIN_DIFF_SAMPLES", 1.0f));
     const UINT requiredDifferentSamples = minDifferentSamples == 0 ? 1 : minDifferentSamples;
-    const bool finalSeparated = finalDifference.differentSamples >= requiredDifferentSamples;
+    const bool finalSeparated = spatialStereoDifferenceAcceptable(
+        finalDifference,
+        requiredDifferentSamples);
     const bool bestSnapshotBeatsFinal =
         !finalSeparated || gBestStereoDiffThisPresent > finalDifference.differentSamples;
     const bool publishBestSnapshot =
@@ -9413,7 +9759,7 @@ void publishSharedStereoFrame(IDirect3DDevice9* device)
         difference.samples = gBestStereoSamplesThisPresent;
         difference.differentSamples = gBestStereoDiffThisPresent;
     }
-    const bool separated = difference.differentSamples >= requiredDifferentSamples;
+    const bool separated = spatialStereoDifferenceAcceptable(difference, requiredDifferentSamples);
     const bool worldCandidate = coherentPair ? true : haveWorldCameraCandidate();
     const bool publishBestSnapshotAsWorld =
         publishBestSnapshot && readEnvBool("FNVXR_D3D9_STEREO_BEST_SNAPSHOT_AS_WORLD", false);
@@ -9475,8 +9821,12 @@ void publishSharedStereoFrame(IDirect3DDevice9* device)
             }
         }
     }
-    else
+    else if (coherentPair)
     {
+        // Count consecutive verified producer transactions, not consecutive
+        // Present calls. Fallout legitimately has Present calls with no native
+        // scene traversal between them; clearing on those gaps made the 12-pair
+        // handoff threshold unreachable and left the headset black forever.
         InterlockedExchange(&gConsecutiveStereoVisualCoverageFrames, 0);
     }
 
@@ -9679,7 +10029,7 @@ void publishSharedStereoFrame(IDirect3DDevice9* device)
         char message[512] {};
         sprintf_s(
             message,
-            "shared stereo captured frame=%ld size=%ux%u seq=%ld producerMode=%ld renderPair=%ld worldCandidate=%d rawWorldCandidate=%d separated=%d uiActive=%d poseValid=%d rawPoseValid=%d visualGate=%d visualReady=%d visualFrames=%ld bestSnapshot=%d bestAsWorld=%d finalSeparated=%d poseSeq=%ld diff=%u/%u finalDiff=%u/%u baseViewT=(%.4f %.4f %.4f) leftHash=0x%08x rightHash=0x%08x",
+            "shared stereo captured frame=%ld size=%ux%u seq=%ld producerMode=%ld renderPair=%ld worldCandidate=%d rawWorldCandidate=%d separated=%d uiActive=%d poseValid=%d rawPoseValid=%d visualGate=%d visualReady=%d visualFrames=%ld bestSnapshot=%d bestAsWorld=%d finalSeparated=%d poseSeq=%ld diff=%u/%u tiles=%u/16 finalDiff=%u/%u finalTiles=%u/16 baseViewT=(%.4f %.4f %.4f) leftHash=0x%08x rightHash=0x%08x",
             static_cast<LONG>(gPresentFrames),
             gStereoTargetWidth,
             gStereoTargetHeight,
@@ -9701,8 +10051,10 @@ void publishSharedStereoFrame(IDirect3DDevice9* device)
             static_cast<LONG>(header->poseSequence),
             difference.differentSamples,
             difference.samples,
+            difference.differentTiles,
             finalDifference.differentSamples,
             finalDifference.samples,
+            finalDifference.differentTiles,
             stereoBaseView.m[3][0],
             stereoBaseView.m[3][1],
             stereoBaseView.m[3][2],
@@ -9732,7 +10084,7 @@ void publishSharedStereoFrame(IDirect3DDevice9* device)
         char proof[1792] {};
         sprintf_s(
             proof,
-            "{\"event\":\"fnvxrD3d9EyeTarget\",\"stage\":\"shared-stereo-publish\",\"frame\":%ld,\"ready\":%s,\"diagnosticSnapshot\":%s,\"bestSnapshot\":%s,\"bestSnapshotAsWorld\":%s,\"finalSeparated\":%s,\"leftRendered\":true,\"rightRendered\":true,\"width\":%u,\"height\":%u,\"format\":%lu,\"sequence\":%ld,\"producerMode\":%ld,\"renderPairSequence\":%ld,\"worldCandidate\":%s,\"rawWorldCandidate\":%s,\"separated\":%s,\"uiActive\":%s,\"poseValid\":%s,\"rawPoseValid\":%s,\"visualCoverageGate\":%s,\"visualCoverageReady\":%s,\"visualCoverageMeasured\":%s,\"visualCoverageFrames\":%ld,\"leftActiveFraction\":%.6f,\"rightActiveFraction\":%.6f,\"leftDominantFraction\":%.6f,\"rightDominantFraction\":%.6f,\"leftDominantBucket\":%u,\"rightDominantBucket\":%u,\"poseSequence\":%ld,\"diffSamples\":%u,\"samples\":%u,\"finalDiffSamples\":%u,\"finalSamples\":%u,\"leftHash\":\"0x%08x\",\"rightHash\":\"0x%08x\",\"finalLeftHash\":\"0x%08x\",\"finalRightHash\":\"0x%08x\"}",
+            "{\"event\":\"fnvxrD3d9EyeTarget\",\"stage\":\"shared-stereo-publish\",\"frame\":%ld,\"ready\":%s,\"diagnosticSnapshot\":%s,\"bestSnapshot\":%s,\"bestSnapshotAsWorld\":%s,\"finalSeparated\":%s,\"leftRendered\":true,\"rightRendered\":true,\"width\":%u,\"height\":%u,\"format\":%lu,\"sequence\":%ld,\"producerMode\":%ld,\"renderPairSequence\":%ld,\"worldCandidate\":%s,\"rawWorldCandidate\":%s,\"separated\":%s,\"uiActive\":%s,\"poseValid\":%s,\"rawPoseValid\":%s,\"visualCoverageGate\":%s,\"visualCoverageReady\":%s,\"visualCoverageMeasured\":%s,\"visualCoverageFrames\":%ld,\"leftActiveFraction\":%.6f,\"rightActiveFraction\":%.6f,\"leftActiveTiles\":%u,\"rightActiveTiles\":%u,\"leftDominantFraction\":%.6f,\"rightDominantFraction\":%.6f,\"leftDominantBucket\":%u,\"rightDominantBucket\":%u,\"poseSequence\":%ld,\"diffSamples\":%u,\"samples\":%u,\"differentTiles\":%u,\"finalDiffSamples\":%u,\"finalSamples\":%u,\"finalDifferentTiles\":%u,\"leftHash\":\"0x%08x\",\"rightHash\":\"0x%08x\",\"finalLeftHash\":\"0x%08x\",\"finalRightHash\":\"0x%08x\"}",
             static_cast<LONG>(gPresentFrames),
             (separated && header->worldCandidate && !header->uiActive && header->poseValid) ? "true" : "false",
             publishIsDiagnosticSnapshot ? "true" : "false",
@@ -9757,6 +10109,8 @@ void publishSharedStereoFrame(IDirect3DDevice9* device)
             visualCoverageFrames,
             leftActiveFraction,
             rightActiveFraction,
+            visualCoverage.left.activeTiles,
+            visualCoverage.right.activeTiles,
             leftDominantFraction,
             rightDominantFraction,
             visualCoverage.left.dominantBucket,
@@ -9764,8 +10118,10 @@ void publishSharedStereoFrame(IDirect3DDevice9* device)
             static_cast<LONG>(header->poseSequence),
             difference.differentSamples,
             difference.samples,
+            difference.differentTiles,
             finalDifference.differentSamples,
             finalDifference.samples,
+            finalDifference.differentTiles,
             difference.leftHash,
             difference.rightHash,
             finalDifference.leftHash,
@@ -10465,22 +10821,36 @@ HRESULT WINAPI hookedSetPixelShader(IDirect3DDevice9* device, IDirect3DPixelShad
 template <typename DrawFn, typename... Args>
 HRESULT replayDrawToStereoTargets(IDirect3DDevice9* device, bool userPrimitiveDraw, DrawFn draw, Args... args)
 {
-    // Count candidate programmable world draws before every replay filter.
-    // A skipped UP/configured-pair/target draw must remain in the coverage
-    // denominator or partial geometry can masquerade as full stereo.
+    // Shader discovery is diagnostic and must observe the programmable draw
+    // stream even when Fallout leaves stale fixed-function VIEW/PROJECTION
+    // state behind. Those stale screen-space transforms are not evidence that
+    // a vertex shader using its own ModelViewProj constants is UI.
     if (gInNativeStereoHook
         && gNativeActiveEye == 2
         && !gInStereoReplay
         && !suppressStereoForUiMode()
         && gActiveVertexShader
-        && gHaveView
+        && readEnvBool("FNVXR_D3D9_DUMP_SHADER_BYTECODE", false))
+    {
+        logWorldShaderWvpDiscovery();
+    }
+
+    // A native center traversal establishes world ownership even when Fallout
+    // leaves a stale fixed-function screen-space VIEW transform behind.  The
+    // programmable shaders consume their own ModelViewProj constants.  Count
+    // every non-composite programmable draw before replay filters so an
+    // unknown or skipped world shader makes the transaction fail closed.
+    const bool programmableWorldDraw = gInNativeStereoHook
+        && gNativeActiveEye == 2
+        && !gInStereoReplay
+        && !suppressStereoForUiMode()
+        && gActiveVertexShader
         && gHaveProjection
         && !currentProjectionLooksScreenSpace()
-        && !currentViewLooksScreenSpace()
-        && haveWorldCameraCandidate())
-    {
+        && !currentDrawSamplesStereoTwin()
+        && !currentShaderPairIsConfiguredStereoSkip();
+    if (programmableWorldDraw)
         InterlockedIncrement(&gShaderWorldDrawCandidates);
-    }
 
     const LONG nativeTraceEye = gNativeActiveEye;
     if (gNativePipelineTraceThisPair
@@ -10678,11 +11048,6 @@ HRESULT replayDrawToStereoTargets(IDirect3DDevice9* device, bool userPrimitiveDr
         currentDrawSamplesStereoTwin()
         && haveOriginalView
         && haveOriginalProjection;
-    const bool programmableWorldDraw = gActiveVertexShader
-        && !screenSpaceTextureComposite
-        && !currentProjectionLooksScreenSpace()
-        && !currentViewLooksScreenSpace()
-        && haveWorldCameraCandidate();
     const D3DMATRIX& leftReplayView = screenSpaceTextureComposite ? originalView : leftView;
     const D3DMATRIX& rightReplayView = screenSpaceTextureComposite ? originalView : rightView;
     const D3DMATRIX& leftReplayProjection = screenSpaceTextureComposite ? originalProjection : leftProjection;
@@ -10732,6 +11097,7 @@ HRESULT replayDrawToStereoTargets(IDirect3DDevice9* device, bool userPrimitiveDr
                     originalProjection,
                     leftView,
                     leftProjection,
+                    0,
                     "left");
         }
         bindStereoTextureTwins(device, true);
@@ -10755,6 +11121,7 @@ HRESULT replayDrawToStereoTargets(IDirect3DDevice9* device, bool userPrimitiveDr
                         originalProjection,
                         rightView,
                         rightProjection,
+                        1,
                         "right");
             }
             bindStereoTextureTwins(device, false);

@@ -104,14 +104,26 @@ public static class FnvxrStereoFrameReader {
         public int MeaningfulDifferent;
         public double LeftActiveFraction;
         public double RightActiveFraction;
+        public int LeftActiveTiles;
+        public int RightActiveTiles;
+        public int DifferentTiles;
     }
 
-    static PixelMetrics Analyze(byte[] left, byte[] right) {
+    static int BitCount(int value) {
+        int count = 0;
+        value &= 0xffff;
+        while (value != 0) { value &= value - 1; count++; }
+        return count;
+    }
+
+    static PixelMetrics Analyze(byte[] left, byte[] right, int width, int height) {
         var result = new PixelMetrics();
         var leftBuckets = new Dictionary<int,int>();
         var rightBuckets = new Dictionary<int,int>();
         int leftDominant = 0;
         int rightDominant = 0;
+        int leftDominantBucket = 0;
+        int rightDominantBucket = 0;
         int pixelCount = Math.Min(left.Length, right.Length) / 4;
         for (int pixel = 0; pixel < pixelCount; pixel += 16) {
             int offset = pixel * 4;
@@ -128,13 +140,33 @@ public static class FnvxrStereoFrameReader {
             int rightCount = rightBuckets.ContainsKey(rightBucket) ? rightBuckets[rightBucket] + 1 : 1;
             leftBuckets[leftBucket] = leftCount;
             rightBuckets[rightBucket] = rightCount;
-            leftDominant = Math.Max(leftDominant, leftCount);
-            rightDominant = Math.Max(rightDominant, rightCount);
+            if (leftCount > leftDominant) { leftDominant = leftCount; leftDominantBucket = leftBucket; }
+            if (rightCount > rightDominant) { rightDominant = rightCount; rightDominantBucket = rightBucket; }
         }
         if (result.Samples > 0) {
             result.LeftActiveFraction = 1.0 - (double)leftDominant / result.Samples;
             result.RightActiveFraction = 1.0 - (double)rightDominant / result.Samples;
         }
+        int leftTileMask = 0, rightTileMask = 0, differentTileMask = 0;
+        for (int pixel = 0; pixel < pixelCount; pixel += 16) {
+            int offset = pixel * 4;
+            int lb = left[offset], lg = left[offset + 1], lr = left[offset + 2];
+            int rb = right[offset], rg = right[offset + 1], rr = right[offset + 2];
+            int x = pixel % width;
+            int y = pixel / width;
+            int tileX = Math.Min(3, x * 4 / width);
+            int tileY = Math.Min(3, y * 4 / height);
+            int tileBit = 1 << (tileY * 4 + tileX);
+            int leftBucket = ((lr >> 4) << 8) | ((lg >> 4) << 4) | (lb >> 4);
+            int rightBucket = ((rr >> 4) << 8) | ((rg >> 4) << 4) | (rb >> 4);
+            if (leftBucket != leftDominantBucket) leftTileMask |= tileBit;
+            if (rightBucket != rightDominantBucket) rightTileMask |= tileBit;
+            if (Math.Max(Math.Max(Math.Abs(lr - rr), Math.Abs(lg - rg)), Math.Abs(lb - rb)) >= 4)
+                differentTileMask |= tileBit;
+        }
+        result.LeftActiveTiles = BitCount(leftTileMask);
+        result.RightActiveTiles = BitCount(rightTileMask);
+        result.DifferentTiles = BitCount(differentTileMask);
         return result;
     }
 
@@ -290,13 +322,16 @@ public static class FnvxrStereoFrameReader {
                     leftHash = sha.ComputeHash(leftPixels);
                     rightHash = sha.ComputeHash(rightPixels);
                 }
-                PixelMetrics metrics = Analyze(leftPixels, rightPixels);
+                PixelMetrics metrics = Analyze(leftPixels, rightPixels, width, height);
                 int minimumNonBlack = Math.Max(64, metrics.Samples / 1000);
                 int minimumMeaningfulDifferent = Math.Max(64, metrics.Samples / 1000);
                 bool pixelProof = metrics.NonBlack >= minimumNonBlack
                     && metrics.MeaningfulDifferent >= minimumMeaningfulDifferent
                     && metrics.LeftActiveFraction >= 0.50
-                    && metrics.RightActiveFraction >= 0.50;
+                    && metrics.RightActiveFraction >= 0.50
+                    && metrics.LeftActiveTiles >= 12
+                    && metrics.RightActiveTiles >= 12
+                    && metrics.DifferentTiles >= 8;
                 if (!pixelProof) {
                     Thread.Sleep(25);
                     continue;
@@ -344,7 +379,10 @@ public static class FnvxrStereoFrameReader {
                     ", \"nonBlack\": " + metrics.NonBlack +
                     ", \"meaningfulDifferent\": " + metrics.MeaningfulDifferent +
                     ", \"leftActiveFraction\": " + metrics.LeftActiveFraction.ToString("R", System.Globalization.CultureInfo.InvariantCulture) +
-                    ", \"rightActiveFraction\": " + metrics.RightActiveFraction.ToString("R", System.Globalization.CultureInfo.InvariantCulture) + "},\n" +
+                    ", \"rightActiveFraction\": " + metrics.RightActiveFraction.ToString("R", System.Globalization.CultureInfo.InvariantCulture) +
+                    ", \"leftActiveTiles\": " + metrics.LeftActiveTiles +
+                    ", \"rightActiveTiles\": " + metrics.RightActiveTiles +
+                    ", \"differentTiles\": " + metrics.DifferentTiles + "},\n" +
                     "  \"previewLeft\": \"" + Path.GetFileName(leftPath) + "\",\n" +
                     "  \"previewRight\": \"" + Path.GetFileName(rightPath) + "\"\n" +
                     "}\n";

@@ -34,6 +34,22 @@ bool vectorNear(
         && std::fabs(value.y - y) < epsilon
         && std::fabs(value.z - z) < epsilon;
 }
+
+bool matrixNear(
+    const fnvxr::stereo::Matrix4& lhs,
+    const fnvxr::stereo::Matrix4& rhs,
+    float epsilon = 0.0001f)
+{
+    for (int row = 0; row < 4; ++row)
+    {
+        for (int column = 0; column < 4; ++column)
+        {
+            if (std::fabs(lhs.m[row][column] - rhs.m[row][column]) >= epsilon)
+                return false;
+        }
+    }
+    return true;
+}
 }
 
 int main()
@@ -90,6 +106,46 @@ int main()
 
     if (!fnvxr::stereo::isFinite(eyes.leftView) || !fnvxr::stereo::isFinite(eyes.rightView))
         return fail("eye matrices should stay finite");
+
+    // The retail shader path receives exact combined NiCamera world-to-clip
+    // matrices. Prove both shader conventions replace only that factor while
+    // preserving an arbitrary draw-local model matrix.
+    fnvxr::stereo::Matrix4 centerVp {};
+    fnvxr::stereo::Matrix4 inverseCenterVp {};
+    fnvxr::stereo::Matrix4 eyeVp {};
+    fnvxr::stereo::Matrix4 model {};
+    centerVp.m[0][0] = 2.0f;
+    centerVp.m[1][1] = 3.0f;
+    centerVp.m[2][2] = 4.0f;
+    centerVp.m[3][3] = 1.0f;
+    inverseCenterVp.m[0][0] = 0.5f;
+    inverseCenterVp.m[1][1] = 1.0f / 3.0f;
+    inverseCenterVp.m[2][2] = 0.25f;
+    inverseCenterVp.m[3][3] = 1.0f;
+    eyeVp = centerVp;
+    eyeVp.m[0][3] = 0.125f;
+    eyeVp.m[1][3] = -0.25f;
+    model.m[0][0] = 0.5f;
+    model.m[1][1] = 0.75f;
+    model.m[2][2] = 1.25f;
+    model.m[3][3] = 1.0f;
+    model.m[0][3] = 7.0f;
+    model.m[1][3] = -4.0f;
+    model.m[2][3] = 2.0f;
+
+    const auto columnOriginal = fnvxr::stereo::multiply(centerVp, model);
+    const auto columnExpected = fnvxr::stereo::multiply(eyeVp, model);
+    const auto columnPatched = fnvxr::stereo::applyViewProjectionDelta(
+        columnOriginal, inverseCenterVp, eyeVp, true);
+    if (!matrixNear(columnPatched, columnExpected))
+        return fail("column-vector shader MVP delta must replace the exact center NiCamera world-to-clip factor");
+
+    const auto rowOriginal = fnvxr::stereo::multiply(model, centerVp);
+    const auto rowExpected = fnvxr::stereo::multiply(model, eyeVp);
+    const auto rowPatched = fnvxr::stereo::applyViewProjectionDelta(
+        rowOriginal, inverseCenterVp, eyeVp, false);
+    if (!matrixNear(rowPatched, rowExpected))
+        return fail("row-vector shader MVP delta must replace the exact center NiCamera world-to-clip factor");
 
     constexpr float Pi = 3.14159265358979323846f;
     const auto origin = fnvxr::stereo::multiply(
@@ -192,6 +248,67 @@ int main()
             expectedCombinedForward.z))
     {
         return fail("head rotation must remain body-local at arbitrary player headings");
+    }
+
+    // Captured from the retail NiCamera immediately before the sideways
+    // regression.  Its columns are camera right, up, and back.  Leveling must
+    // retain that layout instead of replacing it with an actor/world yaw
+    // matrix whose third column is world-up.
+    const fnvxr::stereo::Matrix3 capturedCameraWorld {{
+        { 0.010f, 0.250f, -0.968f },
+        { -1.000f, 0.003f, -0.010f },
+        { -0.000f, 0.968f, 0.250f }
+    }};
+    const auto levelCamera = fnvxr::stereo::gravityLevelCameraWorldRotation(capturedCameraWorld);
+    const fnvxr::stereo::Vector3 cameraLocalRight { 1.0f, 0.0f, 0.0f };
+    const fnvxr::stereo::Vector3 cameraLocalUp { 0.0f, 1.0f, 0.0f };
+    const fnvxr::stereo::Vector3 cameraLocalForward { 0.0f, 0.0f, -1.0f };
+    const auto levelRight = fnvxr::stereo::transform(levelCamera, cameraLocalRight);
+    const auto levelUp = fnvxr::stereo::transform(levelCamera, cameraLocalUp);
+    const auto levelForward = fnvxr::stereo::transform(levelCamera, cameraLocalForward);
+    if (std::fabs(levelRight.z) > 0.0001f
+        || !vectorNear(levelUp, 0.0f, 0.0f, 1.0f)
+        || std::fabs(levelForward.z) > 0.0001f)
+    {
+        return fail("leveled NiCamera must keep right/forward horizontal and camera up on world +Z");
+    }
+    const float capturedRightLength = std::sqrt(
+        capturedCameraWorld.m[0][0] * capturedCameraWorld.m[0][0]
+        + capturedCameraWorld.m[1][0] * capturedCameraWorld.m[1][0]);
+    if (!vectorNear(
+            levelRight,
+            capturedCameraWorld.m[0][0] / capturedRightLength,
+            capturedCameraWorld.m[1][0] / capturedRightLength,
+            0.0f))
+    {
+        return fail("leveled NiCamera must preserve the engine-authored horizontal heading");
+    }
+
+    const auto cameraYaw = fnvxr::stereo::composeBodyAndHead(
+        levelCamera,
+        fnvxr::stereo::cameraLocalHeadRotation(axisAngle(0.0f, 1.0f, 0.0f, Pi * 0.25f)));
+    const auto yawedCameraForward = fnvxr::stereo::transform(cameraYaw, cameraLocalForward);
+    if (std::fabs(yawedCameraForward.z) > 0.0001f)
+        return fail("OpenXR camera-local yaw must stay horizontal instead of becoming pitch");
+
+    const auto cameraPitch = fnvxr::stereo::composeBodyAndHead(
+        levelCamera,
+        fnvxr::stereo::cameraLocalHeadRotation(axisAngle(1.0f, 0.0f, 0.0f, Pi * 0.25f)));
+    const auto pitchedCameraForward = fnvxr::stereo::transform(cameraPitch, cameraLocalForward);
+    if (pitchedCameraForward.z < 0.70f)
+        return fail("OpenXR camera-local positive pitch must lift the view toward world-up");
+
+    const auto cameraRoll = fnvxr::stereo::composeBodyAndHead(
+        levelCamera,
+        fnvxr::stereo::cameraLocalHeadRotation(axisAngle(0.0f, 0.0f, 1.0f, Pi * 0.25f)));
+    const auto rolledCameraForward = fnvxr::stereo::transform(cameraRoll, cameraLocalForward);
+    if (!vectorNear(
+            rolledCameraForward,
+            levelForward.x,
+            levelForward.y,
+            levelForward.z))
+    {
+        return fail("OpenXR camera-local roll must not steer the viewing direction");
     }
 
     // Head and controller are independent tracked poses in the same recenter

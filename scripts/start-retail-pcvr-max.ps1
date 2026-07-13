@@ -15,11 +15,13 @@ param(
     [switch]$FocusOnLaunch,
     [switch]$DisableStereoWorld,
     [switch]$EnableStereoWorld,
+    [switch]$DiscoverShaderContracts,
     [switch]$EnableRetailRig,
     [switch]$ApplyRetailRig,
     [switch]$DisableRetailRig,
     [switch]$ApplyTestLoadout,
     [string]$D3D9ShaderWvpContracts = "",
+    [string]$VerifiedShaderDiscoveryRunDir = "",
     [string]$D3D9ShaderAllowVertexHashes = "",
     [switch]$StageOnly,
     [switch]$ValidateOnly
@@ -28,6 +30,18 @@ param(
 $ErrorActionPreference = "Stop"
 
 & (Join-Path $PSScriptRoot "audit-launch-safety.ps1") | Out-Host
+
+if ([string]::IsNullOrWhiteSpace($D3D9ShaderWvpContracts) -and
+    -not [string]::IsNullOrWhiteSpace($VerifiedShaderDiscoveryRunDir)) {
+    $D3D9ShaderWvpContracts = & (Join-Path $PSScriptRoot "get-verified-shader-wvp-contracts.ps1") `
+        -RunDir $VerifiedShaderDiscoveryRunDir `
+        -ContractsOnly
+    if ([string]::IsNullOrWhiteSpace($D3D9ShaderWvpContracts)) {
+        throw "Verified shader discovery produced an empty contract string."
+    }
+    Write-Host ("Verified {0} shader-contract characters from {1}." -f `
+        $D3D9ShaderWvpContracts.Length, $VerifiedShaderDiscoveryRunDir)
+}
 
 $launchArgs = @{
     Configuration = $Configuration
@@ -59,10 +73,22 @@ if ($StopExisting) {
 if ($FocusOnLaunch) {
     $launchArgs.FocusRetailWindow = $true
 }
-if ($EnableStereoWorld -and $DisableStereoWorld) {
-    throw "-EnableStereoWorld and -DisableStereoWorld are mutually exclusive."
+if (($EnableStereoWorld -or $DiscoverShaderContracts) -and $DisableStereoWorld) {
+    throw "-EnableStereoWorld/-DiscoverShaderContracts and -DisableStereoWorld are mutually exclusive."
 }
-if (-not $DisableStereoWorld) {
+if ($DiscoverShaderContracts) {
+    # Safe producer discovery: run the exact native stereo traversal and dump
+    # strong-fingerprint shader bytecode and keep headset presentation on the
+    # known transport. The rig remains read-only unless explicitly requested.
+    $launchArgs.EnableStereoWorld = $true
+    $launchArgs.StereoProducerProofOnly = $true
+    if (-not ($EnableRetailRig -or $ApplyRetailRig)) {
+        $launchArgs.DisableRetailRig = $true
+    }
+} elseif (-not $DisableStereoWorld) {
+    # Full headset runs keep proof telemetry but disable the high-frequency
+    # per-draw hammer; it added more than 100 ms to some Fallout traversals.
+    $launchArgs.NoTelemetryHammer = $true
     if ([string]::IsNullOrWhiteSpace($D3D9ShaderWvpContracts) -and -not ($StageOnly -or $ValidateOnly)) {
         throw "Full VR is fail-closed until -D3D9ShaderWvpContracts supplies reviewed fnv8/sha256/byteCount@register@column-or-row contracts. Run the producer-only shader discovery profile first."
     }

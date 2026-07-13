@@ -43,12 +43,18 @@ $ManifestPath = Join-Path $RunDir "manifest.json"
 $NvseLoader = Join-Path $GameRoot "nvse_loader.exe"
 $BuildDir = Join-Path $Root "build"
 $CommandExe = Join-Path $BuildDir "$Configuration\fnvxr_command.exe"
+$fallout = $null
+$falloutPid = $null
 
 New-Item -ItemType Directory -Force -Path $RunDir | Out-Null
 
 trap {
-    Write-FnvxrCheckpoint -Path $DebugLog -Message ("ERROR " + $_.Exception.Message)
+    $caught = $_
+    Write-FnvxrCheckpoint -Path $DebugLog -Message ("ERROR " + $caught.Exception.Message)
     try {
+        if ($falloutPid -and (Get-Process -Id $falloutPid -ErrorAction SilentlyContinue)) {
+            Stop-Process -Id $falloutPid -Force -ErrorAction SilentlyContinue
+        }
         if ((Get-Variable -Name fallout -Scope Script -ErrorAction SilentlyContinue) -and $fallout -and -not $fallout.HasExited) {
             Stop-Process -Id $fallout.Id -Force -ErrorAction SilentlyContinue
         }
@@ -61,15 +67,15 @@ trap {
             profile = "retail-sidecar"
             role = "retail-fnv-sidecar-surface-producer"
             failed = $true
-            error = $_.Exception.Message
+            error = $caught.Exception.Message
             runDir = $RunDir
             gameRoot = $GameRoot
             openXrHostLaunched = $false
         }
-        $failureManifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $ManifestPath -Encoding UTF8
+        Write-FnvxrJsonAtomic -Value $failureManifest -Path $ManifestPath -Depth 8
     } catch {
     }
-    Write-Error $_
+    [Console]::Error.WriteLine($caught.ToString())
     exit 1
 }
 

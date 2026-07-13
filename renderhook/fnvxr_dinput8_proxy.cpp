@@ -708,7 +708,10 @@ public:
             commitGameplayLookSample(&initial);
         }
         if (const SharedInputEventQueue* queue = inputEventQueue(); validInputEvents(queue))
-            m_lastInputEventSequence = queue->writeSequence;
+        {
+            m_lastStateInputEventSequence = queue->writeSequence;
+            m_lastBufferedInputEventSequence = queue->writeSequence;
+        }
     }
 
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, LPVOID* out) override
@@ -745,11 +748,35 @@ public:
     HRESULT STDMETHODCALLTYPE GetDeviceState(DWORD bytes, LPVOID data) override
     {
         HRESULT hr = m_real->GetDeviceState(bytes, data);
-        if (FAILED(hr) || !data)
-            return hr;
-
         SharedDInputState snapshot {};
         const SharedDInputState* shared = readSharedSnapshot(snapshot) ? &snapshot : nullptr;
+        if (FAILED(hr) && (hr == DIERR_INPUTLOST || hr == DIERR_NOTACQUIRED))
+        {
+            const HRESULT initialResult = hr;
+            const HRESULT acquireResult = m_real->Acquire();
+            if (SUCCEEDED(acquireResult))
+                hr = m_real->GetDeviceState(bytes, data);
+            if (InterlockedIncrement(&m_loggedDeviceLossRecovery) <= 24)
+            {
+                logLine(
+                    "GetDeviceState recovery mouse=%d keyboard=%d initial=0x%08lx acquire=0x%08lx retry=0x%08lx\n",
+                    m_mouse ? 1 : 0,
+                    m_keyboard ? 1 : 0,
+                    static_cast<unsigned long>(initialResult),
+                    static_cast<unsigned long>(acquireResult),
+                    static_cast<unsigned long>(hr));
+            }
+        }
+        if (FAILED(hr) && data && validShared(shared)
+            && envEnabled("FNVXR_DINPUT_VIRTUAL_OWNER", true))
+        {
+            std::memset(data, 0, bytes);
+            hr = DI_OK;
+            if (InterlockedIncrement(&m_loggedVirtualStateRecovery) <= 24)
+                logLine("GetDeviceState virtual synthesis after real-device failure mouse=%d keyboard=%d bytes=%lu\n", m_mouse ? 1 : 0, m_keyboard ? 1 : 0, bytes);
+        }
+        if (FAILED(hr) || !data)
+            return hr;
         if (m_mouse && !m_loggedMouseStatePoll)
         {
             m_loggedMouseStatePoll = true;
@@ -824,12 +851,30 @@ public:
 
         DWORD requested = *count;
         HRESULT hr = m_real->GetDeviceData(dataSize, outData, count, flags);
+        SharedDInputState snapshot {};
+        const SharedDInputState* shared = readSharedSnapshot(snapshot) ? &snapshot : nullptr;
+        if (FAILED(hr) && (hr == DIERR_INPUTLOST || hr == DIERR_NOTACQUIRED))
+        {
+            const HRESULT acquireResult = m_real->Acquire();
+            if (SUCCEEDED(acquireResult))
+                hr = m_real->GetDeviceData(dataSize, outData, count, flags);
+            if (InterlockedIncrement(&m_loggedDeviceLossRecovery) <= 24)
+                logLine("GetDeviceData recovery mouse=%d keyboard=%d acquire=0x%08lx retry=0x%08lx\n", m_mouse ? 1 : 0, m_keyboard ? 1 : 0, static_cast<unsigned long>(acquireResult), static_cast<unsigned long>(hr));
+        }
+        if (FAILED(hr) && outData && validShared(shared)
+            && dataSize == sizeof(DIDEVICEOBJECTDATA)
+            && !(flags & DIGDD_PEEK)
+            && envEnabled("FNVXR_DINPUT_VIRTUAL_OWNER", true))
+        {
+            *count = 0;
+            hr = DI_OK;
+            if (InterlockedIncrement(&m_loggedVirtualBufferedRecovery) <= 24)
+                logLine("GetDeviceData virtual synthesis after real-device failure mouse=%d keyboard=%d requested=%lu\n", m_mouse ? 1 : 0, m_keyboard ? 1 : 0, requested);
+        }
         if (FAILED(hr) || !outData || dataSize != sizeof(DIDEVICEOBJECTDATA) || requested <= *count || (flags & DIGDD_PEEK))
             return hr;
 
         DWORD written = *count;
-        SharedDInputState snapshot {};
-        const SharedDInputState* shared = readSharedSnapshot(snapshot) ? &snapshot : nullptr;
         if (!m_loggedBufferedPoll)
         {
             m_loggedBufferedPoll = true;
@@ -949,6 +994,9 @@ public:
     HRESULT STDMETHODCALLTYPE GetImageInfo(LPDIDEVICEIMAGEINFOHEADERA value) override { return m_real->GetImageInfo(value); }
 
 private:
+    volatile LONG m_loggedDeviceLossRecovery = 0;
+    volatile LONG m_loggedVirtualStateRecovery = 0;
+    volatile LONG m_loggedVirtualBufferedRecovery = 0;
     void commitGameplayLookSample(const SharedDInputState* shared)
     {
         if (!validShared(shared))
@@ -1040,11 +1088,29 @@ private:
             }
         }
 
-        if (validShared(shared) && shared->mouseClickPacket != m_lastMouseClickPacket)
+        if (!validPointer(shared))
+        {
+            m_mouseClickHoldPolls = 0;
+        }
+        else if (shared->mouseClickPacket != m_lastMouseClickPacket)
         {
             m_lastMouseClickPacket = shared->mouseClickPacket;
+            m_mouseClickHoldPolls = static_cast<int>((std::max<LONG>)(
+                1,
+                envLong("FNVXR_DINPUT_MENU_CLICK_HOLD_POLLS", 6)));
+            logLine(
+                "queue state mouse button0 packet=%lu holdPolls=%d\n",
+                shared->mouseClickPacket,
+                m_mouseClickHoldPolls);
+        }
+        if (m_mouseClickHoldPolls > 0)
+        {
             buttons[0] = 0x80;
-            logLine("inject state mouse button0 packet=%lu\n", shared->mouseClickPacket);
+            --m_mouseClickHoldPolls;
+            logLine(
+                "inject state mouse button0 packet=%lu remainingHoldPolls=%d\n",
+                shared ? shared->mouseClickPacket : m_lastMouseClickPacket,
+                m_mouseClickHoldPolls);
         }
 
         SharedDInputState lookSample {};
@@ -1198,7 +1264,7 @@ private:
             return;
 
         const LONG writeSequence = queue->writeSequence;
-        for (LONG sequence = inputEventStartSequence(m_lastInputEventSequence, writeSequence);
+        for (LONG sequence = inputEventStartSequence(m_lastStateInputEventSequence, writeSequence);
              sequence <= writeSequence;
              ++sequence)
         {
@@ -1224,7 +1290,7 @@ private:
                     break;
             }
         }
-        m_lastInputEventSequence = writeSequence;
+        m_lastStateInputEventSequence = writeSequence;
 
         for (std::uint32_t code = 0; code < 256; ++code)
         {
@@ -1243,7 +1309,7 @@ private:
             return;
 
         const LONG writeSequence = queue->writeSequence;
-        for (LONG sequence = inputEventStartSequence(m_lastInputEventSequence, writeSequence);
+        for (LONG sequence = inputEventStartSequence(m_lastStateInputEventSequence, writeSequence);
              sequence <= writeSequence;
              ++sequence)
         {
@@ -1287,7 +1353,7 @@ private:
                     break;
             }
         }
-        m_lastInputEventSequence = writeSequence;
+        m_lastStateInputEventSequence = writeSequence;
 
         for (std::uint32_t button = 0; button < 8; ++button)
         {
@@ -1316,8 +1382,8 @@ private:
             return;
 
         const LONG writeSequence = queue->writeSequence;
-        LONG lastRepresentedSequence = m_lastInputEventSequence;
-        for (LONG sequence = inputEventStartSequence(m_lastInputEventSequence, writeSequence);
+        LONG lastRepresentedSequence = m_lastBufferedInputEventSequence;
+        for (LONG sequence = inputEventStartSequence(m_lastBufferedInputEventSequence, writeSequence);
              sequence <= writeSequence;
              ++sequence)
         {
@@ -1361,7 +1427,7 @@ private:
             }
             lastRepresentedSequence = sequence;
         }
-        m_lastInputEventSequence = lastRepresentedSequence;
+        m_lastBufferedInputEventSequence = lastRepresentedSequence;
     }
 
     void appendInputQueueMouseEvents(LPDIDEVICEOBJECTDATA outData, DWORD requested, DWORD& written)
@@ -1384,8 +1450,8 @@ private:
             return;
 
         const LONG writeSequence = queue->writeSequence;
-        LONG lastRepresentedSequence = m_lastInputEventSequence;
-        for (LONG sequence = inputEventStartSequence(m_lastInputEventSequence, writeSequence);
+        LONG lastRepresentedSequence = m_lastBufferedInputEventSequence;
+        for (LONG sequence = inputEventStartSequence(m_lastBufferedInputEventSequence, writeSequence);
              sequence <= writeSequence;
              ++sequence)
         {
@@ -1447,7 +1513,7 @@ private:
             }
             lastRepresentedSequence = sequence;
         }
-        m_lastInputEventSequence = lastRepresentedSequence;
+        m_lastBufferedInputEventSequence = lastRepresentedSequence;
     }
 
     void logInputEventOnce(const char* label, const SharedInputEvent& event)
@@ -1736,12 +1802,17 @@ private:
     bool m_loggedBufferedPoll = false;
     bool m_loggedCooperativeLevel = false;
     std::uint32_t m_loggedInputEvents = 0;
-    LONG m_lastInputEventSequence = 0;
+    // Fallout polls both state and buffered DirectInput APIs on the same
+    // device. Each API needs its own queue cursor; sharing one lets the first
+    // poll steal an edge from the other and makes menu presses nondeterministic.
+    LONG m_lastStateInputEventSequence = 0;
+    LONG m_lastBufferedInputEventSequence = 0;
     bool m_forcedInputKeys[256] {};
     bool m_pendingBufferedInputKeyRelease[256] {};
     bool m_forcedInputMouseButtons[8] {};
     bool m_pendingBufferedInputMouseRelease[8] {};
     bool m_pendingBufferedMouseButton0Release = false;
+    int m_mouseClickHoldPolls = 0;
     bool m_pendingBufferedKeyboardAcceptRelease = false;
     bool m_bufferedForwardDown = false;
     bool m_bufferedBackwardDown = false;

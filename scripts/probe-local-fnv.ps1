@@ -1,6 +1,7 @@
 $ErrorActionPreference = "Stop"
 
 $Root = Split-Path -Parent $PSScriptRoot
+. (Join-Path $PSScriptRoot "fnvxr-sidecar-common.ps1")
 $OutDir = Join-Path $Root "local"
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 
@@ -9,8 +10,17 @@ $candidates = New-Object System.Collections.Generic.List[string]
 $commonRoots = @(
     $env:FNVXR_GAME_ROOT,
     "C:\Program Files (x86)\Steam\steamapps\common\Fallout New Vegas",
+    "D:\SteamLibrary\steamapps\common\Fallout New Vegas",
     "C:\GOG Games\Fallout New Vegas"
 )
+
+try {
+    $resolvedRoot = Resolve-FnvxrGameRoot -GameRoot $env:FNVXR_GAME_ROOT
+    if ($resolvedRoot) {
+        $commonRoots += $resolvedRoot
+    }
+} catch {
+}
 
 foreach ($root in $commonRoots) {
     if ($root) {

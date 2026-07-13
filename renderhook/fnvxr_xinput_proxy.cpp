@@ -323,6 +323,15 @@ bool fillVirtualState(DWORD userIndex, XINPUT_STATE* state)
     std::memset(state, 0, sizeof(*state));
     state->dwPacketNumber = shared->packet;
     std::uint16_t buttons = shared->buttons;
+    if (envEnabled("FNVXR_XINPUT_MASK_PLUGIN_OWNED_BUTTONS", true))
+    {
+        buttons &= static_cast<std::uint16_t>(~(
+            XINPUT_GAMEPAD_DPAD_UP | XINPUT_GAMEPAD_DPAD_DOWN
+            | XINPUT_GAMEPAD_DPAD_LEFT | XINPUT_GAMEPAD_DPAD_RIGHT
+            | XINPUT_GAMEPAD_START | XINPUT_GAMEPAD_BACK
+            | XINPUT_GAMEPAD_A | XINPUT_GAMEPAD_B
+            | XINPUT_GAMEPAD_X | XINPUT_GAMEPAD_Y));
+    }
     if (envEnabled("FNVXR_XINPUT_MASK_X", true))
         buttons &= ~XINPUT_GAMEPAD_X;
     if (envEnabled("FNVXR_XINPUT_MASK_B", true))
@@ -332,8 +341,9 @@ bool fillVirtualState(DWORD userIndex, XINPUT_STATE* state)
     if (envEnabled("FNVXR_XINPUT_MASK_THUMBSTICK_CLICKS", true))
         buttons &= static_cast<std::uint16_t>(~(XINPUT_GAMEPAD_LEFT_THUMB | XINPUT_GAMEPAD_RIGHT_THUMB));
     state->Gamepad.wButtons = buttons;
-    state->Gamepad.bLeftTrigger = shared->leftTrigger;
-    state->Gamepad.bRightTrigger = shared->rightTrigger;
+    const bool maskPluginTriggers = envEnabled("FNVXR_XINPUT_MASK_PLUGIN_OWNED_TRIGGERS", true);
+    state->Gamepad.bLeftTrigger = maskPluginTriggers ? 0 : shared->leftTrigger;
+    state->Gamepad.bRightTrigger = maskPluginTriggers ? 0 : shared->rightTrigger;
     state->Gamepad.sThumbLX = shared->leftThumbX;
     state->Gamepad.sThumbLY = shared->leftThumbY;
     const double rightStickScale = std::clamp(envFloat("FNVXR_XINPUT_RIGHT_STICK_SCALE", 1.12f), 0.25f, 2.50f);
@@ -477,6 +487,15 @@ bool synthesizeKeystrokesFromShared(DWORD userIndex)
         return true;
 
     std::uint16_t currentButtons = shared->buttons;
+    if (envEnabled("FNVXR_XINPUT_MASK_PLUGIN_OWNED_BUTTONS", true))
+    {
+        currentButtons &= static_cast<std::uint16_t>(~(
+            XINPUT_GAMEPAD_DPAD_UP | XINPUT_GAMEPAD_DPAD_DOWN
+            | XINPUT_GAMEPAD_DPAD_LEFT | XINPUT_GAMEPAD_DPAD_RIGHT
+            | XINPUT_GAMEPAD_START | XINPUT_GAMEPAD_BACK
+            | XINPUT_GAMEPAD_A | XINPUT_GAMEPAD_B
+            | XINPUT_GAMEPAD_X | XINPUT_GAMEPAD_Y));
+    }
     if (envEnabled("FNVXR_XINPUT_MASK_X", true))
         currentButtons &= ~XINPUT_GAMEPAD_X;
     if (envEnabled("FNVXR_XINPUT_MASK_B", true))
