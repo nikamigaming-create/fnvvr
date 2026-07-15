@@ -68,6 +68,12 @@ int main()
     const auto eyes = fnvxr::stereo::makeEyeMatrices(view, projection, fnvxr::stereo::DefaultIpdGameUnits);
     const float halfIpd = fnvxr::stereo::DefaultIpdGameUnits * 0.5f;
 
+    if (!nearlyEqual(fnvxr::stereo::DefaultGameUnitsPerMeter * 0.10f, 7.0f)
+        || !nearlyEqual(fnvxr::stereo::DefaultIpdGameUnits, 4.48f))
+    {
+        return fail("FNV physical scale must be 70 units/m and 64 mm IPD must be 4.48 units");
+    }
+
     if (!nearlyEqual(eyes.leftView.m[3][0], 12.0f + halfIpd))
         return fail("left eye view X should move by positive half game-unit IPD in FNV view space");
 
@@ -135,17 +141,99 @@ int main()
 
     const auto columnOriginal = fnvxr::stereo::multiply(centerVp, model);
     const auto columnExpected = fnvxr::stereo::multiply(eyeVp, model);
+    const auto columnDelta = fnvxr::stereo::makeViewProjectionDelta(centerVp, eyeVp, true);
+    if (!columnDelta.valid)
+        return fail("column-vector view-projection delta must pass its numerical residual gate");
     const auto columnPatched = fnvxr::stereo::applyViewProjectionDelta(
-        columnOriginal, inverseCenterVp, eyeVp, true);
-    if (!matrixNear(columnPatched, columnExpected))
+        columnOriginal, columnDelta.matrix, true);
+    const auto columnPatchValidation = fnvxr::stereo::validateAppliedViewProjectionDelta(
+        columnOriginal, columnPatched, columnDelta, true);
+    if (!matrixNear(columnPatched, columnExpected) || !columnPatchValidation.valid)
         return fail("column-vector shader MVP delta must replace the exact center NiCamera world-to-clip factor");
 
     const auto rowOriginal = fnvxr::stereo::multiply(model, centerVp);
     const auto rowExpected = fnvxr::stereo::multiply(model, eyeVp);
+    const auto rowDelta = fnvxr::stereo::makeViewProjectionDelta(centerVp, eyeVp, false);
+    if (!rowDelta.valid)
+        return fail("row-vector view-projection delta must pass its numerical residual gate");
     const auto rowPatched = fnvxr::stereo::applyViewProjectionDelta(
-        rowOriginal, inverseCenterVp, eyeVp, false);
-    if (!matrixNear(rowPatched, rowExpected))
+        rowOriginal, rowDelta.matrix, false);
+    const auto rowPatchValidation = fnvxr::stereo::validateAppliedViewProjectionDelta(
+        rowOriginal, rowPatched, rowDelta, false);
+    if (!matrixNear(rowPatched, rowExpected) || !rowPatchValidation.valid)
         return fail("row-vector shader MVP delta must replace the exact center NiCamera world-to-clip factor");
+
+    // Captured retail NiCamera center world-to-clip matrix. Its condition
+    // number is about 1.77e9, so the previous float Gauss-Jordan inverse could
+    // corrupt even E=C by several clip-space units. The new double-precision
+    // delta builder has an exact identity path and a reconstruction gate.
+    const fnvxr::stereo::Matrix4 retailCenter {{
+        { -0.456312f, -0.565370f, 0.0f, -33734.3f },
+        { 0.150332f, -0.121333f, 0.835479f, 3832.55f },
+        { 0.778176f, -0.628068f, 0.0f, 55550.0f },
+        { 0.778165f, -0.628060f, 0.0f, 55554.2f }
+    }};
+    const auto retailIdentityDelta =
+        fnvxr::stereo::makeViewProjectionDelta(retailCenter, retailCenter, true);
+    if (!retailIdentityDelta.valid
+        || retailIdentityDelta.reconstructionResidual != 0.0
+        || !matrixNear(retailIdentityDelta.matrix, projection))
+    {
+        return fail("captured ill-conditioned retail matrix must produce an exact identity delta when E equals C");
+    }
+    const auto retailOriginal = fnvxr::stereo::multiply(retailCenter, model);
+    const auto retailIdentityPatched = fnvxr::stereo::applyViewProjectionDelta(
+        retailOriginal,
+        retailIdentityDelta.matrix,
+        true);
+    if (!matrixNear(retailIdentityPatched, retailOriginal))
+        return fail("identity eye delta must leave a retail-scale shader WVP unchanged");
+
+    fnvxr::stereo::Matrix4 syntheticEyeDelta = projection;
+    syntheticEyeDelta.m[0][2] = 0.00025f;
+    syntheticEyeDelta.m[1][2] = -0.00015f;
+    const auto retailEye = fnvxr::stereo::multiply(syntheticEyeDelta, retailCenter);
+    const auto recoveredRetailDelta =
+        fnvxr::stereo::makeViewProjectionDelta(retailCenter, retailEye, true);
+    if (!recoveredRetailDelta.valid
+        || recoveredRetailDelta.reconstructionResidual > 0.01
+        || recoveredRetailDelta.normalizedReconstructionResidual > 0.000001)
+    {
+        return fail("captured retail matrix eye delta must pass double-precision reconstruction gates");
+    }
+    const auto retailExpected = fnvxr::stereo::multiply(retailEye, model);
+    const auto retailPatched = fnvxr::stereo::applyViewProjectionDelta(
+        retailOriginal,
+        recoveredRetailDelta.matrix,
+        true);
+    const auto retailPatchValidation = fnvxr::stereo::validateAppliedViewProjectionDelta(
+        retailOriginal,
+        retailPatched,
+        recoveredRetailDelta,
+        true,
+        0.02,
+        0.000001);
+    if (!matrixNear(retailPatched, retailExpected, 0.02f) || !retailPatchValidation.valid)
+        return fail("captured retail matrix delta must reproduce the eye WVP within the gated float tolerance");
+
+    fnvxr::stereo::Matrix4 amplifiedRetailWvp {};
+    for (int row = 0; row < 4; ++row)
+        for (int column = 0; column < 4; ++column)
+            amplifiedRetailWvp.m[row][column] = static_cast<float>((row + 1) * (column + 3)) * 100000000.0f;
+    const auto amplifiedRetailPatched = fnvxr::stereo::applyViewProjectionDelta(
+        amplifiedRetailWvp,
+        recoveredRetailDelta.matrix,
+        true);
+    const auto amplifiedPatchValidation = fnvxr::stereo::validateAppliedViewProjectionDelta(
+        amplifiedRetailWvp,
+        amplifiedRetailPatched,
+        recoveredRetailDelta,
+        true);
+    if (amplifiedPatchValidation.valid
+        || amplifiedPatchValidation.maximumAbsoluteError <= 0.01)
+    {
+        return fail("draw-local amplification above the final patched-WVP precision budget must fail closed");
+    }
 
     constexpr float Pi = 3.14159265358979323846f;
     const auto origin = fnvxr::stereo::multiply(
@@ -157,6 +245,43 @@ int main()
     if (!nearlyEqual(bodyOrigin.x, 0.0f) || !nearlyEqual(bodyOrigin.z, 0.0f))
     {
         return fail("gameplay recenter origin must remain aligned with OpenXR gravity");
+    }
+    const auto physicalTiltAtRecenter = fnvxr::stereo::relativeOrientation(bodyOrigin, origin);
+    if (std::fabs(physicalTiltAtRecenter.x) + std::fabs(physicalTiltAtRecenter.z) < 0.01f)
+    {
+        return fail("gravity-aligned recenter must not erase physical headset pitch and roll");
+    }
+    const auto retainedYaw = axisAngle(0.0f, 1.0f, 0.0f, 0.65f);
+    const auto verticalLook = axisAngle(1.0f, 0.0f, 0.0f, Pi * 0.5f);
+    const auto verticalRecenter =
+        fnvxr::stereo::gravityAlignedYawOrientation(verticalLook, retainedYaw);
+    if (std::fabs(verticalRecenter.y - retainedYaw.y) > 0.0001f
+        || std::fabs(verticalRecenter.w - retainedYaw.w) > 0.0001f)
+    {
+        return fail("vertical-look recenter must retain the previous yaw instead of latching atan2 noise");
+    }
+    const auto validEyeBaseline = fnvxr::stereo::validateEyeBaseline(
+        {},
+        { -0.032f, 0.0f, 0.0f },
+        { 0.032f, 0.0f, 0.0f });
+    if (!validEyeBaseline.valid || !nearlyEqual(validEyeBaseline.lengthMeters, 0.064f))
+        return fail("signed 64 mm right-minus-left eye baseline must validate in head-local space");
+    const auto swappedEyeBaseline = fnvxr::stereo::validateEyeBaseline(
+        {},
+        { 0.032f, 0.0f, 0.0f },
+        { -0.032f, 0.0f, 0.0f });
+    const auto verticalEyeBaseline = fnvxr::stereo::validateEyeBaseline(
+        {},
+        { 0.0f, -0.032f, 0.0f },
+        { 0.0f, 0.032f, 0.0f });
+    if (swappedEyeBaseline.valid || verticalEyeBaseline.valid)
+        return fail("swapped or non-lateral eye baselines must fail closed");
+    const float validFov[4] { -0.9f, 1.0f, 0.95f, -1.05f };
+    const float wrappedFov[4] { -3.0f, 3.0f, 1.0f, -1.0f };
+    if (!fnvxr::stereo::openXrFovAnglesUsable(validFov)
+        || fnvxr::stereo::openXrFovAnglesUsable(wrappedFov))
+    {
+        return fail("OpenXR FOV validation must reject angles whose tangents wrap or reverse bounds");
     }
 
     const fnvxr::stereo::Vector3 originPosition { 4.0f, -2.0f, 7.0f };
@@ -205,6 +330,11 @@ int main()
     const auto gamePosition = fnvxr::stereo::xrVectorToGamebryo(expectedLocalPosition);
     if (!vectorNear(gamePosition, 0.25f, 0.40f, -0.10f))
         return fail("OpenXR position must map to Gamebryo right/forward/up axes");
+
+    const auto cameraLocalPosition =
+        fnvxr::stereo::xrVectorToNiCameraLocal(expectedLocalPosition);
+    if (!vectorNear(cameraLocalPosition, 0.25f, -0.10f, -0.40f))
+        return fail("OpenXR position must remain right/up/back in NiCamera-local space");
 
     const fnvxr::stereo::Vector3 gameForward { 0.0f, 1.0f, 0.0f };
     const fnvxr::stereo::Vector3 gameRight { 1.0f, 0.0f, 0.0f };
@@ -282,6 +412,163 @@ int main()
             0.0f))
     {
         return fail("leveled NiCamera must preserve the engine-authored horizontal heading");
+    }
+
+    // Regression witness for the native 6DoF translation bug: NiCamera's
+    // columns are right/up/back. A 10 cm OpenXR forward move is local -Z and
+    // must follow the leveled camera-forward column without gaining height.
+    // The actor mapping would turn it into +Y, which is camera-up here.
+    const auto nativeForwardLocal = fnvxr::stereo::xrVectorToNiCameraLocal({ 0.0f, 0.0f, -0.10f });
+    const auto nativeForwardWorld = fnvxr::stereo::transform(levelCamera, nativeForwardLocal);
+    if (!vectorNear(
+            nativeForwardWorld,
+            levelForward.x * 0.10f,
+            levelForward.y * 0.10f,
+            levelForward.z * 0.10f))
+    {
+        return fail("native OpenXR forward translation must follow NiCamera forward, not camera up");
+    }
+    const auto nativeUpLocal = fnvxr::stereo::xrVectorToNiCameraLocal({ 0.0f, 0.10f, 0.0f });
+    const auto nativeUpWorld = fnvxr::stereo::transform(levelCamera, nativeUpLocal);
+    if (!vectorNear(nativeUpWorld, 0.0f, 0.0f, 0.10f))
+        return fail("native OpenXR height must follow NiCamera up, not camera back");
+
+    fnvxr::stereo::Matrix3 identity3 {{
+        { 1.0f, 0.0f, 0.0f },
+        { 0.0f, 1.0f, 0.0f },
+        { 0.0f, 0.0f, 1.0f }
+    }};
+    constexpr float eyeHalfSeparation = 2.24f;
+    fnvxr::stereo::EyeCullFrustum cullEyes[2] {};
+    for (int eye = 0; eye < 2; ++eye)
+    {
+        cullEyes[eye].rotation = identity3;
+        cullEyes[eye].position = {
+            eye == 0 ? -eyeHalfSeparation : eyeHalfSeparation,
+            0.0f,
+            0.0f
+        };
+        cullEyes[eye].left = -1.0f;
+        cullEyes[eye].right = 1.0f;
+        cullEyes[eye].top = 1.0f;
+        cullEyes[eye].bottom = -1.0f;
+    }
+    const auto centerCull = fnvxr::stereo::conservativeCenterCullFrustum(
+        identity3,
+        {},
+        cullEyes,
+        5.0f,
+        1000.0f);
+    const float expectedHorizontalCull = 1.0f + eyeHalfSeparation / 5.0f;
+    if (!centerCull.valid
+        || centerCull.left > -expectedHorizontalCull
+        || centerCull.right < expectedHorizontalCull
+        || centerCull.top < 1.0f
+        || centerCull.bottom > -1.0f
+        || centerCull.nearDistance > 5.0f
+        || centerCull.farDistance < 1000.0f
+        || std::fabs(centerCull.left + expectedHorizontalCull) > 0.0001f
+        || std::fabs(centerCull.right - expectedHorizontalCull) > 0.0001f
+        || std::fabs(centerCull.nearDistance - 5.0f) > 0.0001f
+        || std::fabs(centerCull.farDistance - 1000.0f) > 0.001f)
+    {
+        return fail("center traversal cull must include displaced eye origins, not only raw FOV tangents");
+    }
+
+    // Independently recompute long-range canted-eye sample points in double.
+    // This catches a subtle failure where production once rounded the matrix
+    // composition/corner transform in float and then expanded the final bound
+    // by only one ULP, which was not actually conservative at 100k units.
+    std::uint32_t frustumRandomState = 0x6d0f2026u;
+    auto frustumRandom = [&frustumRandomState]() {
+        frustumRandomState = frustumRandomState * 1664525u + 1013904223u;
+        return static_cast<float>((frustumRandomState >> 8) * (1.0 / 16777216.0));
+    };
+    for (int trial = 0; trial < 600; ++trial)
+    {
+        const float nearDistance = 4.0f + 6.0f * frustumRandom();
+        const float farDistance = 5000.0f + 95000.0f * frustumRandom();
+        const float halfIpd = 1.9f + 0.7f * frustumRandom();
+        fnvxr::stereo::EyeCullFrustum randomizedEyes[2] {};
+        for (int eye = 0; eye < 2; ++eye)
+        {
+            const float sign = eye == 0 ? -1.0f : 1.0f;
+            const float cant = sign * (0.01f + 0.09f * frustumRandom());
+            const float cosine = std::cos(cant);
+            const float sine = std::sin(cant);
+            randomizedEyes[eye].rotation = {{
+                { cosine, 0.0f, sine },
+                { 0.0f, 1.0f, 0.0f },
+                { -sine, 0.0f, cosine }
+            }};
+            randomizedEyes[eye].position = {
+                sign * halfIpd,
+                (frustumRandom() - 0.5f) * 0.1f,
+                (frustumRandom() - 0.5f) * 0.1f
+            };
+            randomizedEyes[eye].left = -1.4f + 0.5f * frustumRandom();
+            randomizedEyes[eye].right = 0.9f + 0.5f * frustumRandom();
+            randomizedEyes[eye].bottom = -1.3f + 0.4f * frustumRandom();
+            randomizedEyes[eye].top = 0.9f + 0.4f * frustumRandom();
+        }
+        const auto randomizedCull = fnvxr::stereo::conservativeCenterCullFrustum(
+            identity3,
+            {},
+            randomizedEyes,
+            nearDistance,
+            farDistance);
+        if (!randomizedCull.valid)
+            return fail("randomized translated/canted long-range cull must remain constructible");
+
+        for (int eye = 0; eye < 2; ++eye)
+        {
+            const auto& sampleEye = randomizedEyes[eye];
+            const double horizontal[3] {
+                sampleEye.left,
+                (static_cast<double>(sampleEye.left) + sampleEye.right) * 0.5,
+                sampleEye.right
+            };
+            const double vertical[3] {
+                sampleEye.bottom,
+                (static_cast<double>(sampleEye.bottom) + sampleEye.top) * 0.5,
+                sampleEye.top
+            };
+            const double depthSamples[3] {
+                nearDistance,
+                std::sqrt(static_cast<double>(nearDistance) * farDistance),
+                farDistance
+            };
+            for (const double depth : depthSamples)
+            {
+                for (const double tangentX : horizontal)
+                {
+                    for (const double tangentY : vertical)
+                    {
+                        const double local[3] { tangentX * depth, tangentY * depth, -depth };
+                        double center[3] {
+                            sampleEye.position.x,
+                            sampleEye.position.y,
+                            sampleEye.position.z
+                        };
+                        for (int row = 0; row < 3; ++row)
+                            for (int inner = 0; inner < 3; ++inner)
+                                center[row] += static_cast<double>(sampleEye.rotation.m[row][inner]) * local[inner];
+                        const double forward = -center[2];
+                        const double slopeX = center[0] / forward;
+                        const double slopeY = center[1] / forward;
+                        if (forward < randomizedCull.nearDistance
+                            || forward > randomizedCull.farDistance
+                            || slopeX < randomizedCull.left
+                            || slopeX > randomizedCull.right
+                            || slopeY < randomizedCull.bottom
+                            || slopeY > randomizedCull.top)
+                        {
+                            return fail("outward-rounded float cull must contain independent double long-range samples");
+                        }
+                    }
+                }
+            }
+        }
     }
 
     const auto cameraYaw = fnvxr::stereo::composeBodyAndHead(
@@ -384,6 +671,9 @@ int main()
 
     const bool eligibleWorldBasis = fnvxr::stereo::programmableWorldDrawBasis(
         true, false, true, true, false, false, false, false, false);
+    // The fifth argument means proven screen-space, not merely a stale
+    // fixed-function projection. Production passes false until strong shader
+    // semantics exist, so programmable draws cannot escape the denominator.
     if (!fnvxr::stereo::programmableWorldDrawCandidate(eligibleWorldBasis, true))
     {
         return fail("eligible indexed world geometry on the eye target must enter shader coverage");
@@ -391,6 +681,18 @@ int main()
     if (fnvxr::stereo::programmableWorldDrawCandidate(eligibleWorldBasis, false))
     {
         return fail("auxiliary render-target geometry must stay outside eye-image coverage");
+    }
+    if (!fnvxr::stereo::strictEyeTargetDrawLedgerComplete(9, 9)
+        || fnvxr::stereo::strictEyeTargetDrawLedgerComplete(9, 8)
+        || fnvxr::stereo::strictEyeTargetDrawLedgerComplete(0, 0))
+    {
+        return fail("every strict eye-target draw must have a proven successful write to both eyes");
+    }
+    if (!fnvxr::stereo::strictEyeTargetOptionalWriteLedgerComplete(0, 0)
+        || !fnvxr::stereo::strictEyeTargetOptionalWriteLedgerComplete(3, 3)
+        || fnvxr::stereo::strictEyeTargetOptionalWriteLedgerComplete(3, 2))
+    {
+        return fail("every observed strict eye-target clear/copy must succeed on both eyes");
     }
     if (!fnvxr::stereo::programmableWorldDrawBasis(
             true, false, true, true, false, false, false, false, false))
@@ -415,6 +717,34 @@ int main()
             true, false, true, true, false, false, true, false, false))
     {
         return fail("screen/composite/configured-skip draws must stay outside world coverage");
+    }
+
+    if (!fnvxr::stereo::singleTraversalPublishAllowed(false, false)
+        || !fnvxr::stereo::singleTraversalPublishAllowed(true, true)
+        || fnvxr::stereo::singleTraversalPublishAllowed(true, false))
+    {
+        return fail("single-traversal mode must never downgrade an incomplete pair to generic replay");
+    }
+
+    constexpr std::int64_t displayTime = 1000000000LL;
+    constexpr std::int64_t maximumAge = 25000000LL;
+    constexpr std::int64_t futureTolerance = 5000000LL;
+    std::int64_t sourceAge = 0;
+    if (!fnvxr::stereo::sourcePoseAgeWithinBudget(
+            displayTime, displayTime - 20000000LL, maximumAge, futureTolerance, &sourceAge)
+        || sourceAge != 20000000LL)
+    {
+        return fail("a 20 ms source pose must pass the 25 ms projection-layer age budget");
+    }
+    if (fnvxr::stereo::sourcePoseAgeWithinBudget(
+            displayTime, displayTime - 100000000LL, maximumAge, futureTolerance))
+    {
+        return fail("a 100 ms source pose must fail the projection-layer age budget");
+    }
+    if (fnvxr::stereo::sourcePoseAgeWithinBudget(
+            displayTime, displayTime + 10000000LL, maximumAge, futureTolerance))
+    {
+        return fail("a source pose 10 ms in the future must exceed the 5 ms tolerance");
     }
 
     std::cout << "stereo math ok\n";

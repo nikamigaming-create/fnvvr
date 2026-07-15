@@ -1,0 +1,472 @@
+{
+  "schema": "fnvxr-6dof-print-fixture-v1",
+  "generated_utc": "2026-07-15T02:54:39.379069+00:00",
+  "generator": "tools/generate_6dof_proof_artifacts.py",
+  "coordinate_convention": {
+    "openxr": "+X right, +Y up, +Z back, -Z forward",
+    "printer_mapping": "printer X = OpenXR X, printer Y = -OpenXR Z, printer Z = OpenXR Y",
+    "stl_units": "millimeters (STL is unitless; import explicitly as mm)",
+    "assembled_origin": "OpenXR origin is base top / mast flange bottom at printer Z=8 mm"
+  },
+  "scale": {
+    "fallout_units_per_meter": 70.0,
+    "status": "configured approximation derived from about 7 GECK units per 10 cm / 64 units per yard",
+    "source": "https://geckwiki.com/index.php?title=Units",
+    "100_mm_in_fallout_units": 7.0,
+    "64_mm_ipd_in_fallout_units": 4.48,
+    "64_mm_half_ipd_in_fallout_units": 2.24
+  },
+  "landmarks_openxr_mm": {
+    "origin": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "positive_x_endpoint": [
+      151.0,
+      0.0,
+      0.0
+    ],
+    "negative_x_endpoint": [
+      -43.0,
+      0.0,
+      0.0
+    ],
+    "positive_y_mast_endpoint": [
+      0.0,
+      173.0,
+      0.0
+    ],
+    "forward_negative_z_endpoint": [
+      0.0,
+      0.0,
+      -137.0
+    ],
+    "rear_positive_z_endpoint": [
+      0.0,
+      0.0,
+      47.0
+    ],
+    "chiral_brace_endpoint": [
+      83.0,
+      0.0,
+      -61.0
+    ],
+    "stations_mm": [
+      25.0,
+      50.0,
+      100.0
+    ],
+    "ipd_rows_mm": [
+      56.0,
+      60.0,
+      64.0,
+      68.0,
+      72.0
+    ],
+    "mast_stl_datum_z_mm": 8.0,
+    "mast_station_stl_z_mm": [
+      33.0,
+      58.0,
+      108.0
+    ],
+    "mast_endpoint_stl_z_mm": 181.0
+  },
+  "parts": {
+    "base": {
+      "file": "fnvxr_6dof_base.stl",
+      "sha256": "845844d82e870e77b95c4bf746a9c0670e8d95641f31c712cb1bbdc12de25f46",
+      "units": "millimeters",
+      "vertices": 822,
+      "triangles": 1644,
+      "bounds_mm": [
+        [
+          -43.0,
+          -47.0,
+          0.0
+        ],
+        [
+          151.0,
+          137.0,
+          10.5
+        ]
+      ],
+      "size_mm": [
+        194.0,
+        184.0,
+        10.5
+      ],
+      "volume_mm3": 62617.09652500794,
+      "minimum_design_feature_mm_nominal_not_measured": 3.75,
+      "roundtrip_max_bounds_error_mm": 0.0,
+      "roundtrip_volume_error_fraction": 0.0,
+      "custom_checker": {
+        "finite": true,
+        "minimum_triangle_area_mm2": 0.016500514909012054,
+        "minimum_triangle_edge_mm": 0.2570730111871347,
+        "zero_area_triangle_count": 0,
+        "duplicate_face_count": 0,
+        "bad_edge_incidence_count": 0,
+        "connected_components": 1,
+        "signed_volume_mm3": 62617.096525007946
+      },
+      "manifold3d_checker": {
+        "status": "NoError",
+        "triangles": 1644,
+        "vertices": 822,
+        "volume_mm3": 62617.09652500794,
+        "surface_area_mm2": 23620.49613314205,
+        "genus": 1
+      },
+      "checks": {
+        "trimesh_watertight": true,
+        "trimesh_winding_consistent": true,
+        "trimesh_positive_volume": true,
+        "custom_finite": true,
+        "custom_zero_area_triangles": true,
+        "custom_duplicate_faces": true,
+        "custom_edge_incidence_two": true,
+        "custom_one_connected_component": true,
+        "custom_positive_signed_volume": true,
+        "minimum_triangle_area_at_least_0_001_mm2": true,
+        "minimum_triangle_edge_at_least_0_05_mm": true,
+        "manifold3d_no_error": true,
+        "roundtrip_bounds_within_0_02_mm": true,
+        "roundtrip_volume_within_0_1_percent": true,
+        "fits_210_mm_xy_envelope": true
+      },
+      "passed": true
+    },
+    "mast": {
+      "file": "fnvxr_6dof_mast.stl",
+      "sha256": "3483573d2b069bc54521389719ca459ff2d34a38f50b4f5d95bbd9edab99875a",
+      "units": "millimeters",
+      "vertices": 80,
+      "triangles": 156,
+      "bounds_mm": [
+        [
+          -9.0,
+          -6.0,
+          0.0
+        ],
+        [
+          9.0,
+          6.0,
+          181.0
+        ]
+      ],
+      "size_mm": [
+        18.0,
+        12.0,
+        181.0
+      ],
+      "volume_mm3": 11889.599720954895,
+      "minimum_design_feature_mm_nominal_not_measured": 6.0,
+      "roundtrip_max_bounds_error_mm": 0.0,
+      "roundtrip_volume_error_fraction": 0.0,
+      "custom_checker": {
+        "finite": true,
+        "minimum_triangle_area_mm2": 3.0,
+        "minimum_triangle_edge_mm": 1.4142135623730951,
+        "zero_area_triangle_count": 0,
+        "duplicate_face_count": 0,
+        "bad_edge_incidence_count": 0,
+        "connected_components": 1,
+        "signed_volume_mm3": 11889.599720954895
+      },
+      "manifold3d_checker": {
+        "status": "NoError",
+        "triangles": 156,
+        "vertices": 80,
+        "volume_mm3": 11889.599720954895,
+        "surface_area_mm2": 6780.799933433533,
+        "genus": 0
+      },
+      "checks": {
+        "trimesh_watertight": true,
+        "trimesh_winding_consistent": true,
+        "trimesh_positive_volume": true,
+        "custom_finite": true,
+        "custom_zero_area_triangles": true,
+        "custom_duplicate_faces": true,
+        "custom_edge_incidence_two": true,
+        "custom_one_connected_component": true,
+        "custom_positive_signed_volume": true,
+        "minimum_triangle_area_at_least_0_001_mm2": true,
+        "minimum_triangle_edge_at_least_0_05_mm": true,
+        "manifold3d_no_error": true,
+        "roundtrip_bounds_within_0_02_mm": true,
+        "roundtrip_volume_within_0_1_percent": true,
+        "fits_210_mm_xy_envelope": true
+      },
+      "passed": true
+    },
+    "ipd_comb": {
+      "file": "fnvxr_6dof_ipd_comb.stl",
+      "sha256": "350fa4177f52755ce05e13cd5fa54e7a393023498b738ec3a793b15c4a087118",
+      "units": "millimeters",
+      "vertices": 1136,
+      "triangles": 2308,
+      "bounds_mm": [
+        [
+          -52.0,
+          -23.0,
+          0.0
+        ],
+        [
+          52.0,
+          23.0,
+          7.5
+        ]
+      ],
+      "size_mm": [
+        104.0,
+        46.0,
+        7.5
+      ],
+      "volume_mm3": 27323.289096729994,
+      "minimum_design_feature_mm_nominal_not_measured": 6.0,
+      "roundtrip_max_bounds_error_mm": 0.0,
+      "roundtrip_volume_error_fraction": 0.0,
+      "custom_checker": {
+        "finite": true,
+        "minimum_triangle_area_mm2": 0.018300068360986188,
+        "minimum_triangle_edge_mm": 0.07914134919536382,
+        "zero_area_triangle_count": 0,
+        "duplicate_face_count": 0,
+        "bad_edge_incidence_count": 0,
+        "connected_components": 1,
+        "signed_volume_mm3": 27323.289096729994
+      },
+      "manifold3d_checker": {
+        "status": "NoError",
+        "triangles": 2308,
+        "vertices": 1136,
+        "volume_mm3": 27323.289096729997,
+        "surface_area_mm2": 12089.121506098698,
+        "genus": 10
+      },
+      "checks": {
+        "trimesh_watertight": true,
+        "trimesh_winding_consistent": true,
+        "trimesh_positive_volume": true,
+        "custom_finite": true,
+        "custom_zero_area_triangles": true,
+        "custom_duplicate_faces": true,
+        "custom_edge_incidence_two": true,
+        "custom_one_connected_component": true,
+        "custom_positive_signed_volume": true,
+        "minimum_triangle_area_at_least_0_001_mm2": true,
+        "minimum_triangle_edge_at_least_0_05_mm": true,
+        "manifold3d_no_error": true,
+        "roundtrip_bounds_within_0_02_mm": true,
+        "roundtrip_volume_within_0_1_percent": true,
+        "fits_210_mm_xy_envelope": true
+      },
+      "passed": true
+    },
+    "rotation_pitch": {
+      "file": "fnvxr_6dof_rotation_pitch.stl",
+      "sha256": "ec57198ec9d42e06b48caf2d6a0506d974b27c568dc87dff1acd24158149a507",
+      "units": "millimeters",
+      "vertices": 232,
+      "triangles": 460,
+      "bounds_mm": [
+        [
+          -50.0,
+          -6.0,
+          0.0
+        ],
+        [
+          50.0,
+          47.400001525878906,
+          5.800000190734863
+        ]
+      ],
+      "size_mm": [
+        100.0,
+        53.400001525878906,
+        5.800000190734863
+      ],
+      "volume_mm3": 7430.184073093013,
+      "minimum_design_feature_mm_nominal_not_measured": 3.2,
+      "roundtrip_max_bounds_error_mm": 0.0,
+      "roundtrip_volume_error_fraction": 0.0,
+      "custom_checker": {
+        "finite": true,
+        "minimum_triangle_area_mm2": 0.02740187158633489,
+        "minimum_triangle_edge_mm": 0.23618010525020022,
+        "zero_area_triangle_count": 0,
+        "duplicate_face_count": 0,
+        "bad_edge_incidence_count": 0,
+        "connected_components": 1,
+        "signed_volume_mm3": 7430.184073093013
+      },
+      "manifold3d_checker": {
+        "status": "NoError",
+        "triangles": 460,
+        "vertices": 232,
+        "volume_mm3": 7430.184073093013,
+        "surface_area_mm2": 6087.641101301615,
+        "genus": 0
+      },
+      "checks": {
+        "trimesh_watertight": true,
+        "trimesh_winding_consistent": true,
+        "trimesh_positive_volume": true,
+        "custom_finite": true,
+        "custom_zero_area_triangles": true,
+        "custom_duplicate_faces": true,
+        "custom_edge_incidence_two": true,
+        "custom_one_connected_component": true,
+        "custom_positive_signed_volume": true,
+        "minimum_triangle_area_at_least_0_001_mm2": true,
+        "minimum_triangle_edge_at_least_0_05_mm": true,
+        "manifold3d_no_error": true,
+        "roundtrip_bounds_within_0_02_mm": true,
+        "roundtrip_volume_within_0_1_percent": true,
+        "fits_210_mm_xy_envelope": true
+      },
+      "passed": true
+    },
+    "rotation_yaw": {
+      "file": "fnvxr_6dof_rotation_yaw.stl",
+      "sha256": "4a736ad43a41351fa21a538f837dd56963b3b580c00e6c4742c7f3560f0f42a7",
+      "units": "millimeters",
+      "vertices": 271,
+      "triangles": 538,
+      "bounds_mm": [
+        [
+          -50.0,
+          -6.0,
+          0.0
+        ],
+        [
+          50.0,
+          47.400001525878906,
+          5.800000190734863
+        ]
+      ],
+      "size_mm": [
+        100.0,
+        53.400001525878906,
+        5.800000190734863
+      ],
+      "volume_mm3": 7452.433298929606,
+      "minimum_design_feature_mm_nominal_not_measured": 3.2,
+      "roundtrip_max_bounds_error_mm": 0.0,
+      "roundtrip_volume_error_fraction": 0.0,
+      "custom_checker": {
+        "finite": true,
+        "minimum_triangle_area_mm2": 0.02740187158633489,
+        "minimum_triangle_edge_mm": 0.23618010525020022,
+        "zero_area_triangle_count": 0,
+        "duplicate_face_count": 0,
+        "bad_edge_incidence_count": 0,
+        "connected_components": 1,
+        "signed_volume_mm3": 7452.433298929606
+      },
+      "manifold3d_checker": {
+        "status": "NoError",
+        "triangles": 538,
+        "vertices": 271,
+        "volume_mm3": 7452.433298929607,
+        "surface_area_mm2": 6110.167666595679,
+        "genus": 0
+      },
+      "checks": {
+        "trimesh_watertight": true,
+        "trimesh_winding_consistent": true,
+        "trimesh_positive_volume": true,
+        "custom_finite": true,
+        "custom_zero_area_triangles": true,
+        "custom_duplicate_faces": true,
+        "custom_edge_incidence_two": true,
+        "custom_one_connected_component": true,
+        "custom_positive_signed_volume": true,
+        "minimum_triangle_area_at_least_0_001_mm2": true,
+        "minimum_triangle_edge_at_least_0_05_mm": true,
+        "manifold3d_no_error": true,
+        "roundtrip_bounds_within_0_02_mm": true,
+        "roundtrip_volume_within_0_1_percent": true,
+        "fits_210_mm_xy_envelope": true
+      },
+      "passed": true
+    },
+    "rotation_roll": {
+      "file": "fnvxr_6dof_rotation_roll.stl",
+      "sha256": "763a4ec4a52e632918bc4eccc6e383f9796e6b9b164e5ec0a3c940ed2a74fb41",
+      "units": "millimeters",
+      "vertices": 311,
+      "triangles": 618,
+      "bounds_mm": [
+        [
+          -50.0,
+          -6.0,
+          0.0
+        ],
+        [
+          50.0,
+          47.400001525878906,
+          5.800000190734863
+        ]
+      ],
+      "size_mm": [
+        100.0,
+        53.400001525878906,
+        5.800000190734863
+      ],
+      "volume_mm3": 7474.682524854778,
+      "minimum_design_feature_mm_nominal_not_measured": 3.2,
+      "roundtrip_max_bounds_error_mm": 0.0,
+      "roundtrip_volume_error_fraction": 0.0,
+      "custom_checker": {
+        "finite": true,
+        "minimum_triangle_area_mm2": 0.02740187158633489,
+        "minimum_triangle_edge_mm": 0.23618010525020022,
+        "zero_area_triangle_count": 0,
+        "duplicate_face_count": 0,
+        "bad_edge_incidence_count": 0,
+        "connected_components": 1,
+        "signed_volume_mm3": 7474.682524854778
+      },
+      "manifold3d_checker": {
+        "status": "NoError",
+        "triangles": 618,
+        "vertices": 311,
+        "volume_mm3": 7474.6825248547775,
+        "surface_area_mm2": 6132.6942319345835,
+        "genus": 0
+      },
+      "checks": {
+        "trimesh_watertight": true,
+        "trimesh_winding_consistent": true,
+        "trimesh_positive_volume": true,
+        "custom_finite": true,
+        "custom_zero_area_triangles": true,
+        "custom_duplicate_faces": true,
+        "custom_edge_incidence_two": true,
+        "custom_one_connected_component": true,
+        "custom_positive_signed_volume": true,
+        "minimum_triangle_area_at_least_0_001_mm2": true,
+        "minimum_triangle_edge_at_least_0_05_mm": true,
+        "manifold3d_no_error": true,
+        "roundtrip_bounds_within_0_02_mm": true,
+        "roundtrip_volume_within_0_1_percent": true,
+        "fits_210_mm_xy_envelope": true
+      },
+      "passed": true
+    }
+  },
+  "asymmetry_check": {
+    "signed_permutations_tested": 48,
+    "preserving_transform_count": 1,
+    "identity_is_only_preserving_transform": true,
+    "passed": true
+  },
+  "slicer_validation": {
+    "status": "NOT_RUN",
+    "reason": "No PrusaSlicer/OrcaSlicer/admesh executable is installed in this workspace."
+  },
+  "all_available_digital_checks_passed": true
+}

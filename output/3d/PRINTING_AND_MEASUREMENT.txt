@@ -1,0 +1,26 @@
+FNVXR OFFLINE 6DoF METROLOGY FIXTURE
+
+This package is a physical reference, not proof that the runtime consumed a pose.
+
+Import:
+- STL units are millimeters.
+- Print every part with the largest flat face on the bed.
+- Suggested: 0.4 mm nozzle, 0.20 mm layers, 3 perimeters, PLA/PETG, no supports.
+
+Assembly convention:
+- Printer X is OpenXR +X (right).
+- Printer Y is OpenXR -Z (physical forward).
+- Printer Z is OpenXR +Y (up).
+- Insert the mast tab until the 18 x 12 mm flange positively stops on the base top. Do not force it.
+- The base top / mast flange bottom is the assembled zero-height datum (printer Z=8 mm).
+- The IPD comb rows are 56, 60, 64, 68, and 72 mm from bottom to top marker count.
+- On the 64 mm row, the left aperture is square and the right aperture is round.
+- Rotation gauges use one/two/three raised code dots for pitch/yaw/roll.
+
+Physical rejection limits:
+- Any 100 mm station error greater than +/-0.4 mm.
+- The 64 mm aperture separation error greater than +/-0.25 mm.
+- Mast squareness error greater than 0.5 degrees.
+- Base flatness error greater than 0.5 mm.
+
+Do not compensate software math to match a warped print.

@@ -25,7 +25,7 @@ param(
     [switch]$ApplyTestLoadout,
     [switch]$AutomateContinue,
     [string]$D3D9ShaderWvpContracts = "",
-    [string]$VerifiedShaderDiscoveryRunDir = "",
+    [string[]]$VerifiedShaderDiscoveryRunDir = @(),
     [string]$D3D9ShaderAllowVertexHashes = "",
     [switch]$StageOnly,
     [switch]$ValidateOnly
@@ -35,16 +35,20 @@ $ErrorActionPreference = "Stop"
 
 & (Join-Path $PSScriptRoot "audit-launch-safety.ps1") | Out-Host
 
+$verifiedShaderDiscoveryRunDirs = @($VerifiedShaderDiscoveryRunDir |
+    Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
 if ([string]::IsNullOrWhiteSpace($D3D9ShaderWvpContracts) -and
-    -not [string]::IsNullOrWhiteSpace($VerifiedShaderDiscoveryRunDir)) {
+    $verifiedShaderDiscoveryRunDirs.Count -gt 0) {
     $D3D9ShaderWvpContracts = & (Join-Path $PSScriptRoot "get-verified-shader-wvp-contracts.ps1") `
-        -RunDir $VerifiedShaderDiscoveryRunDir `
+        -RunDir $verifiedShaderDiscoveryRunDirs `
         -ContractsOnly
     if ([string]::IsNullOrWhiteSpace($D3D9ShaderWvpContracts)) {
         throw "Verified shader discovery produced an empty contract string."
     }
-    Write-Host ("Verified {0} shader-contract characters from {1}." -f `
-        $D3D9ShaderWvpContracts.Length, $VerifiedShaderDiscoveryRunDir)
+    Write-Host ("Verified {0} shader-contract characters from {1} discovery run(s): {2}." -f `
+        $D3D9ShaderWvpContracts.Length,
+        $verifiedShaderDiscoveryRunDirs.Count,
+        ($verifiedShaderDiscoveryRunDirs -join ", "))
 }
 
 $launchArgs = @{

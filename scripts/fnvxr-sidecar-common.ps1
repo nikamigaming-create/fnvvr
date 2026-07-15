@@ -716,7 +716,10 @@ function Set-FnvxrSidecarEnvironment {
     $env:FNVXR_GAME_PLANE_MODE = "center2d"
     $env:FNVXR_DIALOG_USES_GAMEPLAY_PLANE = "1"
     $env:FNVXR_PIPBOY_SCALE = "0.88"
-    $env:FNVXR_LEFT_GRIP_PIPBOY_MODE = "1"
+    # A natural controller hold must not toggle a menu or change the submitted
+    # view mode. Keep the experimental grip shortcut off until it has its own
+    # explicit interaction acceptance pass.
+    $env:FNVXR_LEFT_GRIP_PIPBOY_MODE = "0"
     $env:FNVXR_PIPBOY_GRIP_THRESHOLD = "0.55"
     $env:FNVXR_RIGHT_GRIP_MENU_MODE = "0"
     $env:FNVXR_MENU_GRIP_THRESHOLD = "0.55"
@@ -905,7 +908,8 @@ function Set-FnvxrSidecarEnvironment {
     $env:FNVXR_D3D9_USE_SHARED_CAMERA_VIEW = "1"
     $env:FNVXR_D3D9_APPLY_HMD_POSE = "0"
     $env:FNVXR_D3D9_POSE_AXIS_MODE = "gamebryo"
-    $env:FNVXR_D3D9_GAME_UNITS_PER_METER = "39.3701"
+    # GECK/FNV world geometry: approximately 7 units per 10 cm (64/yard).
+    $env:FNVXR_D3D9_GAME_UNITS_PER_METER = "70.0"
     $env:FNVXR_D3D9_HEAD_POSITION_SCALE = "1"
     $env:FNVXR_D3D9_STEREO_SCALE = "1"
     # Retail arm IK is injected only by the 32-bit NVSE plugin. Keep it inert
@@ -1003,6 +1007,12 @@ function Set-FnvxrStereoWorldRuntimeEnvironment {
     $env:FNVXR_D3D9_NATIVE_RECENTER_ON_FIRST_GAMEPLAY = "1"
     $env:FNVXR_D3D9_ALLOW_THIRD_PERSON_STEREO = "0"
     $env:FNVXR_D3D9_NATIVE_APPLY_HEAD_ROTATION = "1"
+    # The shader delta proof uses the exact center world-to-camera and frustum
+    # captured before traversal; publication fails if Gamebryo mutates either.
+    $env:FNVXR_D3D9_NATIVE_CENTER_W2C_MAX_DELTA = "0.0001"
+    $env:FNVXR_D3D9_NATIVE_CENTER_FRUSTUM_MAX_DELTA = "0.000001"
+    $env:FNVXR_D3D9_WVP_MAX_PATCH_ABS_ERROR = "0.01"
+    $env:FNVXR_D3D9_WVP_MAX_PATCH_NORMALIZED_ERROR = "0.0000001"
     # NiCamera local axes are right/up/back, the same local convention used by
     # OpenXR poses.  The native hook composes this camera-local delta directly;
     # actor/world-axis permutations are intentionally not selectable here.
@@ -1116,7 +1126,11 @@ function Set-FnvxrStereoWorldRuntimeEnvironment {
     $env:FNVXR_ALLOW_STEREO_WORLD_2D_FALLBACK = "0"
     $env:FNVXR_SHOW_GAME_PLANE_ON_STEREO_LOSS = "0"
     $env:FNVXR_SHOW_GAME_PLANE_IN_GAME = "0"
-    $env:FNVXR_STEREO_STABLE_HANDOFF_FRAMES = "12"
+    # The D3D9 producer has already required 12 consecutive visually valid
+    # single-traversal pairs before advertising world-ready. Consume the first
+    # producer-certified pair so a transient menu/focus edge cannot restart a
+    # second multi-second warmup and leave the headset dark.
+    $env:FNVXR_STEREO_STABLE_HANDOFF_FRAMES = "1"
     $env:FNVXR_STEREO_MIN_RGB_DELTA = "4"
     $env:FNVXR_STEREO_HOST_MIN_DIFF_SAMPLES = "64"
     $env:FNVXR_STEREO_HOST_MIN_ACTIVE_TILES = "12"
@@ -1125,6 +1139,10 @@ function Set-FnvxrStereoWorldRuntimeEnvironment {
     $env:FNVXR_PLAYER_STATE_READ_GRACE_FRAMES = "4"
     $env:FNVXR_STEREO_TRANSIENT_READ_GRACE_POLLS = "4"
     $env:FNVXR_STEREO_MAX_SAME_SEQUENCE_MS = "250"
+    # Translation cannot be exactly reprojected without a depth layer. Reject
+    # source pixels older than roughly two 90 Hz display periods.
+    $env:FNVXR_STEREO_MAX_SOURCE_POSE_AGE_MS = "25"
+    $env:FNVXR_STEREO_SOURCE_POSE_FUTURE_TOLERANCE_MS = "5"
     $env:FNVXR_STEREO_STALE_FRAME_LIMIT = "2"
     # The host distinguishes an ordinary faster-consumer poll from a producer
     # rejection. Keep a coherent unchanged sequence, but never retain a pair

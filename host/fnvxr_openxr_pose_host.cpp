@@ -7,6 +7,7 @@
 
 #include "fnvxr_protocol.h"
 #include "fnvxr_shared_state.h"
+#include "fnvxr_stereo_math.h"
 
 #include <windows.h>
 #include <tlhelp32.h>
@@ -7404,7 +7405,8 @@ int main(int argc, char** argv)
         if (envEnabled("FNVXR_FORCE_GAMEPLAY", false))
             gameUiMode = false;
         const float pipBoyGripThreshold = envFloat("FNVXR_PIPBOY_GRIP_THRESHOLD", 0.55f);
-        const bool pipBoyGripMode = frame.leftGrip > pipBoyGripThreshold;
+        const bool pipBoyGripMode = envEnabled("FNVXR_LEFT_GRIP_PIPBOY_MODE", false)
+            && frame.leftGrip > pipBoyGripThreshold;
         const bool pipBoyMenuMode =
             haveRuntimeUiState
             && (runtimeMenuBits & fnvxr::shared::RuntimePipBoyMenuBit) != 0;
@@ -7774,6 +7776,11 @@ int main(int argc, char** argv)
         };
         bool submitProjectionLayer = false;
         bool submittedStereoFullscreen = false;
+        int64_t sourcePoseAgeNanoseconds = 0;
+        bool sourcePoseAgeValid = false;
+        const int64_t maximumSourcePoseAgeNanoseconds =
+            static_cast<int64_t>(std::max(1, envInt("FNVXR_STEREO_MAX_SOURCE_POSE_AGE_MS", 25)))
+            * 1000000LL;
 
         XrViewLocateInfo viewLocateInfo { XR_TYPE_VIEW_LOCATE_INFO };
         viewLocateInfo.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
@@ -7914,13 +7921,23 @@ int main(int argc, char** argv)
                 renderer.stereoGameRenderedDisplayTime = 0;
                 renderer.stereoStableFrameCount = 0;
             }
+            const int64_t sourcePoseFutureToleranceNanoseconds =
+                static_cast<int64_t>(std::max(0, envInt("FNVXR_STEREO_SOURCE_POSE_FUTURE_TOLERANCE_MS", 5)))
+                * 1000000LL;
+            sourcePoseAgeValid = fnvxr::stereo::sourcePoseAgeWithinBudget(
+                frameState.predictedDisplayTime,
+                renderer.stereoGameRenderedDisplayTime,
+                maximumSourcePoseAgeNanoseconds,
+                sourcePoseFutureToleranceNanoseconds,
+                &sourcePoseAgeNanoseconds);
             const bool stereoFullscreenActive =
                 allowStereoFullscreen
                 && renderer.hasStereoGameFrame
                 && renderer.stereoGameFrameSeparated
                 && renderer.stereoStableFrameCount >= stereoStableHandoffFrames
                 && renderer.stereoReferenceSpaceGeneration == referenceSpaceGeneration
-                && renderer.stereoProducerEpoch == sharedBridge.producerEpoch;
+                && renderer.stereoProducerEpoch == sharedBridge.producerEpoch
+                && sourcePoseAgeValid;
             submittedStereoFullscreen = stereoFullscreenActive;
             std::vector<XrView> submitViews = views;
             bool usingSourceStereoViews = false;
@@ -8018,6 +8035,9 @@ int main(int argc, char** argv)
                           << " stereoSeq=" << renderer.stereoGameFrameSequence
                           << " stereoPoseSeq=" << renderer.stereoGamePoseSequence
                           << " stereoRenderedTime=" << renderer.stereoGameRenderedDisplayTime
+                          << " sourcePoseAgeNs=" << sourcePoseAgeNanoseconds
+                          << " sourcePoseAgeValid=" << static_cast<int>(sourcePoseAgeValid)
+                          << " sourcePoseAgeLimitNs=" << maximumSourcePoseAgeNanoseconds
                           << " exactSourceStereoViews=" << static_cast<int>(usingSourceStereoViews)
                           << " stereoStable=" << renderer.stereoStableFrameCount << "/" << stereoStableHandoffFrames
                           << " stereoUpdates=" << renderer.lastStereoFrameUpdated
@@ -8133,6 +8153,9 @@ int main(int argc, char** argv)
                 << ",\"sourceStereoSequence\":" << renderer.stereoGameFrameSequence
                 << ",\"sourcePoseSequence\":" << renderer.stereoGamePoseSequence
                 << ",\"sourceRenderedDisplayTime\":" << renderer.stereoGameRenderedDisplayTime
+                << ",\"sourcePoseAgeNanoseconds\":" << sourcePoseAgeNanoseconds
+                << ",\"sourcePoseAgeValid\":" << (sourcePoseAgeValid ? "true" : "false")
+                << ",\"sourcePoseAgeLimitNanoseconds\":" << maximumSourcePoseAgeNanoseconds
                 << ",\"leftHash\":\"0x" << std::hex << renderer.stereoLeftHash
                 << "\",\"rightHash\":\"0x" << renderer.stereoRightHash << std::dec
                 << "\",\"pixelSamples\":" << renderer.stereoPixelSamples

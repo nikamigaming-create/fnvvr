@@ -1,0 +1,31 @@
+{
+  "schema": "fnvxr-independent-oracle-reviews-v1",
+  "review_policy": "Five read-only agents were asked independently and were not shown the other agents' conclusions.",
+  "reviews": [
+    {
+      "oracle": 1,
+      "verdict": "CONDITIONAL PASS / RUNTIME FAIL",
+      "summary": "Independently proved the rigid similarity transform and confirmed the native-axis, yaw-only recenter, 70-unit scale, displaced-eye cull, and exact source-pose repairs. Refused headset certification because no-depth translation needs a strict age bound and old logs cannot validate the new binary."
+    },
+    {
+      "oracle": 2,
+      "verdict": "NOT READY",
+      "summary": "Independently reproduced the black screen from missing exact shader contracts: coverage fell to 391/392, the producer aged out, and disabled fallbacks left no visible gameplay layer. It also found incomplete oPos semantics, final-camera timing, stale fixed-state classification, and draw-ledger gaps. The first three implementation-level gaps were tightened afterward; missing bytecode and complete draw ownership remain red."
+    },
+    {
+      "oracle": 3,
+      "verdict": "FIXTURE CONDITIONAL",
+      "summary": "Specified an asymmetric/chiral physical metrology target, IPD comb, height stations, rotation witnesses, and independent mesh checks, while warning that a print cannot prove runtime pose or stereo. Its initial one-unit-per-inch scale assumption was rejected; the generated fixture uses the cited approximate 70 units/m scale."
+    },
+    {
+      "oracle": 4,
+      "verdict": "FAIL END-TO-END",
+      "summary": "Confirmed the spatial theorem, eye/FOV gates, cull construction, source transaction, and post-traversal camera guard. It found final patched-WVP float amplification, configured-skip/fixed-function/UP draw denominator holes, weak skip identities, incomplete shader semantics, and recorded 89-311 ms source age. A double-reference final-WVP gate was added; draw ownership, shader corpus, and temporal feasibility remain blockers."
+    },
+    {
+      "oracle": 5,
+      "verdict": "CORE PASS / PACKAGE FAIL",
+      "summary": "Independently repeated 20,000 rigid-transform cases, verified scale/IPD and every raw STL topology/hash, and judged the red PDF honest. It found float-intermediate frustum under-bounds, no mast hard stop/datum, Boolean slivers, asserted thickness, missing trace hashes, and pending review rows. The generator now uses double cull transforms, a compiled long-range test, a flange datum, simplified/sliver-gated meshes, nominal-feature wording, exact-source build/test hashes, and these five populated reviews. External slicing and runtime proof remain red."
+    }
+  ]
+}

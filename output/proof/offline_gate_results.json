@@ -1,0 +1,274 @@
+{
+  "schema": "fnvxr-6dof-offline-gates-v1",
+  "generated_utc": "2026-07-15T02:54:38.828231+00:00",
+  "commands": [
+    {
+      "name": "build_win32_release",
+      "command": [
+        "cmake",
+        "--build",
+        "build-win32",
+        "--config",
+        "Release"
+      ],
+      "exit_code": 0,
+      "passed": true,
+      "output_sha256": "af73849350fd0a8347d17068c55b23664208b97cdc11cbd81d64ef01c7637c7a",
+      "output_tail": [
+        "MSBuild version 17.14.40+3e7442088 for .NET Framework",
+        "",
+        "  fnvxr_d3d9_proxy.vcxproj -> D:\\code\\fnvvr\\build-win32\\Release\\d3d9.dll",
+        "  fnvxr_dinput8_proxy.vcxproj -> D:\\code\\fnvvr\\build-win32\\Release\\dinput8.dll",
+        "  fnvxr_xinput_proxy.vcxproj -> D:\\code\\fnvvr\\build-win32\\Release\\xinput1_3.dll",
+        "  nvse_fnvxr.vcxproj -> D:\\code\\fnvvr\\build-win32\\Release\\nvse_fnvxr.dll",
+        "  fnvxr_command.vcxproj -> D:\\code\\fnvvr\\build-win32\\Release\\fnvxr_command.exe",
+        "  fnvxr_fabrik_test.vcxproj -> D:\\code\\fnvvr\\build-win32\\Release\\fnvxr_fabrik_test.exe",
+        "  fnvxr_input.vcxproj -> D:\\code\\fnvvr\\build-win32\\Release\\fnvxr_input.exe",
+        "  fnvxr_nvse_bridge_test.vcxproj -> D:\\code\\fnvvr\\build-win32\\Release\\fnvxr_nvse_bridge_test.exe",
+        "  fnvxr_player_transform_test.vcxproj -> D:\\code\\fnvvr\\build-win32\\Release\\fnvxr_player_transform_test.exe",
+        "  fnvxr_plugin_exports_test.vcxproj -> D:\\code\\fnvvr\\build-win32\\Release\\fnvxr_plugin_exports_test.exe",
+        "  fnvxr_pose_fixture.vcxproj -> D:\\code\\fnvvr\\build-win32\\Release\\fnvxr_pose_fixture.exe",
+        "  fnvxr_protocol_layout_test.vcxproj -> D:\\code\\fnvvr\\build-win32\\Release\\fnvxr_protocol_layout_test.exe",
+        "  fnvxr_shared_state_probe.vcxproj -> D:\\code\\fnvvr\\build-win32\\Release\\fnvxr_shared_state_probe.exe",
+        "  fnvxr_stereo_math_test.vcxproj -> D:\\code\\fnvvr\\build-win32\\Release\\fnvxr_stereo_math_test.exe"
+      ]
+    },
+    {
+      "name": "ctest_win32_release",
+      "command": [
+        "ctest",
+        "--test-dir",
+        "build-win32",
+        "-C",
+        "Release",
+        "--output-on-failure"
+      ],
+      "exit_code": 0,
+      "passed": true,
+      "output_sha256": "a92e01abd1a28fd2e9abe71b0652f902448506af46309cd1480324bfd1f55fa4",
+      "output_tail": [
+        "      Start  1: fnvxr_protocol_layout_test",
+        " 1/10 Test  #1: fnvxr_protocol_layout_test .......   Passed    0.01 sec",
+        "      Start  2: fnvxr_shared_state_probe_smoke",
+        " 2/10 Test  #2: fnvxr_shared_state_probe_smoke ...   Passed    0.01 sec",
+        "      Start  3: fnvxr_pose_fixture_help",
+        " 3/10 Test  #3: fnvxr_pose_fixture_help ..........   Passed    0.01 sec",
+        "      Start  4: fnvxr_command_help",
+        " 4/10 Test  #4: fnvxr_command_help ...............   Passed    0.01 sec",
+        "      Start  5: fnvxr_input_help",
+        " 5/10 Test  #5: fnvxr_input_help .................   Passed    0.01 sec",
+        "      Start  6: fnvxr_stereo_math_test",
+        " 6/10 Test  #6: fnvxr_stereo_math_test ...........   Passed    0.01 sec",
+        "      Start  7: fnvxr_player_transform_test",
+        " 7/10 Test  #7: fnvxr_player_transform_test ......   Passed    0.01 sec",
+        "      Start  8: fnvxr_fabrik_test",
+        " 8/10 Test  #8: fnvxr_fabrik_test ................   Passed    0.01 sec",
+        "      Start  9: fnvxr_plugin_exports_test",
+        " 9/10 Test  #9: fnvxr_plugin_exports_test ........   Passed    0.01 sec",
+        "      Start 10: fnvxr_nvse_bridge_test",
+        "10/10 Test #10: fnvxr_nvse_bridge_test ...........   Passed    0.01 sec",
+        "",
+        "100% tests passed, 0 tests failed out of 10",
+        "",
+        "Total Test time (real) =   0.08 sec"
+      ]
+    },
+    {
+      "name": "build_x64_release",
+      "command": [
+        "cmake",
+        "--build",
+        "build",
+        "--config",
+        "Release"
+      ],
+      "exit_code": 0,
+      "passed": true,
+      "output_sha256": "8a4d27eb01f4758da4c0d22e3b420fb5a6859c2c2e1620428530eb5c68b64bfe",
+      "output_tail": [
+        "MSBuild version 17.14.40+3e7442088 for .NET Framework",
+        "",
+        "  fnvxr_command.vcxproj -> D:\\code\\fnvvr\\build\\Release\\fnvxr_command.exe",
+        "  fnvxr_fabrik_test.vcxproj -> D:\\code\\fnvvr\\build\\Release\\fnvxr_fabrik_test.exe",
+        "  fnvxr_input.vcxproj -> D:\\code\\fnvvr\\build\\Release\\fnvxr_input.exe",
+        "  fnvxr_openxr_pose_host.vcxproj -> D:\\code\\fnvvr\\build\\Release\\fnvxr_openxr_pose_host.exe",
+        "  fnvxr_openxr_probe.vcxproj -> D:\\code\\fnvvr\\build\\Release\\fnvxr_openxr_probe.exe",
+        "  fnvxr_player_transform_test.vcxproj -> D:\\code\\fnvvr\\build\\Release\\fnvxr_player_transform_test.exe",
+        "  fnvxr_pose_fixture.vcxproj -> D:\\code\\fnvvr\\build\\Release\\fnvxr_pose_fixture.exe",
+        "  fnvxr_protocol_layout_test.vcxproj -> D:\\code\\fnvvr\\build\\Release\\fnvxr_protocol_layout_test.exe",
+        "  fnvxr_shared_state_probe.vcxproj -> D:\\code\\fnvvr\\build\\Release\\fnvxr_shared_state_probe.exe",
+        "  fnvxr_stereo_math_test.vcxproj -> D:\\code\\fnvvr\\build\\Release\\fnvxr_stereo_math_test.exe"
+      ]
+    },
+    {
+      "name": "ctest_x64_release",
+      "command": [
+        "ctest",
+        "--test-dir",
+        "build",
+        "-C",
+        "Release",
+        "--output-on-failure"
+      ],
+      "exit_code": 0,
+      "passed": true,
+      "output_sha256": "7bf3875060d41137ef2f522e949407e1242e95b9e60f9241067d1d86411c34b2",
+      "output_tail": [
+        "Test project D:/code/fnvvr/build",
+        "    Start 1: fnvxr_protocol_layout_test",
+        "1/8 Test #1: fnvxr_protocol_layout_test .......   Passed    0.01 sec",
+        "    Start 2: fnvxr_shared_state_probe_smoke",
+        "2/8 Test #2: fnvxr_shared_state_probe_smoke ...   Passed    0.01 sec",
+        "    Start 3: fnvxr_pose_fixture_help",
+        "3/8 Test #3: fnvxr_pose_fixture_help ..........   Passed    0.01 sec",
+        "    Start 4: fnvxr_command_help",
+        "4/8 Test #4: fnvxr_command_help ...............   Passed    0.01 sec",
+        "    Start 5: fnvxr_input_help",
+        "5/8 Test #5: fnvxr_input_help .................   Passed    0.01 sec",
+        "    Start 6: fnvxr_stereo_math_test",
+        "6/8 Test #6: fnvxr_stereo_math_test ...........   Passed    0.01 sec",
+        "    Start 7: fnvxr_player_transform_test",
+        "7/8 Test #7: fnvxr_player_transform_test ......   Passed    0.01 sec",
+        "    Start 8: fnvxr_fabrik_test",
+        "8/8 Test #8: fnvxr_fabrik_test ................   Passed    0.01 sec",
+        "",
+        "100% tests passed, 0 tests failed out of 8",
+        "",
+        "Total Test time (real) =   0.05 sec"
+      ]
+    },
+    {
+      "name": "launch_safety_audit",
+      "command": [
+        "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "D:\\code\\fnvvr\\scripts\\audit-launch-safety.ps1"
+      ],
+      "exit_code": 0,
+      "passed": true,
+      "output_sha256": "b6d3037f303907baef9b41dd2a4f419da525d3b5f0d1db9fc1795227454601af",
+      "output_tail": [
+        "{",
+        "    \"scriptsChecked\":  25,",
+        "    \"parseErrors\":  0,",
+        "    \"openXrHostStartsBeforeRetail\":  true,",
+        "    \"sidecarProfilesVerified\":  true,",
+        "    \"osCursorSideChannelsForbidden\":  true,",
+        "    \"networkStubReferencesForbidden\":  true",
+        "}"
+      ]
+    },
+    {
+      "name": "shader_contract_dataflow_selftest",
+      "command": [
+        "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "D:\\code\\fnvvr\\scripts\\get-verified-shader-wvp-contracts.ps1",
+        "-SelfTestOnly"
+      ],
+      "exit_code": 0,
+      "passed": true,
+      "output_sha256": "c8ca19bda5653baf2562c41e129b4235c5489c4d7bcc241ff107665d0817d2ab",
+      "output_tail": [
+        "",
+        "",
+        "Passed                        : True",
+        "PositiveCompleteChainAccepted : True",
+        "UnrelatedTemporariesRejected  : True",
+        "PartialXyRejected             : True",
+        "FinalOverwriteRejected        : True",
+        "",
+        "",
+        ""
+      ]
+    }
+  ],
+  "source_hashes": {
+    "tools/generate_6dof_proof_artifacts.py": {
+      "exists": true,
+      "bytes": 63867,
+      "sha256": "18d480972def0676a1a0602f8257b6b4716e3488e2d238397426741eee7dc5d1"
+    },
+    "docs/6dof-coordinate-proof.md": {
+      "exists": true,
+      "bytes": 5160,
+      "sha256": "8a89bc147b1285da9611db33d26e2457598af9b828875884f2e0a3aa806e73e3"
+    },
+    "renderhook/fnvxr_stereo_math.h": {
+      "exists": true,
+      "bytes": 32476,
+      "sha256": "5c9cfdae6b9bef964bd9e32c87d0e2d384e2487eb0444a39c401da3c0d73c3f5"
+    },
+    "renderhook/fnvxr_d3d9_proxy.cpp": {
+      "exists": true,
+      "bytes": 501667,
+      "sha256": "49ac89822ac1ad30acef4552337f45433c28ec6b86ffb4b3608e6ef8e32cac4b"
+    },
+    "host/fnvxr_openxr_pose_host.cpp": {
+      "exists": true,
+      "bytes": 353242,
+      "sha256": "baa0662b2af3d1baaea0976e7562dbe1d8954963b04ff3c27238cba76136ab0d"
+    },
+    "plugin/fnvxr_nvse_plugin.cpp": {
+      "exists": true,
+      "bytes": 369036,
+      "sha256": "69fe527d06d29e1fe4916d4797af40e9c190392f2f0cee1d7d4ba3e09eb66dc8"
+    },
+    "tests/fnvxr_stereo_math_test.cpp": {
+      "exists": true,
+      "bytes": 33667,
+      "sha256": "767925416c51dc6a6048924d964aea2788aa6980a77099c5cb13018d05dcbfc6"
+    },
+    "scripts/get-verified-shader-wvp-contracts.ps1": {
+      "exists": true,
+      "bytes": 13761,
+      "sha256": "ae9b6765b68f6cfeb41fe9bd979b97364c0f6a803d6d4af6b52ed4af633243b9"
+    },
+    "scripts/fnvxr-sidecar-common.ps1": {
+      "exists": true,
+      "bytes": 59775,
+      "sha256": "7492a7d92597156bf011e9632b03976d7261710aaf9cc113f79d26be36ffc363"
+    },
+    "scripts/audit-launch-safety.ps1": {
+      "exists": true,
+      "bytes": 129109,
+      "sha256": "387cf40a1db4c8884308ed27b886e75148aa84f5d55369fd9ff1269ffcbc59ae"
+    }
+  },
+  "binary_hashes": {
+    "build-win32/Release/d3d9.dll": {
+      "exists": true,
+      "bytes": 243200,
+      "sha256": "439ceddc29d8420a98fd1ae8245ba8770632cc08a7d8e54eba5f7c32946840f7"
+    },
+    "build-win32/Release/nvse_fnvxr.dll": {
+      "exists": true,
+      "bytes": 147456,
+      "sha256": "a88a3a68d3c0e62e2e41546fa851a0b3301d3f82051699f7506160e44a9649f2"
+    },
+    "build-win32/Release/fnvxr_stereo_math_test.exe": {
+      "exists": true,
+      "bytes": 42496,
+      "sha256": "6af0d48be43c7d65f9e88eb1e057a54f7e954b4a3c6d16ca62d68f0f43f39000"
+    },
+    "build/Release/fnvxr_openxr_pose_host.exe": {
+      "exists": true,
+      "bytes": 246784,
+      "sha256": "51e0a8b1306365166017528f60d33dba41e45460550b1263ef783cac645e5015"
+    },
+    "build/Release/fnvxr_stereo_math_test.exe": {
+      "exists": true,
+      "bytes": 44544,
+      "sha256": "139f74a1eb1ecdfde689d465e6507ec17d359f15dab8124332a2122cf4b24386"
+    }
+  },
+  "all_commands_passed": true,
+  "all_traced_files_present": true,
+  "headset_processes_launched": false
+}

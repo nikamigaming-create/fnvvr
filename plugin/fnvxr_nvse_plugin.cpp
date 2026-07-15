@@ -4896,7 +4896,9 @@ RetailControllerWorldPose retailControllerWorldPose(
     wristLocalGame.x *= getFloatFromEnv("FNVXR_D3D9_POSE_X_SIGN", 1.0f);
     wristLocalGame.y *= getFloatFromEnv("FNVXR_D3D9_POSE_Y_SIGN", 1.0f);
     wristLocalGame.z *= getFloatFromEnv("FNVXR_D3D9_POSE_Z_SIGN", 1.0f);
-    const float unitsPerMeter = getFloatFromEnv("FNVXR_D3D9_GAME_UNITS_PER_METER", 39.3701f);
+    const float unitsPerMeter = getFloatFromEnv(
+        "FNVXR_D3D9_GAME_UNITS_PER_METER",
+        70.0f);
     const float positionScale = getFloatFromEnv("FNVXR_RETAIL_RIG_POSITION_SCALE", 1.0f);
     const Quat recenteredGripRotation = multiplyQuat(
         conjugateQuat(g_retailRigOriginHmdRot),
@@ -8855,7 +8857,7 @@ LONG externalDInputRightGrip()
 
 bool externalLeftGripPipBoyHeld()
 {
-    if (!envEnabled("FNVXR_LEFT_GRIP_PIPBOY_MODE", true) || !externalDInputSharedReady())
+    if (!envEnabled("FNVXR_LEFT_GRIP_PIPBOY_MODE", false) || !externalDInputSharedReady())
         return false;
 
     const float threshold = std::clamp(getFloatFromEnv("FNVXR_PIPBOY_GRIP_THRESHOLD", 0.55f), 0.0f, 1.0f);

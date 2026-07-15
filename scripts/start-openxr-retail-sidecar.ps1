@@ -36,6 +36,7 @@ param(
     [switch]$NoSidecarExitWatcher,
     [switch]$NoTelemetryHammer,
     [switch]$NoBuild,
+    [switch]$DumpD3D9ShaderBytecode,
     [switch]$NoRetail,
     [switch]$StageOnly,
     [switch]$ValidateOnly,
@@ -477,8 +478,11 @@ if ($EnableD3D9ShaderStereo) {
     $env:FNVXR_D3D9_STEREO_SNAPSHOT_DRAW_STRIDE = "8"
     Write-FnvxrCheckpoint -Path $DebugLog -Message "stereo producer verified per-hash WVP contract path enabled; generic shader scanner disabled"
 }
-if ($StereoProducerProofOnly) {
+if ($StereoProducerProofOnly -or $DumpD3D9ShaderBytecode) {
     $env:FNVXR_D3D9_DUMP_SHADER_BYTECODE = "1"
+    Write-FnvxrCheckpoint -Path $DebugLog -Message "D3D9 shader bytecode capture enabled by explicit diagnostic launch switch"
+}
+if ($StereoProducerProofOnly) {
     $env:FNVXR_GAME_FULLSCREEN_IN_XR = "0"
     $env:FNVXR_STEREO_FALLBACK_MONO_FULLSCREEN = "0"
     $env:FNVXR_SHOW_GAME_PLANE = "1"
@@ -929,6 +933,7 @@ $manifest = [ordered]@{
         shaderVerifiedVertexHashes = $env:FNVXR_D3D9_SHADER_STEREO_ALLOW_VERTEX_HASHES
         shaderWvpContracts = $env:FNVXR_D3D9_SHADER_WVP_CONTRACTS
         shaderAllowUnverifiedPatches = $env:FNVXR_D3D9_SHADER_ALLOW_UNVERIFIED_PATCHES
+        shaderBytecodeCapture = $env:FNVXR_D3D9_DUMP_SHADER_BYTECODE
         skippedShaderPairs = $env:FNVXR_D3D9_STEREO_SKIP_SHADER_HASH_PAIRS
         visualCoverageGate = $env:FNVXR_D3D9_STEREO_VISUAL_COVERAGE_GATE
         visualStableFrames = $env:FNVXR_D3D9_STEREO_VISUAL_STABLE_FRAMES

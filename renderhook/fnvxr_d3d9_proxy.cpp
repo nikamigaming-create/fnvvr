@@ -295,6 +295,12 @@ LONG gShaderWvpContractsLoaded = 0;
 LONG gShaderWorldDrawCandidates = 0;
 LONG gShaderWorldDraws = 0;
 LONG gShaderContractCoveredWorldDraws = 0;
+LONG gStrictEyeTargetDraws = 0;
+LONG gStrictEyeTargetProvenBothEyeDraws = 0;
+LONG gStrictEyeTargetClears = 0;
+LONG gStrictEyeTargetProvenBothEyeClears = 0;
+LONG gStrictEyeTargetCopies = 0;
+LONG gStrictEyeTargetProvenBothEyeCopies = 0;
 LONG gShaderExcludedUserPrimitiveDraws = 0;
 LONG gShaderExcludedAuxiliaryTargetDraws = 0;
 struct ShaderWvpDiscoveryIdentity
@@ -2314,17 +2320,7 @@ bool posePositionLooksUsable(const float p[3])
 
 bool fovLooksUsable(const float fov[4])
 {
-    if (!finiteArray(fov, 4))
-        return false;
-
-    return fov[0] < -0.01f
-        && fov[1] > 0.01f
-        && fov[2] > 0.01f
-        && fov[3] < -0.01f
-        && absFloat(fov[0]) <= 3.2f
-        && absFloat(fov[1]) <= 3.2f
-        && absFloat(fov[2]) <= 3.2f
-        && absFloat(fov[3]) <= 3.2f;
+    return fnvxr::stereo::openXrFovAnglesUsable(fov);
 }
 
 bool d3d9VrPoseInputEnabled()
@@ -2875,22 +2871,34 @@ void updateSharedVrPose()
         (pose.leftEyePos[1] + pose.rightEyePos[1]) * 0.5f,
         (pose.leftEyePos[2] + pose.rightEyePos[2]) * 0.5f
     };
-    const float rawEyeDelta[3] {
-        pose.rightEyePos[0] - pose.leftEyePos[0],
-        pose.rightEyePos[1] - pose.leftEyePos[1],
-        pose.rightEyePos[2] - pose.leftEyePos[2]
-    };
-    gLatestRawIpdMeters = sqrtf(
-        rawEyeDelta[0] * rawEyeDelta[0]
-        + rawEyeDelta[1] * rawEyeDelta[1]
-        + rawEyeDelta[2] * rawEyeDelta[2]);
-    if (!(gLatestRawIpdMeters >= 0.03f && gLatestRawIpdMeters <= 0.12f))
+    const fnvxr::stereo::EyeBaselineValidation eyeBaseline =
+        fnvxr::stereo::validateEyeBaseline(
+            { pose.hmdRot[0], pose.hmdRot[1], pose.hmdRot[2], pose.hmdRot[3] },
+            { pose.leftEyePos[0], pose.leftEyePos[1], pose.leftEyePos[2] },
+            { pose.rightEyePos[0], pose.rightEyePos[1], pose.rightEyePos[2] });
+    if (!eyeBaseline.valid)
     {
-        rawCenter[0] = pose.hmdPos[0];
-        rawCenter[1] = pose.hmdPos[1];
-        rawCenter[2] = pose.hmdPos[2];
-        gLatestRawIpdMeters = gIpdMeters;
+        gLatestVrPoseSnapshotValid = false;
+        gNativeStereoRenderedPoseValid = false;
+        gHaveVrBodyFrame = false;
+        if (gPublishedVrOriginActive || gPublishedVrOriginCommitted)
+            publishSharedVrOrigin(false);
+        const LONG invalidCount = InterlockedIncrement(&gLoggedSharedVrPoseInvalid);
+        if (invalidCount <= 16 || invalidCount % 300 == 0)
+        {
+            char message[320] {};
+            sprintf_s(
+                message,
+                "shared VR pose rejected: invalid signed eye baseline length=%.6f headLocal=(%.6f %.6f %.6f)",
+                eyeBaseline.lengthMeters,
+                eyeBaseline.headLocalMeters.x,
+                eyeBaseline.headLocalMeters.y,
+                eyeBaseline.headLocalMeters.z);
+            logLine(message);
+        }
+        return;
     }
+    gLatestRawIpdMeters = eyeBaseline.lengthMeters;
     if (!gHaveVrPoseOrigin)
     {
         gVrPoseOrigin[0] = rawCenter[0];
@@ -2900,8 +2908,9 @@ void updateSharedVrPose()
         copyNormalizedQuat(capturedHmdRot, pose.hmdRot);
         captureVrWorldYawCorrection(capturedHmdRot);
         const fnvxr::stereo::Quaternion yawOrigin =
-            fnvxr::stereo::gravityAlignedYawOrientation({
-                capturedHmdRot[0], capturedHmdRot[1], capturedHmdRot[2], capturedHmdRot[3] });
+            fnvxr::stereo::gravityAlignedYawOrientation(
+                { capturedHmdRot[0], capturedHmdRot[1], capturedHmdRot[2], capturedHmdRot[3] },
+                { gVrPoseOriginRot[0], gVrPoseOriginRot[1], gVrPoseOriginRot[2], gVrPoseOriginRot[3] });
         gVrPoseOriginRot[0] = yawOrigin.x;
         gVrPoseOriginRot[1] = yawOrigin.y;
         gVrPoseOriginRot[2] = yawOrigin.z;
@@ -2978,9 +2987,7 @@ void updateSharedVrPose()
         const float qy = gLatestHmdRotDelta[1];
         const float qz = gLatestHmdRotDelta[2];
         const float qw = gLatestHmdRotDelta[3];
-        const float hmdYaw = atan2f(
-            2.0f * (qw * qy + qx * qz),
-            1.0f - 2.0f * (qy * qy + qz * qz));
+        const float hmdYaw = fnvxr::stereo::xrHeadingYawRadians({ qx, qy, qz, qw });
         const float playerYaw = gLatestSharedPlayerSnapshotValid
             ? atan2f(
                 gLatestSharedPlayerSnapshot.playerWorldRot[3],
@@ -3453,7 +3460,6 @@ bool setEyeShaderWvpConstants(
     const fnvxr::stereo::Matrix4 originalProjectionMatrix = toStereoMatrix(originalProjection);
     const fnvxr::stereo::Matrix4 eyeView = toStereoMatrix(eyeViewD3d);
     const fnvxr::stereo::Matrix4 eyeProjection = toStereoMatrix(eyeProjectionD3d);
-    fnvxr::stereo::Matrix4 inverseBaseViewProjection {};
     const bool nativeExactViewProjection =
         gInNativeStereoHook
         && gNativeActiveEye == 2
@@ -3463,24 +3469,58 @@ bool setEyeShaderWvpConstants(
     const fnvxr::stereo::Matrix4 baseViewProjection = nativeExactViewProjection
         ? gNativeSingleTraversalCenterViewProjection
         : multiplyMatrix(originalViewMatrix, originalProjectionMatrix);
-    if (!invertMatrix(baseViewProjection, inverseBaseViewProjection))
-    {
-        logShaderStereoSkip("wvp_base_view_projection_singular");
-        return false;
-    }
-
     const fnvxr::stereo::Matrix4 eyeViewProjection = nativeExactViewProjection
         ? gNativeSingleTraversalEyeViewProjection[eye]
         : multiplyMatrix(eyeView, eyeProjection);
+    const bool columnVector = contract ? contract->columnVector : true;
+    const fnvxr::stereo::ViewProjectionDelta viewProjectionDelta =
+        fnvxr::stereo::makeViewProjectionDelta(
+            baseViewProjection,
+            eyeViewProjection,
+            columnVector);
+    if (!viewProjectionDelta.valid)
+    {
+        logShaderStereoSkip("wvp_view_projection_delta_unstable");
+        return false;
+    }
     const fnvxr::stereo::Matrix4 patchedWvp =
         fnvxr::stereo::applyViewProjectionDelta(
             originalWvp,
-            inverseBaseViewProjection,
-            eyeViewProjection,
-            contract ? contract->columnVector : true);
+            viewProjectionDelta.matrix,
+            columnVector);
     if (!fnvxr::stereo::isFinite(patchedWvp))
     {
         logShaderStereoSkip("wvp_nonfinite");
+        return false;
+    }
+    const double maximumPatchedWvpAbsoluteError = static_cast<double>(
+        readEnvFloat("FNVXR_D3D9_WVP_MAX_PATCH_ABS_ERROR", 0.01f));
+    const double maximumPatchedWvpNormalizedError = static_cast<double>(
+        readEnvFloat("FNVXR_D3D9_WVP_MAX_PATCH_NORMALIZED_ERROR", 0.0000001f));
+    const fnvxr::stereo::ViewProjectionPatchValidation patchValidation =
+        fnvxr::stereo::validateAppliedViewProjectionDelta(
+            originalWvp,
+            patchedWvp,
+            viewProjectionDelta,
+            columnVector,
+            maximumPatchedWvpAbsoluteError,
+            maximumPatchedWvpNormalizedError);
+    if (!patchValidation.valid)
+    {
+        const LONG failure = InterlockedIncrement(&gLoggedShaderStereoSkipped);
+        if (failure <= 48 || failure % 5000 == 0)
+        {
+            char message[320] {};
+            sprintf_s(
+                message,
+                "shader stereo skipped count=%ld reason=wvp_patched_matrix_precision maxAbsError=%.9g allowedAbs=%.9g normalizedError=%.9g allowedNormalized=%.9g",
+                failure,
+                patchValidation.maximumAbsoluteError,
+                maximumPatchedWvpAbsoluteError,
+                patchValidation.normalizedError,
+                maximumPatchedWvpNormalizedError);
+            logLine(message);
+        }
         return false;
     }
 
@@ -4106,6 +4146,7 @@ void logStereoReplaySkip(const char* reason)
 bool shouldReplayCurrentDrawToStereo(bool userPrimitiveDraw)
 {
     const bool textureCompositeDraw = currentDrawSamplesStereoTwin();
+    const bool verifiedProgrammableWorldDraw = currentShaderWvpContract() != nullptr;
 
     if (userPrimitiveDraw && !readEnvBool("FNVXR_D3D9_STEREO_REPLAY_UP_DRAWS", false))
     {
@@ -4127,6 +4168,7 @@ bool shouldReplayCurrentDrawToStereo(bool userPrimitiveDraw)
 
     if (readEnvBool("FNVXR_D3D9_SKIP_SCREENSPACE_BY_PROJECTION_ONLY", true)
         && currentProjectionLooksScreenSpace()
+        && !verifiedProgrammableWorldDraw
         && !textureCompositeDraw)
     {
         logStereoReplaySkip("screen-space-projection");
@@ -4135,6 +4177,7 @@ bool shouldReplayCurrentDrawToStereo(bool userPrimitiveDraw)
 
     if (readEnvBool("FNVXR_D3D9_SKIP_SCREENSPACE_BY_VIEW_ONLY", false)
         && currentViewLooksScreenSpace()
+        && !verifiedProgrammableWorldDraw
         && !textureCompositeDraw)
     {
         logStereoReplaySkip("screen-space-view");
@@ -4144,6 +4187,7 @@ bool shouldReplayCurrentDrawToStereo(bool userPrimitiveDraw)
     if (readEnvBool("FNVXR_D3D9_SKIP_SCREENSPACE_STEREO_DRAWS", true)
         && currentProjectionLooksScreenSpace()
         && currentViewLooksScreenSpace()
+        && !verifiedProgrammableWorldDraw
         && !textureCompositeDraw)
     {
         logStereoReplaySkip("screen-space-transform");
@@ -6510,12 +6554,23 @@ NativeMatrix3 gravityLevelNativeCameraRotation(const NativeMatrix3& matrix)
 
 void captureNativeViewOrigin(const SharedVrPoseState& pose, const char* reason)
 {
-    std::memcpy(gNativeViewOriginRot, pose.hmdRot, sizeof(gNativeViewOriginRot));
+    // A VR recenter may choose heading, but it must not tilt the room basis.
+    // Keeping pitch/roll here while translation uses the gravity-aligned pose
+    // origin gives rotation and translation different frames: later world-up
+    // yaw mixes into pitch/roll and horizontal motion acquires vertical error.
+    const fnvxr::stereo::Quaternion yawOrigin =
+        fnvxr::stereo::gravityAlignedYawOrientation(
+            { pose.hmdRot[0], pose.hmdRot[1], pose.hmdRot[2], pose.hmdRot[3] },
+            { gVrPoseOriginRot[0], gVrPoseOriginRot[1], gVrPoseOriginRot[2], gVrPoseOriginRot[3] });
+    gNativeViewOriginRot[0] = yawOrigin.x;
+    gNativeViewOriginRot[1] = yawOrigin.y;
+    gNativeViewOriginRot[2] = yawOrigin.z;
+    gNativeViewOriginRot[3] = yawOrigin.w;
     gNativeViewOriginValid = true;
     char message[256] {};
     sprintf_s(
         message,
-        "native view recentered reason=%s hmdRot=(%.6f %.6f %.6f %.6f)",
+        "native view recentered reason=%s gravityAligned=1 yawOriginRot=(%.6f %.6f %.6f %.6f)",
         reason ? reason : "unknown",
         gNativeViewOriginRot[0],
         gNativeViewOriginRot[1],
@@ -6710,7 +6765,22 @@ bool prepareNativeStereoRig(NativeStereoRig& rig)
     const bool recenterRequested =
         (rig.pose.trackingFlags & fnvxr::shared::VrPoseTrackingRecenterRequested) != 0;
     if (recenterRequested && !gNativeViewRecenterHeld)
-        captureNativeViewOrigin(rig.pose, "controller-chord");
+    {
+        // Recenter is one rigid-frame transaction. Relatch position and the
+        // gravity-aligned yaw from this same pose before deriving rotation;
+        // changing only the rotation origin leaves translation expressed in
+        // the previous heading frame and violates 6DoF composition.
+        gHaveVrPoseOrigin = false;
+        gHaveVrBodyFrame = false;
+        gNativeViewOriginValid = false;
+        updateSharedVrPose();
+        if (!gHaveVrPoseOrigin || !gHaveVrBodyFrame || !gLatestVrPoseSnapshotValid)
+            return false;
+        rig.pose = gLatestVrPoseSnapshot;
+        rig.poseSequence = gLatestVrPoseSnapshotSequence;
+        rig.displayTime = gLatestVrPoseDisplayTime;
+        captureNativeViewOrigin(rig.pose, "controller-chord-rigid-frame");
+    }
     gNativeViewRecenterHeld = recenterRequested;
 
     const fnvxr::stereo::Quaternion currentHead {
@@ -6775,13 +6845,14 @@ bool prepareNativeStereoRig(NativeStereoRig& rig)
         }
 
         float localXrMeters[3] {};
-        float localGameMeters[3] {};
         composeLocalXrMeters(localEyes[eye], localXrMeters);
-        xrMetersToGamebryoMeters(localXrMeters, localGameMeters);
+        const fnvxr::stereo::Vector3 localCameraMeters =
+            fnvxr::stereo::xrVectorToNiCameraLocal({
+                localXrMeters[0], localXrMeters[1], localXrMeters[2] });
         rig.eyeOffsetUnits[eye] = {
-            localGameMeters[0] * gGameUnitsPerMeter,
-            localGameMeters[1] * gGameUnitsPerMeter,
-            localGameMeters[2] * gGameUnitsPerMeter
+            localCameraMeters.x * gGameUnitsPerMeter,
+            localCameraMeters.y * gGameUnitsPerMeter,
+            localCameraMeters.z * gGameUnitsPerMeter
         };
         std::memcpy(rig.fov[eye], sourceFov[eye], sizeof(rig.fov[eye]));
     }
@@ -6841,6 +6912,15 @@ bool writeNativeEyeCameraState(const NativeCameraSnapshot& base, const NativeSte
     return setNativeCameraFrustum(base.camera, frustum);
 }
 
+NativeVector3 nativeCenterOffsetUnits(const NativeStereoRig& rig)
+{
+    return {
+        (rig.eyeOffsetUnits[0].x + rig.eyeOffsetUnits[1].x) * 0.5f,
+        (rig.eyeOffsetUnits[0].y + rig.eyeOffsetUnits[1].y) * 0.5f,
+        (rig.eyeOffsetUnits[0].z + rig.eyeOffsetUnits[1].z) * 0.5f
+    };
+}
+
 NativeNiTransform nativeCenterWorldTransform(
     const NativeCameraSnapshot& base,
     const NativeStereoRig& rig)
@@ -6852,11 +6932,7 @@ NativeNiTransform nativeCenterWorldTransform(
     else
         desiredWorld.rotation = bodyWorldRotation;
 
-    const NativeVector3 centerOffsetUnits {
-        (rig.eyeOffsetUnits[0].x + rig.eyeOffsetUnits[1].x) * 0.5f,
-        (rig.eyeOffsetUnits[0].y + rig.eyeOffsetUnits[1].y) * 0.5f,
-        (rig.eyeOffsetUnits[0].z + rig.eyeOffsetUnits[1].z) * 0.5f
-    };
+    const NativeVector3 centerOffsetUnits = nativeCenterOffsetUnits(rig);
     const NativeVector3 worldOffset = transformNativeVector(bodyWorldRotation, centerOffsetUnits);
     desiredWorld.translation.x += worldOffset.x;
     desiredWorld.translation.y += worldOffset.y;
@@ -6878,14 +6954,45 @@ bool writeNativeCenterCameraState(const NativeCameraSnapshot& base, const Native
     NativeNiFrustum frustum = base.frustum;
     if (readEnvBool("FNVXR_D3D9_NATIVE_ASYMMETRIC_FOV", true))
     {
-        // Cull once with the union of both OpenXR eye frusta. The D3D replay
-        // path later applies the per-eye view split to the same submitted draw
-        // list, so neither eye can lose geometry solely because it was culled
-        // for the other eye.
-        frustum.left = (std::min)(std::tan(rig.fov[0][0]), std::tan(rig.fov[1][0]));
-        frustum.right = (std::max)(std::tan(rig.fov[0][1]), std::tan(rig.fov[1][1]));
-        frustum.top = (std::max)(std::tan(rig.fov[0][2]), std::tan(rig.fov[1][2]));
-        frustum.bottom = (std::min)(std::tan(rig.fov[0][3]), std::tan(rig.fov[1][3]));
+        const NativeVector3 centerOffsetUnits = nativeCenterOffsetUnits(rig);
+        fnvxr::stereo::Matrix3 centerRotation {};
+        fnvxr::stereo::Vector3 centerPosition {
+            centerOffsetUnits.x, centerOffsetUnits.y, centerOffsetUnits.z
+        };
+        fnvxr::stereo::EyeCullFrustum eyeFrusta[2] {};
+        for (int row = 0; row < 3; ++row)
+            for (int column = 0; column < 3; ++column)
+                centerRotation.m[row][column] = rig.headRotation.m[row][column];
+        for (int eye = 0; eye < 2; ++eye)
+        {
+            for (int row = 0; row < 3; ++row)
+                for (int column = 0; column < 3; ++column)
+                    eyeFrusta[eye].rotation.m[row][column] = rig.eyeRotation[eye].m[row][column];
+            eyeFrusta[eye].position = {
+                rig.eyeOffsetUnits[eye].x,
+                rig.eyeOffsetUnits[eye].y,
+                rig.eyeOffsetUnits[eye].z
+            };
+            eyeFrusta[eye].left = std::tan(rig.fov[eye][0]);
+            eyeFrusta[eye].right = std::tan(rig.fov[eye][1]);
+            eyeFrusta[eye].top = std::tan(rig.fov[eye][2]);
+            eyeFrusta[eye].bottom = std::tan(rig.fov[eye][3]);
+        }
+        const fnvxr::stereo::PerspectiveCullFrustum unionFrustum =
+            fnvxr::stereo::conservativeCenterCullFrustum(
+                centerRotation,
+                centerPosition,
+                eyeFrusta,
+                base.frustum.nearDistance,
+                base.frustum.farDistance);
+        if (!unionFrustum.valid)
+            return false;
+        frustum.left = unionFrustum.left;
+        frustum.right = unionFrustum.right;
+        frustum.top = unionFrustum.top;
+        frustum.bottom = unionFrustum.bottom;
+        frustum.nearDistance = unionFrustum.nearDistance;
+        frustum.farDistance = unionFrustum.farDistance;
         frustum.orthographic = 0;
     }
 
@@ -7590,6 +7697,12 @@ void __fastcall hookedDoRenderFrame(
         const LONG shaderWorldCandidatesBefore = static_cast<LONG>(gShaderWorldDrawCandidates);
         const LONG shaderWorldDrawsBefore = static_cast<LONG>(gShaderWorldDraws);
         const LONG shaderCoveredDrawsBefore = static_cast<LONG>(gShaderContractCoveredWorldDraws);
+        const LONG strictEyeTargetDrawsBefore = static_cast<LONG>(gStrictEyeTargetDraws);
+        const LONG strictEyeTargetProvenBefore = static_cast<LONG>(gStrictEyeTargetProvenBothEyeDraws);
+        const LONG strictEyeTargetClearsBefore = static_cast<LONG>(gStrictEyeTargetClears);
+        const LONG strictEyeTargetProvenClearsBefore = static_cast<LONG>(gStrictEyeTargetProvenBothEyeClears);
+        const LONG strictEyeTargetCopiesBefore = static_cast<LONG>(gStrictEyeTargetCopies);
+        const LONG strictEyeTargetProvenCopiesBefore = static_cast<LONG>(gStrictEyeTargetProvenBothEyeCopies);
         const LONG shaderExcludedUserPrimitiveDrawsBefore =
             static_cast<LONG>(gShaderExcludedUserPrimitiveDraws);
         const LONG shaderExcludedAuxiliaryTargetDrawsBefore =
@@ -7663,12 +7776,34 @@ void __fastcall hookedDoRenderFrame(
                 reinterpret_cast<const float*>(&cameraAfter.world),
                 sizeof(NativeNiTransform) / sizeof(float))
             : FLT_MAX;
+        const float centerWorldToCameraDelta = cameraAfterValid
+            ? matrixMaxAbsDifference(
+                nativeWorldToClipMatrix(centerCamera),
+                nativeWorldToClipMatrix(cameraAfter))
+            : FLT_MAX;
+        const float centerFrustumDelta = cameraAfterValid
+            ? nativeFloatArrayMaxDelta(
+                reinterpret_cast<const float*>(&centerCamera.frustum),
+                reinterpret_cast<const float*>(&cameraAfter.frustum),
+                6)
+            : FLT_MAX;
         const float maxCenterCameraDelta = readEnvFloat(
             "FNVXR_D3D9_NATIVE_CENTER_CAMERA_MAX_DELTA",
             0.05f);
+        const float maxCenterWorldToCameraDelta = readEnvFloat(
+            "FNVXR_D3D9_NATIVE_CENTER_W2C_MAX_DELTA",
+            0.0001f);
+        const float maxCenterFrustumDelta = readEnvFloat(
+            "FNVXR_D3D9_NATIVE_CENTER_FRUSTUM_MAX_DELTA",
+            0.000001f);
         const bool centerCameraStable = cameraAfterValid
             && std::isfinite(centerCameraDelta)
-            && centerCameraDelta <= maxCenterCameraDelta;
+            && std::isfinite(centerWorldToCameraDelta)
+            && std::isfinite(centerFrustumDelta)
+            && centerCameraDelta <= maxCenterCameraDelta
+            && centerWorldToCameraDelta <= maxCenterWorldToCameraDelta
+            && centerFrustumDelta <= maxCenterFrustumDelta
+            && cameraAfter.frustum.orthographic == centerCamera.frustum.orthographic;
 
         InterlockedExchange(&gNativeActiveEye, -1);
         restoreNativeCamera(camera);
@@ -7710,10 +7845,15 @@ void __fastcall hookedDoRenderFrame(
                 char rejected[320] {};
                 sprintf_s(
                     rejected,
-                    "single-traversal stereo rejected: center camera drifted cameraAfterValid=%d maxDelta=%.7g allowed=%.7g",
+                    "single-traversal stereo rejected: center camera drifted cameraAfterValid=%d worldDelta=%.7g worldAllowed=%.7g w2cDelta=%.7g w2cAllowed=%.7g frustumDelta=%.7g frustumAllowed=%.7g orthoMatch=%d",
                     cameraAfterValid ? 1 : 0,
                     centerCameraDelta,
-                    maxCenterCameraDelta);
+                    maxCenterCameraDelta,
+                    centerWorldToCameraDelta,
+                    maxCenterWorldToCameraDelta,
+                    centerFrustumDelta,
+                    maxCenterFrustumDelta,
+                    cameraAfterValid && cameraAfter.frustum.orthographic == centerCamera.frustum.orthographic ? 1 : 0);
                 logLine(rejected);
             }
             return;
@@ -7725,6 +7865,18 @@ void __fastcall hookedDoRenderFrame(
         const LONG shaderWorldDraws = static_cast<LONG>(gShaderWorldDraws) - shaderWorldDrawsBefore;
         const LONG shaderCoveredDraws =
             static_cast<LONG>(gShaderContractCoveredWorldDraws) - shaderCoveredDrawsBefore;
+        const LONG strictEyeTargetDraws =
+            static_cast<LONG>(gStrictEyeTargetDraws) - strictEyeTargetDrawsBefore;
+        const LONG strictEyeTargetProvenBothEyeDraws =
+            static_cast<LONG>(gStrictEyeTargetProvenBothEyeDraws) - strictEyeTargetProvenBefore;
+        const LONG strictEyeTargetClears =
+            static_cast<LONG>(gStrictEyeTargetClears) - strictEyeTargetClearsBefore;
+        const LONG strictEyeTargetProvenBothEyeClears =
+            static_cast<LONG>(gStrictEyeTargetProvenBothEyeClears) - strictEyeTargetProvenClearsBefore;
+        const LONG strictEyeTargetCopies =
+            static_cast<LONG>(gStrictEyeTargetCopies) - strictEyeTargetCopiesBefore;
+        const LONG strictEyeTargetProvenBothEyeCopies =
+            static_cast<LONG>(gStrictEyeTargetProvenBothEyeCopies) - strictEyeTargetProvenCopiesBefore;
         const LONG shaderExcludedUserPrimitiveDraws =
             static_cast<LONG>(gShaderExcludedUserPrimitiveDraws)
             - shaderExcludedUserPrimitiveDrawsBefore;
@@ -7736,11 +7888,26 @@ void __fastcall hookedDoRenderFrame(
             : 0.0;
         const double requiredShaderCoverage = static_cast<double>(
             readEnvFloat("FNVXR_D3D9_SHADER_MIN_CONTRACT_COVERAGE", 1.0f));
+        const bool strictEyeTargetDrawLedgerReady =
+            fnvxr::stereo::strictEyeTargetDrawLedgerComplete(
+                strictEyeTargetDraws,
+                strictEyeTargetProvenBothEyeDraws);
+        const bool strictEyeTargetClearLedgerReady =
+            fnvxr::stereo::strictEyeTargetOptionalWriteLedgerComplete(
+                strictEyeTargetClears,
+                strictEyeTargetProvenBothEyeClears);
+        const bool strictEyeTargetCopyLedgerReady =
+            fnvxr::stereo::strictEyeTargetOptionalWriteLedgerComplete(
+                strictEyeTargetCopies,
+                strictEyeTargetProvenBothEyeCopies);
         const bool shaderCoverageReady = gShaderWvpContractCount > 0
             && shaderWorldCandidates > 0
             && shaderWorldDraws == shaderWorldCandidates
             && shaderCoveredDraws == shaderWorldCandidates
-            && shaderContractCoverage >= requiredShaderCoverage;
+            && shaderContractCoverage >= requiredShaderCoverage
+            && strictEyeTargetDrawLedgerReady
+            && strictEyeTargetClearLedgerReady
+            && strictEyeTargetCopyLedgerReady;
         if (!shaderCoverageReady)
         {
             closeNativeStereoOriginLease("shader-contract-coverage");
@@ -7748,11 +7915,20 @@ void __fastcall hookedDoRenderFrame(
             const LONG failure = InterlockedIncrement(&gLoggedNativeStereoFailure);
             if (failure <= 48 || failure % 120 == 0)
             {
-                char rejected[640] {};
+                char rejected[1024] {};
                 sprintf_s(
                     rejected,
-                    "single-traversal stereo rejected: shader contract coverage replayDraws=%ld programmableCandidates=%ld replayedWorldDraws=%ld covered=%ld excludedImmediatePrimitives=%ld excludedAuxiliaryTargets=%ld fraction=%.8f required=%.8f contracts=%ld",
+                    "single-traversal stereo rejected: shader contract coverage replayDraws=%ld strictDraws=%ld/%ld drawsReady=%d strictClears=%ld/%ld clearsReady=%d strictCopies=%ld/%ld copiesReady=%d programmableCandidates=%ld replayedWorldDraws=%ld covered=%ld excludedImmediatePrimitives=%ld excludedAuxiliaryTargets=%ld fraction=%.8f required=%.8f contracts=%ld",
                     replayDraws,
+                    strictEyeTargetProvenBothEyeDraws,
+                    strictEyeTargetDraws,
+                    strictEyeTargetDrawLedgerReady ? 1 : 0,
+                    strictEyeTargetProvenBothEyeClears,
+                    strictEyeTargetClears,
+                    strictEyeTargetClearLedgerReady ? 1 : 0,
+                    strictEyeTargetProvenBothEyeCopies,
+                    strictEyeTargetCopies,
+                    strictEyeTargetCopyLedgerReady ? 1 : 0,
                     shaderWorldCandidates,
                     shaderWorldDraws,
                     shaderCoveredDraws,
@@ -9703,6 +9879,19 @@ void publishSharedStereoFrame(IDirect3DDevice9* device)
         return;
     }
 
+    if (!fnvxr::stereo::singleTraversalPublishAllowed(
+            gNativeSingleTraversalReplayEnabled,
+            singleTraversalPair))
+    {
+        // Draw replay may still have populated eye targets before the native
+        // transaction failed its camera/pose/shader proof. Never downgrade
+        // those pixels to the generic producer: that made the host alternate
+        // between coherent world stereo and an unowned frame as view-dependent
+        // shaders entered or left the cull set.
+        publishSharedStereoInvalid(false, "incomplete-single-traversal");
+        return;
+    }
+
     if (!coherentPair && gStereoReplayDrawsThisPresent <= 0)
     {
         const LONG logCount = InterlockedIncrement(&gLoggedStereoNoReplayDraws);
@@ -10647,6 +10836,12 @@ HRESULT WINAPI hookedClear(
     device->GetDepthStencilSurface(&originalDepth);
     const bool strictTargetAllowed =
         currentTargetPassesStrictStereoGate(device, originalTarget, originalDepth, "Clear");
+    const bool strictEyeTargetLedgerClear = gInNativeStereoHook
+        && gNativeActiveEye == 2
+        && strictTargetAllowed
+        && (flags & (D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL)) != 0;
+    if (strictEyeTargetLedgerClear)
+        InterlockedIncrement(&gStrictEyeTargetClears);
     const bool replayStereo = gStereoReplayEnabled
         && stereoReplayTransactionAllowed()
         && strictTargetAllowed
@@ -10700,6 +10895,13 @@ HRESULT WINAPI hookedClear(
     const bool clearFailed =
         (replayStereo && (FAILED(leftClearResult) || FAILED(rightClearResult)))
         || (replayWide && FAILED(wideClearResult));
+    if (strictEyeTargetLedgerClear
+        && replayStereo
+        && SUCCEEDED(leftClearResult)
+        && SUCCEEDED(rightClearResult))
+    {
+        InterlockedIncrement(&gStrictEyeTargetProvenBothEyeClears);
+    }
     if (hammerLog || clearFailed)
     {
         char event[512] {};
@@ -10861,6 +11063,12 @@ HRESULT replayDrawToStereoTargets(IDirect3DDevice9* device, bool userPrimitiveDr
         && !gInStereoReplay;
     const bool uiSuppressed = suppressStereoForUiMode();
     const bool screenSpaceProjection = currentProjectionLooksScreenSpace();
+    // A fixed-function projection left behind while a programmable shader is
+    // bound is not a proof that the shader draw is screen-space. Until a
+    // strong exact-bytecode screen/composite manifest exists, count it in the
+    // world denominator. Unknown draws then fail closed instead of escaping
+    // the proof ledger through stale D3DTS_PROJECTION state.
+    const bool provenScreenSpaceDraw = false;
     const bool samplesStereoTwin = currentDrawSamplesStereoTwin();
     const bool configuredSkip = currentShaderPairIsConfiguredStereoSkip();
     const bool replayUserPrimitiveDraws = readEnvBool(
@@ -10871,16 +11079,34 @@ HRESULT replayDrawToStereoTargets(IDirect3DDevice9* device, bool userPrimitiveDr
         uiSuppressed,
         gActiveVertexShader != nullptr,
         gHaveProjection,
-        screenSpaceProjection,
+        provenScreenSpaceDraw,
         samplesStereoTwin,
         configuredSkip,
         userPrimitiveDraw,
         replayUserPrimitiveDraws);
+    bool strictEyeTargetLedgerDraw = false;
+    if (nativeCenterTraversal && !uiSuppressed && device && !samplesStereoTwin)
+    {
+        IDirect3DSurface9* ledgerTarget = nullptr;
+        IDirect3DSurface9* ledgerDepth = nullptr;
+        if (SUCCEEDED(device->GetRenderTarget(0, &ledgerTarget)) && ledgerTarget)
+        {
+            device->GetDepthStencilSurface(&ledgerDepth);
+            strictEyeTargetLedgerDraw = currentTargetPassesStrictStereoGate(
+                device,
+                ledgerTarget,
+                ledgerDepth,
+                "DrawLedger");
+        }
+        releaseSurface(ledgerTarget);
+        releaseSurface(ledgerDepth);
+        if (strictEyeTargetLedgerDraw)
+            InterlockedIncrement(&gStrictEyeTargetDraws);
+    }
     if (nativeCenterTraversal
         && !uiSuppressed
         && gActiveVertexShader
         && gHaveProjection
-        && !screenSpaceProjection
         && !samplesStereoTwin
         && !configuredSkip
         && userPrimitiveDraw
@@ -11194,7 +11420,11 @@ HRESULT replayDrawToStereoTargets(IDirect3DDevice9* device, bool userPrimitiveDr
     {
         InterlockedIncrement(&gShaderWorldDraws);
         if (leftWvpPatched && rightWvpPatched)
+        {
             InterlockedIncrement(&gShaderContractCoveredWorldDraws);
+            if (strictEyeTargetLedgerDraw)
+                InterlockedIncrement(&gStrictEyeTargetProvenBothEyeDraws);
+        }
     }
 
     const LONG replayResultLog = InterlockedIncrement(&gLoggedStereoReplayDrawResult);
@@ -11814,6 +12044,15 @@ HRESULT WINAPI hookedStretchRect(
 {
     const HRESULT result = gRealStretchRect(device, sourceSurface, sourceRect, destinationSurface, destRect, filter);
     const LONG call = InterlockedIncrement(&gStretchRectCalls);
+    const bool strictEyeTargetLedgerCopy = SUCCEEDED(result)
+        && gInNativeStereoHook
+        && gNativeActiveEye == 2
+        && !gInStereoReplay
+        && destinationSurface
+        && gMain3DSceneRenderTarget
+        && destinationSurface == gMain3DSceneRenderTarget;
+    if (strictEyeTargetLedgerCopy)
+        InterlockedIncrement(&gStrictEyeTargetCopies);
 
     if (!gInStereoReplay)
     {
@@ -11980,6 +12219,8 @@ HRESULT WINAPI hookedStretchRect(
             {
                 probeStereoSurfacePair(device, destinationTwin, "stretch-dst", call);
             }
+            if (strictEyeTargetLedgerCopy && SUCCEEDED(leftCopy) && SUCCEEDED(rightCopy))
+                InterlockedIncrement(&gStrictEyeTargetProvenBothEyeCopies);
         }
     }
 
