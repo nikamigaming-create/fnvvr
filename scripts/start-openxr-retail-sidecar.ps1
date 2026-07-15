@@ -16,7 +16,10 @@ param(
     [int]$RetailReadyTimeoutSeconds = 60,
     [int]$WorldEntryTimeoutSeconds = 300,
     [int]$WorldProofTimeoutSeconds = 30,
+    [int]$WorldProofStableSamples = 12,
+    [int]$AutomatedMenuTimeoutSeconds = 60,
     [int]$TestLoadoutTimeoutSeconds = 180,
+    [string]$AutomatedSaveName = "FNVXR_HostExitRecovery",
     [switch]$StopExisting,
     [switch]$FocusRetailWindow,
     [switch]$AllowFiniteHostRun,
@@ -37,6 +40,7 @@ param(
     [switch]$StageOnly,
     [switch]$ValidateOnly,
     [switch]$ApplyTestLoadout,
+    [switch]$AutomateContinue,
     [double]$D3D9ShaderSanityOffset = 0,
     [string]$D3D9ShaderSanitySlot = "c1w",
     [string]$D3D9ShaderAllowVertexHashes = "",
@@ -53,6 +57,7 @@ $BuildWin32Dir = Join-Path $Root "build-win32"
 $HostExe = Join-Path $BuildDir "$Configuration\fnvxr_openxr_pose_host.exe"
 $ProbeExe = Join-Path $BuildDir "$Configuration\fnvxr_shared_state_probe.exe"
 $CommandExe = Join-Path $BuildDir "$Configuration\fnvxr_command.exe"
+$InputExe = Join-Path $BuildDir "$Configuration\fnvxr_input.exe"
 $NvseLoader = Join-Path $GameRoot "nvse_loader.exe"
 $RunRoot = Join-Path $Root "local\openxr-retail-sidecar-runs"
 $Stamp = Get-Date -Format "yyyyMMdd-HHmmss-fff"
@@ -141,6 +146,18 @@ if ($EnableD3D9ShaderStereo -and [string]::IsNullOrWhiteSpace($D3D9ShaderWvpCont
 }
 if ($Frames -gt 0 -and -not $AllowFiniteHostRun) {
     throw "Finite host runs require -AllowFiniteHostRun. Use -Frames 0 for headset testing."
+}
+if ($WorldProofStableSamples -lt 1 -or $WorldProofStableSamples -gt 120) {
+    throw "-WorldProofStableSamples must be between 1 and 120."
+}
+if ($AutomateContinue -and $AutomatedMenuTimeoutSeconds -lt 1) {
+    throw "-AutomatedMenuTimeoutSeconds must be positive when -AutomateContinue is used."
+}
+if ($AutomateContinue -and -not (Test-Path -LiteralPath $CommandExe)) {
+    throw "-AutomateContinue requires the already-built command helper: $CommandExe"
+}
+if ($AutomateContinue -and $AutomatedSaveName -notmatch '^[A-Za-z0-9_-]+$') {
+    throw "-AutomatedSaveName must contain only letters, numbers, underscores, or hyphens."
 }
 
 $Source2DPreset = $Source2DPreset.ToLowerInvariant()
@@ -264,6 +281,7 @@ if (-not $NoBuild -and -not $ValidateOnly) {
         $HostExe,
         $ProbeExe,
         $CommandExe,
+        $InputExe,
         (Join-Path $BuildWin32Dir "$Configuration\nvse_fnvxr.dll"),
         (Join-Path $BuildWin32Dir "$Configuration\d3d9.dll"),
         (Join-Path $BuildWin32Dir "$Configuration\dinput8.dll"),
@@ -273,17 +291,33 @@ if (-not $NoBuild -and -not $ValidateOnly) {
     if ($missingArtifacts.Count -gt 0) {
         throw "Artifact validation refused because runtime artifacts are missing: $($missingArtifacts -join ', ')"
     }
-    $runtimeSources = @(
-        Get-ChildItem -LiteralPath (Join-Path $Root "host"),(Join-Path $Root "plugin"),(Join-Path $Root "protocol"),(Join-Path $Root "renderhook") -Recurse -File |
+    $sharedBuildSources = @(
+        Get-ChildItem -LiteralPath (Join-Path $Root "protocol") -Recurse -File |
             Where-Object { $_.Extension -in @(".cpp", ".h", ".hpp", ".def") }
     )
-    $runtimeSources += Get-Item -LiteralPath (Join-Path $Root "CMakeLists.txt")
-    $newestSource = $runtimeSources | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
-    $staleArtifacts = @($runtimeArtifacts | Where-Object {
-        (Get-Item -LiteralPath $_).LastWriteTimeUtc -lt $newestSource.LastWriteTimeUtc
-    })
+    $sharedBuildSources += Get-Item -LiteralPath (Join-Path $Root "CMakeLists.txt")
+    $artifactDependencySets = @(
+        [ordered]@{ artifact=$HostExe; sources=@((Get-Item (Join-Path $Root "host\fnvxr_openxr_pose_host.cpp"))) + $sharedBuildSources },
+        [ordered]@{ artifact=$ProbeExe; sources=@((Get-Item (Join-Path $Root "tools\fnvxr_shared_state_probe.cpp"))) + $sharedBuildSources },
+        [ordered]@{ artifact=$CommandExe; sources=@((Get-Item (Join-Path $Root "tools\fnvxr_command.cpp"))) + $sharedBuildSources },
+        [ordered]@{ artifact=$InputExe; sources=@((Get-Item (Join-Path $Root "tools\fnvxr_input.cpp"))) + $sharedBuildSources },
+        [ordered]@{ artifact=(Join-Path $BuildWin32Dir "$Configuration\nvse_fnvxr.dll"); sources=@(Get-ChildItem -LiteralPath (Join-Path $Root "plugin") -Recurse -File | Where-Object { $_.Extension -in @(".cpp", ".h", ".hpp", ".def") }) + $sharedBuildSources },
+        [ordered]@{ artifact=(Join-Path $BuildWin32Dir "$Configuration\d3d9.dll"); sources=@((Get-Item (Join-Path $Root "renderhook\fnvxr_d3d9_proxy.cpp")),(Get-Item (Join-Path $Root "renderhook\fnvxr_stereo_math.h"))) + $sharedBuildSources },
+        [ordered]@{ artifact=(Join-Path $BuildWin32Dir "$Configuration\dinput8.dll"); sources=@((Get-Item (Join-Path $Root "renderhook\fnvxr_dinput8_proxy.cpp"))) + $sharedBuildSources },
+        [ordered]@{ artifact=(Join-Path $BuildWin32Dir "$Configuration\xinput1_3.dll"); sources=@((Get-Item (Join-Path $Root "renderhook\fnvxr_xinput_proxy.cpp"))) + $sharedBuildSources }
+    )
+    $staleArtifacts = @()
+    foreach ($dependencySet in $artifactDependencySets) {
+        $artifactInfo = Get-Item -LiteralPath $dependencySet.artifact
+        $newestDependency = $dependencySet.sources |
+            Sort-Object LastWriteTimeUtc -Descending |
+            Select-Object -First 1
+        if ($artifactInfo.LastWriteTimeUtc -lt $newestDependency.LastWriteTimeUtc) {
+            $staleArtifacts += ("{0} (newer dependency: {1})" -f $artifactInfo.FullName,$newestDependency.FullName)
+        }
+    }
     if ($staleArtifacts.Count -gt 0) {
-        throw "Artifact validation refused because artifacts are older than $($newestSource.FullName): $($staleArtifacts -join ', ')"
+        throw "Artifact validation refused because target-specific dependencies are newer: $($staleArtifacts -join ', ')"
     }
 }
 
@@ -543,6 +577,19 @@ $testLoadout = [ordered]@{
 }
 $worldEntryProof = $null
 $worldProof = $null
+$worldProofConsecutive = 0
+$worldProofSamples = @()
+$retailRigProof = $null
+$retailRigProofRequired = [bool](
+    $StereoWorldActive -and
+    -not $StereoProducerProofOnly -and
+    $env:FNVXR_RETAIL_RIG_APPLY -eq "1")
+$retailRigTelemetryPath = Join-Path $GameRoot "Data\NVSE\Plugins\fnvxr_input_telemetry.log"
+$forcedMenuAction = $false
+$resolvedAutomatedSaveName = $null
+$automatedLoadProof = $null
+$automatedLoadProofConsecutive = 0
+$automatedLoadProofSamples = @()
 
 if (-not $NoRetail) {
     $fallout = Start-Process -FilePath $NvseLoader -WorkingDirectory $GameRoot -PassThru
@@ -591,6 +638,120 @@ if (-not $NoRetail) {
     } else {
         Write-FnvxrCheckpoint -Path $DebugLog -Message "OpenXR pose stream pending; headset may be idle, retail remains live with neutral VR input"
     }
+    if ($AutomateContinue) {
+        Write-FnvxrCheckpoint -Path $DebugLog -Message (
+            "waiting for Fallout Start Menu before unattended direct save load; timeout={0}s" -f
+            $AutomatedMenuTimeoutSeconds)
+        $menuDeadline = (Get-Date).AddSeconds($AutomatedMenuTimeoutSeconds)
+        do {
+            $menuProbeOutput = & $ProbeExe `
+                --require-runtime `
+                --require-video `
+                --require-advancing `
+                --sample-delay-ms 100 2>&1
+            if ($LASTEXITCODE -eq 0) {
+                $menuProbe = $null
+                try {
+                    $menuProbe = ($menuProbeOutput -join "`n") | ConvertFrom-Json
+                } catch {
+                    Write-FnvxrCheckpoint -Path $DebugLog -Message (
+                        "unattended load ignored one malformed shared-state sample")
+                }
+                if ($null -ne $menuProbe) {
+                    $startMenuVisible = [bool](
+                        $menuProbe.runtime.phase -eq 1 -and
+                        (([uint32]$menuProbe.runtime.menuBits -band 2) -ne 0) -and
+                        $menuProbe.runtime.uiInputAllowed)
+                    if ($startMenuVisible) {
+                        $saveRoot = Join-Path ([Environment]::GetFolderPath("MyDocuments")) "My Games\FalloutNV\Saves"
+                        $savePath = Join-Path $saveRoot ($AutomatedSaveName + ".fos")
+                        if (-not (Test-Path -LiteralPath $savePath -PathType Leaf)) {
+                            throw "Automated save '$AutomatedSaveName' was not found at '$savePath'. Direct load was not submitted."
+                        }
+                        $resolvedAutomatedSaveName = $AutomatedSaveName
+                        $loadSubmitted = Invoke-FnvxrRuntimeConsoleCommand `
+                            -CommandExe $CommandExe `
+                            -Line ("load {0}" -f $resolvedAutomatedSaveName) `
+                            -DebugLog $DebugLog `
+                            -Label "unattended direct save load" `
+                            -WaitMs 10000
+                        if (-not $loadSubmitted) {
+                            throw "Direct load of '$resolvedAutomatedSaveName' was rejected by the runtime console bridge."
+                        }
+                        Write-FnvxrCheckpoint -Path $DebugLog -Message (
+                            "unattended direct save load submitted save='{0}'; waiting for gameplay/camera proof" -f
+                            $resolvedAutomatedSaveName)
+
+                        $loadDeadline = (Get-Date).AddSeconds([Math]::Min([Math]::Max($AutomatedMenuTimeoutSeconds, 30), 90))
+                        $closeAllMenusSubmitted = $false
+                        do {
+                            $loadProbeOutput = & $ProbeExe `
+                                --require-runtime `
+                                --require-camera `
+                                --require-advancing `
+                                --sample-delay-ms 250 2>&1
+                            if ($LASTEXITCODE -eq 0) {
+                                try {
+                                    $loadProbe = ($loadProbeOutput -join "`n") | ConvertFrom-Json
+                                    if ($loadProbe.runtime.phase -eq 3 -and $loadProbe.runtime.cameraActive) {
+                                        if (-not $closeAllMenusSubmitted) {
+                                            $closeAllMenusSubmitted = Invoke-FnvxrRuntimeConsoleCommand `
+                                                -CommandExe $CommandExe `
+                                                -Line "CloseAllMenus" `
+                                                -DebugLog $DebugLog `
+                                                -Label "unattended post-load menu close" `
+                                                -WaitMs 10000
+                                            if (-not $closeAllMenusSubmitted) {
+                                                throw "Post-load CloseAllMenus was rejected by the runtime console bridge."
+                                            }
+                                            $automatedLoadProofConsecutive = 0
+                                        } else {
+                                            $automatedLoadProofConsecutive++
+                                            $automatedLoadProofSamples += [ordered]@{
+                                                frame = $loadProbe.runtime.frame
+                                                phase = $loadProbe.runtime.phase
+                                                menuBits = $loadProbe.runtime.menuBits
+                                                cameraActive = $loadProbe.runtime.cameraActive
+                                            }
+                                            if ($automatedLoadProofSamples.Count -gt 24) {
+                                                $automatedLoadProofSamples = @($automatedLoadProofSamples | Select-Object -Last 24)
+                                            }
+                                            if ($automatedLoadProofConsecutive -ge 12) {
+                                                $automatedLoadProof = $loadProbe
+                                                $forcedMenuAction = $true
+                                                break
+                                            }
+                                        }
+                                    } else {
+                                        $automatedLoadProofConsecutive = 0
+                                    }
+                                } catch {
+                                    if ($_.Exception.Message -eq "Post-load CloseAllMenus was rejected by the runtime console bridge.") {
+                                        throw
+                                    }
+                                    $automatedLoadProofConsecutive = 0
+                                    Write-FnvxrCheckpoint -Path $DebugLog -Message "unattended load ignored one malformed gameplay proof sample"
+                                }
+                            }
+                            Start-Sleep -Milliseconds 250
+                        } while ((Get-Date) -lt $loadDeadline)
+                        if (-not $forcedMenuAction) {
+                            throw "Direct load of '$resolvedAutomatedSaveName' did not reach proven gameplay with an active world camera."
+                        }
+                        Write-FnvxrCheckpoint -Path $DebugLog -Message (
+                            "unattended direct save load proven phase=3 cameraActive=1 stableSamples={0} save='{1}'" -f
+                            $automatedLoadProofConsecutive,
+                            $resolvedAutomatedSaveName)
+                        break
+                    }
+                }
+            }
+            Start-Sleep -Milliseconds 500
+        } while ((Get-Date) -lt $menuDeadline)
+        if (-not $forcedMenuAction) {
+            throw "Fallout Start Menu was not proven within $AutomatedMenuTimeoutSeconds seconds; unattended direct save load was not sent."
+        }
+    }
     $activationReachApplied = Invoke-FnvxrRuntimeConsoleCommand `
         -CommandExe $CommandExe `
         -Line "setgs iActivatePickLength 260" `
@@ -607,9 +768,7 @@ if (-not $NoRetail) {
         do {
             $loadoutProbeOutput = & $ProbeExe `
                 --require-runtime `
-                --require-video `
                 --require-camera `
-                --require-pose `
                 --require-advancing `
                 --sample-delay-ms 250 2>&1
             if ($LASTEXITCODE -eq 0) {
@@ -649,7 +808,6 @@ if (-not $NoRetail) {
         do {
             $entryProbeOutput = & $ProbeExe `
                 --require-runtime `
-                --require-video `
                 --require-camera `
                 --require-pose `
                 --require-advancing `
@@ -666,20 +824,72 @@ if (-not $NoRetail) {
             Write-FnvxrCheckpoint -Path $DebugLog -Message "stereo world entry proof timed out before gameplay/camera; runtime remains live and gameplay stereo stays closed"
         }
 
+        Write-FnvxrCheckpoint -Path $DebugLog -Message (
+            "requiring sustained stereo proof samples={0} retailRigProof={1}" -f
+            $WorldProofStableSamples,
+            [int]$retailRigProofRequired)
         $deadline = (Get-Date).AddSeconds($WorldProofTimeoutSeconds)
         do {
             $probeOutput = & $ProbeExe `
                 --require-runtime `
-                --require-video `
                 --require-stereo `
                 --require-world-stereo `
                 --require-pose `
                 --require-advancing `
                 --sample-delay-ms 250 2>&1
             if ($LASTEXITCODE -eq 0) {
-                $worldProof = $probeOutput
-                Write-FnvxrCheckpoint -Path $DebugLog -Message "retail world stereo proof observed"
-                break
+                ++$worldProofConsecutive
+                $worldProofSamples += [ordered]@{
+                    observedAt = (Get-Date).ToString("o")
+                    output = ($probeOutput -join "`n")
+                }
+                if ($worldProofSamples.Count -gt $WorldProofStableSamples) {
+                    $worldProofSamples = @($worldProofSamples | Select-Object -Last $WorldProofStableSamples)
+                }
+
+                $retailRigReady = -not $retailRigProofRequired
+                if ($retailRigProofRequired -and (Test-Path -LiteralPath $retailRigTelemetryPath)) {
+                    $rigDiscovery = Select-String `
+                        -LiteralPath $retailRigTelemetryPath `
+                        -Pattern 'retailRig discovery[^\r\n]*complete=1' | Select-Object -Last 1
+                    $rigSolve = Select-String `
+                        -LiteralPath $retailRigTelemetryPath `
+                        -Pattern 'retailRig solve[^\r\n]*apply=1 leftSolved=1 rightSolved=1 weaponAligned=1 weaponApply=1' | Select-Object -Last 1
+                    $rigApplied = Select-String `
+                        -LiteralPath $retailRigTelemetryPath `
+                        -Pattern '"event":"fnvxrRigIndependence"[^\r\n]*"apply":true[^\r\n]*"rightSolved":true[^\r\n]*"weaponAligned":true[^\r\n]*"weaponWriteApplied":true' | Select-Object -Last 1
+                    if ($rigDiscovery -and $rigSolve -and $rigApplied) {
+                        $retailRigReady = $true
+                        $retailRigProof = [ordered]@{
+                            discovery = $rigDiscovery.Line
+                            solve = $rigSolve.Line
+                            applied = $rigApplied.Line
+                        }
+                    }
+                }
+
+                Write-FnvxrCheckpoint -Path $DebugLog -Message (
+                    "stereo proof progress consecutive={0}/{1} retailRigReady={2}" -f
+                    $worldProofConsecutive,
+                    $WorldProofStableSamples,
+                    [int]$retailRigReady)
+                if ($worldProofConsecutive -ge $WorldProofStableSamples -and $retailRigReady) {
+                    $worldProof = $worldProofSamples
+                    Write-FnvxrCheckpoint -Path $DebugLog -Message (
+                        "retail world stereo proof observed sustainedSamples={0} retailRigReady={1}" -f
+                        $worldProofConsecutive,
+                        [int]$retailRigReady)
+                    break
+                }
+            } else {
+                if ($worldProofConsecutive -gt 0) {
+                    Write-FnvxrCheckpoint -Path $DebugLog -Message (
+                        "stereo proof continuity lost after {0}/{1} samples" -f
+                        $worldProofConsecutive,
+                        $WorldProofStableSamples)
+                }
+                $worldProofConsecutive = 0
+                $worldProofSamples = @()
             }
             Start-Sleep -Seconds 1
         } while ((Get-Date) -lt $deadline)
@@ -746,6 +956,8 @@ $manifest = [ordered]@{
     worldEntryProofObserved = $null -ne $worldEntryProof
     worldEntryProof = $worldEntryProof
     worldProofRequestedSeconds = $WorldProofTimeoutSeconds
+    worldProofRequiredStableSamples = $WorldProofStableSamples
+    worldProofConsecutiveSamples = $worldProofConsecutive
     worldProofWatchdogDisabled = [bool]$NoWorldProofWatchdog
     enableD3D9ShaderStereo = [bool]$EnableD3D9ShaderStereo
     enableRetailRig = [bool]($env:FNVXR_RETAIL_RIG_ENABLE -eq "1")
@@ -756,6 +968,9 @@ $manifest = [ordered]@{
     enablePeripheralShield = [bool]$EnablePeripheralShield
     worldProofObserved = $null -ne $worldProof
     worldProof = $worldProof
+    retailRigProofRequired = $retailRigProofRequired
+    retailRigProofObserved = $null -ne $retailRigProof
+    retailRigProof = $retailRigProof
     activationReach = [ordered]@{
         gameSetting = "iActivatePickLength"
         value = 260
@@ -772,7 +987,11 @@ $manifest = [ordered]@{
     }
     retailBackbuffer = "${GameBackbufferWidth}x${GameBackbufferHeight}"
     hostGameTexture = "${HostGameTextureWidth}x${HostGameTextureHeight}"
-    forcedMenuAction = $false
+    forcedMenuAction = $forcedMenuAction
+    automatedSaveName = $resolvedAutomatedSaveName
+    automatedLoadProof = $automatedLoadProof
+    automatedLoadProofConsecutiveSamples = $automatedLoadProofConsecutive
+    automatedLoadProofSamples = $automatedLoadProofSamples
     staged = $staged
 }
 Write-FnvxrJsonAtomic -Value $manifest -Path $ManifestPath -Depth 8

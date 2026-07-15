@@ -17,7 +17,18 @@ function Write-FnvxrCheckpoint {
         [string]$Message
     )
 
-    Add-Content -LiteralPath $Path -Value ("{0:o} {1}" -f (Get-Date), $Message) -Encoding UTF8
+    $line = "{0:o} {1}" -f (Get-Date), $Message
+    for ($attempt = 0; $attempt -lt 12; $attempt++) {
+        try {
+            Add-Content -LiteralPath $Path -Value $line -Encoding UTF8
+            return
+        } catch [System.IO.IOException] {
+            if ($attempt -eq 11) {
+                throw
+            }
+            Start-Sleep -Milliseconds 25
+        }
+    }
 }
 
 function Test-FnvxrRetailGameRoot {
@@ -473,7 +484,12 @@ function Invoke-FnvxrTestLoadout {
         @{ Label = "loadout bind slot5 9mm-pistol"; Line = "SetHotkeyItem 5 000E3778"; Slot = 5; Item = "9mm Pistol"; FormId = "000E3778" },
         @{ Label = "loadout bind slot6 service-rifle"; Line = "SetHotkeyItem 6 000E9C3B"; Slot = 6; Item = "Service Rifle"; FormId = "000E9C3B" },
         @{ Label = "loadout bind slot7 caravan-shotgun"; Line = "SetHotkeyItem 7 000CD53A"; Slot = 7; Item = "Caravan Shotgun"; FormId = "000CD53A" },
-        @{ Label = "loadout bind slot8 cowboy-repeater"; Line = "SetHotkeyItem 8 0008F21A"; Slot = 8; Item = "Cowboy Repeater"; FormId = "0008F21A" }
+        @{ Label = "loadout bind slot8 cowboy-repeater"; Line = "SetHotkeyItem 8 0008F21A"; Slot = 8; Item = "Cowboy Repeater"; FormId = "0008F21A" },
+        # The loadout is also the unattended muzzle/weapon-rig fixture.  Merely
+        # adding and binding a firearm can leave the currently loaded save in
+        # its unarmed first-person branch, where no projectile or muzzle node
+        # exists and gun alignment cannot be measured.
+        @{ Label = "loadout equip 9mm-pistol"; Line = "player.equipitem 000E3778"; Slot = 5; Item = "9mm Pistol"; FormId = "000E3778" }
     )
 
     $results = @()
@@ -740,6 +756,7 @@ function Set-FnvxrSidecarEnvironment {
     $env:FNVXR_HOST_SENDINPUT_CLICK = "0"
     $env:FNVXR_HOST_CURSOR_CLICK_FALLBACK = "0"
     $env:FNVXR_DINPUT_FORCE_BACKGROUND = "1"
+    $env:FNVXR_CLOSE_FOCUS_LOSS_PAUSE = "1"
     $env:FNVXR_DINPUT_VIRTUAL_OWNER = "1"
     # A host trigger is an edge packet, while Fallout samples mouse state.
     # Hold the synthetic button across several engine polls so a click cannot

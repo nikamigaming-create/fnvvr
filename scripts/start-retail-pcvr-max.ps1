@@ -11,6 +11,9 @@ param(
     [int]$RetailReadyTimeoutSeconds = 60,
     [int]$WorldEntryTimeoutSeconds = 300,
     [int]$WorldProofTimeoutSeconds = 30,
+    [int]$WorldProofStableSamples = 12,
+    [int]$AutomatedMenuTimeoutSeconds = 60,
+    [string]$AutomatedSaveName = "FNVXR_HostExitRecovery",
     [switch]$StopExisting,
     [switch]$FocusOnLaunch,
     [switch]$DisableStereoWorld,
@@ -20,6 +23,7 @@ param(
     [switch]$ApplyRetailRig,
     [switch]$DisableRetailRig,
     [switch]$ApplyTestLoadout,
+    [switch]$AutomateContinue,
     [string]$D3D9ShaderWvpContracts = "",
     [string]$VerifiedShaderDiscoveryRunDir = "",
     [string]$D3D9ShaderAllowVertexHashes = "",
@@ -53,6 +57,9 @@ $launchArgs = @{
     RetailReadyTimeoutSeconds = $RetailReadyTimeoutSeconds
     WorldEntryTimeoutSeconds = $WorldEntryTimeoutSeconds
     WorldProofTimeoutSeconds = $WorldProofTimeoutSeconds
+    WorldProofStableSamples = $WorldProofStableSamples
+    AutomatedMenuTimeoutSeconds = $AutomatedMenuTimeoutSeconds
+    AutomatedSaveName = $AutomatedSaveName
 }
 
 # Let the OpenXR launcher select its verified 1664x1808 runtime-aspect tier
@@ -112,6 +119,9 @@ if ($DisableRetailRig) {
 }
 if ($ApplyTestLoadout) {
     $launchArgs.ApplyTestLoadout = $true
+}
+if ($AutomateContinue) {
+    $launchArgs.AutomateContinue = $true
 }
 if ($StageOnly) {
     $launchArgs.StageOnly = $true

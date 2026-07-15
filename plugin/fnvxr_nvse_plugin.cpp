@@ -558,6 +558,12 @@ UInt64 g_retailRigHeadOnlySamples = 0;
 UInt64 g_retailRigControllerOnlySamples = 0;
 LONG g_retailRigPoseOriginUnavailableCount = 0;
 LONG g_retailRigPoseOriginSkewCount = 0;
+LONG g_retailRigNoHmdCount = 0;
+LONG g_retailRigNoCurrentControllerCount = 0;
+LONG g_retailRigNoRootCount = 0;
+LONG g_retailRigDiscoveryFailureCount = 0;
+LONG g_retailRigIncompleteCount = 0;
+LONG g_retailRigNoBodyRootCount = 0;
 using GetProjectileNodeFn = void* (__thiscall*)(void*);
 GetProjectileNodeFn g_originalGetProjectileNode = nullptr;
 void** g_projectileNodeVtable = nullptr;
@@ -1397,6 +1403,17 @@ bool currentProcessHasForegroundWindow()
 
     DWORD processId = 0;
     GetWindowThreadProcessId(foreground, &processId);
+    return processId == GetCurrentProcessId();
+}
+
+bool currentProcessHasActiveWindow()
+{
+    HWND active = GetActiveWindow();
+    if (!active)
+        return false;
+
+    DWORD processId = 0;
+    GetWindowThreadProcessId(active, &processId);
     return processId == GetCurrentProcessId();
 }
 
@@ -5387,6 +5404,26 @@ void resetRetailRigOrigin(const char* reason)
     g_retailRigControllerOnlySamples = 0;
 }
 
+void logRetailRigGateSkip(
+    LONG& reasonCounter,
+    const char* reason,
+    const VrRigPoseSnapshot& pose,
+    void* root = nullptr)
+{
+    const LONG count = InterlockedIncrement(&reasonCounter);
+    if (count <= 12 || count % 300 == 0)
+    {
+        logTelemetry(
+            "retailRig skipped count=%ld reason=%s poseSeq=%ld poseFrame=%llu tracking=0x%03lX root=%p\n",
+            count,
+            reason ? reason : "unknown",
+            pose.sequence,
+            static_cast<unsigned long long>(pose.frame),
+            static_cast<unsigned long>(pose.trackingFlags),
+            root);
+    }
+}
+
 void onRetailPostAnimation(void* animData)
 {
     if (!envEnabled("FNVXR_RETAIL_RIG_ENABLE", false))
@@ -5449,7 +5486,10 @@ void onRetailPostAnimation(void* animData)
     if (pose.sequence == g_lastRetailRigPoseSequence)
         return;
     if ((pose.trackingFlags & fnvxr::shared::VrPoseTrackingHmd) == 0)
+    {
+        logRetailRigGateSkip(g_retailRigNoHmdCount, "hmd-not-tracked", pose);
         return;
+    }
     const bool leftControllerUsable =
         (pose.trackingFlags & fnvxr::shared::VrPoseTrackingLeftGripActive) != 0
         && (pose.trackingFlags & fnvxr::shared::VrPoseTrackingLeftGripCurrent) != 0;
@@ -5457,15 +5497,33 @@ void onRetailPostAnimation(void* animData)
         (pose.trackingFlags & fnvxr::shared::VrPoseTrackingRightGripActive) != 0
         && (pose.trackingFlags & fnvxr::shared::VrPoseTrackingRightGripCurrent) != 0;
     if (!leftControllerUsable && !rightControllerUsable)
+    {
+        logRetailRigGateSkip(
+            g_retailRigNoCurrentControllerCount,
+            "no-current-controller-grip",
+            pose);
         return;
+    }
 
     void* root = retrievePlayerRootNode(true);
     if (!root)
         root = readPointer(Camera1stBipedNodeAddress);
+    if (!root)
+    {
+        logRetailRigGateSkip(g_retailRigNoRootCount, "first-person-root-unavailable", pose);
+        return;
+    }
     if (root != g_retailRigNodes.root || !retailRigNodesComplete(g_retailRigNodes))
     {
         if (!discoverRetailRigNodes(root))
+        {
+            logRetailRigGateSkip(
+                g_retailRigDiscoveryFailureCount,
+                "first-person-rig-discovery-failed",
+                pose,
+                root);
             return;
+        }
     }
     const UInt64 weaponRefreshStride = static_cast<UInt64>((std::max)(
         1,
@@ -5473,11 +5531,21 @@ void onRetailPostAnimation(void* animData)
     if (g_retailRigSolveCount == 0 || (g_retailRigSolveCount % weaponRefreshStride) == 0)
         refreshRetailWeaponNodes();
     if (!retailRigNodesComplete(g_retailRigNodes))
+    {
+        logRetailRigGateSkip(
+            g_retailRigIncompleteCount,
+            "first-person-rig-incomplete",
+            pose,
+            root);
         return;
+    }
 
     void* bodyRoot = retrievePlayerRootNode(false);
     if (!bodyRoot)
+    {
+        logRetailRigGateSkip(g_retailRigNoBodyRootCount, "body-root-unavailable", pose);
         return;
+    }
     const Matrix33 bodyWorldRotation = readMatrix33(
         reinterpret_cast<std::uintptr_t>(bodyRoot) + NiAvObjectWorldRotationOffset);
     const Vec3 bodyWorldPosition = readVec3(
@@ -7873,6 +7941,78 @@ bool runPluginConsoleCommand(const char* eventName, const char* command)
     return ok;
 }
 
+void recoverFocusLossPause(UInt64 frame, UInt32 menuBits, RuntimePhase phase)
+{
+    static bool initialized = false;
+    static bool previousInteractive = false;
+    static RuntimePhase previousPhase = RuntimePhase::Unknown;
+    static UInt32 previousMenuBits = fnvxr::shared::RuntimeBlockingMenuBits;
+    static bool focusLossArmed = false;
+    static UInt64 lastCloseAttemptFrame = 0;
+
+    if (!retailSidecarProfile() || !envEnabled("FNVXR_CLOSE_FOCUS_LOSS_PAUSE", true))
+        return;
+
+    const bool foreground = currentProcessHasForegroundWindow();
+    const bool active = currentProcessHasActiveWindow();
+    const bool interactive = foreground || active;
+    if (!initialized)
+    {
+        initialized = true;
+        previousInteractive = interactive;
+        previousPhase = phase;
+        previousMenuBits = menuBits;
+        return;
+    }
+
+    const bool cleanPreviousGameplay =
+        previousPhase == RuntimePhase::Gameplay
+        && (previousMenuBits & fnvxr::shared::RuntimeBlockingMenuBits) == 0u;
+    if (previousInteractive && !interactive && cleanPreviousGameplay)
+    {
+        focusLossArmed = true;
+        lastCloseAttemptFrame = 0;
+        logTelemetry(
+            "focusLossPause armed frame=%llu previousBits=0x%02lx\n",
+            static_cast<unsigned long long>(frame),
+            static_cast<unsigned long>(previousMenuBits));
+    }
+
+    constexpr UInt32 nonStartBlockingBits =
+        fnvxr::shared::RuntimeBlockingMenuBits
+        & ~fnvxr::shared::RuntimeStartMenuBit;
+    const bool focusPauseVisible =
+        (menuBits & fnvxr::shared::RuntimeStartMenuBit) != 0u
+        && (menuBits & nonStartBlockingBits) == 0u;
+    if (focusLossArmed
+        && focusPauseVisible
+        && (lastCloseAttemptFrame == 0 || frame >= lastCloseAttemptFrame + 30))
+    {
+        lastCloseAttemptFrame = frame;
+        const bool closed = runPluginConsoleCommand(
+            "fnvxrFocusLossPauseRecovery",
+            "CloseAllMenus");
+        logTelemetry(
+            "focusLossPause close frame=%llu bits=0x%02lx foreground=%d active=%d ok=%d\n",
+            static_cast<unsigned long long>(frame),
+            static_cast<unsigned long>(menuBits),
+            static_cast<int>(foreground),
+            static_cast<int>(active),
+            static_cast<int>(closed));
+        if (closed)
+            focusLossArmed = false;
+    }
+
+    // A normal foreground gameplay frame closes the recovery window. Menus
+    // opened deliberately while Fallout already has focus never arm it.
+    if (interactive && phase == RuntimePhase::Gameplay)
+        focusLossArmed = false;
+
+    previousInteractive = interactive;
+    previousPhase = phase;
+    previousMenuBits = menuBits;
+}
+
 bool ensureAutoVanityCameraDisabled(UInt64 frame)
 {
     if (!strictFirstPersonEnabled()
@@ -9402,6 +9542,7 @@ void processMainGameLoop()
     const UInt32 menuBits = currentMenuBits();
     const RuntimePhase phase = runtimePhaseFromMenuBits(menuBits);
     const bool uiInputAllowed = uiInputAllowedFromMenuBits(menuBits);
+    recoverFocusLossPause(frame, menuBits, phase);
     if (phase == RuntimePhase::Gameplay)
     {
         ensureAutoVanityCameraDisabled(frame);

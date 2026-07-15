@@ -382,6 +382,41 @@ int main()
     if (!nearlyEqual(gunMotion, 0.10f * fnvxr::stereo::DefaultGameUnitsPerMeter))
         return fail("controller-only movement must move the gun target at the configured meter-to-unit scale");
 
+    const bool eligibleWorldBasis = fnvxr::stereo::programmableWorldDrawBasis(
+        true, false, true, true, false, false, false, false, false);
+    if (!fnvxr::stereo::programmableWorldDrawCandidate(eligibleWorldBasis, true))
+    {
+        return fail("eligible indexed world geometry on the eye target must enter shader coverage");
+    }
+    if (fnvxr::stereo::programmableWorldDrawCandidate(eligibleWorldBasis, false))
+    {
+        return fail("auxiliary render-target geometry must stay outside eye-image coverage");
+    }
+    if (!fnvxr::stereo::programmableWorldDrawBasis(
+            true, false, true, true, false, false, false, false, false))
+    {
+        return fail("eligible indexed world geometry must enter shader coverage");
+    }
+    if (fnvxr::stereo::programmableWorldDrawBasis(
+            true, false, true, true, false, false, false, true, false))
+    {
+        return fail("unsupported immediate UI primitives must not poison world coverage");
+    }
+    if (!fnvxr::stereo::programmableWorldDrawBasis(
+            true, false, true, true, false, false, false, true, true))
+    {
+        return fail("immediate primitives must enter coverage when replay is explicitly enabled");
+    }
+    if (fnvxr::stereo::programmableWorldDrawBasis(
+            true, false, true, true, true, false, false, false, false)
+        || fnvxr::stereo::programmableWorldDrawBasis(
+            true, false, true, true, false, true, false, false, false)
+        || fnvxr::stereo::programmableWorldDrawBasis(
+            true, false, true, true, false, false, true, false, false))
+    {
+        return fail("screen/composite/configured-skip draws must stay outside world coverage");
+    }
+
     std::cout << "stereo math ok\n";
     return 0;
 }

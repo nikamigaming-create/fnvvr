@@ -295,6 +295,8 @@ LONG gShaderWvpContractsLoaded = 0;
 LONG gShaderWorldDrawCandidates = 0;
 LONG gShaderWorldDraws = 0;
 LONG gShaderContractCoveredWorldDraws = 0;
+LONG gShaderExcludedUserPrimitiveDraws = 0;
+LONG gShaderExcludedAuxiliaryTargetDraws = 0;
 struct ShaderWvpDiscoveryIdentity
 {
     std::uint32_t vertexHash = 0;
@@ -7588,6 +7590,10 @@ void __fastcall hookedDoRenderFrame(
         const LONG shaderWorldCandidatesBefore = static_cast<LONG>(gShaderWorldDrawCandidates);
         const LONG shaderWorldDrawsBefore = static_cast<LONG>(gShaderWorldDraws);
         const LONG shaderCoveredDrawsBefore = static_cast<LONG>(gShaderContractCoveredWorldDraws);
+        const LONG shaderExcludedUserPrimitiveDrawsBefore =
+            static_cast<LONG>(gShaderExcludedUserPrimitiveDraws);
+        const LONG shaderExcludedAuxiliaryTargetDrawsBefore =
+            static_cast<LONG>(gShaderExcludedAuxiliaryTargetDraws);
         LARGE_INTEGER begin {};
         LARGE_INTEGER end {};
         QueryPerformanceCounter(&begin);
@@ -7719,6 +7725,12 @@ void __fastcall hookedDoRenderFrame(
         const LONG shaderWorldDraws = static_cast<LONG>(gShaderWorldDraws) - shaderWorldDrawsBefore;
         const LONG shaderCoveredDraws =
             static_cast<LONG>(gShaderContractCoveredWorldDraws) - shaderCoveredDrawsBefore;
+        const LONG shaderExcludedUserPrimitiveDraws =
+            static_cast<LONG>(gShaderExcludedUserPrimitiveDraws)
+            - shaderExcludedUserPrimitiveDrawsBefore;
+        const LONG shaderExcludedAuxiliaryTargetDraws =
+            static_cast<LONG>(gShaderExcludedAuxiliaryTargetDraws)
+            - shaderExcludedAuxiliaryTargetDrawsBefore;
         const double shaderContractCoverage = shaderWorldCandidates > 0
             ? static_cast<double>(shaderCoveredDraws) / static_cast<double>(shaderWorldCandidates)
             : 0.0;
@@ -7736,14 +7748,16 @@ void __fastcall hookedDoRenderFrame(
             const LONG failure = InterlockedIncrement(&gLoggedNativeStereoFailure);
             if (failure <= 48 || failure % 120 == 0)
             {
-                char rejected[512] {};
+                char rejected[640] {};
                 sprintf_s(
                     rejected,
-                    "single-traversal stereo rejected: shader contract coverage replayDraws=%ld programmableCandidates=%ld replayedWorldDraws=%ld covered=%ld fraction=%.8f required=%.8f contracts=%ld",
+                    "single-traversal stereo rejected: shader contract coverage replayDraws=%ld programmableCandidates=%ld replayedWorldDraws=%ld covered=%ld excludedImmediatePrimitives=%ld excludedAuxiliaryTargets=%ld fraction=%.8f required=%.8f contracts=%ld",
                     replayDraws,
                     shaderWorldCandidates,
                     shaderWorldDraws,
                     shaderCoveredDraws,
+                    shaderExcludedUserPrimitiveDraws,
+                    shaderExcludedAuxiliaryTargetDraws,
                     shaderContractCoverage,
                     requiredShaderCoverage,
                     gShaderWvpContractCount);
@@ -7766,7 +7780,7 @@ void __fastcall hookedDoRenderFrame(
             char message[1536] {};
             sprintf_s(
                 message,
-                "{\"event\":\"fnvxrSingleTraversalStereo\",\"pair\":%ld,\"presentFrame\":%ld,\"poseSeq\":%ld,\"renderMs\":%.3f,\"originalTraversals\":1,\"replayDraws\":%ld,\"programmableWorldCandidates\":%ld,\"programmableWorldDraws\":%ld,\"contractCoveredWorldDraws\":%ld,\"shaderContractCoverage\":%.8f,\"verifiedShaderContracts\":%ld,\"centerCameraApplied\":true,\"centerCameraStable\":true,\"centerCameraDelta\":%.8g,\"headDeterminant\":%.8g,\"headOrthonormalError\":%.8g,\"headLocal\":[%.6f,%.6f,%.6f],\"headRotation\":[%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g],\"leftOffset\":[%.6f,%.6f,%.6f],\"rightOffset\":[%.6f,%.6f,%.6f]}",
+                "{\"event\":\"fnvxrSingleTraversalStereo\",\"pair\":%ld,\"presentFrame\":%ld,\"poseSeq\":%ld,\"renderMs\":%.3f,\"originalTraversals\":1,\"replayDraws\":%ld,\"programmableWorldCandidates\":%ld,\"programmableWorldDraws\":%ld,\"contractCoveredWorldDraws\":%ld,\"excludedImmediatePrimitiveDraws\":%ld,\"excludedAuxiliaryTargetDraws\":%ld,\"shaderContractCoverage\":%.8f,\"verifiedShaderContracts\":%ld,\"centerCameraApplied\":true,\"centerCameraStable\":true,\"centerCameraDelta\":%.8g,\"headDeterminant\":%.8g,\"headOrthonormalError\":%.8g,\"headLocal\":[%.6f,%.6f,%.6f],\"headRotation\":[%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g,%.8g],\"leftOffset\":[%.6f,%.6f,%.6f],\"rightOffset\":[%.6f,%.6f,%.6f]}",
                 pairSequence,
                 presentBefore,
                 rig.poseSequence,
@@ -7775,6 +7789,8 @@ void __fastcall hookedDoRenderFrame(
                 shaderWorldCandidates,
                 shaderWorldDraws,
                 shaderCoveredDraws,
+                shaderExcludedUserPrimitiveDraws,
+                shaderExcludedAuxiliaryTargetDraws,
                 shaderContractCoverage,
                 gShaderWvpContractCount,
                 centerCameraDelta,
@@ -10840,18 +10856,38 @@ HRESULT replayDrawToStereoTargets(IDirect3DDevice9* device, bool userPrimitiveDr
     // programmable shaders consume their own ModelViewProj constants.  Count
     // every non-composite programmable draw before replay filters so an
     // unknown or skipped world shader makes the transaction fail closed.
-    const bool programmableWorldDraw = gInNativeStereoHook
+    const bool nativeCenterTraversal = gInNativeStereoHook
         && gNativeActiveEye == 2
-        && !gInStereoReplay
-        && !suppressStereoForUiMode()
+        && !gInStereoReplay;
+    const bool uiSuppressed = suppressStereoForUiMode();
+    const bool screenSpaceProjection = currentProjectionLooksScreenSpace();
+    const bool samplesStereoTwin = currentDrawSamplesStereoTwin();
+    const bool configuredSkip = currentShaderPairIsConfiguredStereoSkip();
+    const bool replayUserPrimitiveDraws = readEnvBool(
+        "FNVXR_D3D9_STEREO_REPLAY_UP_DRAWS",
+        false);
+    const bool programmableWorldDrawBasis = fnvxr::stereo::programmableWorldDrawBasis(
+        nativeCenterTraversal,
+        uiSuppressed,
+        gActiveVertexShader != nullptr,
+        gHaveProjection,
+        screenSpaceProjection,
+        samplesStereoTwin,
+        configuredSkip,
+        userPrimitiveDraw,
+        replayUserPrimitiveDraws);
+    if (nativeCenterTraversal
+        && !uiSuppressed
         && gActiveVertexShader
         && gHaveProjection
-        && !currentProjectionLooksScreenSpace()
-        && !currentDrawSamplesStereoTwin()
-        && !currentShaderPairIsConfiguredStereoSkip();
-    if (programmableWorldDraw)
-        InterlockedIncrement(&gShaderWorldDrawCandidates);
-
+        && !screenSpaceProjection
+        && !samplesStereoTwin
+        && !configuredSkip
+        && userPrimitiveDraw
+        && !replayUserPrimitiveDraws)
+    {
+        InterlockedIncrement(&gShaderExcludedUserPrimitiveDraws);
+    }
     const LONG nativeTraceEye = gNativeActiveEye;
     if (gNativePipelineTraceThisPair
         && gInNativeStereoHook
@@ -10957,11 +10993,8 @@ HRESULT replayDrawToStereoTargets(IDirect3DDevice9* device, bool userPrimitiveDr
         return D3DERR_INVALIDCALL;
     }
 
-    if (!nativePostprocessComposite && !shouldReplayCurrentDrawToStereo(userPrimitiveDraw))
-        return D3DERR_INVALIDCALL;
-
-    if (!stereoReplayRequested && !gWideWorldReplayEnabled)
-        return D3DERR_INVALIDCALL;
+    const bool drawPolicyAllowsStereo = nativePostprocessComposite
+        || shouldReplayCurrentDrawToStereo(userPrimitiveDraw);
 
     IDirect3DSurface9* originalTarget = nullptr;
     IDirect3DSurface9* originalDepth = nullptr;
@@ -10974,6 +11007,19 @@ HRESULT replayDrawToStereoTargets(IDirect3DDevice9* device, bool userPrimitiveDr
     device->GetDepthStencilSurface(&originalDepth);
     const bool strictTargetAllowed =
         currentTargetPassesStrictStereoGate(device, originalTarget, originalDepth, "DrawReplay");
+    const bool programmableWorldDraw = fnvxr::stereo::programmableWorldDrawCandidate(
+        programmableWorldDrawBasis,
+        strictTargetAllowed);
+    if (programmableWorldDrawBasis && !strictTargetAllowed)
+        InterlockedIncrement(&gShaderExcludedAuxiliaryTargetDraws);
+    if (programmableWorldDraw)
+        InterlockedIncrement(&gShaderWorldDrawCandidates);
+    if (!drawPolicyAllowsStereo)
+    {
+        releaseSurface(originalTarget);
+        releaseSurface(originalDepth);
+        return D3DERR_INVALIDCALL;
+    }
     const bool replayStereo = stereoReplayRequested
         && strictTargetAllowed
         && ensureStereoTargets(device);

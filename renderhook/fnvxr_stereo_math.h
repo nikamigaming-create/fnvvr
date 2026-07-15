@@ -350,4 +350,38 @@ inline Matrix4 projectionFromTangents(
     result.m[2][1] = (top + bottom) / (bottom - top);
     return result;
 }
+
+// The shader-coverage denominator must describe draws the stereo producer is
+// actually permitted to replay. Fallout uses Draw*PrimitiveUP for immediate
+// UI geometry; counting those as world candidates while the replay policy
+// rejects them makes 100% coverage mathematically unreachable.
+inline bool programmableWorldDrawBasis(
+    bool nativeCenterTraversal,
+    bool uiSuppressed,
+    bool haveVertexShader,
+    bool haveProjection,
+    bool screenSpaceProjection,
+    bool samplesStereoTwin,
+    bool configuredSkip,
+    bool userPrimitiveDraw,
+    bool replayUserPrimitiveDraws)
+{
+    return nativeCenterTraversal
+        && !uiSuppressed
+        && haveVertexShader
+        && haveProjection
+        && !screenSpaceProjection
+        && !samplesStereoTwin
+        && !configuredSkip
+        && (!userPrimitiveDraw || replayUserPrimitiveDraws);
+}
+
+// Only the full-resolution scene target contributes pixels to the stereo eye
+// images. Auxiliary world passes (shadow maps, reflections, render textures)
+// may use the same world shaders, but the strict target gate deliberately
+// leaves them mono and they must not make eye-image coverage unreachable.
+inline bool programmableWorldDrawCandidate(bool drawBasis, bool stereoTargetEligible)
+{
+    return drawBasis && stereoTargetEligible;
+}
 }
