@@ -75,7 +75,9 @@ int main(int argc, char** argv)
         return fail("retail mutation proof must remain source-blocked");
 
     NVSEInterface nvse {};
-    nvse.nvseVersion = 0x060408;
+    // xNVSE 6.4.8 uses MAKE_NEW_VEGAS_VERSION(6, 4, 8), not a compact
+    // hexadecimal rendering of the dotted version.
+    nvse.nvseVersion = 0x06040080;
     nvse.runtimeVersion = 0x040020d0;
     nvse.GetPluginHandle = testPluginHandle;
 
@@ -87,6 +89,11 @@ int main(int argc, char** argv)
     wrongRuntime.runtimeVersion = 1;
     if (query(&wrongRuntime, &info))
         return fail("NVSEPlugin_Query accepted an unsupported runtime");
+
+    NVSEInterface wrongNvse = nvse;
+    wrongNvse.nvseVersion = 0x060408;
+    if (query(&wrongNvse, &info) || load(&wrongNvse))
+        return fail("plugin accepted a non-exact xNVSE build");
 
     NVSEInterface noGoreRuntime = nvse;
     noGoreRuntime.runtimeVersion = 0x040020d1;

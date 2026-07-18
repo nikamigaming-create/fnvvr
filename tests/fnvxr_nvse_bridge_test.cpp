@@ -191,7 +191,7 @@ int main(int argc, char** argv)
             return fail("missing xNVSE exports");
 
         NVSEInterface nvse {};
-        nvse.nvseVersion = 0x060408;
+        nvse.nvseVersion = 0x06040080;
         nvse.runtimeVersion = 0x040020d0;
         nvse.GetPluginHandle = testPluginHandle;
 

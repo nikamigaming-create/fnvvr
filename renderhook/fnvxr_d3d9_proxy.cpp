@@ -6,6 +6,7 @@
 #include <intrin.h>
 
 #include "../protocol/fnvxr_shared_state.h"
+#include "fnvxr_d3d9_activation.h"
 #include "fnvxr_stereo_math.h"
 
 #include <algorithm>
@@ -883,6 +884,10 @@ bool shouldTelemetryHammerLog(LONG count, const char* strideEnv, LONG fallbackSt
 }
 
 constexpr bool StereoWorldProductionProofComplete = false;
+// Independent integration fuse: the retained D3D replay code is not allowed
+// to become WorldStereo merely because its historical proof fuse is edited.
+// Production must enter through the engine transaction/product controller.
+constexpr bool ProductWorldStereoIntegrationComplete = false;
 
 bool stereoWorldRuntimeRequested()
 {
@@ -893,12 +898,17 @@ bool stereoWorldRuntimeEnabled()
 {
     // This source-level gate is independent of launcher policy. Environment
     // variables alone cannot activate the unsafe traversal/replay path.
-    return StereoWorldProductionProofComplete && stereoWorldRuntimeRequested();
+    return fnvxr::d3d9::ProductionRendererAuthorized
+        && StereoWorldProductionProofComplete
+        && ProductWorldStereoIntegrationComplete
+        && stereoWorldRuntimeRequested();
 }
 
 bool stereoProofModeArmed()
 {
-    return StereoWorldProductionProofComplete
+    return fnvxr::d3d9::ProductionRendererAuthorized
+        && StereoWorldProductionProofComplete
+        && ProductWorldStereoIntegrationComplete
         && (readRawEnvBool("FNVXR_D3D9_SHARED_STEREO", false)
         || readRawEnvBool("FNVXR_D3D9_NATIVE_STEREO", false)
         || readRawEnvBool("FNVXR_D3D9_NATIVE_SINGLE_TRAVERSAL_REPLAY", false));
@@ -7060,10 +7070,10 @@ bool ensureStereoTargets(IDirect3DDevice9* device)
     return true;
 }
 
-// Fallout: New Vegas 1.4.0.525 retail render entry point. The production VR
-// path applies an HMD-centered camera here exactly once, lets Gamebryo cull and
-// submit one coherent scene, then mirrors each resulting D3D9 draw to both eye
-// targets. The legacy two-traversal path remains code-gated for diagnostics.
+// Fallout: New Vegas 1.4.0.525 retail render entry point used by the retained
+// source-blocked D3D replay diagnostic. Per-draw mirroring cannot recover
+// camera-dependent geometry omitted before D3D submission and is not the
+// production VR architecture. See docs/architecture-v2.md.
 constexpr std::uintptr_t FalloutDoRenderFrameAddress = 0x008706B0;
 constexpr std::uintptr_t FalloutWorldSceneGraphAddress = 0x011DEB7C;
 constexpr std::uintptr_t FalloutNiCameraSetViewFrustumAddress = 0x00A6FAF0;
@@ -14074,6 +14084,9 @@ bool criticalDeviceHooksIntact(IDirect3DDevice9* device)
 
 bool installDeviceHooks(IDirect3DDevice9* device)
 {
+    if constexpr (!fnvxr::d3d9::ProductionRendererAuthorized)
+        return false;
+
     if (!device)
         return false;
 
@@ -14446,6 +14459,9 @@ bool buildLogPath(char* path, size_t pathSize, const char* leafName)
 
 void logLine(const char* text)
 {
+    if constexpr (!fnvxr::d3d9::ProductionRendererAuthorized)
+        return;
+
     char path[MAX_PATH] {};
     if (!buildLogPath(path, sizeof(path), "fnvxr_d3d9_proxy.log"))
         return;
@@ -14569,8 +14585,6 @@ bool ensureD3D9ProxyInitialized()
 
 bool loadRealD3D9()
 {
-    if (!ensureD3D9ProxyInitialized())
-        return false;
     if (gRealD3D9)
         return true;
 
@@ -14582,21 +14596,14 @@ bool loadRealD3D9()
     strcat_s(systemPath, "\\d3d9.dll");
     gRealD3D9 = LoadLibraryA(systemPath);
     if (!gRealD3D9)
-    {
-        logLine("failed to load system d3d9.dll");
         return false;
-    }
 
     gRealDirect3DCreate9 = reinterpret_cast<Direct3DCreate9Fn>(GetProcAddress(gRealD3D9, "Direct3DCreate9"));
     gRealDirect3DCreate9Ex = reinterpret_cast<Direct3DCreate9ExFn>(GetProcAddress(gRealD3D9, "Direct3DCreate9Ex"));
 
     if (!gRealDirect3DCreate9)
-    {
-        logLine("failed to resolve Direct3DCreate9");
         return false;
-    }
 
-    logLine("loaded system d3d9.dll");
     return true;
 }
 
@@ -14803,13 +14810,20 @@ private:
 
 extern "C" IDirect3D9* WINAPI FNVXR_Direct3DCreate9(UINT sdkVersion)
 {
-    if (!ensureD3D9ProxyInitialized())
-        return nullptr;
-    logLine("Direct3DCreate9 called");
     if (!loadRealD3D9())
         return nullptr;
 
     IDirect3D9* real = gRealDirect3DCreate9(sdkVersion);
+    if constexpr (!fnvxr::d3d9::ProductionRendererAuthorized)
+        return real;
+
+    if (!ensureD3D9ProxyInitialized())
+    {
+        if (real)
+            real->Release();
+        return nullptr;
+    }
+    logLine("Direct3DCreate9 called");
     if (!real)
     {
         logLine("Direct3DCreate9 returned null");
@@ -14830,21 +14844,29 @@ extern "C" IDirect3D9* WINAPI FNVXR_Direct3DCreate9(UINT sdkVersion)
 
 extern "C" HRESULT WINAPI FNVXR_Direct3DCreate9Ex(UINT sdkVersion, IDirect3D9Ex** out)
 {
-    if (!ensureD3D9ProxyInitialized())
+    if (!loadRealD3D9() || !gRealDirect3DCreate9Ex)
+    {
+        if (out)
+            *out = nullptr;
         return D3DERR_NOTAVAILABLE_RESULT;
-    logLine("Direct3DCreate9Ex called");
+    }
+
+    if constexpr (!fnvxr::d3d9::ProductionRendererAuthorized)
+        return gRealDirect3DCreate9Ex(sdkVersion, out);
+
     if (!out)
         return E_POINTER;
     *out = nullptr;
+
+    if (!ensureD3D9ProxyInitialized())
+        return D3DERR_NOTAVAILABLE_RESULT;
+    logLine("Direct3DCreate9Ex called");
 
     if (stereoProofModeArmed())
     {
         logLine("Direct3DCreate9Ex rejected: Ex vtable is not covered by the stereo proof");
         return D3DERR_NOTAVAILABLE_RESULT;
     }
-
-    if (!loadRealD3D9() || !gRealDirect3DCreate9Ex)
-        return D3DERR_NOTAVAILABLE_RESULT;
 
     const HRESULT result = gRealDirect3DCreate9Ex(sdkVersion, out);
     logLine(SUCCEEDED(result) ? "Direct3DCreate9Ex forwarded successfully" : "Direct3DCreate9Ex failed");

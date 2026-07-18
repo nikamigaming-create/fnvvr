@@ -13,8 +13,9 @@ world presentation.
 - Engine-sensitive work stays in xNVSE. Every shared mapping must have a
   fixed/versioned layout, a stable-snapshot rule, and one declared producer per
   mutable field before it is trusted.
-- Startup, menus, pause, Pip-Boy, inventory, dialogue, VATS, loading, and
-  unknown/non-gameplay states use the flat mono retail surface.
+- Confirmed startup/menu, pause, Pip-Boy, inventory, dialogue, VATS, and loading
+  states use the flat mono retail surface. Unknown/stale runtime fails blank;
+  it cannot relabel arbitrary pixels as an allowed UI quad.
 - All non-blocking gameplay requires true binocular stereo, independent 6DoF,
   a tracked authoritative retail weapon, and no persistent gameplay HUD.
   Invalid gameplay stereo is a visible rejection, not a mono fallback.
@@ -114,8 +115,10 @@ double input, or a lost pointer.
   expected pixel separation without structural divergence.
 - Install no address- or vtable-based hook until the loaded `1.4.0.525` module,
   function prologues, call signatures, singleton pointers, and object
-  ownership validate. Failed validation leaves retail mutation inert and live
-  VR blocked.
+  ownership validate. Re-read the current PE, protected function bytes, and
+  compatibility-module inventory synchronously at the mutation decision;
+  cached probe evidence is not authority. Failed validation leaves retail
+  mutation inert and live VR blocked.
 
 ## Extending xNVSE Safely
 

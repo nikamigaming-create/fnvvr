@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
+#include <string_view>
 
 namespace
 {
@@ -58,6 +59,7 @@ int main()
             [](const LoadedFunctionManifestEntry& entry) {
                 return entry.name != nullptr
                     && entry.name[0] != '\0'
+                    && entry.sha256.valid
                     && entry.preferredAddress >= SupportedImageBase
                     && entry.byteCount != 0
                     && entry.preferredAddress + entry.byteCount
@@ -98,6 +100,29 @@ int main()
     require(
         RetailEngineManifest[1].preferredAddress == WorldRenderAddress,
         "the manifest must anchor the verified world-render boundary");
+
+    const auto addVisibleArray = std::find_if(
+        RetailEngineManifest.begin(),
+        RetailEngineManifest.end(),
+        [](const LoadedFunctionManifestEntry& entry) {
+            return std::string_view(entry.name) == "NiAccumulator::AddVisibleArray";
+        });
+    require(
+        addVisibleArray != RetailEngineManifest.end(),
+        "the accumulator population ABI must be protected");
+    require(
+        addVisibleArray->preferredAddress == 0x00A9B790u
+            && addVisibleArray->byteCount == 189u
+            && addVisibleArray->preferredAddress + addVisibleArray->byteCount
+                == 0x00A9B84Du,
+        "AddVisibleArray must cover only its callable body, not the adjacent cluster");
+
+    constexpr Sha256Digest malformed = sha256FromHex(
+        "G8CC17DF032791EAF2C6D898898827F72A1EB63926B1423E7DDB395395C3D0D5");
+    require(!malformed.valid, "invalid SHA-256 hex must be rejected, not decoded as zero");
+    require(
+        !digestMatches(malformed, malformed.bytes.data(), malformed.bytes.size()),
+        "a malformed expected digest must never match runtime bytes");
 
     std::cout << "retail engine manifest contract passed\n";
     return EXIT_SUCCESS;

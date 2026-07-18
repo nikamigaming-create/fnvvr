@@ -36,9 +36,10 @@ inline bool matchesLoadedExecutableIdentity(const LoadedExecutableIdentity& valu
 struct Sha256Digest
 {
     std::array<std::uint8_t, 32> bytes {};
+    bool valid = false;
 };
 
-constexpr std::uint8_t hexNibble(char value)
+constexpr int hexNibble(char value)
 {
     return value >= '0' && value <= '9'
         ? static_cast<std::uint8_t>(value - '0')
@@ -46,7 +47,7 @@ constexpr std::uint8_t hexNibble(char value)
             ? static_cast<std::uint8_t>(value - 'A' + 10)
             : value >= 'a' && value <= 'f'
                 ? static_cast<std::uint8_t>(value - 'a' + 10)
-                : 0;
+                : -1;
 }
 
 template <std::size_t Size>
@@ -54,11 +55,20 @@ constexpr Sha256Digest sha256FromHex(const char (&text)[Size])
 {
     static_assert(Size == 65, "SHA-256 text must contain exactly 64 hex digits");
     Sha256Digest result {};
+    result.valid = text[64] == '\0';
     for (std::size_t index = 0; index < result.bytes.size(); ++index)
     {
-        result.bytes[index] = static_cast<std::uint8_t>(
-            (hexNibble(text[index * 2]) << 4)
-            | hexNibble(text[index * 2 + 1]));
+        const int high = hexNibble(text[index * 2]);
+        const int low = hexNibble(text[index * 2 + 1]);
+        if (high < 0 || low < 0)
+        {
+            result.valid = false;
+            result.bytes[index] = 0;
+        }
+        else
+        {
+            result.bytes[index] = static_cast<std::uint8_t>((high << 4) | low);
+        }
     }
     return result;
 }
@@ -68,7 +78,7 @@ inline bool digestMatches(
     const std::uint8_t* actual,
     std::size_t actualBytes)
 {
-    if (!actual || actualBytes != expected.bytes.size())
+    if (!expected.valid || !actual || actualBytes != expected.bytes.size())
         return false;
 
     std::uint8_t difference = 0;
@@ -85,9 +95,11 @@ struct LoadedFunctionManifestEntry
     Sha256Digest sha256 {};
 };
 
-// Every range is a complete instruction-aligned function body extracted from
-// two independent loaded-memory dumps. Both dumps produced identical bytes.
-inline constexpr std::array<LoadedFunctionManifestEntry, 11> RetailEngineManifest {{
+// Every range is one complete instruction-aligned function body extracted
+// from two independent loaded-memory dumps. Both dumps produced identical
+// bytes. Do not widen a callable entry to cover adjacent alignment bytes or
+// functions: a matching cluster is not ABI evidence for the named function.
+inline constexpr std::array<LoadedFunctionManifestEntry, 13> RetailEngineManifest {{
     {
         "DoRenderFrame",
         WholeFrameRenderAddress,
@@ -99,6 +111,18 @@ inline constexpr std::array<LoadedFunctionManifestEntry, 11> RetailEngineManifes
         WorldRenderAddress,
         4698u,
         sha256FromHex("D2355FF1593FD9D843C0C61FE95205C1B2C4F1FB6D560499B6FA4EE9C312AEAE"),
+    },
+    {
+        "RenderFirstPerson",
+        FirstPersonRenderAddress,
+        3361u,
+        sha256FromHex("7F734D69C1C74C2099BE684FB4FE682BF84B3F75A108F109CCF1DF74EF9D55F2"),
+    },
+    {
+        "PlayerCharacter::UpdateCamera",
+        0x0094AE40u,
+        5433u,
+        sha256FromHex("6BB45EDC72162B703610CBF425DB949BE060C516F2187A84D8420B2224FB35B5"),
     },
     {
         "NiCamera::SetViewFrustum",
@@ -115,8 +139,8 @@ inline constexpr std::array<LoadedFunctionManifestEntry, 11> RetailEngineManifes
     {
         "NiAccumulator::AddVisibleArray",
         0x00A9B790u,
-        530u,
-        sha256FromHex("A9F4B4D00E3E517BBF5A967B573EF987E7F4A229A8B187160441E53E3A5ED85A"),
+        189u,
+        sha256FromHex("A929F2C8289B45EC15F5A16E88A5052D5E1C3F1348880E07C66E223DCB592843"),
     },
     {
         "FinalizeAccumulator",

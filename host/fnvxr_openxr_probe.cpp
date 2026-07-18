@@ -57,10 +57,24 @@ void writeProbeStep(const char* step)
     std::ofstream out("local/openxr-probe-step.txt", std::ios::app);
     out << step << "\n";
 }
+
+// This diagnostic can enumerate the active runtime and create an OpenXR
+// instance, so it is live runtime code even though it does not present frames.
+// Keep that path source-fused until its runtime-touch proof is implemented and
+// reviewed. Environment variables and wrapper scripts cannot bypass this fuse.
+constexpr bool OpenXrDiagnosticRuntimeProofComplete = false;
 }
 
 int main()
 {
+    if (!OpenXrDiagnosticRuntimeProofComplete)
+    {
+        std::cerr
+            << "OpenXR diagnostic is intentionally disabled: its reviewed runtime-touch "
+               "proof is incomplete. No OpenXR loader or runtime was touched.\n";
+        return 27;
+    }
+
     CreateDirectoryA("local", nullptr);
     DeleteFileA("local/openxr-probe-step.txt");
     writeProbeStep("start");

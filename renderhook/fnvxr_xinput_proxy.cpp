@@ -7,6 +7,7 @@
 #include <xinput.h>
 
 #include "../protocol/fnvxr_shared_state.h"
+#include "fnvxr_input_proxy_safety.h"
 
 #include <cstdarg>
 #include <algorithm>
@@ -54,6 +55,11 @@
 
 namespace
 {
+constexpr bool vrInputMutationAuthorized() noexcept
+{
+    return fnvxr::input_proxy::productionInputMutationAuthorizedForCurrentBuild();
+}
+
 constexpr std::uint32_t XInputSharedMagic = fnvxr::shared::XInputSharedMagic;
 constexpr std::uint32_t XInputSharedVersion = fnvxr::shared::XInputSharedVersion;
 constexpr std::uint8_t XInputReservedRetailConsumed = fnvxr::shared::XInputReservedRetailConsumed;
@@ -194,6 +200,55 @@ Fn realProcOrdinal(WORD ordinal)
     }
 
     return g_realXInput ? reinterpret_cast<Fn>(GetProcAddress(g_realXInput, MAKEINTRESOURCEA(ordinal))) : nullptr;
+}
+
+DWORD forwardXInputGetState(DWORD userIndex, XINPUT_STATE* state)
+{
+    using Fn = DWORD (WINAPI*)(DWORD, XINPUT_STATE*);
+    if (Fn fn = realProc<Fn>("XInputGetState"))
+        return fn(userIndex, state);
+    return ERROR_DEVICE_NOT_CONNECTED;
+}
+
+DWORD forwardXInputGetCapabilities(
+    DWORD userIndex,
+    DWORD flags,
+    XINPUT_CAPABILITIES* capabilities)
+{
+    using Fn = DWORD (WINAPI*)(DWORD, DWORD, XINPUT_CAPABILITIES*);
+    if (Fn fn = realProc<Fn>("XInputGetCapabilities"))
+        return fn(userIndex, flags, capabilities);
+    return ERROR_DEVICE_NOT_CONNECTED;
+}
+
+DWORD forwardXInputGetBatteryInformation(
+    DWORD userIndex,
+    BYTE deviceType,
+    XINPUT_BATTERY_INFORMATION* batteryInformation)
+{
+    using Fn = DWORD (WINAPI*)(DWORD, BYTE, XINPUT_BATTERY_INFORMATION*);
+    if (Fn fn = realProc<Fn>("XInputGetBatteryInformation"))
+        return fn(userIndex, deviceType, batteryInformation);
+    return ERROR_DEVICE_NOT_CONNECTED;
+}
+
+DWORD forwardXInputGetKeystroke(
+    DWORD userIndex,
+    DWORD reserved,
+    PXINPUT_KEYSTROKE keystroke)
+{
+    using Fn = DWORD (WINAPI*)(DWORD, DWORD, PXINPUT_KEYSTROKE);
+    if (Fn fn = realProc<Fn>("XInputGetKeystroke"))
+        return fn(userIndex, reserved, keystroke);
+    return ERROR_EMPTY;
+}
+
+DWORD forwardXInputGetStateEx(DWORD userIndex, XINPUT_STATE* state)
+{
+    using Fn = DWORD (WINAPI*)(DWORD, XINPUT_STATE*);
+    if (Fn fn = realProcOrdinal<Fn>(100))
+        return fn(userIndex, state);
+    return ERROR_DEVICE_NOT_CONNECTED;
 }
 
 SharedXInputState* sharedState()
@@ -567,6 +622,9 @@ void cleanup()
 
 extern "C" DWORD WINAPI FNVXR_XInputGetState(DWORD dwUserIndex, XINPUT_STATE* pState)
 {
+    if (!vrInputMutationAuthorized())
+        return forwardXInputGetState(dwUserIndex, pState);
+
     if (InterlockedCompareExchange(&g_loggedGetState, 1, 0) == 0)
         logLine("XInputGetState user=%lu\n", dwUserIndex);
 
@@ -590,10 +648,7 @@ extern "C" DWORD WINAPI FNVXR_XInputGetState(DWORD dwUserIndex, XINPUT_STATE* pS
         return ERROR_SUCCESS;
     }
 
-    using Fn = DWORD (WINAPI*)(DWORD, XINPUT_STATE*);
-    if (Fn fn = realProc<Fn>("XInputGetState"))
-        return fn(dwUserIndex, pState);
-    return ERROR_DEVICE_NOT_CONNECTED;
+    return forwardXInputGetState(dwUserIndex, pState);
 }
 
 extern "C" DWORD WINAPI FNVXR_XInputSetState(DWORD dwUserIndex, XINPUT_VIBRATION* pVibration)
@@ -606,6 +661,9 @@ extern "C" DWORD WINAPI FNVXR_XInputSetState(DWORD dwUserIndex, XINPUT_VIBRATION
 
 extern "C" DWORD WINAPI FNVXR_XInputGetCapabilities(DWORD dwUserIndex, DWORD dwFlags, XINPUT_CAPABILITIES* pCapabilities)
 {
+    if (!vrInputMutationAuthorized())
+        return forwardXInputGetCapabilities(dwUserIndex, dwFlags, pCapabilities);
+
     if (InterlockedCompareExchange(&g_loggedGetCapabilities, 1, 0) == 0)
         logLine("XInputGetCapabilities user=%lu flags=0x%lx\n", dwUserIndex, dwFlags);
 
@@ -625,10 +683,7 @@ extern "C" DWORD WINAPI FNVXR_XInputGetCapabilities(DWORD dwUserIndex, DWORD dwF
         return ERROR_SUCCESS;
     }
 
-    using Fn = DWORD (WINAPI*)(DWORD, DWORD, XINPUT_CAPABILITIES*);
-    if (Fn fn = realProc<Fn>("XInputGetCapabilities"))
-        return fn(dwUserIndex, dwFlags, pCapabilities);
-    return ERROR_DEVICE_NOT_CONNECTED;
+    return forwardXInputGetCapabilities(dwUserIndex, dwFlags, pCapabilities);
 }
 
 extern "C" void WINAPI FNVXR_XInputEnable(BOOL enable)
@@ -648,6 +703,9 @@ extern "C" DWORD WINAPI FNVXR_XInputGetDSoundAudioDeviceGuids(DWORD dwUserIndex,
 
 extern "C" DWORD WINAPI FNVXR_XInputGetBatteryInformation(DWORD dwUserIndex, BYTE devType, XINPUT_BATTERY_INFORMATION* pBatteryInformation)
 {
+    if (!vrInputMutationAuthorized())
+        return forwardXInputGetBatteryInformation(dwUserIndex, devType, pBatteryInformation);
+
     if (dwUserIndex == 0 && pBatteryInformation)
     {
         pBatteryInformation->BatteryType = BATTERY_TYPE_WIRED;
@@ -655,14 +713,14 @@ extern "C" DWORD WINAPI FNVXR_XInputGetBatteryInformation(DWORD dwUserIndex, BYT
         return ERROR_SUCCESS;
     }
 
-    using Fn = DWORD (WINAPI*)(DWORD, BYTE, XINPUT_BATTERY_INFORMATION*);
-    if (Fn fn = realProc<Fn>("XInputGetBatteryInformation"))
-        return fn(dwUserIndex, devType, pBatteryInformation);
-    return ERROR_DEVICE_NOT_CONNECTED;
+    return forwardXInputGetBatteryInformation(dwUserIndex, devType, pBatteryInformation);
 }
 
 extern "C" DWORD WINAPI FNVXR_XInputGetKeystroke(DWORD dwUserIndex, DWORD dwReserved, PXINPUT_KEYSTROKE pKeystroke)
 {
+    if (!vrInputMutationAuthorized())
+        return forwardXInputGetKeystroke(dwUserIndex, dwReserved, pKeystroke);
+
     if (!pKeystroke)
         return ERROR_BAD_ARGUMENTS;
 
@@ -688,14 +746,13 @@ extern "C" DWORD WINAPI FNVXR_XInputGetKeystroke(DWORD dwUserIndex, DWORD dwRese
         return ERROR_EMPTY;
     }
 
-    using Fn = DWORD (WINAPI*)(DWORD, DWORD, PXINPUT_KEYSTROKE);
-    if (Fn fn = realProc<Fn>("XInputGetKeystroke"))
-        return fn(dwUserIndex, dwReserved, pKeystroke);
-    return ERROR_EMPTY;
+    return forwardXInputGetKeystroke(dwUserIndex, dwReserved, pKeystroke);
 }
 
 extern "C" DWORD WINAPI FNVXR_XInputGetStateEx(DWORD dwUserIndex, XINPUT_STATE* pState)
 {
+    if (!vrInputMutationAuthorized())
+        return forwardXInputGetStateEx(dwUserIndex, pState);
     return FNVXR_XInputGetState(dwUserIndex, pState);
 }
 
@@ -726,10 +783,7 @@ extern "C" DWORD WINAPI FNVXR_XInputPowerOffController(DWORD dwUserIndex)
 BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
 {
     if (reason == DLL_PROCESS_ATTACH)
-    {
         DisableThreadLibraryCalls(module);
-        logLine("DllMain attach xinput proxy pid=%lu\n", GetCurrentProcessId());
-    }
     // Process teardown releases mappings/modules. Blocking on SRW locks or
     // calling FreeLibrary from DllMain would run under the loader lock.
     return TRUE;

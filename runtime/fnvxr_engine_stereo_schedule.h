@@ -30,6 +30,22 @@ enum class StereoScheduleFailure : std::uint32_t
     RightFinalize = 15,
     RightEnd = 16,
     StateRestore = 17,
+    LeftIsolationToken = 18,
+    RightIsolationToken = 19,
+};
+
+// The backend sets backendToken before its first eye-specific mutation. Eye
+// identity is deliberately absent: the expected eye remains caller-owned and
+// is passed explicitly to end/rollback, so opaque backend state cannot redirect
+// cleanup. Zero means no isolation became active; nonzero must be unwound.
+struct EyeIsolationToken
+{
+    std::uint64_t backendToken = 0;
+
+    bool active() const noexcept
+    {
+        return backendToken != 0;
+    }
 };
 
 struct StereoScheduleResources
@@ -50,6 +66,9 @@ struct StereoScheduleResult
 {
     bool complete = false;
     StereoScheduleFailure failure = StereoScheduleFailure::None;
+    // Resource handles are public only after a complete schedule. Every
+    // failure returns this structure all-zero after the backend has discarded
+    // any partial internal allocation.
     StereoScheduleResources resources {};
 };
 
@@ -58,6 +77,9 @@ class StereoScheduleBackend
 public:
     virtual ~StereoScheduleBackend() = default;
 
+    // This operation must be observational/pure: it may copy the state needed
+    // for a later restore, but it must not mutate authoritative engine state.
+    // A false result therefore aborts without calling restoreAuthoritativeState.
     virtual bool snapshotAuthoritativeState() noexcept = 0;
     virtual bool buildConservativeVisibleSet(std::uint64_t& visibleSet) noexcept = 0;
     virtual bool createFreshAccumulator(
@@ -69,7 +91,8 @@ public:
     // therefore be bound before populateAccumulator, not merely before render.
     virtual bool bindEyeCameraAndTargets(
         EngineEye eye,
-        std::uint64_t accumulator) noexcept = 0;
+        std::uint64_t accumulator,
+        EyeIsolationToken& isolation) noexcept = 0;
     virtual bool populateAccumulator(
         EngineEye eye,
         std::uint64_t accumulator,
@@ -80,7 +103,16 @@ public:
     virtual bool finalizeAccumulator(
         EngineEye eye,
         std::uint64_t accumulator) noexcept = 0;
-    virtual bool endEyeIsolation(EngineEye eye) noexcept = 0;
+    // A successful end must clear backendToken. The explicit eye is the
+    // caller-owned cleanup identity and must not be inferred from the mutable
+    // opaque token. rollbackEyeIsolation must be idempotent and clear any token
+    // left active by a partial bind or end.
+    virtual bool endEyeIsolation(
+        EngineEye eye,
+        EyeIsolationToken& isolation) noexcept = 0;
+    virtual void rollbackEyeIsolation(
+        EngineEye eye,
+        EyeIsolationToken& isolation) noexcept = 0;
 
     virtual bool restoreAuthoritativeState() noexcept = 0;
     virtual void discardResources(
@@ -93,100 +125,159 @@ inline StereoScheduleResult failSchedule(
     StereoScheduleBackend& backend,
     StereoScheduleFailure failure,
     const StereoScheduleResources& resources,
-    bool eyeIsolationActive = false,
-    EngineEye activeEye = EngineEye::Left) noexcept
+    EyeIsolationToken* isolation = nullptr,
+    EngineEye isolationEye = EngineEye::Left) noexcept
 {
-    if (eyeIsolationActive)
-        backend.endEyeIsolation(activeEye);
+    if (isolation && isolation->active())
+        backend.rollbackEyeIsolation(isolationEye, *isolation);
     if (!backend.restoreAuthoritativeState())
         failure = StereoScheduleFailure::StateRestore;
     backend.discardResources(
         resources.visibleSet,
         resources.leftAccumulator,
         resources.rightAccumulator);
-    return { false, failure, resources };
+    return { false, failure, {} };
 }
 
-inline StereoScheduleFailure renderScheduledEye(
+struct ScheduledEyeResult
+{
+    StereoScheduleFailure failure = StereoScheduleFailure::None;
+    EyeIsolationToken isolation {};
+};
+
+inline ScheduledEyeResult renderScheduledEye(
     StereoScheduleBackend& backend,
     EngineEye eye,
     std::uint64_t accumulator,
     std::uint64_t visibleSet) noexcept
 {
     const bool left = eye == EngineEye::Left;
-    if (!backend.bindEyeCameraAndTargets(eye, accumulator))
-        return left ? StereoScheduleFailure::LeftBind : StereoScheduleFailure::RightBind;
+    ScheduledEyeResult result {};
+    if (!backend.bindEyeCameraAndTargets(eye, accumulator, result.isolation))
+    {
+        result.failure = left
+            ? StereoScheduleFailure::LeftBind
+            : StereoScheduleFailure::RightBind;
+        return result;
+    }
+    if (!result.isolation.active())
+    {
+        result.failure = left
+            ? StereoScheduleFailure::LeftIsolationToken
+            : StereoScheduleFailure::RightIsolationToken;
+        return result;
+    }
     if (!backend.populateAccumulator(eye, accumulator, visibleSet))
-        return left ? StereoScheduleFailure::LeftPopulate : StereoScheduleFailure::RightPopulate;
+    {
+        result.failure = left
+            ? StereoScheduleFailure::LeftPopulate
+            : StereoScheduleFailure::RightPopulate;
+        return result;
+    }
     if (!backend.renderAccumulator(eye, accumulator))
-        return left ? StereoScheduleFailure::LeftRender : StereoScheduleFailure::RightRender;
+    {
+        result.failure = left
+            ? StereoScheduleFailure::LeftRender
+            : StereoScheduleFailure::RightRender;
+        return result;
+    }
     if (!backend.finalizeAccumulator(eye, accumulator))
-        return left ? StereoScheduleFailure::LeftFinalize : StereoScheduleFailure::RightFinalize;
-    if (!backend.endEyeIsolation(eye))
-        return left ? StereoScheduleFailure::LeftEnd : StereoScheduleFailure::RightEnd;
-    return StereoScheduleFailure::None;
-}
-
-inline bool eyeIsolationRemainsActive(StereoScheduleFailure failure)
-{
-    return failure == StereoScheduleFailure::LeftBind
-        || failure == StereoScheduleFailure::LeftPopulate
-        || failure == StereoScheduleFailure::LeftRender
-        || failure == StereoScheduleFailure::LeftFinalize
-        || failure == StereoScheduleFailure::RightBind
-        || failure == StereoScheduleFailure::RightPopulate
-        || failure == StereoScheduleFailure::RightRender
-        || failure == StereoScheduleFailure::RightFinalize;
+    {
+        result.failure = left
+            ? StereoScheduleFailure::LeftFinalize
+            : StereoScheduleFailure::RightFinalize;
+        return result;
+    }
+    if (!backend.endEyeIsolation(eye, result.isolation)
+        || result.isolation.active())
+    {
+        result.failure = left
+            ? StereoScheduleFailure::LeftEnd
+            : StereoScheduleFailure::RightEnd;
+        return result;
+    }
+    return result;
 }
 
 inline StereoScheduleResult executeStereoSchedule(
     StereoScheduleBackend& backend) noexcept
 {
-    StereoScheduleResources resources {};
+    // Backend allocation APIs receive provisional writable outputs. Once all
+    // three handles are validated, copy them into a private const snapshot and
+    // use only that snapshot for eye work, cleanup, and the public result.
+    StereoScheduleResources backendResourceOutputs {};
     if (!backend.snapshotAuthoritativeState())
     {
         backend.discardResources(0, 0, 0);
-        return { false, StereoScheduleFailure::Snapshot, resources };
+        return { false, StereoScheduleFailure::Snapshot, {} };
     }
 
-    if (!backend.buildConservativeVisibleSet(resources.visibleSet))
-        return failSchedule(backend, StereoScheduleFailure::ConservativeVisibility, resources);
-    if (!backend.createFreshAccumulator(EngineEye::Left, resources.leftAccumulator))
-        return failSchedule(backend, StereoScheduleFailure::LeftAccumulator, resources);
-    if (!backend.createFreshAccumulator(EngineEye::Right, resources.rightAccumulator))
-        return failSchedule(backend, StereoScheduleFailure::RightAccumulator, resources);
-    if (!resources.valid())
-        return failSchedule(backend, StereoScheduleFailure::InvalidResource, resources);
-    if (resources.leftAccumulator == resources.rightAccumulator)
-        return failSchedule(backend, StereoScheduleFailure::AliasedAccumulators, resources);
+    if (!backend.buildConservativeVisibleSet(backendResourceOutputs.visibleSet))
+        return failSchedule(
+            backend,
+            StereoScheduleFailure::ConservativeVisibility,
+            backendResourceOutputs);
+    if (!backend.createFreshAccumulator(
+            EngineEye::Left,
+            backendResourceOutputs.leftAccumulator))
+    {
+        return failSchedule(
+            backend,
+            StereoScheduleFailure::LeftAccumulator,
+            backendResourceOutputs);
+    }
+    if (!backend.createFreshAccumulator(
+            EngineEye::Right,
+            backendResourceOutputs.rightAccumulator))
+    {
+        return failSchedule(
+            backend,
+            StereoScheduleFailure::RightAccumulator,
+            backendResourceOutputs);
+    }
+    if (!backendResourceOutputs.valid())
+        return failSchedule(
+            backend,
+            StereoScheduleFailure::InvalidResource,
+            backendResourceOutputs);
+    if (backendResourceOutputs.leftAccumulator
+        == backendResourceOutputs.rightAccumulator)
+    {
+        return failSchedule(
+            backend,
+            StereoScheduleFailure::AliasedAccumulators,
+            backendResourceOutputs);
+    }
 
-    StereoScheduleFailure failure = renderScheduledEye(
+    const StereoScheduleResources resources = backendResourceOutputs;
+
+    ScheduledEyeResult eyeResult = renderScheduledEye(
         backend,
         EngineEye::Left,
         resources.leftAccumulator,
         resources.visibleSet);
-    if (failure != StereoScheduleFailure::None)
+    if (eyeResult.failure != StereoScheduleFailure::None)
     {
         return failSchedule(
             backend,
-            failure,
+            eyeResult.failure,
             resources,
-            eyeIsolationRemainsActive(failure),
+            &eyeResult.isolation,
             EngineEye::Left);
     }
 
-    failure = renderScheduledEye(
+    eyeResult = renderScheduledEye(
         backend,
         EngineEye::Right,
         resources.rightAccumulator,
         resources.visibleSet);
-    if (failure != StereoScheduleFailure::None)
+    if (eyeResult.failure != StereoScheduleFailure::None)
     {
         return failSchedule(
             backend,
-            failure,
+            eyeResult.failure,
             resources,
-            eyeIsolationRemainsActive(failure),
+            &eyeResult.isolation,
             EngineEye::Right);
     }
 
@@ -196,7 +287,7 @@ inline StereoScheduleResult executeStereoSchedule(
             resources.visibleSet,
             resources.leftAccumulator,
             resources.rightAccumulator);
-        return { false, StereoScheduleFailure::StateRestore, resources };
+        return { false, StereoScheduleFailure::StateRestore, {} };
     }
     return { true, StereoScheduleFailure::None, resources };
 }

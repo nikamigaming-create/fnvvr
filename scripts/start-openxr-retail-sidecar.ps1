@@ -56,6 +56,9 @@ $ErrorActionPreference = "Stop"
 if ($StageOnly -and $ValidateOnly) {
     throw "-StageOnly and -ValidateOnly are mutually exclusive."
 }
+if ($ValidateOnly -and $StopExisting) {
+    throw "-ValidateOnly is read-only with respect to running processes and cannot be combined with -StopExisting."
+}
 if (-not ($StageOnly -or $ValidateOnly)) {
     throw "All live OpenXR presentation is intentionally blocked. The remaining finite blockers are an authenticated supervisor/completion record, source-correlated asynchronous output proof, isolated color/depth render transactions, conservative stereo visibility, per-eye depth, complete auxiliary-resource twinning, exact VS+PS camera provenance, and a proved retail rig schedule. This launcher can only -StageOnly or -ValidateOnly; it will not launch the game or touch an OpenXR runtime."
 }
@@ -67,6 +70,14 @@ $HostExe = Join-Path $BuildDir "$Configuration\fnvxr_openxr_pose_host.exe"
 $ProbeExe = Join-Path $BuildDir "$Configuration\fnvxr_shared_state_probe.exe"
 $CommandExe = Join-Path $BuildDir "$Configuration\fnvxr_command.exe"
 $InputExe = Join-Path $BuildDir "$Configuration\fnvxr_input.exe"
+$BuildAttestationPath = Join-Path $BuildDir "fnvxr-retail-build-attestation-$Configuration.json"
+$RuntimeArtifactDescriptors = Get-FnvxrRetailRuntimeArtifactDescriptors `
+    -Root $Root `
+    -Configuration $Configuration
+$TestCatalogDescriptors = @(
+    [ordered]@{ key = "x64"; buildDirectory = $BuildDir; configuration = $Configuration },
+    [ordered]@{ key = "x86"; buildDirectory = $BuildWin32Dir; configuration = $Configuration }
+)
 $NvseLoader = Join-Path $GameRoot "nvse_loader.exe"
 $RunRoot = Join-Path $Root "local\openxr-retail-sidecar-runs"
 $Stamp = Get-Date -Format "yyyyMMdd-HHmmss-fff"
@@ -78,6 +89,7 @@ $hostProcess = $null
 $fallout = $null
 $falloutPid = $null
 $watcher = $null
+$BuildAttestationNonce = ""
 
 New-Item -ItemType Directory -Force -Path $RunDir | Out-Null
 
@@ -304,6 +316,14 @@ if ($StopExisting) {
 }
 
 if (-not $NoBuild -and -not $ValidateOnly) {
+    # A failed or interrupted build must not leave an older attestation that a
+    # later no-build stage can reuse as if this transaction had passed.
+    if (Test-Path -LiteralPath $BuildAttestationPath) {
+        Remove-Item -LiteralPath $BuildAttestationPath -Force
+    }
+    $BuildAttestationNonce = [Guid]::NewGuid().ToString("N")
+    $sourceSnapshotBeforeBuild = Get-FnvxrBuildSourceSnapshot -Root $Root
+
     & (Join-Path $PSScriptRoot "build-win32.ps1") -Configuration $Configuration
     if ($LASTEXITCODE -ne 0) {
         throw "Win32 build failed with exit code $LASTEXITCODE"
@@ -313,53 +333,48 @@ if (-not $NoBuild -and -not $ValidateOnly) {
     if ($LASTEXITCODE -ne 0) {
         throw "CMake configure failed with exit code $LASTEXITCODE"
     }
-    cmake --build $BuildDir --config $Configuration --target fnvxr_openxr_pose_host fnvxr_shared_state_probe fnvxr_command
+    cmake --build $BuildDir --config $Configuration --clean-first --parallel
     if ($LASTEXITCODE -ne 0) {
-        throw "OpenXR host/probe build failed with exit code $LASTEXITCODE"
+        throw "Clean x64 build failed with exit code $LASTEXITCODE"
     }
+    ctest --test-dir $BuildDir -C $Configuration --no-tests=error --output-on-failure
+    if ($LASTEXITCODE -ne 0) {
+        throw "x64 CTest failed with exit code $LASTEXITCODE"
+    }
+
+    $TestCatalogSnapshot = Get-FnvxrCtestCatalogSnapshot `
+        -BuildDescriptors $TestCatalogDescriptors
+    $sourceSnapshotAfterBuild = Get-FnvxrBuildSourceSnapshot -Root $Root
+    if ($sourceSnapshotBeforeBuild.count -ne $sourceSnapshotAfterBuild.count -or
+        $sourceSnapshotBeforeBuild.sha256 -cne $sourceSnapshotAfterBuild.sha256) {
+        throw "Build attestation refused because source inputs changed during the build."
+    }
+    $artifactSnapshot = Get-FnvxrArtifactContentSnapshot `
+        -Descriptors $RuntimeArtifactDescriptors
+    Write-FnvxrBuildAttestation `
+        -Path $BuildAttestationPath `
+        -Root $Root `
+        -Configuration $Configuration `
+        -Nonce $BuildAttestationNonce `
+        -SourceSnapshot $sourceSnapshotAfterBuild `
+        -ArtifactSnapshot $artifactSnapshot `
+        -TestCatalogSnapshot $TestCatalogSnapshot
+    Assert-FnvxrBuildAttestation `
+        -Path $BuildAttestationPath `
+        -Root $Root `
+        -Configuration $Configuration `
+        -ArtifactDescriptors $RuntimeArtifactDescriptors `
+        -TestCatalogSnapshot $TestCatalogSnapshot `
+        -ExpectedNonce $BuildAttestationNonce | Out-Null
 } else {
-    $runtimeArtifacts = @(
-        $HostExe,
-        $ProbeExe,
-        $CommandExe,
-        $InputExe,
-        (Join-Path $BuildWin32Dir "$Configuration\nvse_fnvxr.dll"),
-        (Join-Path $BuildWin32Dir "$Configuration\d3d9.dll"),
-        (Join-Path $BuildWin32Dir "$Configuration\dinput8.dll"),
-        (Join-Path $BuildWin32Dir "$Configuration\xinput1_3.dll")
-    )
-    $missingArtifacts = @($runtimeArtifacts | Where-Object { -not (Test-Path -LiteralPath $_) })
-    if ($missingArtifacts.Count -gt 0) {
-        throw "Artifact validation refused because runtime artifacts are missing: $($missingArtifacts -join ', ')"
-    }
-    $sharedBuildSources = @(
-        Get-ChildItem -LiteralPath (Join-Path $Root "protocol") -Recurse -File |
-            Where-Object { $_.Extension -in @(".cpp", ".h", ".hpp", ".def") }
-    )
-    $sharedBuildSources += Get-Item -LiteralPath (Join-Path $Root "CMakeLists.txt")
-    $artifactDependencySets = @(
-        [ordered]@{ artifact=$HostExe; sources=@((Get-Item (Join-Path $Root "host\fnvxr_openxr_pose_host.cpp"))) + $sharedBuildSources },
-        [ordered]@{ artifact=$ProbeExe; sources=@((Get-Item (Join-Path $Root "tools\fnvxr_shared_state_probe.cpp"))) + $sharedBuildSources },
-        [ordered]@{ artifact=$CommandExe; sources=@((Get-Item (Join-Path $Root "tools\fnvxr_command.cpp"))) + $sharedBuildSources },
-        [ordered]@{ artifact=$InputExe; sources=@((Get-Item (Join-Path $Root "tools\fnvxr_input.cpp"))) + $sharedBuildSources },
-        [ordered]@{ artifact=(Join-Path $BuildWin32Dir "$Configuration\nvse_fnvxr.dll"); sources=@(Get-ChildItem -LiteralPath (Join-Path $Root "plugin") -Recurse -File | Where-Object { $_.Extension -in @(".cpp", ".h", ".hpp", ".def") }) + $sharedBuildSources },
-        [ordered]@{ artifact=(Join-Path $BuildWin32Dir "$Configuration\d3d9.dll"); sources=@((Get-Item (Join-Path $Root "renderhook\fnvxr_d3d9_proxy.cpp")),(Get-Item (Join-Path $Root "renderhook\fnvxr_stereo_math.h"))) + $sharedBuildSources },
-        [ordered]@{ artifact=(Join-Path $BuildWin32Dir "$Configuration\dinput8.dll"); sources=@((Get-Item (Join-Path $Root "renderhook\fnvxr_dinput8_proxy.cpp"))) + $sharedBuildSources },
-        [ordered]@{ artifact=(Join-Path $BuildWin32Dir "$Configuration\xinput1_3.dll"); sources=@((Get-Item (Join-Path $Root "renderhook\fnvxr_xinput_proxy.cpp"))) + $sharedBuildSources }
-    )
-    $staleArtifacts = @()
-    foreach ($dependencySet in $artifactDependencySets) {
-        $artifactInfo = Get-Item -LiteralPath $dependencySet.artifact
-        $newestDependency = $dependencySet.sources |
-            Sort-Object LastWriteTimeUtc -Descending |
-            Select-Object -First 1
-        if ($artifactInfo.LastWriteTimeUtc -lt $newestDependency.LastWriteTimeUtc) {
-            $staleArtifacts += ("{0} (newer dependency: {1})" -f $artifactInfo.FullName,$newestDependency.FullName)
-        }
-    }
-    if ($staleArtifacts.Count -gt 0) {
-        throw "Artifact validation refused because target-specific dependencies are newer: $($staleArtifacts -join ', ')"
-    }
+    $TestCatalogSnapshot = Get-FnvxrCtestCatalogSnapshot `
+        -BuildDescriptors $TestCatalogDescriptors
+    Assert-FnvxrBuildAttestation `
+        -Path $BuildAttestationPath `
+        -Root $Root `
+        -Configuration $Configuration `
+        -ArtifactDescriptors $RuntimeArtifactDescriptors `
+        -TestCatalogSnapshot $TestCatalogSnapshot | Out-Null
 }
 
 if (-not (Test-Path -LiteralPath $HostExe)) {
@@ -369,11 +384,16 @@ if (-not (Test-Path -LiteralPath $HostExe)) {
 $OpenXrLoader = if ($ValidateOnly) {
     $loaderSource = Resolve-FnvxrOpenXrLoader -DebugLog $DebugLog
     $loaderDestination = Join-Path (Split-Path -Parent $HostExe) "openxr_loader.dll"
-    if (-not (Test-Path -LiteralPath $loaderDestination)) {
+    $loaderSourceInfo = Get-FnvxrArtifactInfo -Path $loaderSource
+    $loaderDestinationInfo = Get-FnvxrArtifactInfo -Path $loaderDestination
+    if (-not $loaderDestinationInfo.exists) {
         throw "Validate-only artifact check found no staged OpenXR loader: $loaderDestination"
     }
-    if ((Get-FileHash -LiteralPath $loaderSource -Algorithm SHA256).Hash -ne
-        (Get-FileHash -LiteralPath $loaderDestination -Algorithm SHA256).Hash) {
+    if ($loaderSourceInfo.peMachine -ne "0x8664" -or
+        $loaderDestinationInfo.peMachine -ne "0x8664") {
+        throw "Validate-only OpenXR loader is not x64: $loaderDestination"
+    }
+    if ($loaderSourceInfo.sha256 -ne $loaderDestinationInfo.sha256) {
         throw "Validate-only artifact check found a stale OpenXR loader: $loaderDestination"
     }
     $loaderDestination
@@ -385,7 +405,18 @@ $staged = Copy-FnvxrRetailArtifacts `
     -Root $Root `
     -Configuration $Configuration `
     -GameRoot $GameRoot `
-    -Copy (-not $ValidateOnly)
+    -Copy (-not $ValidateOnly) `
+    -BuildBeforeCopy $false
+
+# Close the source/artifact race after staging as well as before it. A source
+# edit or rebuilt binary during this transaction invalidates the whole result.
+Assert-FnvxrBuildAttestation `
+    -Path $BuildAttestationPath `
+    -Root $Root `
+    -Configuration $Configuration `
+    -ArtifactDescriptors $RuntimeArtifactDescriptors `
+    -TestCatalogSnapshot $TestCatalogSnapshot `
+    -ExpectedNonce $BuildAttestationNonce | Out-Null
 
 if ($ValidateOnly) {
     $failed = @($staged | Where-Object { -not $_.optional -and -not $_.verified })

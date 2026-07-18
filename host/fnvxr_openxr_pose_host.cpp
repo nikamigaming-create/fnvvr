@@ -7213,6 +7213,11 @@ struct ComApartment
 // asynchronous output proof, and complete render-transaction prerequisites
 // listed at the fail-closed return in main are implemented and reviewed.
 constexpr bool OpenXrLiveRuntimeProofComplete = false;
+// A separate integration fuse prevents a future one-line OpenXR fuse change
+// from reviving the legacy environment-driven mono gameplay/HUD path. This may
+// become true only when the tested PresentationController and GPU transaction
+// are the sole production composition path.
+constexpr bool ProductPresentationControllerIntegrated = false;
 }
 
 int main(int argc, char** argv)
@@ -7257,6 +7262,15 @@ int main(int argc, char** argv)
                "per-eye depth, complete auxiliary-resource twinning, and exact VS+PS camera "
                "provenance. No OpenXR loader or headset session was touched.\n";
         return 26;
+    }
+
+    if (!ProductPresentationControllerIntegrated)
+    {
+        std::cerr
+            << "Live OpenXR presentation is intentionally disabled: the tested HUD-free "
+               "WorldStereo/UiQuad product controller is not integrated into the host. "
+               "No OpenXR loader or headset session was touched.\n";
+        return 27;
     }
 
     OpenXr xr {};

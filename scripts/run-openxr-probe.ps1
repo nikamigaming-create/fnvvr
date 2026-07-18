@@ -4,6 +4,11 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+$OpenXrDiagnosticRuntimeProofComplete = $false
+if (-not $OpenXrDiagnosticRuntimeProofComplete) {
+    throw "OpenXR diagnostic is intentionally blocked before configure, build, or OpenXR runtime touch: its reviewed source proof is incomplete."
+}
+
 $Root = Split-Path -Parent $PSScriptRoot
 $BuildDir = Join-Path $Root "build"
 

@@ -195,19 +195,32 @@ function Copy-FnvxrOpenXrLoader {
 
     $source = Resolve-FnvxrOpenXrLoader -DebugLog $DebugLog
     $destination = Join-Path (Split-Path -Parent $HostExe) "openxr_loader.dll"
-    $copy = $true
-    if (Test-Path -LiteralPath $destination) {
-        $sourceHash = (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash
-        $destinationHash = (Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash
-        $copy = ($sourceHash -ne $destinationHash)
+    $sourceInfo = Get-FnvxrArtifactInfo -Path $source
+    if (-not $sourceInfo.exists -or $sourceInfo.peMachine -ne "0x8664") {
+        throw "OpenXR loader is not an x64 PE image: $source"
     }
+
+    $destinationInfo = Get-FnvxrArtifactInfo -Path $destination
+    $copy = -not ($destinationInfo.exists -and
+        $sourceInfo.sha256 -eq $destinationInfo.sha256 -and
+        $destinationInfo.peMachine -eq "0x8664")
 
     if ($copy) {
         Copy-Item -LiteralPath $source -Destination $destination -Force
     }
 
+    # A successful Copy-Item is not proof that the bytes now mapped by the
+    # host path are the bytes we authenticated above. Re-open the destination
+    # after either branch and require the complete source identity.
+    $destinationInfo = Get-FnvxrArtifactInfo -Path $destination
+    if (-not $destinationInfo.exists -or
+        $destinationInfo.sha256 -ne $sourceInfo.sha256 -or
+        $destinationInfo.peMachine -ne "0x8664") {
+        throw "Staged OpenXR loader identity mismatch: $source -> $destination"
+    }
+
     if ($DebugLog) {
-        Write-FnvxrCheckpoint -Path $DebugLog -Message ("openxr_loader staged source='{0}' destination='{1}' copied={2}" -f $source, $destination, $copy)
+        Write-FnvxrCheckpoint -Path $DebugLog -Message ("openxr_loader staged source='{0}' destination='{1}' copied={2} sha256={3} machine={4}" -f $source, $destination, $copy, $destinationInfo.sha256, $destinationInfo.peMachine)
     }
     return $destination
 }
@@ -537,13 +550,28 @@ function Get-FnvxrArtifactInfo {
         peMachine = $null
     }
     if ($exists) {
-        $item = Get-Item -LiteralPath $Path
-        $info.length = $item.Length
-        $info.sha256 = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
-        if ($item.Extension -in @(".dll", ".exe")) {
+        $fullPath = [System.IO.Path]::GetFullPath($Path)
+        try {
+            # One non-writable, non-delete-share handle binds length, hash, and
+            # PE machine to the same file object. Separate path opens would
+            # allow a replacement between identity fields.
+            $stream = [System.IO.File]::Open(
+                $fullPath,
+                [System.IO.FileMode]::Open,
+                [System.IO.FileAccess]::Read,
+                [System.IO.FileShare]::Read)
             try {
-                $stream = [System.IO.File]::Open($Path, 'Open', 'Read', 'ReadWrite')
+                $info.length = $stream.Length
+                $hasher = [System.Security.Cryptography.SHA256]::Create()
                 try {
+                    $digest = $hasher.ComputeHash($stream)
+                } finally {
+                    $hasher.Dispose()
+                }
+                $info.sha256 = ([System.BitConverter]::ToString($digest)).Replace("-", "").ToLowerInvariant()
+
+                if ([System.IO.Path]::GetExtension($fullPath).ToLowerInvariant() -in @(".dll", ".exe")) {
+                    $stream.Position = 0
                     $reader = [System.IO.BinaryReader]::new($stream)
                     if ($reader.ReadUInt16() -ne 0x5A4D) { throw "missing MZ signature" }
                     $stream.Position = 0x3C
@@ -552,15 +580,392 @@ function Get-FnvxrArtifactInfo {
                     $stream.Position = $peOffset
                     if ($reader.ReadUInt32() -ne 0x00004550) { throw "missing PE signature" }
                     $info.peMachine = ('0x{0:X4}' -f $reader.ReadUInt16())
-                } finally {
-                    $stream.Dispose()
                 }
-            } catch {
-                throw "Unable to verify PE architecture for $Path`: $($_.Exception.Message)"
+            } finally {
+                $stream.Dispose()
             }
+        } catch {
+            throw "Unable to capture artifact identity for $Path`: $($_.Exception.Message)"
         }
     }
     return $info
+}
+
+function Get-FnvxrLockedFileIdentity {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $fullPath = [System.IO.Path]::GetFullPath($Path)
+    $stream = [System.IO.File]::Open(
+        $fullPath,
+        [System.IO.FileMode]::Open,
+        [System.IO.FileAccess]::Read,
+        [System.IO.FileShare]::Read)
+    try {
+        $length = $stream.Length
+        $hasher = [System.Security.Cryptography.SHA256]::Create()
+        try {
+            $digest = $hasher.ComputeHash($stream)
+        } finally {
+            $hasher.Dispose()
+        }
+    } finally {
+        $stream.Dispose()
+    }
+
+    return [ordered]@{
+        path = $fullPath
+        length = $length
+        sha256 = ([System.BitConverter]::ToString($digest)).Replace("-", "").ToLowerInvariant()
+    }
+}
+
+function Get-FnvxrRecordDigest {
+    param([Parameter(Mandatory = $true)][object[]]$Records)
+
+    $lines = foreach ($record in $Records) {
+        $keyBytes = [System.Text.Encoding]::UTF8.GetBytes([string]$record.key)
+        $encodedKey = [System.Convert]::ToBase64String($keyBytes)
+        "{0}|{1}|{2}" -f $encodedKey, [uint64]$record.length, ([string]$record.sha256).ToLowerInvariant()
+    }
+    $payload = [System.Text.Encoding]::UTF8.GetBytes(($lines -join "`n"))
+    $hasher = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $digest = $hasher.ComputeHash($payload)
+    } finally {
+        $hasher.Dispose()
+    }
+    return ([System.BitConverter]::ToString($digest)).Replace("-", "").ToLowerInvariant()
+}
+
+function Get-FnvxrStringSha256 {
+    param([Parameter(Mandatory = $true)][string]$Value)
+
+    $payload = [System.Text.Encoding]::UTF8.GetBytes($Value)
+    $hasher = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $digest = $hasher.ComputeHash($payload)
+    } finally {
+        $hasher.Dispose()
+    }
+    return ([System.BitConverter]::ToString($digest)).Replace("-", "").ToLowerInvariant()
+}
+
+function Get-FnvxrCtestCatalogSnapshot {
+    param([Parameter(Mandatory = $true)][object[]]$BuildDescriptors)
+
+    $records = @()
+    foreach ($descriptor in ($BuildDescriptors | Sort-Object key)) {
+        $buildDirectory = [string]$descriptor.buildDirectory
+        $configuration = [string]$descriptor.configuration
+        if (-not (Test-Path -LiteralPath $buildDirectory -PathType Container)) {
+            throw "CTest catalog build directory is missing: $buildDirectory"
+        }
+        $catalogText = (& ctest `
+            --test-dir $buildDirectory `
+            -C $configuration `
+            --show-only=json-v1 2>&1 | Out-String)
+        if ($LASTEXITCODE -ne 0) {
+            throw "CTest catalog query failed for $buildDirectory with exit code $LASTEXITCODE`: $catalogText"
+        }
+        try {
+            $catalog = $catalogText | ConvertFrom-Json
+        } catch {
+            throw "CTest catalog is unreadable for $buildDirectory`: $($_.Exception.Message)"
+        }
+        $tests = @($catalog.tests)
+        if ($tests.Count -eq 0) {
+            throw "CTest catalog is empty for $buildDirectory"
+        }
+        foreach ($test in ($tests | Sort-Object name)) {
+            $name = [string]$test.name
+            if ([string]::IsNullOrWhiteSpace($name)) {
+                throw "CTest catalog contains an unnamed test in $buildDirectory"
+            }
+            $key = (([string]$descriptor.key) + "/" + $name).ToLowerInvariant()
+            $records += [ordered]@{
+                key = $key
+                length = 0
+                sha256 = Get-FnvxrStringSha256 -Value $key
+            }
+        }
+    }
+
+    $records = @($records | Sort-Object key)
+
+    return [ordered]@{
+        count = $records.Count
+        sha256 = Get-FnvxrRecordDigest -Records $records
+        records = $records
+    }
+}
+
+function Get-FnvxrBuildSourceSnapshot {
+    param(
+        [Parameter(Mandatory = $true)][string]$Root,
+        [string[]]$SourceDirectories = @(
+            "host",
+            "plugin",
+            "protocol",
+            "renderhook",
+            "runtime",
+            "scripts",
+            "tests",
+            "tools")
+    )
+
+    $resolvedRoot = (Resolve-Path -LiteralPath $Root).Path.TrimEnd('\', '/')
+    $rootPrefix = $resolvedRoot + [System.IO.Path]::DirectorySeparatorChar
+    $filesByPath = @{}
+
+    $rootCmake = Join-Path $resolvedRoot "CMakeLists.txt"
+    if (-not (Test-Path -LiteralPath $rootCmake -PathType Leaf)) {
+        throw "Build attestation source is missing: $rootCmake"
+    }
+    $filesByPath[[System.IO.Path]::GetFullPath($rootCmake).ToLowerInvariant()] =
+        Get-Item -LiteralPath $rootCmake
+
+    foreach ($relativeDirectory in $SourceDirectories) {
+        $directory = Join-Path $resolvedRoot $relativeDirectory
+        if (-not (Test-Path -LiteralPath $directory -PathType Container)) {
+            throw "Build attestation source directory is missing: $directory"
+        }
+        $directoryItem = Get-Item -LiteralPath $directory
+        if (($directoryItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "Build attestation refuses a reparse-point source directory: $directory"
+        }
+        foreach ($nestedDirectory in (Get-ChildItem -LiteralPath $directory -Directory -Recurse)) {
+            if (($nestedDirectory.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "Build attestation refuses a reparse-point source directory: $($nestedDirectory.FullName)"
+            }
+        }
+        foreach ($file in (Get-ChildItem -LiteralPath $directory -File -Recurse)) {
+            if (($file.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "Build attestation refuses a reparse-point source file: $($file.FullName)"
+            }
+            $fullPath = [System.IO.Path]::GetFullPath($file.FullName)
+            if (-not $fullPath.StartsWith(
+                    $rootPrefix,
+                    [System.StringComparison]::OrdinalIgnoreCase)) {
+                throw "Build attestation source escaped the repository root: $fullPath"
+            }
+            $filesByPath[$fullPath.ToLowerInvariant()] = $file
+        }
+    }
+
+    # Mirror the OpenXR include glob in CMakeLists.txt. These vendored headers
+    # are compiler inputs even though they live outside the first-party source
+    # directories above.
+    $openXrSourceRoot = Join-Path $resolvedRoot "deps\sources"
+    if (Test-Path -LiteralPath $openXrSourceRoot -PathType Container) {
+        $openXrIncludeDirectories = @(
+            Get-ChildItem -LiteralPath $openXrSourceRoot -Directory |
+                Where-Object { $_.Name -like "OpenXR-SDK-release-1.1.*" } |
+                ForEach-Object {
+                    Get-ChildItem -LiteralPath $_.FullName -Directory |
+                        ForEach-Object {
+                            $candidate = Join-Path $_.FullName "include"
+                            if (Test-Path -LiteralPath $candidate -PathType Container) {
+                                Get-Item -LiteralPath $candidate
+                            }
+                        }
+                })
+        foreach ($includeDirectory in $openXrIncludeDirectories) {
+            if (($includeDirectory.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "Build attestation refuses a reparse-point OpenXR include directory: $($includeDirectory.FullName)"
+            }
+            foreach ($file in (Get-ChildItem -LiteralPath $includeDirectory.FullName -File -Recurse)) {
+                if (($file.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                    throw "Build attestation refuses a reparse-point OpenXR source file: $($file.FullName)"
+                }
+                $fullPath = [System.IO.Path]::GetFullPath($file.FullName)
+                if (-not $fullPath.StartsWith(
+                        $rootPrefix,
+                        [System.StringComparison]::OrdinalIgnoreCase)) {
+                    throw "Build attestation OpenXR source escaped the repository root: $fullPath"
+                }
+                $filesByPath[$fullPath.ToLowerInvariant()] = $file
+            }
+        }
+    }
+
+    $records = @()
+    foreach ($file in ($filesByPath.Values | Sort-Object FullName)) {
+        $identity = Get-FnvxrLockedFileIdentity -Path $file.FullName
+        if (-not $identity.path.StartsWith(
+                $rootPrefix,
+                [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "Build attestation source escaped the repository root: $($identity.path)"
+        }
+        $relativePath = $identity.path.Substring($rootPrefix.Length).Replace('\', '/').ToLowerInvariant()
+        $records += [ordered]@{
+            key = $relativePath
+            length = $identity.length
+            sha256 = $identity.sha256
+        }
+    }
+    if ($records.Count -eq 0) {
+        throw "Build attestation captured no source inputs."
+    }
+    $records = @($records | Sort-Object key)
+
+    return [ordered]@{
+        count = $records.Count
+        sha256 = Get-FnvxrRecordDigest -Records $records
+        records = $records
+    }
+}
+
+function Get-FnvxrRetailRuntimeArtifactDescriptors {
+    param(
+        [Parameter(Mandatory = $true)][string]$Root,
+        [Parameter(Mandatory = $true)][string]$Configuration
+    )
+
+    $buildX64 = Join-Path $Root "build\$Configuration"
+    $buildWin32 = Join-Path $Root "build-win32\$Configuration"
+    return @(
+        [ordered]@{ key = "x64/fnvxr_openxr_pose_host.exe"; path = Join-Path $buildX64 "fnvxr_openxr_pose_host.exe"; machine = "0x8664" },
+        [ordered]@{ key = "x64/fnvxr_shared_state_probe.exe"; path = Join-Path $buildX64 "fnvxr_shared_state_probe.exe"; machine = "0x8664" },
+        [ordered]@{ key = "x64/fnvxr_command.exe"; path = Join-Path $buildX64 "fnvxr_command.exe"; machine = "0x8664" },
+        [ordered]@{ key = "x64/fnvxr_input.exe"; path = Join-Path $buildX64 "fnvxr_input.exe"; machine = "0x8664" },
+        [ordered]@{ key = "x86/nvse_fnvxr.dll"; path = Join-Path $buildWin32 "nvse_fnvxr.dll"; machine = "0x014C" },
+        [ordered]@{ key = "x86/d3d9.dll"; path = Join-Path $buildWin32 "d3d9.dll"; machine = "0x014C" },
+        [ordered]@{ key = "x86/dinput8.dll"; path = Join-Path $buildWin32 "dinput8.dll"; machine = "0x014C" },
+        [ordered]@{ key = "x86/xinput1_3.dll"; path = Join-Path $buildWin32 "xinput1_3.dll"; machine = "0x014C" },
+        [ordered]@{ key = "build/x64-cmake-cache"; path = Join-Path $Root "build\CMakeCache.txt"; machine = "" },
+        [ordered]@{ key = "build/x86-cmake-cache"; path = Join-Path $Root "build-win32\CMakeCache.txt"; machine = "" }
+    )
+}
+
+function Get-FnvxrArtifactContentSnapshot {
+    param([Parameter(Mandatory = $true)][object[]]$Descriptors)
+
+    $records = @()
+    foreach ($descriptor in ($Descriptors | Sort-Object key)) {
+        $info = Get-FnvxrArtifactInfo -Path ([string]$descriptor.path)
+        if (-not $info.exists) {
+            throw "Build attestation artifact is missing: $($descriptor.path)"
+        }
+        $expectedMachine = [string]$descriptor.machine
+        if ($expectedMachine -and $info.peMachine -ne $expectedMachine) {
+            throw "Build attestation artifact has wrong PE architecture: $($descriptor.path) expected=$expectedMachine actual=$($info.peMachine)"
+        }
+        $records += [ordered]@{
+            key = ([string]$descriptor.key).ToLowerInvariant()
+            path = [System.IO.Path]::GetFullPath([string]$descriptor.path)
+            length = [uint64]$info.length
+            sha256 = ([string]$info.sha256).ToLowerInvariant()
+            peMachine = $info.peMachine
+        }
+    }
+    if ($records.Count -eq 0) {
+        throw "Build attestation captured no runtime artifacts."
+    }
+    $records = @($records | Sort-Object key)
+
+    return [ordered]@{
+        count = $records.Count
+        sha256 = Get-FnvxrRecordDigest -Records $records
+        records = $records
+    }
+}
+
+function Write-FnvxrBuildAttestation {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Root,
+        [Parameter(Mandatory = $true)][string]$Configuration,
+        [Parameter(Mandatory = $true)][string]$Nonce,
+        [Parameter(Mandatory = $true)]$SourceSnapshot,
+        [Parameter(Mandatory = $true)]$ArtifactSnapshot,
+        [Parameter(Mandatory = $true)]$TestCatalogSnapshot
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Nonce)) {
+        throw "Build attestation nonce is required."
+    }
+
+    $attestation = [ordered]@{
+        schema = 1
+        nonce = $Nonce
+        repositoryRoot = (Resolve-Path -LiteralPath $Root).Path
+        configuration = $Configuration
+        createdAtUtc = [DateTime]::UtcNow.ToString("o")
+        source = $SourceSnapshot
+        artifacts = $ArtifactSnapshot
+        tests = [ordered]@{
+            passed = $true
+            count = $TestCatalogSnapshot.count
+            sha256 = $TestCatalogSnapshot.sha256
+            records = $TestCatalogSnapshot.records
+        }
+        successfulBuildRequired = $true
+    }
+    Write-FnvxrJsonAtomic -Value $attestation -Path $Path -Depth 10
+}
+
+function Assert-FnvxrBuildAttestation {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Root,
+        [Parameter(Mandatory = $true)][string]$Configuration,
+        [Parameter(Mandatory = $true)][object[]]$ArtifactDescriptors,
+        [Parameter(Mandatory = $true)]$TestCatalogSnapshot,
+        [string]$ExpectedNonce = "",
+        [string[]]$SourceDirectories = @(
+            "host",
+            "plugin",
+            "protocol",
+            "renderhook",
+            "runtime",
+            "scripts",
+            "tests",
+            "tools")
+    )
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "Build attestation is missing: $Path"
+    }
+    try {
+        $attestation = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
+    } catch {
+        throw "Build attestation is unreadable: $Path`: $($_.Exception.Message)"
+    }
+    $resolvedRoot = (Resolve-Path -LiteralPath $Root).Path
+    if ($attestation.schema -ne 1 -or
+        -not $attestation.successfulBuildRequired -or
+        -not [string]::Equals(
+            [string]$attestation.repositoryRoot,
+            $resolvedRoot,
+            [System.StringComparison]::OrdinalIgnoreCase) -or
+        [string]$attestation.configuration -cne $Configuration) {
+        throw "Build attestation context mismatch: $Path"
+    }
+    if ($ExpectedNonce -and
+        [string]$attestation.nonce -cne $ExpectedNonce) {
+        throw "Build attestation nonce mismatch: $Path"
+    }
+    if (-not $attestation.tests.passed -or
+        [uint64]$attestation.tests.count -ne [uint64]$TestCatalogSnapshot.count -or
+        [string]$attestation.tests.sha256 -cne [string]$TestCatalogSnapshot.sha256) {
+        throw "Build attestation test catalog mismatch: $Path"
+    }
+
+    $sourceSnapshot = Get-FnvxrBuildSourceSnapshot `
+        -Root $Root `
+        -SourceDirectories $SourceDirectories
+    if ([uint64]$attestation.source.count -ne [uint64]$sourceSnapshot.count -or
+        [string]$attestation.source.sha256 -cne [string]$sourceSnapshot.sha256) {
+        throw "Build attestation source digest mismatch: $Path"
+    }
+
+    $artifactSnapshot = Get-FnvxrArtifactContentSnapshot `
+        -Descriptors $ArtifactDescriptors
+    if ([uint64]$attestation.artifacts.count -ne [uint64]$artifactSnapshot.count -or
+        [string]$attestation.artifacts.sha256 -cne [string]$artifactSnapshot.sha256) {
+        throw "Build attestation artifact digest mismatch: $Path"
+    }
+    return $attestation
 }
 
 function Copy-FnvxrStageArtifact {
@@ -624,8 +1029,19 @@ function Copy-FnvxrRetailArtifacts {
         [string]$Root,
         [string]$Configuration,
         [string]$GameRoot,
-        [bool]$Copy
+        [bool]$Copy,
+        [bool]$BuildBeforeCopy = $true
     )
+
+    if ($Copy -and $BuildBeforeCopy) {
+        # Deployment authority comes only from a build that has just completed
+        # the full Win32 CTest suite against this source tree. Never trust a
+        # pre-existing configuration directory merely because the DLL exists.
+        & (Join-Path $Root "scripts\build-win32.ps1") -Configuration $Configuration | Out-Host
+        if ($LASTEXITCODE -ne 0) {
+            throw "Refusing retail artifact copy: audited Win32 build/test failed with exit code $LASTEXITCODE"
+        }
+    }
 
     $buildWin32 = Join-Path $Root "build-win32\$Configuration"
     $pluginDir = Join-Path $GameRoot "Data\NVSE\Plugins"
@@ -980,6 +1396,8 @@ function Set-FnvxrSidecarEnvironment {
 }
 
 function Set-FnvxrStereoWorldRuntimeEnvironment {
+    throw "Legacy D3D replay/full-frame stereo environment is retired. Production WorldStereo requires the integrated engine transaction, GPU color/depth transport, product presentation controller, and weapon proof."
+
     $env:FNVXR_DISABLE_STEREO_WORLD = "0"
     # The host consumes this only for the first OpenXR focus regain. Later
     # overlay/Alt-Tab focus bounces keep the menu surface fixed; the explicit

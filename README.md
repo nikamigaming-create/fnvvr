@@ -41,7 +41,9 @@ The presentation contract has two modes:
   Pip-Boy, and other blocking retail UI use the stable mono quad. The
   controller ray drives the ordinary retail mouse pointer and click path.
 - Leaving UI holds the last valid quad until one fresh, complete, pose-matched
-  stereo transaction is ready, then changes to world stereo atomically.
+  stereo transaction from a strictly newer retail source frame is ready, then
+  changes to world stereo atomically. Stale stereo remains rejected even after
+  the bounded quad hold expires to a safety blank.
 
 ## Current Status
 
@@ -49,6 +51,9 @@ The retained per-D3D-draw replay and CPU readback/ring work is diagnostic only;
 it is a production NO-GO. **Every live OpenXR presentation path and every
 retail mutation path is currently source-blocked.** The installed plugin is
 inert by default, and config or environment variables cannot bypass the fuse.
+The legacy stereo environment setup now throws before writing activation
+variables, and separate host/D3D integration fuses prevent a one-line proof
+flip from reviving mono gameplay fallback or the persistent-HUD path.
 
 Read-only inspection of the loaded retail `1.4.0.525` executable has verified
 the world-render boundary, explicit visible-array culling, and separate
@@ -99,11 +104,9 @@ Build the FNV-compatible 32-bit plugin and retail proxy DLLs:
 .\scripts\build-win32.ps1
 ```
 
-Verify the local OpenXR loader/runtime:
-
-```powershell
-.\scripts\run-openxr-probe.ps1
-```
+OpenXR diagnostic (blocked): `scripts/run-openxr-probe.ps1` intentionally
+refuses before configure, build, loader, or runtime access until its reviewed
+runtime-touch proof and compiled source fuse are complete.
 
 Stage the xNVSE plugin without modifying the live game install:
 

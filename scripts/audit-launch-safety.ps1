@@ -87,6 +87,26 @@ function Require-TextBefore {
     }
 }
 
+function Require-TextOnBothSides {
+    param(
+        [string]$Path,
+        [string]$GuardText,
+        [string]$MiddleText,
+        [string]$Reason
+    )
+
+    $content = Get-Content -LiteralPath $Path -Raw
+    $middleOffset = $content.IndexOf($MiddleText, [StringComparison]::Ordinal)
+    $firstGuardOffset = $content.IndexOf($GuardText, [StringComparison]::Ordinal)
+    $lastGuardOffset = $content.LastIndexOf($GuardText, [StringComparison]::Ordinal)
+    if ($middleOffset -lt 0 -or
+        $firstGuardOffset -lt 0 -or
+        $firstGuardOffset -ge $middleOffset -or
+        $lastGuardOffset -le $middleOffset) {
+        throw "Required guard ordering missing in $Path`: $Reason"
+    }
+}
+
 function Require-EarlyThrowAst {
     param(
         [string]$Path,
@@ -148,6 +168,8 @@ $retailScript = Join-Path $scriptRoot "start-retail-surface-producer.ps1"
 $legacyScript = Join-Path $scriptRoot "start-rock-solid.ps1"
 $pcvrScript = Join-Path $scriptRoot "start-retail-pcvr-max.ps1"
 $commonScript = Join-Path $scriptRoot "fnvxr-sidecar-common.ps1"
+$stagePluginScript = Join-Path $scriptRoot "stage-plugin.ps1"
+$buildWin32Script = Join-Path $scriptRoot "build-win32.ps1"
 $watchExitScript = Join-Path $scriptRoot "watch-retail-exit.ps1"
 $directHostScript = Join-Path $scriptRoot "run-openxr-pose-host.ps1"
 $legacyHostWatchScript = Join-Path $scriptRoot "watch-host.ps1"
@@ -160,9 +182,11 @@ $protocolCode = Join-Path $Root "protocol\fnvxr_protocol.h"
 $sharedStateCode = Join-Path $Root "protocol\fnvxr_shared_state.h"
 $hostCode = Join-Path $Root "host\fnvxr_openxr_pose_host.cpp"
 $pluginCode = Join-Path $Root "plugin\fnvxr_nvse_plugin.cpp"
+$inputProxySafety = Join-Path $Root "renderhook\fnvxr_input_proxy_safety.h"
 $dinputCode = Join-Path $Root "renderhook\fnvxr_dinput8_proxy.cpp"
 $xinputCode = Join-Path $Root "renderhook\fnvxr_xinput_proxy.cpp"
 $d3d9Code = Join-Path $Root "renderhook\fnvxr_d3d9_proxy.cpp"
+$d3d9ActivationCode = Join-Path $Root "renderhook\fnvxr_d3d9_activation.h"
 $verifyScript = Join-Path $scriptRoot "verify-fnvxr-proof.ps1"
 $verifiedContractScript = Join-Path $scriptRoot "get-verified-shader-wvp-contracts.ps1"
 $oldSmokeScript = Join-Path $scriptRoot (("run-" + "loop" + "back-" + "smoke.ps1"))
@@ -170,7 +194,7 @@ $oldTransportDir = Join-Path $Root ("trans" + "port")
 $stereoWorldSwitchParam = '[switch]$Enable' + 'StereoWorld'
 $stereoWorldRetailArg = '$retailArgs += "-Enable' + 'StereoWorld"'
 
-foreach ($path in @($openxrScript, $retailScript, $legacyScript, $pcvrScript, $commonScript, $watchExitScript, $directHostScript, $legacyHostWatchScript, $cacheOnlyScript, $buildSceneCacheScript, $liveAnalyzerScript, $verifyScript, $verifiedContractScript, $readme, $cmake, $protocolCode, $sharedStateCode, $hostCode, $pluginCode, $dinputCode, $xinputCode, $d3d9Code)) {
+foreach ($path in @($openxrScript, $retailScript, $legacyScript, $pcvrScript, $commonScript, $stagePluginScript, $buildWin32Script, $watchExitScript, $directHostScript, $legacyHostWatchScript, $cacheOnlyScript, $buildSceneCacheScript, $liveAnalyzerScript, $verifyScript, $verifiedContractScript, $readme, $cmake, $protocolCode, $sharedStateCode, $hostCode, $pluginCode, $inputProxySafety, $dinputCode, $xinputCode, $d3d9Code, $d3d9ActivationCode)) {
     if (-not (Test-Path -LiteralPath $path)) {
         throw "Missing required sidecar path: $path"
     }
@@ -192,6 +216,9 @@ Require-EarlyThrowAst -Path $directHostScript -MessageFragment 'Direct OpenXR ho
 Require-EarlyThrowAst -Path $legacyHostWatchScript -MessageFragment 'Legacy host restart loops are intentionally blocked:' -BeforePattern 'Start-Process|fnvxr_openxr_pose_host'
 Require-EarlyThrowAst -Path $cacheOnlyScript -MessageFragment 'Cache-only OpenXR launch is intentionally blocked:' -BeforePattern 'Start-Process|fnvxr_openxr_pose_host'
 Require-EarlyThrowAst -Path $buildSceneCacheScript -MessageFragment 'Legacy live scene-cache capture is intentionally blocked:' -BeforePattern 'Start-Process|start-openxr-retail-sidecar'
+Require-EarlyThrowAst -Path $retailScript -MessageFragment 'Legacy flat retail surface producer is retired.' -BeforePattern 'Copy-FnvxrRetailArtifacts|Start-Process|New-Item'
+Require-EarlyThrowAst -Path $stagePluginScript -MessageFragment 'Direct plugin-only game installation is retired.' -BeforePattern 'Copy-Item' -ConditionPattern '\$InstallToGame'
+Require-EarlyThrowAst -Path $openxrScript -MessageFragment '-ValidateOnly is read-only with respect to running processes' -BeforePattern 'Stop-FnvxrLaunchProcess|New-Item' -ConditionPattern '\$ValidateOnly\s+-and\s+\$StopExisting'
 Require-Text -Path $openxrScript -Text 'Live OpenXR host-only and watcher-free modes are intentionally blocked.' -Reason "Every live host launch must retain the external progress watchdog"
 Require-Text -Path $openxrScript -Text 'Infinite OpenXR host runs are intentionally blocked' -Reason "No launcher path may start an unauthenticated infinite host"
 Require-Text -Path $directHostScript -Text 'Direct OpenXR host launch is intentionally blocked:' -Reason "A direct foreground host must not bypass bounded sidecar cleanup"
@@ -203,6 +230,15 @@ Require-Text -Path $liveAnalyzerScript -Text '$badGameplaySubmitsAfterHandoff = 
 Require-Text -Path $liveAnalyzerScript -Text 'flat_surface_live_pixels_and_submit' -Reason "2D acceptance must prove advancing nonblack pixels and successful OpenXR submissions"
 Require-Text -Path $openxrScript -Text 'Resolve-FnvxrGameRoot -GameRoot $GameRoot -DebugLog $DebugLog' -Reason "OpenXR launcher must auto-resolve the retail sandbox root before staging or launch"
 Require-Text -Path $openxrScript -Text 'Copy-FnvxrOpenXrLoader -HostExe $HostExe -DebugLog $DebugLog' -Reason "OpenXR launcher must stage openxr_loader.dll beside the host instead of relying on PATH"
+Require-Text -Path $openxrScript -Text 'Validate-only OpenXR loader is not x64' -Reason "Validate-only must reject a wrong-architecture OpenXR loader"
+Require-Text -Path $openxrScript -Text 'Write-FnvxrBuildAttestation' -Reason "A successful guarded build must emit a content attestation"
+Require-Text -Path $openxrScript -Text 'cmake --build $BuildDir --config $Configuration --clean-first --parallel' -Reason "The guarded x64 build must rebuild every validated target from clean objects"
+Require-Text -Path $openxrScript -Text 'ctest --test-dir $BuildDir -C $Configuration --no-tests=error --output-on-failure' -Reason "The guarded x64 build must pass the complete registered test catalog"
+Forbid-Text -Path $openxrScript -Text '--target fnvxr_openxr_pose_host' -Reason "A selective x64 build can leave a validated runtime tool stale"
+Forbid-Text -Path $openxrScript -Text 'LastWriteTimeUtc -lt' -Reason "Artifact freshness must not rely on filesystem timestamps"
+Require-TextBefore -Path $openxrScript -RequiredText 'Remove-Item -LiteralPath $BuildAttestationPath -Force' -BeforeText '& (Join-Path $PSScriptRoot "build-win32.ps1")' -Reason "A failed build must not leave reusable prior authority"
+Require-TextBefore -Path $openxrScript -RequiredText 'Write-FnvxrBuildAttestation' -BeforeText '$staged = Copy-FnvxrRetailArtifacts' -Reason "No game-tree copy may precede build attestation publication"
+Require-TextOnBothSides -Path $openxrScript -GuardText '-ExpectedNonce $BuildAttestationNonce | Out-Null' -MiddleText '$staged = Copy-FnvxrRetailArtifacts' -Reason "The exact build nonce must be verified before and after game-tree staging"
 Require-Text -Path $openxrScript -Text 'OpenXR host exited before creating its session/bridge' -Reason "OpenXR launcher must distinguish instant host exit from headset-idle pose readiness"
 Require-Text -Path $openxrScript -Text 'Pattern "fnvxrHostBridgeReady xrSessionCreated=1 sharedMappingsReady=1"' -Reason "OpenXR session and cross-bitness bridge must be ready before retail launch"
 Require-Text -Path $openxrScript -Text 'retail remains live with neutral VR input' -Reason "An idle headset must not prevent or poison the retail sidecar launch"
@@ -210,6 +246,13 @@ Require-Text -Path $hostCode -Text 'fnvxrHostBridgeReady xrSessionCreated=1 shar
 Require-Text -Path $hostCode -Text 'MaximumUnsupervisedFrames = 7200' -Reason "Direct host invocation must have a hard finite upper bound"
 Require-TextBefore -Path $hostCode -RequiredText 'constexpr bool OpenXrLiveRuntimeProofComplete = false;' -BeforeText 'OpenXr xr {};' -Reason "The compiled host fuse must be declared false before any OpenXR object is initialized"
 Require-TextBefore -Path $hostCode -RequiredText 'if (!OpenXrLiveRuntimeProofComplete)' -BeforeText 'OpenXr xr {};' -Reason "The host must branch on its source fuse before loading OpenXR"
+Require-TextBefore -Path $hostCode -RequiredText 'constexpr bool ProductPresentationControllerIntegrated = false;' -BeforeText 'OpenXr xr {};' -Reason "A separate product-controller integration fuse must block revival of legacy mono gameplay"
+Require-TextBefore -Path $hostCode -RequiredText 'if (!ProductPresentationControllerIntegrated)' -BeforeText 'OpenXr xr {};' -Reason "The host must enforce the product-controller integration fuse before loading OpenXR"
+Require-TextBefore -Path $commonScript -RequiredText 'throw "Legacy D3D replay/full-frame stereo environment is retired.' -BeforeText '$env:FNVXR_DISABLE_STEREO_WORLD = "0"' -Reason "Legacy stereo environment configuration must fail before any activation variable is written"
+Require-TextBefore -Path $commonScript -RequiredText '& (Join-Path $Root "scripts\build-win32.ps1") -Configuration $Configuration' -BeforeText '$stageMap = @(' -Reason "Every retail artifact copy must follow a fresh complete Win32 build/test"
+Require-TextBefore -Path $stagePluginScript -RequiredText '& (Join-Path $PSScriptRoot "build-win32.ps1") -Configuration $Configuration' -BeforeText 'Copy-Item -LiteralPath $PluginDll' -Reason "Plugin staging/install must never trust a pre-existing DLL"
+Require-Text -Path $buildWin32Script -Text 'cmake --build $BuildDir --config $Configuration --clean-first --parallel' -Reason "Win32 staging authority must come from a clean complete build"
+Require-Text -Path $buildWin32Script -Text 'ctest --test-dir $BuildDir -C $Configuration --no-tests=error --output-on-failure' -Reason "An empty or failing Win32 test catalog must block staging"
 Require-Text -Path $hostCode -Text 'Infinite and malformed runs fail closed.' -Reason "Malformed frame text must never parse as an infinite run"
 Require-Text -Path $openxrScript -Text 'Retail sidecar was not launched' -Reason "OpenXR launcher must fail closed before retail"
 Require-Text -Path $openxrScript -Text '$fallout = Start-Process' -Reason "OpenXR launcher must explicitly launch retail after readiness gates"
@@ -224,6 +267,11 @@ Require-Text -Path $commonScript -Text 'Resolve-FnvxrGameRoot' -Reason "Launcher
 Require-Text -Path $commonScript -Text 'Fallout New Vegas ARQA' -Reason "Local ARQA sandbox must be a first-class retail root candidate"
 Require-Text -Path $commonScript -Text 'Data\FalloutNV.esm' -Reason "Retail game-root discovery must validate the actual FNV data root"
 Require-Text -Path $commonScript -Text 'Copy-FnvxrOpenXrLoader' -Reason "Launchers must share OpenXR loader staging"
+Require-Text -Path $commonScript -Text 'OpenXR loader is not an x64 PE image' -Reason "OpenXR loader staging must reject the wrong PE architecture"
+Require-Text -Path $commonScript -Text 'Staged OpenXR loader identity mismatch' -Reason "OpenXR loader staging must authenticate the destination after copying"
+Require-Text -Path $commonScript -Text 'Get-FnvxrBuildSourceSnapshot' -Reason "No-build and validate-only paths must bind artifacts to source content"
+Require-Text -Path $commonScript -Text 'Get-FnvxrArtifactContentSnapshot' -Reason "Build attestation must bind exact artifact content and PE identity"
+Require-Text -Path $commonScript -Text 'Assert-FnvxrBuildAttestation' -Reason "No-build and validate-only paths must reject missing or stale attestations"
 Require-Text -Path $commonScript -Text 'SteamVR\bin\win64\openxr_loader.dll' -Reason "OpenXR loader discovery must include the locally installed SteamVR Khronos loader"
 Require-Text -Path $commonScript -Text 'ABI max 4096x2560' -Reason "Shared D3D9 frame guard must match the raised high-resolution ABI ceiling"
 Require-Text -Path $sharedStateCode -Text 'D3D9SharedFrameMaxWidth = 4096' -Reason "Protocol shared-frame mapping must allow the high-resolution 2D source preset"
@@ -532,10 +580,6 @@ Require-Text -Path $commonScript -Text '$env:FNVXR_GAME_FULLSCREEN_IN_XR = "1"' 
 Require-Text -Path $commonScript -Text '$env:FNVXR_USE_STEREO_GAME_TEXTURES = "1"' -Reason "Stereo runtime must let the host consume shared stereo textures"
 Require-Text -Path $commonScript -Text '$env:FNVXR_REQUIRE_WORLD_STEREO = "1"' -Reason "Host acceptance must reject separated pixels that are not certified as a gameplay world frame"
 Require-Text -Path $commonScript -Text '$env:FNVXR_REQUIRE_WORLD_STEREO_BEFORE_GAMEPLAY_UI = "0"' -Reason "World proof must not misclassify real gameplay as a menu while stereo warms up"
-Require-Text -Path $commonScript -Text '$env:FNVXR_STEREO_FALLBACK_MONO_FULLSCREEN = "1"' -Reason "A rejected stereo pair must fall back to the current mono image rather than black or stale eye pixels"
-Require-Text -Path $commonScript -Text '$env:FNVXR_ALLOW_STEREO_WORLD_2D_FALLBACK = "1"' -Reason "Diagnostics must stay visibly anchored while certified stereo is unavailable"
-Require-Text -Path $commonScript -Text '$env:FNVXR_SHOW_GAME_PLANE_ON_STEREO_LOSS = "1"' -Reason "A producer fault must expose a visible anchored plane instead of a black headset"
-Require-Text -Path $commonScript -Text '$env:FNVXR_SHOW_GAME_PLANE_IN_GAME = "1"' -Reason "Diagnostic gameplay must retain a visible fallback while stereo certification is closed"
 Require-Text -Path $commonScript -Text '$env:FNVXR_STEREO_STABLE_HANDOFF_FRAMES = "1"' -Reason "Host must consume the first frame that passed the producer's independent 12-pair visual stability proof"
 Require-Text -Path $commonScript -Text '$env:FNVXR_STEREO_CELL_STABLE_FRAMES = "60"' -Reason "Native stereo must count one second of distinct retail gameplay frames while camera and scene state settle after a cell transition"
 Require-Text -Path $commonScript -Text '$env:FNVXR_PLAYER_STATE_READ_GRACE_FRAMES = "4"' -Reason "A bounded sequence-writer overlap must not masquerade as a retail cell transition"
@@ -692,6 +736,18 @@ Require-Text -Path $sharedStateCode -Text 'readSequencedSharedSnapshot' -Reason 
 Require-Text -Path $sharedStateCode -Text 'XInput_State_v2' -Reason "XInput ABI growth must use a new mapping object name"
 Require-Text -Path $sharedStateCode -Text 'DInput_State_v9' -Reason "Cumulative DirectInput ABI must use a new mapping object name"
 Require-Text -Path $hostCode -Text 'bridge.xinputState->connected = 0' -Reason "Clean host shutdown must neutralize and disconnect its virtual input payload"
+Require-Text -Path $inputProxySafety -Text 'inline constexpr bool ProductionInputMutationProofComplete = false;' -Reason "Input remapping must remain behind a compile-time production proof"
+Require-Text -Path $inputProxySafety -Text 'inline constexpr bool ProductInputControllerIntegrated = false;' -Reason "An old input experiment must not become the product controller through one fuse edit"
+Require-Text -Path $inputProxySafety -Text 'exactCompatibilityModuleInventory' -Reason "Input authorization must include the live compatibility-module inventory"
+Require-Text -Path $dinputCode -Text '#include "fnvxr_input_proxy_safety.h"' -Reason "DirectInput must consume the shared production input fuse"
+Require-TextBefore -Path $dinputCode -RequiredText 'if (!vrInputMutationAuthorized())' -BeforeText 'void* realOut = nullptr;' -Reason "Source-fused DirectInput must forward before allocating or wrapping a COM result"
+Require-Text -Path $xinputCode -Text '#include "fnvxr_input_proxy_safety.h"' -Reason "XInput must consume the shared production input fuse"
+Require-TextBefore -Path $xinputCode -RequiredText 'if (!vrInputMutationAuthorized())' -BeforeText 'if (InterlockedCompareExchange(&g_loggedGetState' -Reason "Source-fused XInput must forward before polling shared input or logging"
+Require-Text -Path $xinputCode -Text 'return forwardXInputGetCapabilities(dwUserIndex, dwFlags, pCapabilities);' -Reason "Source-fused XInput capabilities must preserve the system result"
+Require-Text -Path $xinputCode -Text 'return forwardXInputGetBatteryInformation(dwUserIndex, devType, pBatteryInformation);' -Reason "Source-fused XInput battery queries must preserve the system result"
+Require-Text -Path $xinputCode -Text 'return forwardXInputGetKeystroke(dwUserIndex, dwReserved, pKeystroke);' -Reason "Source-fused XInput keystrokes must preserve the system result"
+Require-Text -Path $xinputCode -Text 'return forwardXInputGetStateEx(dwUserIndex, pState);' -Reason "XInput ordinal 100 must preserve system forwarding while input mutation is fused"
+Forbid-Text -Path $xinputCode -Text 'DllMain attach xinput proxy' -Reason "A transparent input forwarder must not write logs under loader lock"
 Require-Text -Path $hostCode -Text 'InputCoreProducerMutexName' -Reason "Input core startup must take an exclusive producer lease and recover abandoned writes safely"
 Require-Text -Path $hostCode -Text 'addWrappedInt32' -Reason "Host look telemetry must publish cumulative angle counters"
 Require-Text -Path $xinputCode -Text 'readEffectiveSharedState' -Reason "XInput proxy must bridge transient overlaps and neutralize stale producer packets"
@@ -950,7 +1006,6 @@ Require-Text -Path $dinputCode -Text 'inject buffered gameplay keyboard' -Reason
 Require-Text -Path $dinputCode -Text 'inject buffered gameplay mouse-look' -Reason "DInput proxy must log buffered gameplay look injection"
 Require-Text -Path $dinputCode -Text 'headLookInputActive' -Reason "DInput proxy must consume headspace look through an explicit gameplay-only gate"
 Require-Text -Path $xinputCode -Text 'FNVXR_RUN_LOG_DIR' -Reason "XInput proxy telemetry must honor the current run directory"
-Require-Text -Path $xinputCode -Text 'DllMain attach xinput proxy' -Reason "XInput proxy must log DLL load even before XInputGetState is polled"
 Require-Text -Path $xinputCode -Text 'XInputReservedRetailConsumed' -Reason "XInput proxy must mark shared memory through a named retail-consumed slot"
 Require-Text -Path $xinputCode -Text 'XInputReservedAutoRun' -Reason "XInput proxy must consume the named auto-run slot"
 Require-Text -Path $xinputCode -Text 'FNVXR_XINPUT_AUTO_RUN_LEFT_THUMB_ENABLE' -Reason "XInput proxy must explicitly gate auto-run full-forward left thumb synthesis"
@@ -963,7 +1018,14 @@ Require-Text -Path $xinputCode -Text 'FNVXR_XINPUT_RIGHT_STICK_SCALE' -Reason "X
 Require-Text -Path $d3d9Code -Text 'retailSidecarProfile()' -Reason "D3D9 hook must understand retail sidecar profile"
 Require-Text -Path $d3d9Code -Text 'stereoWorldRuntimeEnabled()' -Reason "D3D9 hook must gate expensive stereo work behind runtime stereo intent"
 Require-Text -Path $d3d9Code -Text 'constexpr bool StereoWorldProductionProofComplete = false;' -Reason "Native stereo must remain source-level blocked while the structural render proof is incomplete"
-Require-Text -Path $d3d9Code -Text 'return StereoWorldProductionProofComplete && stereoWorldRuntimeRequested();' -Reason "Environment variables alone must never bypass the incomplete production proof"
+Require-Text -Path $d3d9Code -Text 'constexpr bool ProductWorldStereoIntegrationComplete = false;' -Reason "D3D replay must remain independently blocked until the production product controller is integrated"
+Require-Text -Path $d3d9Code -Text '&& ProductWorldStereoIntegrationComplete' -Reason "A historical D3D proof-fuse edit alone must never revive legacy stereo"
+Require-Text -Path $d3d9ActivationCode -Text 'inline constexpr ProductionRendererProof CompiledProductionRendererProof {};' -Reason "The D3D9 proxy must compile with every renderer authorization fact false"
+Require-Text -Path $d3d9ActivationCode -Text 'static_assert(!CompiledInterpositionPolicy.patchDeviceVtable);' -Reason "The checked-in D3D9 proxy policy must forbid device-vtable mutation"
+Require-Text -Path $d3d9ActivationCode -Text 'static_assert(!CompiledInterpositionPolicy.accessSharedMappings);' -Reason "The checked-in D3D9 proxy policy must forbid shared mappings"
+Require-Text -Path $d3d9ActivationCode -Text 'static_assert(!CompiledInterpositionPolicy.captureOrCpuReadback);' -Reason "The checked-in D3D9 proxy policy must forbid capture/readback"
+Require-Text -Path $d3d9ActivationCode -Text 'static_assert(!CompiledInterpositionPolicy.perFrameLogging);' -Reason "The checked-in D3D9 proxy policy must forbid frame logging"
+Require-Text -Path $d3d9Code -Text 'if constexpr (!fnvxr::d3d9::ProductionRendererAuthorized)' -Reason "D3D9 wrapper and hook side effects must be compile-time fused"
 Require-Text -Path $d3d9Code -Text 'Local\\FNVXR_D3D9_Frame_Producer_v1' -Reason "The flat fallback frame must have exactly one process-lifetime producer"
 Require-Text -Path $d3d9Code -Text 'Local\\FNVXR_D3D9_WorldFrame_Producer_v1' -Reason "The legacy wide diagnostic frame must have exactly one process-lifetime producer"
 Require-Text -Path $d3d9Code -Text 'A consumer may keep this page mapped across a producer restart.' -Reason "Retained flat-frame storage must be invalidated under writing before producer relabeling"

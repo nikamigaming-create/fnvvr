@@ -5,13 +5,18 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+if ($InstallToGame) {
+    throw "Direct plugin-only game installation is retired. Use start-openxr-retail-sidecar.ps1 -StageOnly so the plugin and all transparent proxies are built, attested, and verified as one set."
+}
+
 $Root = Split-Path -Parent $PSScriptRoot
 $BuildDir = Join-Path $Root "build-win32"
 $PluginDll = Join-Path $BuildDir "$Configuration\nvse_fnvxr.dll"
 $PluginPdb = Join-Path $BuildDir "$Configuration\nvse_fnvxr.pdb"
 
-if (-not (Test-Path -LiteralPath $PluginDll)) {
-    & (Join-Path $PSScriptRoot "build-win32.ps1") -Configuration $Configuration
+& (Join-Path $PSScriptRoot "build-win32.ps1") -Configuration $Configuration
+if ($LASTEXITCODE -ne 0) {
+    throw "Refusing plugin stage: audited Win32 build/test failed with exit code $LASTEXITCODE"
 }
 
 if (-not (Test-Path -LiteralPath $PluginDll)) {

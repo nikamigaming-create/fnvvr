@@ -440,6 +440,10 @@ enum class RuntimePhase : UInt32
 
 PluginHandle g_pluginHandle = InvalidPluginHandle;
 const NVSEInterface* g_nvse = nullptr;
+// Intentionally empty until a production in-process validator reads and
+// verifies the loaded PE/function ranges and supplies every acceptance gate.
+// No environment variable or loader argument populates this record.
+fnvxr::safety::RetailMutationEvidenceToken g_retailMutationEvidence {};
 NVSEConsoleInterface* g_console = nullptr;
 NVSEMessagingInterface* g_messaging = nullptr;
 NVSEPlayerControlsInterface* g_playerControls = nullptr;
@@ -758,6 +762,26 @@ bool isCompatibleRuntime(const NVSEInterface* nvse)
         nvse->isEditor != 0,
         nvse->nvseVersion,
         nvse->runtimeVersion);
+}
+
+bool rejectUntilCurrentProcessIntegrityValidatorImplemented(
+    const fnvxr::safety::RetailMutationEvidenceToken&,
+    void*) noexcept
+{
+    // Deliberately fail closed until the plugin can synchronously re-read the
+    // loaded PE, protected function bytes, and compatibility-module inventory
+    // at each mutation decision. Flipping the source fuse alone is insufficient.
+    return false;
+}
+
+bool retailMutationAllowedForCurrentProcess(bool requested)
+{
+    return fnvxr::safety::retailMutationAllowed(
+        requested,
+        g_retailMutationEvidence,
+        GetCurrentProcessId(),
+        rejectUntilCurrentProcessIntegrityValidatorImplemented,
+        nullptr);
 }
 
 bool bridgeDisabledByEnv()
@@ -3998,9 +4022,9 @@ bool installCameraHook()
         logTelemetry("cameraHook install disabled\n");
         return true;
     }
-    if (!fnvxr::safety::retailMutationAllowed(requested))
+    if (!retailMutationAllowedForCurrentProcess(requested))
     {
-        logTelemetry("cameraHook hard-blocked: retail mutation proof incomplete\n");
+        logTelemetry("cameraHook hard-blocked: retail mutation source/evidence proof incomplete\n");
         return true;
     }
 
@@ -6301,9 +6325,9 @@ bool installRetailRigHook()
         logTelemetry("retailRig hook install disabled\n");
         return true;
     }
-    if (!fnvxr::safety::retailMutationAllowed(requested))
+    if (!retailMutationAllowedForCurrentProcess(requested))
     {
-        logTelemetry("retailRig hook hard-blocked: retail mutation proof incomplete\n");
+        logTelemetry("retailRig hook hard-blocked: retail mutation source/evidence proof incomplete\n");
         return true;
     }
 #if !defined(_M_IX86)
@@ -9944,13 +9968,13 @@ void handleNvseMessage(NVSEMessagingInterface::Message* message)
 
     if (message->type == MessageMainGameLoop)
     {
-        if (!fnvxr::safety::RetailMutationProofComplete)
+        if (!retailMutationAllowedForCurrentProcess(true))
         {
             static bool logged = false;
             if (!logged)
             {
                 logged = true;
-                logTelemetry("mainloop bridge hard-blocked: retail mutation proof incomplete\n");
+                logTelemetry("mainloop bridge hard-blocked: retail mutation source/evidence proof incomplete\n");
             }
             return;
         }
@@ -10392,7 +10416,7 @@ extern "C" __declspec(dllexport) bool NVSEPlugin_Query(const NVSEInterface* nvse
 
 extern "C" __declspec(dllexport) bool FNVXR_RetailMutationProofComplete()
 {
-    return fnvxr::safety::RetailMutationProofComplete;
+    return retailMutationAllowedForCurrentProcess(true);
 }
 
 extern "C" __declspec(dllexport) bool NVSEPlugin_Load(const NVSEInterface* nvse)
@@ -10403,10 +10427,11 @@ extern "C" __declspec(dllexport) bool NVSEPlugin_Load(const NVSEInterface* nvse)
     g_nvse = nvse;
     if (nvse->GetPluginHandle)
         g_pluginHandle = nvse->GetPluginHandle();
-    if (!fnvxr::safety::RetailMutationProofComplete)
+    if (!retailMutationAllowedForCurrentProcess(true))
     {
         logTelemetry(
-            "plugin loaded inert: retail mutation proof incomplete runtime=%u\n",
+            "plugin loaded inert: retail mutation source/evidence proof incomplete nvse=%u runtime=%u\n",
+            nvse->nvseVersion,
             nvse->runtimeVersion);
         return g_pluginHandle != InvalidPluginHandle;
     }

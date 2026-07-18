@@ -15,8 +15,10 @@ no persistent gameplay HUD. Mono gameplay cannot satisfy acceptance.
 Startup, pause, inventory, barter, terminals, dialogue, VATS, loading,
 Pip-Boy, and other blocking retail UI use the stable mono quad. The controller
 ray drives retail mouse pointer/click input. On UI exit, the last valid quad is
-held until one fresh complete pose-matched stereo transaction is ready, then
-the compositor changes to world stereo atomically.
+held until one fresh complete pose-matched stereo transaction with a strictly
+newer retail source-frame identity is ready, then the compositor changes to
+world stereo atomically. That freshness watermark remains enforced after the
+bounded quad hold expires into a safety blank.
 
 ## Proven Foundation
 
@@ -29,7 +31,10 @@ the compositor changes to world stereo atomically.
   editor runtimes are rejected.
 - Retail mutation remains hard source-fused. The current plugin returns inert
   before creating mappings/listeners or applying camera, input, rig, or code
-  hooks. Config and environment values cannot bypass that fuse.
+  hooks. Config and environment values cannot bypass that fuse. A future fuse
+  change is still insufficient without a synchronous live PE/function/module
+  integrity check at the exact mutation decision; the current validator
+  deliberately rejects.
 - The standalone host creates a real OpenXR session and samples HMD, grip, aim,
   buttons, triggers, squeeze, and thumbsticks.
 - Shared pose ABI v5 carries independent left/right grip and aim poses with
@@ -51,10 +56,45 @@ the compositor changes to world stereo atomically.
   continuously.
 - The retail D3D9 proxy's mono UI capture remains useful. Its per-draw replay
   and CPU readback/ring are historical diagnostics and a production NO-GO.
+  The legacy flat retail producer is now runtime-fused, and direct plugin-only
+  game installation is fused; the guarded stage/validate path is the only
+  game-tree deployment route.
+- GPU stereo metadata uses a fixed 200-byte cross-architecture v4 ABI, one
+  fully ordered odd/even producer helper, non-aliased color/depth handles, an
+  exact runtime-state sample identity, and a frame-bound consumer-observed
+  shared-fence requirement. No GPU resource producer or consumer is implemented
+  yet, so this is a tested contract rather than a completed transport.
 - Retail player rig discovery searches for and logs arm-chain, hand, weapon,
   projectile, and muzzle-flash nodes; retained runs have not proved a complete
   non-null weapon/projectile/muzzle chain. FABRIK solver tests cover the arm
   math foundation.
+- The four shipped Win32 DLLs compile and link reproducibly with `/Brepro` and
+  non-incremental linking. Two independent clean build roots produced identical
+  bytes. The pinned plugin is now SHA-256
+  `E394CB96DC1F881E66DF5E11877BCCBA55033FE50A4D407FD70CCB359BB3650D`.
+- The guarded deployment transaction now invalidates prior authority, assigns
+  a fresh nonce, clean-builds x64 and Win32, requires nonempty complete test
+  catalogs, hashes 110 first-party/vendored source inputs before and after the
+  build, and binds ten exact artifact/configuration identities. The July 18
+  Release transaction passed 77/77 combined tests and its independent
+  ValidateOnly pass matched every installed mandatory destination without
+  copying or launching anything.
+- The exact 124-module retail census contract validates owned primary/post
+  snapshots, process creation identity, generation and transaction ordering,
+  non-overlapping PE32 mappings, mapped executable evidence, proxy policy, and
+  JIP/ShowOff dispositions. Diagnostic scanning is bounded at 512 and reports
+  Steam/NVIDIA overlays explicitly even when both are present. No live census
+  adapter supplies these proofs yet, so production authorization remains false.
+- A pure mapped-image verifier now reconstructs PE32 executable coverage,
+  relocation normalization, exact patch allowances, and full stable protection
+  partitions while rejecting RWX, guards, gaps, overlap, and unexpected
+  executable pages. Steam-encrypted `FalloutNV.exe` still needs an independent
+  clean loaded-page reference manifest; encrypted disk bytes are not treated as
+  a valid loaded-image reference.
+- The center/center resource owner has move-only context and cleanup
+  capabilities, exact camera/culler/accumulator layouts, non-aliased left/right
+  ownership, reverse-order teardown, and adversarial lifecycle tests. It has no
+  production authorization issuer and invokes no retail constructor today.
 
 ## Current Headset Boundary
 
@@ -62,6 +102,12 @@ All live OpenXR presentation is source-blocked in both the host executable and
 the guarded launcher. This includes the former flat-compositor baseline. The
 retained live observations below explain the boundary; they are not a current
 authorization to launch the game or headset.
+
+The legacy stereo environment function now throws before setting activation
+variables. Independent host and D3D product-integration fuses also remain
+false, so changing one historical proof constant cannot revive the old mono
+gameplay fallback/HUD path. The standalone OpenXR diagnostic is separately
+source-fused before loading the OpenXR loader.
 
 ### Head tracking
 
@@ -138,10 +184,27 @@ then complete restoration and atomic publication. Failure discards isolated
 outputs. The backend must handle both stock world-accumulation branches and
 must not globally hook helpers shared by auxiliary passes.
 
-All selected functions were byte-identical across two independent loaded-memory
-dumps and a fresh default flat launch. The exact PE identity and function hashes
-are now a tested manifest and read-only runtime probe. This is a GO for the
-bounded engine renderer implementation, not proof that headset VR is finished.
+Read-only samples established stable candidate addresses and loaded instruction
+blocks for the world/culling/accumulator path. That is not yet sufficient to
+authorize construction or rendering: constructor arguments, ownership,
+destruction, both stock branches, synchronous loaded-page identity, and the
+complete compatibility patch sets remain hard gates. The strict probe exposed
+a compatibility conflict: JIP LN 57.30 rewrites the
+call displacement at `0x008751C7..0x008751CA` inside `RenderFirstPerson`; no
+other bytes in that function differed in that sample. The target was inside the
+loaded `jip_nvse.dll` (installed SHA-256
+`9D2779647ED0CE63043390F47FC978E3234AF8E558DC6CB6BCB231478A2D74D4`).
+Later initialization samples also showed JIP-era rewrites in accumulator and
+culling helpers, proving that hash-before-initialization was a TOCTOU bug. The
+probe now waits for live SceneGraph initialization, hashes afterward, and
+rejects the loaded JIP module itself until its complete patch set is normalized
+and bound to an exact module hash. This supports continuing the bounded engine
+renderer implementation; it is not proof that headset VR is finished.
+
+Installed `ShowOffNVSE.dll` is also treated as uncontrolled module inventory;
+it has not been normalized or authorized by the engine proof. JIP and ShowOff
+remain installed for the user's mod stack, but no production stereo/mutation
+gate can pass while their complete loaded patch sets are unverified.
 
 ## xNVSE Extraction Boundary
 
@@ -160,23 +223,38 @@ executable checks, pointer validation, logging, and fail-closed rejection.
 
 ## Immediate Blockers
 
-1. Implement the exact-version/hash-validated world-boundary backend for both
-   stock accumulation branches with complete authoritative state restoration.
-2. Prove center/center, then distinct-eye transactions using one conservative
+1. Implement the read-only live census/evidence adapter and the independently
+   sampled loaded-page reference manifest for Steam-encrypted `FalloutNV.exe`.
+   It must leave all proxy/JIP/ShowOff proof dispositions failed until their
+   complete patch and mapped-image evidence exists.
+2. Implement the exact-version/hash-validated world-boundary backend for both
+   stock accumulation branches with complete authoritative state restoration,
+   plus explicit hash-bound compatibility contracts for the complete loaded
+   patch sets of JIP, ShowOff, and any other code-mutating module; arbitrary or
+   unenumerated patched code remains a hard reject.
+3. Prove center/center, then distinct-eye transactions using one conservative
    visible set and fresh non-aliased per-eye accumulators.
-3. Implement GPU-native D3D9Ex-to-D3D11/OpenXR color and encoded-depth sharing
+4. Implement GPU-native D3D9Ex-to-D3D11/OpenXR color and encoded-depth sharing
    with handles, adapter identity, completion sequencing, and transaction IDs;
    no CPU eye-pixel ring.
-4. Prove the authoritative retail weapon, muzzle, projectile/hit, recoil, and
+5. Prove the authoritative retail weapon, muzzle, projectile/hit, recoil, and
    reload chain against the right-controller aim pose.
-5. Pass retail/headset acceptance across UI transitions, exterior/interior cell
+6. Pass retail/headset acceptance across UI transitions, exterior/interior cell
    changes, first-person geometry, particles/transparency, twelve-direction
    pose motion, and performance. Invalid gameplay stereo is a visible reject,
    never a successful mono fallback.
 
 ## Safe Local Artifacts
 
-- staged plugin layout under `local/fnv-plugin-stage/`;
+- nonce-bound, tested no-launch StageOnly manifest under
+  `local/openxr-retail-sidecar-runs/20260718-085015-525/`;
+- independent no-copy/no-launch ValidateOnly manifest under
+  `local/openxr-retail-sidecar-runs/20260718-085104-081/`;
+- current build attestation at
+  `build/fnvxr-retail-build-attestation-Release.json` (110 source inputs,
+  ten artifact/config identities, 77 passed registered tests);
+- exact installed/quarantined hash inventory at
+  `local/installed-artifact-manifest.json`;
 - dependency manifest at `deps/manifest.json`;
 - retail probe at `local/fnv-probe.json`;
 - combined preflight at `local/preflight-fnvxr.json`;
@@ -184,4 +262,11 @@ executable checks, pointer validation, logging, and fail-closed rejection.
   retail game root;
 - recoverable backups of the stale installed mutators under
   `local/installed-artifact-backups/20260718-050105-432/`. The live game-root
-  copies were replaced by current source-fused/inert builds.
+  FNVXR copies were replaced through a clean 77/77 combined Release
+  build/test/stage.
+  The installed compound-gated inert plugin is SHA-256
+  `E394CB96DC1F881E66DF5E11877BCCBA55033FE50A4D407FD70CCB359BB3650D`.
+  The default-on retail oracle and stale pre-fuse game-root OpenXR host were
+  quarantined into that backup directory; neither remains in an auto-load or
+  executable game-root location. All preceding plugin/proxy versions remain
+  recoverable there.

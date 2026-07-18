@@ -5,6 +5,7 @@
 #include <dinput.h>
 
 #include "../protocol/fnvxr_shared_state.h"
+#include "fnvxr_input_proxy_safety.h"
 
 #include <algorithm>
 #include <cstdarg>
@@ -15,6 +16,11 @@
 
 namespace
 {
+constexpr bool vrInputMutationAuthorized() noexcept
+{
+    return fnvxr::input_proxy::productionInputMutationAuthorizedForCurrentBuild();
+}
+
 constexpr std::uint32_t DInputSharedMagic = fnvxr::shared::DInputSharedMagic;
 constexpr std::uint32_t DInputSharedVersion = fnvxr::shared::DInputSharedVersion;
 constexpr std::uint32_t InputEventSharedMagic = fnvxr::shared::InputEventSharedMagic;
@@ -2117,12 +2123,19 @@ private:
 
 extern "C" HRESULT WINAPI FNVXR_DirectInput8Create(HINSTANCE instance, DWORD version, REFIID riid, LPVOID* out, LPUNKNOWN outer)
 {
-    logLine("DirectInput8Create version=%lu out=%p\n", version, out);
     using Fn = HRESULT (WINAPI*)(HINSTANCE, DWORD, REFIID, LPVOID*, LPUNKNOWN);
     auto* fn = realDInput() ? reinterpret_cast<Fn>(GetProcAddress(g_realDInput, "DirectInput8Create")) : nullptr;
     if (!fn)
         return DIERR_GENERIC;
 
+    // The shipping proxy is a transparent system-DLL forwarder until exact
+    // production input authorization exists. Forward the caller's output
+    // pointer directly so no wrapper, shared map, environment value, or log
+    // can alter DirectInput behavior on this path.
+    if (!vrInputMutationAuthorized())
+        return fn(instance, version, riid, out, outer);
+
+    logLine("DirectInput8Create version=%lu out=%p\n", version, out);
     void* realOut = nullptr;
     HRESULT hr = fn(instance, version, riid, &realOut, outer);
     if (FAILED(hr) || !realOut || !out)

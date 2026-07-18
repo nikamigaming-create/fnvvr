@@ -33,6 +33,8 @@ $ErrorActionPreference = "Stop"
 
 . (Join-Path $PSScriptRoot "fnvxr-sidecar-common.ps1")
 
+throw "Legacy flat retail surface producer is retired. Use start-openxr-retail-sidecar.ps1 -StageOnly or -ValidateOnly; live flat gameplay is outside the FNVXR product contract."
+
 if (-not [string]::IsNullOrWhiteSpace($D3D9ShaderWvpContracts)) {
     throw "Raw -D3D9ShaderWvpContracts text is not accepted. WVP-only contracts are non-certifying and disabled until exact VS+PS semantic/camera provenance exists."
 }
@@ -58,7 +60,9 @@ New-Item -ItemType Directory -Force -Path $RunDir | Out-Null
 
 trap {
     $caught = $_
-    Write-FnvxrCheckpoint -Path $DebugLog -Message ("ERROR " + $caught.Exception.Message)
+    if (-not [string]::IsNullOrWhiteSpace([string]$DebugLog)) {
+        Write-FnvxrCheckpoint -Path $DebugLog -Message ("ERROR " + $caught.Exception.Message)
+    }
     try {
         if ($falloutPid -and (Get-Process -Id $falloutPid -ErrorAction SilentlyContinue)) {
             Stop-Process -Id $falloutPid -Force -ErrorAction SilentlyContinue

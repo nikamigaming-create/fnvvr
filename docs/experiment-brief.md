@@ -66,17 +66,22 @@ buttons, triggers, grips, thumbsticks, pointer position, and input intent.
 Retail-to-host state includes runtime/UI phase, player/body and camera
 transforms, weapon classification and rig diagnostics, plus versioned mono-UI
 or stereo GPU resource metadata. Eye pixels do not travel through a CPU ring.
+Stereo GPU metadata is published only through the fully ordered odd/even
+producer helper, and the host must observe the declared shared fence itself.
 
 ## Presentation Contract
 
-The normal retail mono frame is the UI source. Any startup/menu, pause,
-Pip-Boy/inventory, dialogue, VATS, loading, or unknown state is shown flat in
-the headset. UI input remains ordinary retail mouse/keyboard/controller input.
+The normal retail mono frame is the UI source. Confirmed startup/menu, pause,
+Pip-Boy/inventory, dialogue, VATS, and loading states are shown flat in the
+headset. Unknown/stale runtime fails blank and cannot manufacture an allowed
+quad. UI input remains ordinary retail mouse/keyboard/controller input.
 
 All non-blocking gameplay requires native stereo with no persistent gameplay
 HUD. A world transition requires a fresh, complete, pose-matched same-frame
-color/depth pair. A UI transition enters the flat retail surface; an invalid or
-stale gameplay transaction is rejected and is not reported as mono VR.
+color/depth pair whose retail source frame strictly postdates the last displayed
+UI frame. That UI freshness watermark survives transition-hold expiry. A UI
+transition enters the flat retail surface; an invalid or stale gameplay
+transaction is rejected and is not reported as mono VR.
 
 ## Current Milestone
 
