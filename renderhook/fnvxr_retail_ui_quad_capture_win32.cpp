@@ -74,64 +74,84 @@ bool RetailUiQuadPresentHookWin32::initializeAuthorizedDevice(
         return false;
     }
 
-    constexpr SIZE_T vtableBytes =
-        RetailD3D9ExDeviceMethodCount * sizeof(void*);
-    void** privateVtable = static_cast<void**>(VirtualAlloc(
-        nullptr,
-        vtableBytes,
-        MEM_COMMIT | MEM_RESERVE,
-        PAGE_READWRITE));
-    if (!privateVtable)
-    {
-        InterlockedCompareExchangePointer(&sActiveHook, nullptr, this);
-        mFailure = RetailUiQuadPresentHookFailure::VtableAllocationFailed;
-        return false;
-    }
-    std::memcpy(privateVtable, originalVtable, vtableBytes);
-    privateVtable[RetailD3D9PresentVtableSlot] =
-        vtableEntryFromFunction(&presentAdapter);
-    DWORD oldProtection = 0u;
-    if (!VirtualProtect(
-            privateVtable,
-            vtableBytes,
-            PAGE_READONLY,
-            &oldProtection))
-    {
-        VirtualFree(privateVtable, 0u, MEM_RELEASE);
-        InterlockedCompareExchangePointer(&sActiveHook, nullptr, this);
-        mFailure = RetailUiQuadPresentHookFailure::VtableProtectionFailed;
-        return false;
-    }
-
     mDevice = device;
     mOriginalVtable = originalVtable;
-    mPrivateVtable = privateVtable;
+    mPresentEntry = &originalVtable[RetailD3D9PresentVtableSlot];
     mOriginalPresent = originalPresent;
     if (!mCapture.initialize(operations))
     {
-        VirtualFree(privateVtable, 0u, MEM_RELEASE);
         mDevice = nullptr;
         mOriginalVtable = nullptr;
-        mPrivateVtable = nullptr;
+        mPresentEntry = nullptr;
         mOriginalPresent = nullptr;
         InterlockedCompareExchangePointer(&sActiveHook, nullptr, this);
         mFailure = RetailUiQuadPresentHookFailure::OperationsIncomplete;
         return false;
     }
 
-    void* observed = InterlockedCompareExchangePointer(
-        reinterpret_cast<void* volatile*>(deviceVtableAddress),
-        privateVtable,
-        originalVtable);
-    if (observed != originalVtable)
+    // Do not replace the concrete D3D9 device's vptr. Windows' CD3DHal uses
+    // implementation-private entries beyond the public IDirect3DDevice9Ex
+    // interface. A public-length clone truncates that private tail and turns
+    // internal dispatch into an out-of-bounds call. Lease only the documented
+    // Present entry in the native table and leave the concrete vptr intact.
+    DWORD oldProtection = 0u;
+    if (!VirtualProtect(
+            mPresentEntry,
+            sizeof(*mPresentEntry),
+            PAGE_EXECUTE_READWRITE,
+            &oldProtection))
     {
-        VirtualFree(privateVtable, 0u, MEM_RELEASE);
         mDevice = nullptr;
         mOriginalVtable = nullptr;
-        mPrivateVtable = nullptr;
+        mPresentEntry = nullptr;
         mOriginalPresent = nullptr;
         InterlockedCompareExchangePointer(&sActiveHook, nullptr, this);
-        mFailure = RetailUiQuadPresentHookFailure::VtableSwapFailed;
+        mFailure = RetailUiQuadPresentHookFailure::VtableProtectionFailed;
+        return false;
+    }
+    void* const adapterEntry = vtableEntryFromFunction(&presentAdapter);
+    void* const originalEntry = vtableEntryFromFunction(originalPresent);
+    void* observed = InterlockedCompareExchangePointer(
+        reinterpret_cast<void* volatile*>(mPresentEntry),
+        adapterEntry,
+        originalEntry);
+    DWORD ignoredProtection = 0u;
+    const bool protectionRestored = VirtualProtect(
+        mPresentEntry,
+        sizeof(*mPresentEntry),
+        oldProtection,
+        &ignoredProtection) != FALSE;
+    if (observed != originalEntry || !protectionRestored)
+    {
+        if (observed == originalEntry)
+        {
+            DWORD rollbackProtection = 0u;
+            if (VirtualProtect(
+                    mPresentEntry,
+                    sizeof(*mPresentEntry),
+                    PAGE_EXECUTE_READWRITE,
+                    &rollbackProtection))
+            {
+                InterlockedCompareExchangePointer(
+                    reinterpret_cast<void* volatile*>(mPresentEntry),
+                    originalEntry,
+                    adapterEntry);
+                DWORD rollbackIgnored = 0u;
+                VirtualProtect(
+                    mPresentEntry,
+                    sizeof(*mPresentEntry),
+                    oldProtection,
+                    &rollbackIgnored);
+            }
+        }
+        mDevice = nullptr;
+        mOriginalVtable = nullptr;
+        mPresentEntry = nullptr;
+        mOriginalPresent = nullptr;
+        InterlockedCompareExchangePointer(&sActiveHook, nullptr, this);
+        mFailure = protectionRestored
+            ? RetailUiQuadPresentHookFailure::PresentSlotLeaseFailed
+            : RetailUiQuadPresentHookFailure::VtableProtectionFailed;
         return false;
     }
 
@@ -142,20 +162,44 @@ bool RetailUiQuadPresentHookWin32::initializeAuthorizedDevice(
 
 bool RetailUiQuadPresentHookWin32::detachWhileDeviceAlive() noexcept
 {
-    if (!mInstalled || !mDevice || !mOriginalVtable || !mPrivateVtable)
+    if (!mInstalled || !mDevice || !mOriginalVtable || !mPresentEntry)
         return false;
     auto*** deviceVtableAddress = reinterpret_cast<void***>(mDevice);
-    void* observed = InterlockedCompareExchangePointer(
-        reinterpret_cast<void* volatile*>(deviceVtableAddress),
-        mOriginalVtable,
-        mPrivateVtable);
-    if (observed != mPrivateVtable)
+    if (!deviceVtableAddress || *deviceVtableAddress != mOriginalVtable)
         return false;
+    DWORD oldProtection = 0u;
+    if (!VirtualProtect(
+            mPresentEntry,
+            sizeof(*mPresentEntry),
+            PAGE_EXECUTE_READWRITE,
+            &oldProtection))
+    {
+        mFailure = RetailUiQuadPresentHookFailure::VtableProtectionFailed;
+        return false;
+    }
+    void* const adapterEntry = vtableEntryFromFunction(&presentAdapter);
+    void* const originalEntry = vtableEntryFromFunction(mOriginalPresent);
+    void* observed = InterlockedCompareExchangePointer(
+        reinterpret_cast<void* volatile*>(mPresentEntry),
+        originalEntry,
+        adapterEntry);
+    DWORD ignoredProtection = 0u;
+    const bool protectionRestored = VirtualProtect(
+        mPresentEntry,
+        sizeof(*mPresentEntry),
+        oldProtection,
+        &ignoredProtection) != FALSE;
+    if (observed != adapterEntry || !protectionRestored)
+    {
+        mFailure = protectionRestored
+            ? RetailUiQuadPresentHookFailure::PresentSlotLeaseFailed
+            : RetailUiQuadPresentHookFailure::VtableProtectionFailed;
+        return false;
+    }
     InterlockedCompareExchangePointer(&sActiveHook, nullptr, this);
-    VirtualFree(mPrivateVtable, 0u, MEM_RELEASE);
     mDevice = nullptr;
     mOriginalVtable = nullptr;
-    mPrivateVtable = nullptr;
+    mPresentEntry = nullptr;
     mOriginalPresent = nullptr;
     mInstalled = false;
     mFailure = RetailUiQuadPresentHookFailure::InvalidDevice;
@@ -168,7 +212,7 @@ bool RetailUiQuadPresentHookWin32::ready() const noexcept
         && mFailure == RetailUiQuadPresentHookFailure::None
         && mDevice
         && mOriginalVtable
-        && mPrivateVtable
+        && mPresentEntry
         && mOriginalPresent
         && mCapture.ready()
         && InterlockedCompareExchangePointer(

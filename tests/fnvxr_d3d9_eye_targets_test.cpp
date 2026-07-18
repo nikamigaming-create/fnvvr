@@ -247,6 +247,22 @@ void requireOriginalState(const FakeState& state)
 
 int main()
 {
+    require(RetailSharedEyeTargetColorFormats.size() == 3u,
+        "retail shared-eye format policy must contain all transport formats");
+    require(RetailSharedEyeTargetColorFormats[0] == 32u,
+        "A8B8G8R8 must remain the first shared-eye candidate when supported");
+    require(RetailSharedEyeTargetColorFormats[1] == 31u,
+        "A2B10G10R10 must be the first fallback for adapters that reject A8B8G8R8");
+    require(RetailSharedEyeTargetColorFormats[2] == 113u,
+        "A16B16G16R16F must remain the final shared-eye fallback");
+    for (const std::uint32_t format : RetailSharedEyeTargetColorFormats)
+    {
+        require(retailSharedEyeTargetColorFormatAccepted(format),
+            "a policy candidate was not accepted by the transport format fuse");
+    }
+    require(!retailSharedEyeTargetColorFormatAccepted(21u),
+        "A8R8G8B8 must not enter a transport that cannot map its DXGI format");
+
     {
         FakeState state;
         RetailEyeTargetContext context;

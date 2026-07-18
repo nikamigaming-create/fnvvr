@@ -7369,8 +7369,6 @@ bool ensureStereoTargets(IDirect3DDevice9* device)
     return true;
 }
 
-constexpr D3DFORMAT RetailEngineSharedColorFormat = D3DFMT_A8B8G8R8;
-
 bool retailEngineEyeTargetsMatch(
     IDirect3DDevice9* device,
     const D3DSURFACE_DESC& color,
@@ -7390,7 +7388,8 @@ bool retailEngineEyeTargetsMatch(
         || gLeftEyeD3D9SharedHandle == gRightEyeD3D9SharedHandle
         || gStereoTargetWidth != color.Width
         || gStereoTargetHeight != color.Height
-        || gStereoTargetFormat != RetailEngineSharedColorFormat)
+        || !fnvxr::d3d9::retailSharedEyeTargetColorFormatAccepted(
+            static_cast<std::uint32_t>(gStereoTargetFormat)))
     {
         return false;
     }
@@ -7405,10 +7404,10 @@ bool retailEngineEyeTargetsMatch(
         && SUCCEEDED(gRightEyeDepth->GetDesc(&rightDepth))
         && leftColor.Width == color.Width
         && leftColor.Height == color.Height
-        && leftColor.Format == RetailEngineSharedColorFormat
+        && leftColor.Format == gStereoTargetFormat
         && rightColor.Width == color.Width
         && rightColor.Height == color.Height
-        && rightColor.Format == RetailEngineSharedColorFormat
+        && rightColor.Format == gStereoTargetFormat
         && leftDepth.Width == depth.Width
         && leftDepth.Height == depth.Height
         && leftDepth.Format == depth.Format
@@ -7468,52 +7467,6 @@ bool ensureRetailEngineEyeTargets(IDirect3DDevice9* device) noexcept
         return false;
     }
 
-    D3DDEVICE_CREATION_PARAMETERS creationParameters {};
-    D3DDISPLAYMODE adapterMode {};
-    IDirect3D9* direct3D = nullptr;
-    HRESULT colorFormatResult = D3DERR_INVALIDCALL;
-    HRESULT depthMatchResult = D3DERR_INVALIDCALL;
-    const bool adapterContextAvailable = SUCCEEDED(
-            device->GetCreationParameters(&creationParameters))
-        && creationParameters.DeviceType == D3DDEVTYPE_HAL
-        && SUCCEEDED(device->GetDirect3D(&direct3D))
-        && direct3D
-        && SUCCEEDED(direct3D->GetAdapterDisplayMode(
-            creationParameters.AdapterOrdinal,
-            &adapterMode));
-    if (adapterContextAvailable)
-    {
-        colorFormatResult = direct3D->CheckDeviceFormat(
-            creationParameters.AdapterOrdinal,
-            creationParameters.DeviceType,
-            adapterMode.Format,
-            D3DUSAGE_RENDERTARGET,
-            D3DRTYPE_TEXTURE,
-            RetailEngineSharedColorFormat);
-        depthMatchResult = direct3D->CheckDepthStencilMatch(
-            creationParameters.AdapterOrdinal,
-            creationParameters.DeviceType,
-            adapterMode.Format,
-            RetailEngineSharedColorFormat,
-            depthDescription.Format);
-    }
-    if (direct3D)
-        direct3D->Release();
-    if (!adapterContextAvailable
-        || FAILED(colorFormatResult)
-        || FAILED(depthMatchResult))
-    {
-        char message[256] {};
-        sprintf_s(
-            message,
-            "retail eye targets rejected: A8B8G8R8 share probe context=%d format=0x%08lx depthMatch=0x%08lx",
-            adapterContextAvailable ? 1 : 0,
-            static_cast<unsigned long>(colorFormatResult),
-            static_cast<unsigned long>(depthMatchResult));
-        logLine(message);
-        return false;
-    }
-
     if (retailEngineEyeTargetsMatch(
             device,
             colorDescription,
@@ -7522,42 +7475,96 @@ bool ensureRetailEngineEyeTargets(IDirect3DDevice9* device) noexcept
         return true;
     }
 
-    releaseStereoTargets();
-    if (!createEyeTarget(
-            device,
-            colorDescription.Width,
-            colorDescription.Height,
-            RetailEngineSharedColorFormat,
-            gLeftEyeTexture,
-            gLeftEyeSurface,
-            gLeftEyeDepth,
-            depthDescription.Format,
-            &gLeftEyeD3D9SharedHandle)
-        || !createEyeTarget(
-            device,
-            colorDescription.Width,
-            colorDescription.Height,
-            RetailEngineSharedColorFormat,
-            gRightEyeTexture,
-            gRightEyeSurface,
-            gRightEyeDepth,
-            depthDescription.Format,
-            &gRightEyeD3D9SharedHandle)
-        || !gLeftEyeD3D9SharedHandle
-        || !gRightEyeD3D9SharedHandle
-        || gLeftEyeD3D9SharedHandle == gRightEyeD3D9SharedHandle)
+    D3DDEVICE_CREATION_PARAMETERS creationParameters {};
+    D3DDISPLAYMODE adapterMode {};
+    IDirect3D9* direct3D = nullptr;
+    const bool adapterContextAvailable = SUCCEEDED(
+            device->GetCreationParameters(&creationParameters))
+        && creationParameters.DeviceType == D3DDEVTYPE_HAL
+        && SUCCEEDED(device->GetDirect3D(&direct3D))
+        && direct3D
+        && SUCCEEDED(direct3D->GetAdapterDisplayMode(
+            creationParameters.AdapterOrdinal,
+            &adapterMode));
+    if (!adapterContextAvailable)
     {
-        releaseStereoTargets();
-        logLine("retail eye targets rejected: shared A8B8G8R8 allocation or distinct D3D9 handles failed");
+        if (direct3D)
+            direct3D->Release();
+        logRetailVrLine(
+            "retail eye targets rejected: adapter format context is unavailable");
         return false;
     }
 
-    gRetailEngineEyeTargetDevice = device;
-    gStereoTargetsAliasTwin = false;
-    gStereoTargetWidth = colorDescription.Width;
-    gStereoTargetHeight = colorDescription.Height;
-    gStereoTargetFormat = RetailEngineSharedColorFormat;
-    return true;
+    releaseStereoTargets();
+    HRESULT lastColorFormatResult = D3DERR_NOTAVAILABLE_RESULT;
+    HRESULT lastDepthMatchResult = D3DERR_NOTAVAILABLE_RESULT;
+    D3DFORMAT lastCandidate = D3DFMT_UNKNOWN;
+    for (const std::uint32_t candidateValue :
+        fnvxr::d3d9::RetailSharedEyeTargetColorFormats)
+    {
+        const D3DFORMAT candidate = static_cast<D3DFORMAT>(candidateValue);
+        lastCandidate = candidate;
+        lastColorFormatResult = direct3D->CheckDeviceFormat(
+            creationParameters.AdapterOrdinal,
+            creationParameters.DeviceType,
+            adapterMode.Format,
+            D3DUSAGE_RENDERTARGET,
+            D3DRTYPE_TEXTURE,
+            candidate);
+        lastDepthMatchResult = direct3D->CheckDepthStencilMatch(
+            creationParameters.AdapterOrdinal,
+            creationParameters.DeviceType,
+            adapterMode.Format,
+            candidate,
+            depthDescription.Format);
+        if (FAILED(lastColorFormatResult) || FAILED(lastDepthMatchResult))
+            continue;
+
+        if (createEyeTarget(
+                device,
+                colorDescription.Width,
+                colorDescription.Height,
+                candidate,
+                gLeftEyeTexture,
+                gLeftEyeSurface,
+                gLeftEyeDepth,
+                depthDescription.Format,
+                &gLeftEyeD3D9SharedHandle)
+            && createEyeTarget(
+                device,
+                colorDescription.Width,
+                colorDescription.Height,
+                candidate,
+                gRightEyeTexture,
+                gRightEyeSurface,
+                gRightEyeDepth,
+                depthDescription.Format,
+                &gRightEyeD3D9SharedHandle)
+            && gLeftEyeD3D9SharedHandle
+            && gRightEyeD3D9SharedHandle
+            && gLeftEyeD3D9SharedHandle != gRightEyeD3D9SharedHandle)
+        {
+            direct3D->Release();
+            gRetailEngineEyeTargetDevice = device;
+            gStereoTargetsAliasTwin = false;
+            gStereoTargetWidth = colorDescription.Width;
+            gStereoTargetHeight = colorDescription.Height;
+            gStereoTargetFormat = candidate;
+            return true;
+        }
+        releaseStereoTargets();
+    }
+
+    direct3D->Release();
+    char message[256] {};
+    sprintf_s(
+        message,
+        "retail eye targets rejected: no transport format survived format/depth/shared probes last=%u format=0x%08lx depth=0x%08lx",
+        static_cast<unsigned>(lastCandidate),
+        static_cast<unsigned long>(lastColorFormatResult),
+        static_cast<unsigned long>(lastDepthMatchResult));
+    logRetailVrLine(message);
+    return false;
 }
 
 [[maybe_unused]] bool prepareRetailEngineEyeTargetOperations(
@@ -7736,8 +7743,10 @@ bool copyRetailUiBackBufferToMonoTargets(
         && source.Height == left.Height
         && left.Width == right.Width
         && left.Height == right.Height
-        && left.Format == RetailEngineSharedColorFormat
-        && right.Format == RetailEngineSharedColorFormat;
+        && left.Format == gStereoTargetFormat
+        && right.Format == gStereoTargetFormat
+        && fnvxr::d3d9::retailSharedEyeTargetColorFormatAccepted(
+            static_cast<std::uint32_t>(gStereoTargetFormat));
     const bool copied = descriptionsMatch
         && SUCCEEDED(device->StretchRect(
             backBuffer,

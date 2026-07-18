@@ -14,7 +14,6 @@
 namespace fnvxr::d3d9
 {
 inline constexpr std::size_t RetailD3D9PresentVtableSlot = 17u;
-inline constexpr std::size_t RetailD3D9ExDeviceMethodCount = 134u;
 
 enum class RetailUiQuadPresentHookFailure : std::uint8_t
 {
@@ -23,9 +22,8 @@ enum class RetailUiQuadPresentHookFailure : std::uint8_t
     OperationsIncomplete,
     AnotherHookActive,
     InvalidVtable,
-    VtableAllocationFailed,
     VtableProtectionFailed,
-    VtableSwapFailed,
+    PresentSlotLeaseFailed,
 };
 
 using RetailD3D9PresentFunction = HRESULT(WINAPI*)(
@@ -77,7 +75,7 @@ private:
     RetailUiQuadCaptureController mCapture {};
     IDirect3DDevice9* mDevice = nullptr;
     void** mOriginalVtable = nullptr;
-    void** mPrivateVtable = nullptr;
+    void** mPresentEntry = nullptr;
     RetailD3D9PresentFunction mOriginalPresent = nullptr;
     RetailUiQuadPresentHookFailure mFailure =
         RetailUiQuadPresentHookFailure::InvalidDevice;

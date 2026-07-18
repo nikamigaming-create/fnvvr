@@ -2,12 +2,35 @@
 
 #include "../runtime/fnvxr_retail_center_renderer_operations.h"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
 
 namespace fnvxr::d3d9
 {
+// D3D9Ex/D3D11 sharing only accepts this transport-mapped subset. Adapters
+// are permitted to reject individual members, so retail allocation probes in
+// this order and stops at the first format that passes render-target, depth,
+// and shared-resource creation. Numeric values are the stable D3DFORMAT ABI.
+inline constexpr std::array<std::uint32_t, 3u>
+    RetailSharedEyeTargetColorFormats {
+        32u,  // D3DFMT_A8B8G8R8 -> DXGI_FORMAT_R8G8B8A8_UNORM
+        31u,  // D3DFMT_A2B10G10R10 -> DXGI_FORMAT_R10G10B10A2_UNORM
+        113u, // D3DFMT_A16B16G16R16F -> DXGI_FORMAT_R16G16B16A16_FLOAT
+    };
+
+constexpr bool retailSharedEyeTargetColorFormatAccepted(
+    std::uint32_t format) noexcept
+{
+    for (const std::uint32_t candidate : RetailSharedEyeTargetColorFormats)
+    {
+        if (candidate == format)
+            return true;
+    }
+    return false;
+}
+
 enum class EyeTargetSurfaceIdentity : std::uint8_t
 {
     Failure,
