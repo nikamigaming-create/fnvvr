@@ -25,7 +25,9 @@ $authoritativeManifest = Get-Content -LiteralPath $RunManifestPath -Raw | Conver
 if (-not $authoritativeManifest.runDir) {
     throw "Run manifest does not identify runDir: $RunManifestPath"
 }
-& (Join-Path $PSScriptRoot "analyze-fnvxr-live-run.ps1") -RunDir ([string]$authoritativeManifest.runDir)
+& (Join-Path $PSScriptRoot "analyze-fnvxr-live-run.ps1") `
+    -RunDir ([string]$authoritativeManifest.runDir) `
+    -ExpectedProfile 'full-vr'
 exit $LASTEXITCODE
 
 function Read-TextOrEmpty {

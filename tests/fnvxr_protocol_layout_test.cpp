@@ -108,7 +108,7 @@ int main()
         return fail("SharedDInputState host publish did not preserve plugin accept packet");
     }
 
-    if (sizeof(fnvxr::shared::SharedVrPoseState) != 272)
+    if (sizeof(fnvxr::shared::SharedVrPoseState) != 288)
         return fail("SharedVrPoseState size mismatch");
 
     if (offsetof(fnvxr::shared::SharedVrPoseState, predictedDisplayTime) != 24)
@@ -135,11 +135,17 @@ int main()
     if (offsetof(fnvxr::shared::SharedVrPoseState, referenceSpaceGeneration) != 264)
         return fail("SharedVrPoseState reference generation offset mismatch");
 
-    if (fnvxr::shared::VrPoseSharedVersion != 7)
-        return fail("SharedVrPoseState reference-generation contract version mismatch");
+    if (offsetof(fnvxr::shared::SharedVrPoseState, producerEpoch) != 272)
+        return fail("SharedVrPoseState producer epoch offset mismatch");
 
-    if (sizeof(fnvxr::shared::SharedVrOriginState) != 144
-        || fnvxr::shared::VrOriginSharedVersion != 5
+    if (offsetof(fnvxr::shared::SharedVrPoseState, recenterRequestId) != 280)
+        return fail("SharedVrPoseState recenter request offset mismatch");
+
+    if (fnvxr::shared::VrPoseSharedVersion != 8)
+        return fail("SharedVrPoseState event-mailbox contract version mismatch");
+
+    if (sizeof(fnvxr::shared::SharedVrOriginState) != 216
+        || fnvxr::shared::VrOriginSharedVersion != 6
         || offsetof(fnvxr::shared::SharedVrOriginState, sequence) != 8
         || offsetof(fnvxr::shared::SharedVrOriginState, active) != 12
         || offsetof(fnvxr::shared::SharedVrOriginState, generation) != 16
@@ -147,14 +153,76 @@ int main()
         || offsetof(fnvxr::shared::SharedVrOriginState, poseFrame) != 24
         || offsetof(fnvxr::shared::SharedVrOriginState, originRot) != 32
         || offsetof(fnvxr::shared::SharedVrOriginState, originPos) != 48
-        || offsetof(fnvxr::shared::SharedVrOriginState, renderPoseSequence) != 64
-        || offsetof(fnvxr::shared::SharedVrOriginState, renderPoseFrame) != 72
-        || offsetof(fnvxr::shared::SharedVrOriginState, renderedDisplayTime) != 80
-        || offsetof(fnvxr::shared::SharedVrOriginState, renderCameraAddress) != 88
-        || offsetof(fnvxr::shared::SharedVrOriginState, renderCameraWorldRot) != 96
-        || offsetof(fnvxr::shared::SharedVrOriginState, renderCameraWorldPos) != 132)
+        || offsetof(fnvxr::shared::SharedVrOriginState, producerEpoch) != 64
+        || offsetof(fnvxr::shared::SharedVrOriginState, renderPoseSequence) != 72
+        || offsetof(fnvxr::shared::SharedVrOriginState, renderPoseFrame) != 80
+        || offsetof(fnvxr::shared::SharedVrOriginState, renderedDisplayTime) != 88
+        || offsetof(fnvxr::shared::SharedVrOriginState, renderCameraAddress) != 96
+        || offsetof(fnvxr::shared::SharedVrOriginState, renderCameraWorldRot) != 104
+        || offsetof(fnvxr::shared::SharedVrOriginState, renderCameraWorldPos) != 140
+        || offsetof(fnvxr::shared::SharedVrOriginState, bodyRootAddress) != 152
+        || offsetof(fnvxr::shared::SharedVrOriginState, bodyRootWorldRot) != 160
+        || offsetof(fnvxr::shared::SharedVrOriginState, bodyRootWorldPos) != 196
+        || offsetof(fnvxr::shared::SharedVrOriginState, bodyRootWorldScale) != 208)
     {
         return fail("SharedVrOriginState authoritative recenter layout mismatch");
+    }
+
+    if (fnvxr::shared::D3D9StereoFrameSharedVersion != 7
+        || sizeof(fnvxr::shared::SharedD3D9StereoFrameHeader) != 216
+        || offsetof(fnvxr::shared::SharedD3D9StereoFrameHeader, producerEpoch) != 176
+        || offsetof(fnvxr::shared::SharedD3D9StereoFrameHeader, rendererProducerEpoch) != 184
+        || offsetof(fnvxr::shared::SharedD3D9StereoFrameHeader, producerProcessId) != 192
+        || offsetof(fnvxr::shared::SharedD3D9StereoFrameHeader, publishedSlot) != 196
+        || offsetof(fnvxr::shared::SharedD3D9StereoFrameHeader, readerSlots) != 200
+        || offsetof(fnvxr::shared::SharedD3D9StereoFrameHeader, publicationGeneration) != 208
+        || fnvxr::shared::D3D9StereoFrameReaderLaneCount != 2
+        || fnvxr::shared::D3D9StereoFrameSlotCount != 4)
+    {
+        return fail("SharedD3D9StereoFrameHeader 64-bit producer identity mismatch");
+    }
+
+    LONG highSequence = 0;
+    const std::uint32_t highEvenBits = 0x7ffffffeu;
+    std::memcpy(&highSequence, &highEvenBits, sizeof(highSequence));
+    if (!fnvxr::shared::beginSequencedSharedWrite(highSequence))
+        return fail("high-bit sequence write did not begin");
+    fnvxr::shared::endSequencedSharedWrite(highSequence);
+    if (fnvxr::shared::sequencedValueBits(highSequence) != 0x80000000u
+        || !fnvxr::shared::sequencedValueIsPublished(highSequence))
+    {
+        return fail("negative even sequence was not accepted modulo 2^32");
+    }
+
+    const std::uint32_t finalEvenBits = 0xfffffffeu;
+    std::memcpy(&highSequence, &finalEvenBits, sizeof(highSequence));
+    if (!fnvxr::shared::beginSequencedSharedWrite(highSequence))
+        return fail("wrap sequence write did not begin");
+    fnvxr::shared::endSequencedSharedWrite(highSequence);
+    if (fnvxr::shared::sequencedValueBits(highSequence) != 2u
+        || !fnvxr::shared::sequencedValueIsPublished(highSequence))
+    {
+        return fail("seqlock published the reserved zero sequence at wrap");
+    }
+
+    LONG publicationCounter = 0;
+    const std::uint32_t publicationFinalBits = 0xffffffffu;
+    std::memcpy(&publicationCounter, &publicationFinalBits, sizeof(publicationCounter));
+    if (fnvxr::shared::sequencedValueBits(
+            fnvxr::shared::incrementNonzeroSharedCounter(publicationCounter)) != 1u)
+    {
+        return fail("plain publication counter emitted zero at wrap");
+    }
+    LONG previousPublication = 0;
+    std::memcpy(&previousPublication, &publicationFinalBits, sizeof(previousPublication));
+    if (!fnvxr::shared::nonzeroSharedCounterAdvanced(publicationCounter, previousPublication))
+        return fail("plain publication counter did not advance modularly across wrap");
+    if (fnvxr::shared::nonzeroSharedCounterDistance(1u, 0xfffffff0u) != 16u
+        || fnvxr::shared::nonzeroSharedCounterDistance(17u, 1u) != 16u
+        || fnvxr::shared::nonzeroSharedCounterDistance(1u, 1u) != 0u
+        || fnvxr::shared::nonzeroSharedCounterDistance(0u, 1u) != 0u)
+    {
+        return fail("nonzero publication distance mishandled wrap or sentinel zero");
     }
 
     if (fnvxr::shared::StereoProducerDrawReplay != 1
@@ -266,9 +334,29 @@ int main()
     if (sizeof(fnvxr::shared::SharedD3D9FrameHeader) != 28)
         return fail("SharedD3D9FrameHeader size mismatch");
 
-    if (fnvxr::shared::D3D9StereoFrameSharedVersion != 3
-        || sizeof(fnvxr::shared::SharedD3D9StereoFrameHeader) != 184)
+    if (fnvxr::shared::D3D9StereoFrameSharedVersion != 7
+        || sizeof(fnvxr::shared::SharedD3D9StereoFrameHeader) != 216)
         return fail("SharedD3D9StereoFrameHeader size mismatch");
+
+    for (LONG publishedSlot = -1; publishedSlot < 4; ++publishedSlot)
+    {
+        for (LONG hostReaderSlot = -1; hostReaderSlot < 4; ++hostReaderSlot)
+        {
+            for (LONG captureReaderSlot = -1; captureReaderSlot < 4; ++captureReaderSlot)
+            {
+                const LONG writable = fnvxr::shared::selectWritableStereoFrameSlot(
+                    publishedSlot, hostReaderSlot, captureReaderSlot);
+                if (writable < 0
+                    || writable >= 4
+                    || writable == publishedSlot
+                    || writable == hostReaderSlot
+                    || writable == captureReaderSlot)
+                {
+                    return fail("four-slot stereo ring failed with two independent or stale readers");
+                }
+            }
+        }
+    }
 
     if (offsetof(fnvxr::shared::SharedD3D9StereoFrameHeader, writing) != 12
         || offsetof(fnvxr::shared::SharedD3D9StereoFrameHeader, sequence) != 16)

@@ -17,7 +17,8 @@ namespace
             * static_cast<std::size_t>(fnvxr::shared::D3D9SharedFrameMaxHeight) * 4u;
     constexpr std::size_t SharedStereoMappingBytes = sizeof(fnvxr::shared::SharedD3D9StereoFrameHeader)
         + static_cast<std::size_t>(fnvxr::shared::D3D9SharedFrameMaxWidth)
-            * static_cast<std::size_t>(fnvxr::shared::D3D9SharedFrameMaxHeight) * 4u * 2u;
+            * static_cast<std::size_t>(fnvxr::shared::D3D9SharedFrameMaxHeight) * 4u * 2u
+            * fnvxr::shared::D3D9StereoFrameSlotCount;
 
     struct MappingView
     {
@@ -85,6 +86,7 @@ namespace
     {
         bool present = false;
         bool usable = false;
+        bool modular32 = false;
         std::uint64_t value = 0;
     };
 
@@ -294,7 +296,38 @@ namespace
 
     bool counterAdvanced(const CounterStatus& before, const CounterStatus& after)
     {
-        return before.usable && after.usable && after.value > before.value;
+        if (!before.usable || !after.usable || before.modular32 != after.modular32)
+            return false;
+        if (!before.modular32)
+            return after.value > before.value;
+        const std::uint32_t older = static_cast<std::uint32_t>(before.value);
+        const std::uint32_t newer = static_cast<std::uint32_t>(after.value);
+        const std::uint32_t delta = newer - older;
+        return newer != 0u && delta != 0u && delta < 0x80000000u;
+    }
+
+    bool stereoPayloadLayoutUsable(const fnvxr::shared::SharedD3D9StereoFrameHeader& header)
+    {
+        if (header.publishedSlot < 0
+            || header.publishedSlot >= static_cast<LONG>(fnvxr::shared::D3D9StereoFrameSlotCount)
+            || header.width <= 0
+            || header.height <= 0
+            || header.pitchBytes != header.width * 4)
+        {
+            return false;
+        }
+        constexpr std::uint64_t slotBytes =
+            static_cast<std::uint64_t>(fnvxr::shared::D3D9SharedFrameMaxWidth)
+            * fnvxr::shared::D3D9SharedFrameMaxHeight * 4u * 2u;
+        const std::uint64_t planeBytes =
+            static_cast<std::uint64_t>(header.pitchBytes) * header.height;
+        const std::uint64_t expectedLeft = sizeof(header)
+            + static_cast<std::uint64_t>(header.publishedSlot) * slotBytes;
+        const std::uint64_t expectedRight = expectedLeft + planeBytes;
+        return header.leftPayloadOffset == expectedLeft
+            && header.rightPayloadOffset == expectedRight
+            && expectedRight + planeBytes <= expectedLeft + slotBytes
+            && expectedRight + planeBytes <= header.totalMappingBytes;
     }
 
     CounterStatus readPlayerCounter(const char* mappingName, std::uint32_t expectedMagic, std::uint32_t expectedVersion)
@@ -394,21 +427,31 @@ namespace
         const bool protocolOk = header.magic == fnvxr::shared::D3D9StereoFrameSharedMagic
             && header.version == fnvxr::shared::D3D9StereoFrameSharedVersion
             && header.headerBytes == sizeof(header)
-            && header.leftPayloadOffset == sizeof(header)
-            && header.totalMappingBytes == SharedStereoMappingBytes;
+            && header.totalMappingBytes == SharedStereoMappingBytes
+            && header.rendererProducerEpoch != 0
+            && header.producerProcessId != 0
+            && header.publicationGeneration != 0
+            && stereoPayloadLayoutUsable(header);
         const bool usable = stable && protocolOk
-            && dimensionsOk && header.poseValid != 0 && header.uiActive == 0;
+            && dimensionsOk
+            && header.poseValid != 0
+            && fnvxr::shared::sequencedValueIsPublished(header.poseSequence)
+            && header.renderedDisplayTime > 0
+            && header.referenceSpaceGeneration != 0
+            && header.producerEpoch != 0
+            && header.uiActive == 0;
         const bool coherentSameTickProducer =
             (header.producerMode == static_cast<LONG>(fnvxr::shared::StereoProducerNativeSameFrame)
                 || header.producerMode == static_cast<LONG>(fnvxr::shared::StereoProducerSingleTraversal))
-            && header.renderPairSequence > 0;
+            && fnvxr::shared::sequencedValueBits(header.renderPairSequence) != 0u;
         const bool world = usable
             && coherentSameTickProducer
             && header.worldCandidate != 0
             && header.separated != 0;
         status.present = true;
         status.usable = requireWorld ? world : usable;
-        status.value = static_cast<std::uint64_t>(header.sequence);
+        status.modular32 = true;
+        status.value = fnvxr::shared::sequencedValueBits(header.sequence);
         return status;
     }
 
@@ -631,20 +674,29 @@ namespace
         const bool protocolOk = magicOk
             && header.version == fnvxr::shared::D3D9StereoFrameSharedVersion
             && header.headerBytes == sizeof(header)
-            && header.leftPayloadOffset == sizeof(header)
-            && header.totalMappingBytes == SharedStereoMappingBytes;
+            && header.totalMappingBytes == SharedStereoMappingBytes
+            && header.rendererProducerEpoch != 0
+            && header.producerProcessId != 0
+            && header.publicationGeneration != 0
+            && stereoPayloadLayoutUsable(header);
         const bool dimensionsOk = header.width > 0 && header.height > 0
             && header.width <= static_cast<LONG>(fnvxr::shared::D3D9SharedFrameMaxWidth)
             && header.height <= static_cast<LONG>(fnvxr::shared::D3D9SharedFrameMaxHeight)
             && header.pitchBytes >= header.width * 4;
-        const bool usable = protocolOk && stable && dimensionsOk && header.poseValid != 0 && header.uiActive == 0;
+        const bool usable = protocolOk && stable && dimensionsOk
+            && header.poseValid != 0
+            && fnvxr::shared::sequencedValueIsPublished(header.poseSequence)
+            && header.renderedDisplayTime > 0
+            && header.referenceSpaceGeneration != 0
+            && header.producerEpoch != 0
+            && header.uiActive == 0;
         const bool nativeSameFrame = header.producerMode
             == static_cast<LONG>(fnvxr::shared::StereoProducerNativeSameFrame);
         const bool singleTraversal = header.producerMode
             == static_cast<LONG>(fnvxr::shared::StereoProducerSingleTraversal);
         const bool coherentSameTickProducer =
             (nativeSameFrame || singleTraversal)
-            && header.renderPairSequence > 0;
+            && fnvxr::shared::sequencedValueBits(header.renderPairSequence) != 0u;
         const bool worldStereo = usable
             && coherentSameTickProducer
             && header.worldCandidate != 0

@@ -19,11 +19,11 @@ foreach ($script in $scripts) {
     $tokens = $null
     $errors = $null
     [System.Management.Automation.Language.Parser]::ParseFile($script.FullName, [ref]$tokens, [ref]$errors) | Out-Null
-    foreach ($error in $errors) {
+    foreach ($parseErrorRecord in $errors) {
         $parseErrors += [pscustomobject]@{
             File = $script.FullName
-            Line = $error.Extent.StartLineNumber
-            Message = $error.Message
+            Line = $parseErrorRecord.Extent.StartLineNumber
+            Message = $parseErrorRecord.Message
         }
     }
 }
@@ -71,12 +71,89 @@ function Forbid-Pattern {
     }
 }
 
+function Require-TextBefore {
+    param(
+        [string]$Path,
+        [string]$RequiredText,
+        [string]$BeforeText,
+        [string]$Reason
+    )
+
+    $content = Get-Content -LiteralPath $Path -Raw
+    $requiredOffset = $content.IndexOf($RequiredText, [StringComparison]::Ordinal)
+    $beforeOffset = $content.IndexOf($BeforeText, [StringComparison]::Ordinal)
+    if ($requiredOffset -lt 0 -or $beforeOffset -lt 0 -or $requiredOffset -ge $beforeOffset) {
+        throw "Required safety ordering missing in $Path`: $Reason"
+    }
+}
+
+function Require-EarlyThrowAst {
+    param(
+        [string]$Path,
+        [string]$MessageFragment,
+        [string]$BeforePattern,
+        [string]$ConditionPattern = ""
+    )
+
+    $tokens = $null
+    $errors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+        $Path,
+        [ref]$tokens,
+        [ref]$errors)
+    if ($errors.Count -ne 0) {
+        throw "Cannot prove early throw in syntactically invalid script: $Path"
+    }
+    $throwAst = @($ast.FindAll({
+        param($node)
+        $node -is [System.Management.Automation.Language.ThrowStatementAst] -and
+            $node.Extent.Text.Contains($MessageFragment)
+    }, $true) | Sort-Object { $_.Extent.StartOffset } | Select-Object -First 1)
+    if ($throwAst.Count -ne 1) {
+        throw "Missing executable throw AST in $Path for '$MessageFragment'"
+    }
+
+    if ($ConditionPattern) {
+        $owner = $throwAst[0].Parent
+        while ($owner -and $owner -isnot [System.Management.Automation.Language.IfStatementAst]) {
+            if ($owner -is [System.Management.Automation.Language.FunctionDefinitionAst]) {
+                throw "Safety throw in $Path is hidden inside a function"
+            }
+            $owner = $owner.Parent
+        }
+        if (-not $owner) {
+            throw "Safety throw in $Path is not owned by the required live-mode condition"
+        }
+        $conditionMatches = @($owner.Clauses | Where-Object {
+            $_.Item1.Extent.Text -match $ConditionPattern
+        })
+        if ($conditionMatches.Count -eq 0) {
+            throw "Safety throw in $Path has the wrong live-mode condition"
+        }
+    }
+
+    $hazards = @($ast.FindAll({
+        param($node)
+        $node -is [System.Management.Automation.Language.CommandAst] -and
+            $node.Extent.Text -match $BeforePattern
+    }, $true) | Sort-Object { $_.Extent.StartOffset })
+    if ($hazards.Count -gt 0 -and
+        $throwAst[0].Extent.StartOffset -ge $hazards[0].Extent.StartOffset) {
+        throw "Safety throw in $Path occurs after a forbidden launch-side effect: $($hazards[0].Extent.Text)"
+    }
+}
+
 $openxrScript = Join-Path $scriptRoot "start-openxr-retail-sidecar.ps1"
 $retailScript = Join-Path $scriptRoot "start-retail-surface-producer.ps1"
 $legacyScript = Join-Path $scriptRoot "start-rock-solid.ps1"
 $pcvrScript = Join-Path $scriptRoot "start-retail-pcvr-max.ps1"
 $commonScript = Join-Path $scriptRoot "fnvxr-sidecar-common.ps1"
 $watchExitScript = Join-Path $scriptRoot "watch-retail-exit.ps1"
+$directHostScript = Join-Path $scriptRoot "run-openxr-pose-host.ps1"
+$legacyHostWatchScript = Join-Path $scriptRoot "watch-host.ps1"
+$cacheOnlyScript = Join-Path $scriptRoot "start-cache-only-scene.ps1"
+$buildSceneCacheScript = Join-Path $scriptRoot "build-scene-cache.ps1"
+$liveAnalyzerScript = Join-Path $scriptRoot "analyze-fnvxr-live-run.ps1"
 $readme = Join-Path $Root "README.md"
 $cmake = Join-Path $Root "CMakeLists.txt"
 $protocolCode = Join-Path $Root "protocol\fnvxr_protocol.h"
@@ -93,7 +170,7 @@ $oldTransportDir = Join-Path $Root ("trans" + "port")
 $stereoWorldSwitchParam = '[switch]$Enable' + 'StereoWorld'
 $stereoWorldRetailArg = '$retailArgs += "-Enable' + 'StereoWorld"'
 
-foreach ($path in @($openxrScript, $retailScript, $legacyScript, $pcvrScript, $commonScript, $verifyScript, $verifiedContractScript, $readme, $cmake, $protocolCode, $sharedStateCode, $hostCode, $pluginCode, $dinputCode, $xinputCode, $d3d9Code)) {
+foreach ($path in @($openxrScript, $retailScript, $legacyScript, $pcvrScript, $commonScript, $watchExitScript, $directHostScript, $legacyHostWatchScript, $cacheOnlyScript, $buildSceneCacheScript, $liveAnalyzerScript, $verifyScript, $verifiedContractScript, $readme, $cmake, $protocolCode, $sharedStateCode, $hostCode, $pluginCode, $dinputCode, $xinputCode, $d3d9Code)) {
     if (-not (Test-Path -LiteralPath $path)) {
         throw "Missing required sidecar path: $path"
     }
@@ -106,12 +183,34 @@ if (Test-Path -LiteralPath $oldTransportDir) {
 }
 
 Require-Text -Path $openxrScript -Text 'profile = "openxr-sidecar"' -Reason "OpenXR launcher must use explicit sidecar profile"
+Require-EarlyThrowAst `
+    -Path $openxrScript `
+    -MessageFragment 'All live OpenXR presentation is intentionally blocked.' `
+    -BeforePattern 'Resolve-FnvxrGameRoot|Start-Process|New-Item\s+-ItemType\s+Directory' `
+    -ConditionPattern '-not\s*\(\s*\$StageOnly\s*-or\s*\$ValidateOnly\s*\)'
+Require-EarlyThrowAst -Path $directHostScript -MessageFragment 'Direct OpenXR host launch is intentionally blocked:' -BeforePattern 'cmake|Start-Process|fnvxr_openxr_pose_host'
+Require-EarlyThrowAst -Path $legacyHostWatchScript -MessageFragment 'Legacy host restart loops are intentionally blocked:' -BeforePattern 'Start-Process|fnvxr_openxr_pose_host'
+Require-EarlyThrowAst -Path $cacheOnlyScript -MessageFragment 'Cache-only OpenXR launch is intentionally blocked:' -BeforePattern 'Start-Process|fnvxr_openxr_pose_host'
+Require-EarlyThrowAst -Path $buildSceneCacheScript -MessageFragment 'Legacy live scene-cache capture is intentionally blocked:' -BeforePattern 'Start-Process|start-openxr-retail-sidecar'
+Require-Text -Path $openxrScript -Text 'Live OpenXR host-only and watcher-free modes are intentionally blocked.' -Reason "Every live host launch must retain the external progress watchdog"
+Require-Text -Path $openxrScript -Text 'Infinite OpenXR host runs are intentionally blocked' -Reason "No launcher path may start an unauthenticated infinite host"
+Require-Text -Path $directHostScript -Text 'Direct OpenXR host launch is intentionally blocked:' -Reason "A direct foreground host must not bypass bounded sidecar cleanup"
+Require-Text -Path $legacyHostWatchScript -Text 'Legacy host restart loops are intentionally blocked:' -Reason "An existence-only restart loop must not relaunch a stuck host"
+Require-Text -Path $cacheOnlyScript -Text 'Cache-only OpenXR launch is intentionally blocked:' -Reason "The unbounded cache-only host path must remain quarantined"
+Require-Text -Path $buildSceneCacheScript -Text 'Legacy live scene-cache capture is intentionally blocked:' -Reason "The legacy force-kill/stereo cache builder must remain quarantined"
+Require-Text -Path $liveAnalyzerScript -Text '$computedPoseAge = $predictedDisplayTime - $sourceRenderedDisplayTime' -Reason "Acceptance must independently recompute pose age from the two source timestamps"
+Require-Text -Path $liveAnalyzerScript -Text '$badGameplaySubmitsAfterHandoff = @($submitEvents' -Reason "Post-handoff failures must not disappear merely because runtimeGameplay flipped false"
+Require-Text -Path $liveAnalyzerScript -Text 'flat_surface_live_pixels_and_submit' -Reason "2D acceptance must prove advancing nonblack pixels and successful OpenXR submissions"
 Require-Text -Path $openxrScript -Text 'Resolve-FnvxrGameRoot -GameRoot $GameRoot -DebugLog $DebugLog' -Reason "OpenXR launcher must auto-resolve the retail sandbox root before staging or launch"
 Require-Text -Path $openxrScript -Text 'Copy-FnvxrOpenXrLoader -HostExe $HostExe -DebugLog $DebugLog' -Reason "OpenXR launcher must stage openxr_loader.dll beside the host instead of relying on PATH"
 Require-Text -Path $openxrScript -Text 'OpenXR host exited before creating its session/bridge' -Reason "OpenXR launcher must distinguish instant host exit from headset-idle pose readiness"
 Require-Text -Path $openxrScript -Text 'Pattern "fnvxrHostBridgeReady xrSessionCreated=1 sharedMappingsReady=1"' -Reason "OpenXR session and cross-bitness bridge must be ready before retail launch"
 Require-Text -Path $openxrScript -Text 'retail remains live with neutral VR input' -Reason "An idle headset must not prevent or poison the retail sidecar launch"
 Require-Text -Path $hostCode -Text 'fnvxrHostBridgeReady xrSessionCreated=1 sharedMappingsReady=1' -Reason "Host must publish an explicit pre-retail bridge readiness handshake"
+Require-Text -Path $hostCode -Text 'MaximumUnsupervisedFrames = 7200' -Reason "Direct host invocation must have a hard finite upper bound"
+Require-TextBefore -Path $hostCode -RequiredText 'constexpr bool OpenXrLiveRuntimeProofComplete = false;' -BeforeText 'OpenXr xr {};' -Reason "The compiled host fuse must be declared false before any OpenXR object is initialized"
+Require-TextBefore -Path $hostCode -RequiredText 'if (!OpenXrLiveRuntimeProofComplete)' -BeforeText 'OpenXr xr {};' -Reason "The host must branch on its source fuse before loading OpenXR"
+Require-Text -Path $hostCode -Text 'Infinite and malformed runs fail closed.' -Reason "Malformed frame text must never parse as an infinite run"
 Require-Text -Path $openxrScript -Text 'Retail sidecar was not launched' -Reason "OpenXR launcher must fail closed before retail"
 Require-Text -Path $openxrScript -Text '$fallout = Start-Process' -Reason "OpenXR launcher must explicitly launch retail after readiness gates"
 Require-Text -Path $openxrScript -Text 'Set-FnvxrWindowForeground -Handle $falloutHwnd -DebugLog $DebugLog' -Reason "OpenXR launcher must refocus retail after the first proven video frame so SFX/input do not stay backgrounded"
@@ -256,6 +355,21 @@ Require-Text -Path $commonScript -Text 'FNVXR_DINPUT_LOOK_SCALE = "11.2"' -Reaso
 Require-Text -Path $commonScript -Text 'xinput9_1_0.dll' -Reason "Retail staging must cover games that import XInput 9.1.0"
 Require-Text -Path $commonScript -Text 'xinput1_4.dll' -Reason "Retail staging must cover newer XInput import names"
 Require-Text -Path $commonScript -Text 'FNVXR_GAME_PLANE_CAPTURE_HZ = "0"' -Reason "Fallback quad must upload the newest shared frame every rendered OpenXR frame"
+Require-Text -Path $commonScript -Text 'FNVXR_GAME_PLANE_MAX_STALE_MS = "250"' -Reason "A stalled mono producer must not leave an indefinitely frozen headset quad"
+Require-Text -Path $commonScript -Text 'FNVXR_GAME_PLANE_WINDOW_FALLBACK_ON_BLACK = "0"' -Reason "DWM-retained window pixels must not masquerade as advancing game transport"
+Require-Text -Path $commonScript -Text 'FNVXR_GAME_PLANE_SOURCE = "shared"' -Reason "The accepted flat path must use the sequence-protected shared producer"
+Require-Text -Path $commonScript -Text 'FNVXR_WORLD_PLANE_MAX_STALE_MS = "250"' -Reason "A stalled legacy wide producer must not leave retained peripheral pixels indefinitely"
+Require-Text -Path $commonScript -Text 'FNVXR_STEREO_STATE_MAX_STALE_MS = "250"' -Reason "Retained stereo metadata must not keep world-ready state alive without producer advancement"
+Require-Text -Path $commonScript -Text 'FNVXR_STEREO_PROGRESS_WATCHDOG_MS = "1000"' -Reason "A post-handoff stereo loss must end the live session instead of rendering black indefinitely"
+Require-Text -Path $hostCode -Text 'fnvxrStereoProgressWatchdog' -Reason "The host must emit a terminal post-proof stereo-loss event"
+Require-Text -Path $commonScript -Text 'FNVXR_RUNTIME_STATE_MAX_STALE_MS = "250"' -Reason "A stalled plugin runtime state must neutralize gameplay controls"
+Require-Text -Path $commonScript -Text 'FNVXR_PLAYER_STATE_MAX_STALE_MS = "250"' -Reason "A stalled player/cell record must not remain authoritative"
+Require-Text -Path $hostCode -Text 'gameTexture staleExpired=1' -Reason "Host must visibly drop retained mono pixels after the freshness deadline"
+Require-Text -Path $hostCode -Text 'gameTexture staleSafetyPattern=1' -Reason "Expired live pixels must become an unmistakable safety image rather than a frozen window capture"
+Require-Text -Path $hostCode -Text 'gameTexture rejectedMostlyBlack=1' -Reason "A captured black frame must not be accepted as a valid fallback image"
+Require-Text -Path $hostCode -Text 'captureSwapchainRenderProof' -Reason "Acceptance must hash nonblack/nonuniform post-draw swapchain pixels before release"
+Require-Text -Path $commonScript -Text 'FNVXR_RENDER_OUTPUT_PROOF = "1"' -Reason "Live evidence runs must enable post-draw eye-output readback"
+Require-Text -Path $commonScript -Text 'FNVXR_INPUT_EVENT_MAX_HOLD_MS = "500"' -Reason "Lost queued input-up events must expire while producer heartbeats preserve legitimate holds"
 Require-Text -Path $commonScript -Text 'FNVXR_GAME_PLANE_AUTO_CENTER_FRAMES = "0"' -Reason "Fallback quad must latch once instead of following the headset"
 Require-Text -Path $commonScript -Text 'FNVXR_GAME_PLANE_LOCK_TO_HEAD = "0"' -Reason "Fallback quad must be world anchored by default"
 Require-Text -Path $commonScript -Text 'FNVXR_GAME_PLANE_RECENTER_ON_FOCUS = "1"' -Reason "Fallback quad must recenter once after Alt-Tab/OpenXR focus regain"
@@ -319,8 +433,8 @@ Require-Text -Path $commonScript -Text 'FNVXR_RETAIL_RIG_APPLY = "0"' -Reason "O
 Require-Text -Path $openxrScript -Text '[switch]$ApplyRetailRig' -Reason "The OpenXR launcher must expose an explicit retail-rig write gate"
 Require-Text -Path $openxrScript -Text '[switch]$DisableRetailRig' -Reason "Stereo diagnostics must have an explicit kill switch for retail arm/weapon writes"
 Require-Text -Path $openxrScript -Text '$env:FNVXR_RETAIL_RIG_ENABLE = "1"' -Reason "Stereo gameplay must install the independent retail controller-to-arm path by default"
-Require-Text -Path $openxrScript -Text '$env:FNVXR_RETAIL_RIG_APPLY = "1"' -Reason "Stereo gameplay must apply the independently recentered retail arm path"
-Require-Text -Path $openxrScript -Text '$env:FNVXR_RETAIL_WEAPON_APPLY = "1"' -Reason "Stereo gameplay must let the right aim pose own the retail gun transform"
+Require-Text -Path $openxrScript -Text 'Retail rig application is intentionally blocked:' -Reason "Retail arm mutation must remain closed until the animation/render commit schedule is proved"
+Require-Text -Path $openxrScript -Text '$env:FNVXR_RETAIL_RIG_APPLY = $(if ($ApplyRetailRig) { "1" } else { "0" })' -Reason "Read-only retail rig telemetry must stay the default"
 Require-Text -Path $commonScript -Text 'FNVXR_D3D9_MAX_LOCAL_VIEW_OFFSET_UNITS = "400"' -Reason "Retail producer must reject exploding local view offsets"
 Require-Text -Path $commonScript -Text 'FNVXR_D3D9_SHADER_STEREO = "0"' -Reason "Fallback quad must not run shader stereo patching by default"
 Require-Text -Path $commonScript -Text 'FNVXR_D3D9_SHADER_MATRIX_DELTA = "0"' -Reason "Fallback quad must not run shader matrix deltas by default"
@@ -386,10 +500,14 @@ Require-Text -Path $commonScript -Text '$env:FNVXR_D3D9_STEREO_TARGET_DIFF_PROBE
 Require-Text -Path $commonScript -Text '$env:FNVXR_D3D9_STEREO_VISUAL_COVERAGE_GATE = "1"' -Reason "Stereo runtime must reject a separated but mostly occluded/corrupt image before fullscreen handoff"
 Require-Text -Path $commonScript -Text '$env:FNVXR_D3D9_STEREO_VISUAL_STABLE_FRAMES = "12"' -Reason "Stereo runtime must prove a short stable run of visually distributed eye frames before handoff"
 Require-Text -Path $commonScript -Text '$env:FNVXR_D3D9_STEREO_MIN_ACTIVE_FRACTION = "0.50"' -Reason "Stereo runtime must reject the measured 53.5-percent dominant dark occluder from the failed headset capture"
-Require-Text -Path (Join-Path $scriptRoot "capture-scene-cache.ps1") -Text 'const UInt32 SharedStereoVersion = 3;' -Reason "Independent stereo capture must require the current shared-frame ABI version"
-Require-Text -Path (Join-Path $scriptRoot "capture-scene-cache.ps1") -Text 'const int HeaderSize = 184;' -Reason "Stereo preview capture must start after the complete current shared-frame header"
-Require-Text -Path (Join-Path $scriptRoot "capture-scene-cache.ps1") -Text 'Local\\FNVXR_D3D9_StereoFrame_v3' -Reason "Independent capture must open the current stereo mapping"
-Require-Text -Path (Join-Path $scriptRoot "capture-scene-cache.ps1") -Text 'sequenceAfterCopy != sequence' -Reason "Stereo preview capture must reject a producer write that overlaps the pixel copy"
+Require-Text -Path (Join-Path $scriptRoot "capture-scene-cache.ps1") -Text 'const UInt32 SharedStereoVersion = 7;' -Reason "Independent stereo capture must require the current shared-frame ABI version"
+Require-Text -Path (Join-Path $scriptRoot "capture-scene-cache.ps1") -Text 'const int HeaderSize = 216;' -Reason "Stereo preview capture must start after the complete current shared-frame header"
+Require-Text -Path (Join-Path $scriptRoot "capture-scene-cache.ps1") -Text 'const int SlotCount = 4;' -Reason "Two reader lanes plus the current publication must always leave one writable slot"
+Require-Text -Path (Join-Path $scriptRoot "capture-scene-cache.ps1") -Text 'const int ReaderSlotOffset = 204;' -Reason "Independent capture must use its own reader lane rather than starving the OpenXR host"
+Require-Text -Path (Join-Path $scriptRoot "capture-scene-cache.ps1") -Text 'EntryPoint="RtlMoveMemory"' -Reason "Capture must import the actual kernel memory-copy export rather than the unavailable CopyMemory macro"
+Require-Text -Path (Join-Path $scriptRoot "capture-scene-cache.ps1") -Text 'Local\\FNVXR_D3D9_StereoFrame_v7' -Reason "Independent capture must open the current stereo mapping"
+Require-Text -Path (Join-Path $scriptRoot "capture-scene-cache.ps1") -Text 'NativeInterlockedCompareExchange(readerSlotAddress, publishedSlot, -1)' -Reason "Independent capture must claim an immutable ring slot before copying pixels"
+Require-Text -Path (Join-Path $scriptRoot "capture-scene-cache.ps1") -Text 'stableCopy = true;' -Reason "A claimed immutable payload must remain usable while newer publications advance"
 Require-Text -Path $commonScript -Text '$env:FNVXR_D3D9_RESOURCE_GRAPH_TELEMETRY = "0"' -Reason "Production native stereo must not pay continuous D3D9 render-graph telemetry overhead"
 Require-Text -Path $commonScript -Text '$env:FNVXR_D3D9_NATIVE_PIPELINE_TRACE = "0"' -Reason "Production native stereo must keep detailed pipeline tracing opt-in"
 Require-Text -Path $commonScript -Text '$env:FNVXR_D3D9_NATIVE_REQUIRE_STABLE_CELL = "1"' -Reason "Native stereo must suspend the stateful second traversal until retail reports a stable gameplay cell"
@@ -414,10 +532,10 @@ Require-Text -Path $commonScript -Text '$env:FNVXR_GAME_FULLSCREEN_IN_XR = "1"' 
 Require-Text -Path $commonScript -Text '$env:FNVXR_USE_STEREO_GAME_TEXTURES = "1"' -Reason "Stereo runtime must let the host consume shared stereo textures"
 Require-Text -Path $commonScript -Text '$env:FNVXR_REQUIRE_WORLD_STEREO = "1"' -Reason "Host acceptance must reject separated pixels that are not certified as a gameplay world frame"
 Require-Text -Path $commonScript -Text '$env:FNVXR_REQUIRE_WORLD_STEREO_BEFORE_GAMEPLAY_UI = "0"' -Reason "World proof must not misclassify real gameplay as a menu while stereo warms up"
-Require-Text -Path $commonScript -Text '$env:FNVXR_STEREO_FALLBACK_MONO_FULLSCREEN = "0"' -Reason "Stereo runtime must fail visibly instead of masking stereo failure with a coherent mono fullscreen slab"
-Require-Text -Path $commonScript -Text '$env:FNVXR_ALLOW_STEREO_WORLD_2D_FALLBACK = "0"' -Reason "Stereo gameplay must never snap between stereoscopic world and a head-locked 2D plane"
-Require-Text -Path $commonScript -Text '$env:FNVXR_SHOW_GAME_PLANE_ON_STEREO_LOSS = "0"' -Reason "A stereo producer fault must fail dark instead of causing a sickness-inducing dimensional switch"
-Require-Text -Path $commonScript -Text '$env:FNVXR_SHOW_GAME_PLANE_IN_GAME = "0"' -Reason "Stereo startup and cell changes must not snap gameplay back to a 2D quad"
+Require-Text -Path $commonScript -Text '$env:FNVXR_STEREO_FALLBACK_MONO_FULLSCREEN = "1"' -Reason "A rejected stereo pair must fall back to the current mono image rather than black or stale eye pixels"
+Require-Text -Path $commonScript -Text '$env:FNVXR_ALLOW_STEREO_WORLD_2D_FALLBACK = "1"' -Reason "Diagnostics must stay visibly anchored while certified stereo is unavailable"
+Require-Text -Path $commonScript -Text '$env:FNVXR_SHOW_GAME_PLANE_ON_STEREO_LOSS = "1"' -Reason "A producer fault must expose a visible anchored plane instead of a black headset"
+Require-Text -Path $commonScript -Text '$env:FNVXR_SHOW_GAME_PLANE_IN_GAME = "1"' -Reason "Diagnostic gameplay must retain a visible fallback while stereo certification is closed"
 Require-Text -Path $commonScript -Text '$env:FNVXR_STEREO_STABLE_HANDOFF_FRAMES = "1"' -Reason "Host must consume the first frame that passed the producer's independent 12-pair visual stability proof"
 Require-Text -Path $commonScript -Text '$env:FNVXR_STEREO_CELL_STABLE_FRAMES = "60"' -Reason "Native stereo must count one second of distinct retail gameplay frames while camera and scene state settle after a cell transition"
 Require-Text -Path $commonScript -Text '$env:FNVXR_PLAYER_STATE_READ_GRACE_FRAMES = "4"' -Reason "A bounded sequence-writer overlap must not masquerade as a retail cell transition"
@@ -426,7 +544,7 @@ Require-Text -Path $commonScript -Text '$env:FNVXR_STEREO_MAX_SAME_SEQUENCE_MS =
 Require-Text -Path $commonScript -Text '$env:FNVXR_STEREO_MAX_SOURCE_POSE_AGE_MS = "25"' -Reason "Pixels without depth must stay within a strict source-pose age budget before projection-layer submission"
 Require-Text -Path $commonScript -Text '$env:FNVXR_STEREO_SOURCE_POSE_FUTURE_TOLERANCE_MS = "5"' -Reason "Source pose timestamps implausibly ahead of the current prediction must fail closed"
 Require-Text -Path $commonScript -Text '$env:FNVXR_STEREO_STALE_FRAME_LIMIT = "2"' -Reason "Stereo runtime must not expose a multi-second stale scene after producer invalidation"
-Require-Text -Path $commonScript -Text '$env:FNVXR_STEREO_RETAIN_LAST_VALID_ON_REJECT = "1"' -Reason "A brief producer overlap must retain coherent stereo instead of changing presentation dimensions"
+Require-Text -Path $commonScript -Text '$env:FNVXR_STEREO_RETAIN_LAST_VALID_ON_REJECT = "0"' -Reason "A rejected stereo pair must never retain historical pixels under a newer pose"
 Require-Text -Path $hostCode -Text 'stereoStableFrameCount' -Reason "OpenXR host must track accepted stereo producer stability before fullscreen handoff"
 Require-Text -Path $hostCode -Text 'stereoGameFrameSequence' -Reason "OpenXR host must log and gate stereo handoff by shared producer sequence"
 Require-Text -Path $hostCode -Text 'stereoGamePoseSequence' -Reason "OpenXR host must log producer pose sequence alongside stereo pixels"
@@ -506,7 +624,12 @@ Require-Text -Path $openxrScript -Text '-DisableMultisampling:$StereoWorldActive
 Require-Text -Path $retailScript -Text 'Set-FnvxrStereoWorldRuntimeEnvironment' -Reason "Retail producer must keep stereo runtime helper available for explicit stereo launches"
 Require-Text -Path $retailScript -Text '[string]$D3D9ShaderAllowVertexHashes = ""' -Reason "Retail producer launcher must expose explicit shader vertex hash allowlisting"
 Require-Text -Path $retailScript -Text 'FNVXR_D3D9_SHADER_STEREO_ALLOW_VERTEX_HASHES = $D3D9ShaderAllowVertexHashes' -Reason "Retail producer launcher must pass explicit shader vertex hash allowlisting into D3D9"
-Require-Text -Path $openxrScript -Text '-EnableD3D9ShaderStereo requires verified -D3D9ShaderWvpContracts' -Reason "Shader stereo must refuse launch without explicit verified shader contracts"
+Require-Text -Path $openxrScript -Text '-EnableD3D9ShaderStereo requires -VerifiedShaderDiscoveryRunDir' -Reason "Shader stereo must regenerate ownership contracts from captured bytecode"
+Require-Text -Path $openxrScript -Text 'OpenXR stereo launch is intentionally blocked:' -Reason "Headset stereo must remain closed until matching depth submission and isolated proof rendering are implemented"
+Require-Text -Path $retailScript -Text 'Raw -D3D9ShaderWvpContracts text is not accepted.' -Reason "Off-headset launchers must not bypass exact shader-contract generation with raw text"
+Require-Text -Path $retailScript -Text 'Stereo producer launch is intentionally blocked off-headset too:' -Reason "Unsafe stereo traversal must stay blocked even when no OpenXR host is launched"
+Require-Text -Path $retailScript -Text 'D3D9 shader stereo is disabled:' -Reason "WVP-only replay must remain disabled until exact VS+PS semantics and camera provenance exist"
+Require-Text -Path $hostCode -Text 'FNVXR_ENABLE_UNPROVEN_COLOR_ONLY_STEREO_DIAGNOSTIC' -Reason "The host must keep color-only stereo outside the certified production path"
 Require-Text -Path $openxrScript -Text '$env:FNVXR_D3D9_SHADER_STEREO = "0"' -Reason "Production stereo must keep the unverified generic shader patcher disabled"
 Require-Text -Path $openxrScript -Text '$env:FNVXR_D3D9_SHADER_MATRIX_DELTA = "0"' -Reason "Production stereo must keep heuristic matrix-delta scanning disabled"
 Require-Text -Path $openxrScript -Text '$env:FNVXR_D3D9_SHADER_MATRIX_ORDER = "column"' -Reason "Shader stereo live path must use the FNV shader constant packing order"
@@ -736,6 +859,12 @@ if ($hostStartIndex -lt 0 -or $retailStartIndex -lt 0 -or $hostStartIndex -gt $r
 
 Require-Text -Path $hostCode -Text 'openxr-sidecar' -Reason "Host must understand OpenXR sidecar profile"
 Require-Text -Path $hostCode -Text 'stereoWorldRuntimeEnabled()' -Reason "Host must use runtime stereo intent instead of a launch flag"
+Require-Text -Path $hostCode -Text 'envInt("FNVXR_SESSION_READY_TIMEOUT_SECONDS", 45)' -Reason "A runtime that never leaves READY must have a finite default fail-stop deadline"
+Require-Text -Path $hostCode -Text 'fnvxrHostProgress' -Reason "The out-of-process watchdog must have a flushed host heartbeat to distinguish progress from a hung runtime call"
+Require-Text -Path $hostCode -Text 'waitForD3D11GpuIdle' -Reason "OpenXR swapchains must not be destroyed until submitted D3D11 work is proven complete"
+Require-Text -Path $hostCode -Text 'sourcePoseFutureToleranceNanoseconds' -Reason "Submit telemetry must expose the future tolerance needed for independent pose-age recomputation"
+Forbid-Text -Path $hostCode -Text 'XR_INFINITE_DURATION' -Reason "Swapchain waits must remain finite so a runtime stall cannot pin the headset path forever"
+Require-Text -Path $watchExitScript -Text 'host progress watchdog expired' -Reason "The launcher watchdog must terminate a host whose in-process runtime call stops making progress"
 Require-Text -Path $hostCode -Text 'FNVXR_RUNTIME_UI_STUCK_FORCE_WORLD' -Reason "Host profile must disable UI-stuck forced world transitions"
 Require-Text -Path $hostCode -Text 'stereoWorldIntent' -Reason "Host must use one stereo-world intent gate for shared stereo reads and fullscreen"
 Require-Text -Path $hostCode -Text 'runtimeGameplayPhase(snapshot.phase, snapshot.menuBits, snapshot.showroomActive)' -Reason "Host world probe must use the shared runtime gameplay predicate"
@@ -775,6 +904,8 @@ Require-Text -Path $commonScript -Text 'FNVXR_MENU_POINTER_HEAD_FALLBACK = "1"' 
 Require-Text -Path $pluginCode -Text 'sidecar shared pointer click' -Reason "NVSE sidecar click path must use shared pointer dispatch"
 Require-Text -Path $pluginCode -Text 'sidecar shared pointer click raw=(%ld,%ld) menuBits=0x%02lx pipboy=%d' -Reason "Pip-Boy clicks must be explicitly proved on the shared pointer click line"
 Require-Text -Path $pluginCode -Text 'FNVXR_RUN_LOG_DIR' -Reason "NVSE plugin telemetry must honor the current run directory"
+Require-Text -Path $pluginCode -Text 'Local\\FNVXR_GamePlugin_Producer_v1' -Reason "Camera, runtime, and player shared states must have one process-lifetime producer lease"
+Require-Text -Path $pluginCode -Text 'if (!acquireGamePluginProducerLease())' -Reason "A second retail process must fail closed before initializing plugin-owned shared mappings"
 Require-Text -Path $pluginCode -Text 'fnvxrSharedCommandRequest' -Reason "NVSE plugin must telemeter every save/quit command request"
 Require-Text -Path $pluginCode -Text 'fnvxrSharedCommandComplete' -Reason "NVSE plugin must telemeter save/quit command completion"
 Require-Text -Path $pluginCode -Text 'mapSharedPointerToWindow(hwnd' -Reason "NVSE click path must map canonical shared coordinates to the retail window"
@@ -831,6 +962,11 @@ Require-Text -Path $xinputCode -Text 'FNVXR_XINPUT_RIGHT_STICK_Y_ENABLE' -Reason
 Require-Text -Path $xinputCode -Text 'FNVXR_XINPUT_RIGHT_STICK_SCALE' -Reason "XInput proxy must expose a tuned right-stick response scalar"
 Require-Text -Path $d3d9Code -Text 'retailSidecarProfile()' -Reason "D3D9 hook must understand retail sidecar profile"
 Require-Text -Path $d3d9Code -Text 'stereoWorldRuntimeEnabled()' -Reason "D3D9 hook must gate expensive stereo work behind runtime stereo intent"
+Require-Text -Path $d3d9Code -Text 'constexpr bool StereoWorldProductionProofComplete = false;' -Reason "Native stereo must remain source-level blocked while the structural render proof is incomplete"
+Require-Text -Path $d3d9Code -Text 'return StereoWorldProductionProofComplete && stereoWorldRuntimeRequested();' -Reason "Environment variables alone must never bypass the incomplete production proof"
+Require-Text -Path $d3d9Code -Text 'Local\\FNVXR_D3D9_Frame_Producer_v1' -Reason "The flat fallback frame must have exactly one process-lifetime producer"
+Require-Text -Path $d3d9Code -Text 'Local\\FNVXR_D3D9_WorldFrame_Producer_v1' -Reason "The legacy wide diagnostic frame must have exactly one process-lifetime producer"
+Require-Text -Path $d3d9Code -Text 'A consumer may keep this page mapped across a producer restart.' -Reason "Retained flat-frame storage must be invalidated under writing before producer relabeling"
 Require-Text -Path $d3d9Code -Text 'readRawEnvBool("FNVXR_DISABLE_STEREO_WORLD", false)' -Reason "D3D9 runtime stereo gate must be disabled only by the explicit kill switch"
 Require-Text -Path $d3d9Code -Text 'FNVXR_RUN_LOG_DIR' -Reason "D3D9 proxy telemetry must honor the current run directory"
 Require-Text -Path $d3d9Code -Text 'forceImmediatePresentation' -Reason "D3D9 proxy must clamp CreateDevice/Reset to immediate presentation"
@@ -917,7 +1053,8 @@ foreach ($path in $networkForbiddenPaths) {
 $summary = [ordered]@{
     scriptsChecked = $scripts.Count
     parseErrors = $parseErrors.Count
-    openXrHostStartsBeforeRetail = $true
+    liveOpenXrPresentationBlocked = $true
+    openXrHostStartsBeforeRetail = $false
     sidecarProfilesVerified = $true
     osCursorSideChannelsForbidden = $true
     networkStubReferencesForbidden = $true

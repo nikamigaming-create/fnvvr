@@ -3,6 +3,7 @@
 #include "fnvxr_protocol.h"
 #include "fnvxr_shared_state.h"
 #include "fnvxr_fabrik.h"
+#include "fnvxr_retail_safety.h"
 
 #include <windows.h>
 #include <dbghelp.h>
@@ -12,6 +13,7 @@
 #include <cctype>
 #include <cstdarg>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstdio>
@@ -39,6 +41,11 @@ constexpr UInt32 InterfaceMessaging = 2;
 constexpr UInt32 InterfaceData = 7;
 constexpr UInt32 InterfacePlayerControls = 10;
 constexpr UInt32 NvseDataDiHookControl = 1;
+constexpr const char* GamePluginProducerMutexName = "Local\\FNVXR_GamePlugin_Producer_v1";
+// The OpenXR host is the sole producer for XInput, DInput, and VR pose in the
+// supported architecture.  Retained in-plugin writers stay source-disabled
+// until they acquire the same lifetime/epoch protocol as the host.
+constexpr bool LegacyNvseInputProducerEnabled = false;
 constexpr UInt32 MouseButtonOffset = 256;
 constexpr UInt32 MaxDirectInputMacros = MouseButtonOffset + 8 + 2;
 constexpr UInt32 DIK_ESCAPE = 0x01;
@@ -360,7 +367,8 @@ struct VrRigPoseSnapshot
     std::int64_t predictedDisplayTime {};
     UInt32 trackingFlags {};
     UInt32 referenceSpaceGeneration {};
-    UInt32 producerEpoch {};
+    UInt64 producerEpoch {};
+    UInt32 recenterRequestId {};
     Quat hmdRot { 0.0f, 0.0f, 0.0f, 1.0f };
     Vec3 hmdPos {};
     Quat leftRot { 0.0f, 0.0f, 0.0f, 1.0f };
@@ -439,6 +447,9 @@ DirectInputHookControl* g_directInputHook = nullptr;
 bool g_publishedDirectInputHoldKnown[MaxDirectInputMacros] {};
 bool g_publishedDirectInputHoldState[MaxDirectInputMacros] {};
 bool g_publishedDirectInputHoldViaHook[MaxDirectInputMacros] {};
+UInt64 g_publishedDirectInputHoldHeartbeatMs[MaxDirectInputMacros] {};
+constexpr UInt64 DirectInputHoldHeartbeatMilliseconds = 200;
+constexpr bool LegacyInProcessDirectInputHoldFallbackEnabled = false;
 using BufferedKeyTapFn = void (__thiscall*)(void*, UInt32);
 BufferedKeyTapFn g_bufferedKeyTap = nullptr;
 bool g_triedResolveBufferedKeyTap = false;
@@ -504,11 +515,17 @@ HANDLE g_runtimeMapping = nullptr;
 SharedRuntimeState* g_runtimeState = nullptr;
 HANDLE g_playerMapping = nullptr;
 SharedPlayerState* g_playerState = nullptr;
+HANDLE g_gamePluginProducerMutex = nullptr;
+bool g_gamePluginProducerMutexOwned = false;
+DWORD g_gamePluginProducerThreadId = 0;
+HANDLE g_gamePluginProducerThread = nullptr;
 HANDLE g_commandMapping = nullptr;
 SharedCommandState* g_commandState = nullptr;
+HANDLE g_commandWriterMutex = nullptr;
 UInt32 g_lastCommandRequestId = 0;
 HANDLE g_inputEventMapping = nullptr;
 SharedInputEventQueue* g_inputEvents = nullptr;
+HANDLE g_inputEventWriterMutex = nullptr;
 POINT g_lastMenuPointerClient {};
 bool g_hasMenuPointer = false;
 std::uint64_t g_loggedPointerFrames = 0;
@@ -535,7 +552,7 @@ Vec3 g_retailRigOriginHmdPos {};
 void* g_retailRigOriginBodyRoot = nullptr;
 Vec3 g_retailRigBodyAnchorLocal {};
 UInt32 g_retailRigReferenceSpaceGeneration = 0;
-UInt32 g_retailRigProducerEpoch = 0;
+UInt64 g_retailRigProducerEpoch = 0;
 UInt32 g_retailRigOriginPoseSequence = 0;
 LONG g_retailRigOriginAuthoritySequence = 0;
 LONG g_lastRetailRigPoseSequence = 0;
@@ -737,11 +754,10 @@ bool isCompatibleRuntime(const NVSEInterface* nvse)
 {
     if (!nvse)
         return false;
-
-    if (nvse->isEditor)
-        return false;
-
-    return nvse->nvseVersion != 0;
+    return fnvxr::safety::compatibleNvseRuntime(
+        nvse->isEditor != 0,
+        nvse->nvseVersion,
+        nvse->runtimeVersion);
 }
 
 bool bridgeDisabledByEnv()
@@ -994,6 +1010,23 @@ Quat multiplyQuat(Quat a, Quat b)
     });
 }
 
+Quat gravityAlignedYawQuat(Quat input, Quat fallback = { 0.0f, 0.0f, 0.0f, 1.0f })
+{
+    const Quat q = normalizeQuat(input);
+    const float forwardX = -2.0f * (q.x * q.z + q.w * q.y);
+    const float forwardZ = -(1.0f - 2.0f * (q.x * q.x + q.y * q.y));
+    const float horizontalForwardSquared = forwardX * forwardX + forwardZ * forwardZ;
+    const Quat headingSource = (!std::isfinite(horizontalForwardSquared)
+            || horizontalForwardSquared < 0.000001f)
+        ? normalizeQuat(fallback)
+        : q;
+    const float yaw = std::atan2(
+        2.0f * (headingSource.x * headingSource.z + headingSource.w * headingSource.y),
+        1.0f - 2.0f * (headingSource.x * headingSource.x + headingSource.y * headingSource.y));
+    const float halfYaw = yaw * 0.5f;
+    return { 0.0f, std::sin(halfYaw), 0.0f, std::cos(halfYaw) };
+}
+
 Matrix33 matrixFromQuat(Quat q)
 {
     q = normalizeQuat(q);
@@ -1148,10 +1181,9 @@ Vec3 xrDeltaToGamebryoVector(Vec3 xrDelta)
     };
 }
 
-// Return an OpenXR position in the full gameplay-origin frame.  Applying only
-// the origin yaw leaves pitch/roll in the basis and makes horizontal physical
-// motion trace an ellipse.  Camera and controller consumers must use this
-// exact same origin-space operation.
+// Return an OpenXR position in the gravity-aligned gameplay-origin frame.
+// g_vrOriginRot is latched as yaw-only so recenter pitch/roll can never tilt
+// room translation into the gravity axis.
 Vec3 xrPositionInOriginFrame(Quat originRotation, Vec3 originPosition, Vec3 currentPosition)
 {
     const Matrix33 inverseOrigin = matrixFromQuat(conjugateQuat(normalizeQuat(originRotation)));
@@ -1216,7 +1248,7 @@ bool readLatestCameraPose(Quat& rotationDelta, Vec3& positionDelta)
 
     if (!g_haveVrOrigin || envEnabled("FNVXR_CAMERA_RESET_ORIGIN", false))
     {
-        g_vrOriginRot = currentRot;
+        g_vrOriginRot = gravityAlignedYawQuat(currentRot, g_vrOriginRot);
         g_vrOriginPos = currentPos;
         g_haveVrOrigin = true;
         logTelemetry(
@@ -1514,18 +1546,8 @@ void initSharedXInput()
     const bool existingSnapshotValid = existingHeaderValid
         && fnvxr::shared::readSequencedSharedSnapshot(g_xinputState, existingSnapshot, 16);
     const bool existingValid = existingHeaderValid;
-    if (!existingValid)
-    {
-        std::memset(g_xinputState, 0, sizeof(*g_xinputState));
-        g_xinputState->magic = XInputSharedMagic;
-        g_xinputState->version = XInputSharedVersion;
-        // Mapping existence is not producer liveness. The OpenXR host sets
-        // connected only when it publishes its first complete input frame.
-        g_xinputState->connected = 0;
-        g_xinputState->reserved[fnvxr::shared::XInputReservedRetailConsumed] = 0;
-        g_xinputState->reserved[fnvxr::shared::XInputReservedAutoRun] = 0;
-        g_xinputState->reserved[fnvxr::shared::XInputReservedMovementMode] = 0;
-    }
+    // This plugin is a reader plus owner of explicitly documented atomic
+    // mailbox bytes. It must not initialize host-owned producer fields.
     logTelemetry("xinput shared ready state=%p mapping=%p existing=%d stable=%d\n",
         g_xinputState,
         g_xinputMapping,
@@ -1569,12 +1591,7 @@ void initSharedDInput()
     const bool existingSnapshotValid = existingHeaderValid
         && fnvxr::shared::readSequencedSharedSnapshot(g_dinputState, existingSnapshot, 16);
     const bool existingValid = existingHeaderValid;
-    if (!existingValid)
-    {
-        std::memset(g_dinputState, 0, sizeof(*g_dinputState));
-        g_dinputState->magic = DInputSharedMagic;
-        g_dinputState->version = DInputSharedVersion;
-    }
+    // Leave a new/invalid map zeroed until the InputCore lease owner publishes.
     const UInt32 initialMouseClickPacket = existingSnapshotValid ? existingSnapshot.mouseClickPacket : 0u;
     const UInt32 initialFrame = existingSnapshotValid ? existingSnapshot.frame : 0u;
     g_lastConsumedDInputMouseClickPacket = initialMouseClickPacket;
@@ -1729,25 +1746,107 @@ void initSharedVrPose()
     const bool existingValid = createError == ERROR_ALREADY_EXISTS
         && g_vrPoseState->magic == VrPoseSharedMagic
         && g_vrPoseState->version == VrPoseSharedVersion;
-    if (!existingValid)
-    {
-        std::memset(g_vrPoseState, 0, sizeof(*g_vrPoseState));
-        g_vrPoseState->magic = VrPoseSharedMagic;
-        g_vrPoseState->version = VrPoseSharedVersion;
-        g_vrPoseState->hmdRot[3] = 1.0f;
-        g_vrPoseState->leftRot[3] = 1.0f;
-        g_vrPoseState->rightRot[3] = 1.0f;
-        g_vrPoseState->leftAimRot[3] = 1.0f;
-        g_vrPoseState->rightAimRot[3] = 1.0f;
-        g_vrPoseState->leftEyeRot[3] = 1.0f;
-        g_vrPoseState->rightEyeRot[3] = 1.0f;
-    }
+    // VR_Pose is host-owned. An invalid header remains unreadable until the
+    // InputCore producer publishes; reader startup never mutates its seqlock.
     logTelemetry("vr pose shared ready state=%p mapping=%p existing=%d seq=%ld frame=%llu\n",
         g_vrPoseState,
         g_vrPoseMapping,
         static_cast<int>(existingValid),
         g_vrPoseState->sequence,
         static_cast<unsigned long long>(g_vrPoseState->frame));
+}
+
+bool acquireGamePluginProducerLease()
+{
+    if (g_gamePluginProducerMutexOwned)
+        return true;
+
+    g_gamePluginProducerMutex = CreateMutexA(
+        nullptr,
+        FALSE,
+        GamePluginProducerMutexName);
+    if (!g_gamePluginProducerMutex)
+    {
+        logTelemetry("game plugin producer lease CreateMutex failed err=%lu\n", GetLastError());
+        return false;
+    }
+
+    const DWORD wait = WaitForSingleObject(g_gamePluginProducerMutex, 0);
+    if (wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED)
+    {
+        const DWORD ownerThreadId = GetCurrentThreadId();
+        HANDLE ownerThread = OpenThread(SYNCHRONIZE, FALSE, ownerThreadId);
+        if (!ownerThread)
+        {
+            ReleaseMutex(g_gamePluginProducerMutex);
+            CloseHandle(g_gamePluginProducerMutex);
+            g_gamePluginProducerMutex = nullptr;
+            logTelemetry(
+                "game plugin producer lease owner-thread handle failed err=%lu\n",
+                GetLastError());
+            return false;
+        }
+        g_gamePluginProducerMutexOwned = true;
+        g_gamePluginProducerThreadId = ownerThreadId;
+        g_gamePluginProducerThread = ownerThread;
+        logTelemetry(
+            "game plugin producer lease acquired name=%s abandoned=%d pid=%lu\n",
+            GamePluginProducerMutexName,
+            static_cast<int>(wait == WAIT_ABANDONED),
+            GetCurrentProcessId());
+        return true;
+    }
+
+    logTelemetry(
+        "game plugin producer lease refused name=%s wait=%lu err=%lu; another retail process owns camera/runtime/player publication\n",
+        GamePluginProducerMutexName,
+        wait,
+        GetLastError());
+    CloseHandle(g_gamePluginProducerMutex);
+    g_gamePluginProducerMutex = nullptr;
+    return false;
+}
+
+bool gamePluginProducerLeaseHeldByCurrentThread()
+{
+    return g_gamePluginProducerMutexOwned
+        && g_gamePluginProducerThreadId != 0
+        && g_gamePluginProducerThreadId == GetCurrentThreadId()
+        && g_gamePluginProducerThread
+        && WaitForSingleObject(g_gamePluginProducerThread, 0) == WAIT_TIMEOUT;
+}
+
+template <typename T>
+bool publishNeutralPluginOwnedState(
+    T* state,
+    std::uint32_t magic,
+    std::uint32_t version)
+{
+    if (!state || !gamePluginProducerLeaseHeldByCurrentThread())
+        return false;
+
+    const LONG sequence = InterlockedCompareExchange(&state->sequence, 0, 0);
+    const bool ownsInheritedOddWrite = (sequence & 1) != 0;
+    if (!ownsInheritedOddWrite
+        && !fnvxr::shared::beginSequencedSharedWrite(state->sequence))
+    {
+        return false;
+    }
+
+    // Preserve the odd transaction marker while replacing every other byte.
+    // Resetting the whole struct would briefly publish an even zero sequence
+    // to readers that keep this mapping alive across a retail restart.
+    auto* bytes = reinterpret_cast<std::uint8_t*>(state);
+    constexpr std::size_t sequenceOffset = offsetof(T, sequence);
+    std::memset(bytes, 0, sequenceOffset);
+    std::memset(
+        bytes + sequenceOffset + sizeof(state->sequence),
+        0,
+        sizeof(T) - sequenceOffset - sizeof(state->sequence));
+    state->magic = magic;
+    state->version = version;
+    fnvxr::shared::endSequencedSharedWrite(state->sequence);
+    return true;
 }
 
 void initSharedCamera()
@@ -1767,6 +1866,7 @@ void initSharedCamera()
         logTelemetry("camera shared CreateFileMapping failed err=%lu\n", GetLastError());
         return;
     }
+    const DWORD createError = GetLastError();
 
     g_cameraState = static_cast<SharedCameraState*>(
         MapViewOfFile(g_cameraMapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(SharedCameraState)));
@@ -1778,10 +1878,19 @@ void initSharedCamera()
         return;
     }
 
-    std::memset(g_cameraState, 0, sizeof(*g_cameraState));
-    g_cameraState->magic = CameraSharedMagic;
-    g_cameraState->version = CameraSharedVersion;
-    logTelemetry("camera shared ready state=%p mapping=%p\n", g_cameraState, g_cameraMapping);
+    if (!publishNeutralPluginOwnedState(g_cameraState, CameraSharedMagic, CameraSharedVersion))
+    {
+        logTelemetry("camera shared neutral publication failed; disabling publisher\n");
+        UnmapViewOfFile(g_cameraState);
+        g_cameraState = nullptr;
+        CloseHandle(g_cameraMapping);
+        g_cameraMapping = nullptr;
+        return;
+    }
+    logTelemetry("camera shared ready state=%p mapping=%p retained=%d\n",
+        g_cameraState,
+        g_cameraMapping,
+        static_cast<int>(createError == ERROR_ALREADY_EXISTS));
 }
 
 void initSharedRuntime()
@@ -1801,6 +1910,7 @@ void initSharedRuntime()
         logTelemetry("runtime shared CreateFileMapping failed err=%lu\n", GetLastError());
         return;
     }
+    const DWORD createError = GetLastError();
 
     g_runtimeState = static_cast<SharedRuntimeState*>(
         MapViewOfFile(g_runtimeMapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(SharedRuntimeState)));
@@ -1812,13 +1922,20 @@ void initSharedRuntime()
         return;
     }
 
-    std::memset(g_runtimeState, 0, sizeof(*g_runtimeState));
-    g_runtimeState->magic = RuntimeSharedMagic;
-    g_runtimeState->version = RuntimeSharedVersion;
-    logTelemetry("runtime shared ready state=%p mapping=%p bytes=%zu\n",
+    if (!publishNeutralPluginOwnedState(g_runtimeState, RuntimeSharedMagic, RuntimeSharedVersion))
+    {
+        logTelemetry("runtime shared neutral publication failed; disabling publisher\n");
+        UnmapViewOfFile(g_runtimeState);
+        g_runtimeState = nullptr;
+        CloseHandle(g_runtimeMapping);
+        g_runtimeMapping = nullptr;
+        return;
+    }
+    logTelemetry("runtime shared ready state=%p mapping=%p bytes=%zu retained=%d\n",
         g_runtimeState,
         g_runtimeMapping,
-        sizeof(SharedRuntimeState));
+        sizeof(SharedRuntimeState),
+        static_cast<int>(createError == ERROR_ALREADY_EXISTS));
 }
 
 void initSharedPlayer()
@@ -1838,6 +1955,7 @@ void initSharedPlayer()
         logTelemetry("player shared CreateFileMapping failed err=%lu\n", GetLastError());
         return;
     }
+    const DWORD createError = GetLastError();
 
     g_playerState = static_cast<SharedPlayerState*>(
         MapViewOfFile(g_playerMapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(SharedPlayerState)));
@@ -1849,13 +1967,63 @@ void initSharedPlayer()
         return;
     }
 
-    std::memset(g_playerState, 0, sizeof(*g_playerState));
-    g_playerState->magic = PlayerSharedMagic;
-    g_playerState->version = PlayerSharedVersion;
-    logTelemetry("player shared ready state=%p mapping=%p bytes=%zu\n",
+    if (!publishNeutralPluginOwnedState(g_playerState, PlayerSharedMagic, PlayerSharedVersion))
+    {
+        logTelemetry("player shared neutral publication failed; disabling publisher\n");
+        UnmapViewOfFile(g_playerState);
+        g_playerState = nullptr;
+        CloseHandle(g_playerMapping);
+        g_playerMapping = nullptr;
+        return;
+    }
+    logTelemetry("player shared ready state=%p mapping=%p bytes=%zu retained=%d\n",
         g_playerState,
         g_playerMapping,
-        sizeof(SharedPlayerState));
+        sizeof(SharedPlayerState),
+        static_cast<int>(createError == ERROR_ALREADY_EXISTS));
+}
+
+bool acquireSharedCommandWriter(DWORD timeoutMilliseconds = 2000)
+{
+    if (!g_commandWriterMutex)
+        return false;
+    const DWORD wait = WaitForSingleObject(g_commandWriterMutex, timeoutMilliseconds);
+    return wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED;
+}
+
+void releaseSharedCommandWriter()
+{
+    if (g_commandWriterMutex)
+        ReleaseMutex(g_commandWriterMutex);
+}
+
+void repairSharedCommandState(bool recoverOrphanedRunning = false)
+{
+    if (!g_commandState)
+        return;
+    if (g_commandState->magic != CommandSharedMagic
+        || g_commandState->version != CommandSharedVersion)
+    {
+        std::memset(g_commandState, 0, sizeof(*g_commandState));
+        g_commandState->magic = CommandSharedMagic;
+        g_commandState->version = CommandSharedVersion;
+        g_commandState->status = fnvxr::shared::CommandStatusIdle;
+        return;
+    }
+    if ((g_commandState->sequence & 1) != 0)
+    {
+        g_commandState->status = fnvxr::shared::CommandStatusFailed;
+        g_commandState->resultCode = ERROR_OPERATION_ABORTED;
+        fnvxr::shared::endSequencedSharedWrite(g_commandState->sequence);
+    }
+    if (recoverOrphanedRunning
+        && g_commandState->status == fnvxr::shared::CommandStatusRunning
+        && fnvxr::shared::beginSequencedSharedWrite(g_commandState->sequence))
+    {
+        g_commandState->status = fnvxr::shared::CommandStatusFailed;
+        g_commandState->resultCode = ERROR_OPERATION_ABORTED;
+        fnvxr::shared::endSequencedSharedWrite(g_commandState->sequence);
+    }
 }
 
 void initSharedCommand()
@@ -1863,16 +2031,30 @@ void initSharedCommand()
     if (g_commandState)
         return;
 
+    g_commandWriterMutex = CreateMutexA(
+        nullptr, FALSE, fnvxr::shared::CommandWriterMutexName);
+    if (!g_commandWriterMutex || !acquireSharedCommandWriter())
+    {
+        logTelemetry("command shared writer mutex unavailable err=%lu\n", GetLastError());
+        if (g_commandWriterMutex)
+            CloseHandle(g_commandWriterMutex);
+        g_commandWriterMutex = nullptr;
+        return;
+    }
+
     g_commandMapping = CreateFileMappingA(
         INVALID_HANDLE_VALUE,
         nullptr,
         PAGE_READWRITE,
         0,
         sizeof(SharedCommandState),
-        "Local\\FNVXR_Command_State");
+        fnvxr::shared::CommandSharedMappingName);
     if (!g_commandMapping)
     {
         logTelemetry("command shared CreateFileMapping failed err=%lu\n", GetLastError());
+        releaseSharedCommandWriter();
+        CloseHandle(g_commandWriterMutex);
+        g_commandWriterMutex = nullptr;
         return;
     }
     const DWORD createError = GetLastError();
@@ -1884,20 +2066,19 @@ void initSharedCommand()
         logTelemetry("command shared MapViewOfFile failed err=%lu\n", GetLastError());
         CloseHandle(g_commandMapping);
         g_commandMapping = nullptr;
+        releaseSharedCommandWriter();
+        CloseHandle(g_commandWriterMutex);
+        g_commandWriterMutex = nullptr;
         return;
     }
 
     const bool existingValid = createError == ERROR_ALREADY_EXISTS
         && g_commandState->magic == CommandSharedMagic
         && g_commandState->version == CommandSharedVersion;
-    if (!existingValid)
-    {
-        std::memset(g_commandState, 0, sizeof(*g_commandState));
-        g_commandState->magic = CommandSharedMagic;
-        g_commandState->version = CommandSharedVersion;
-        g_commandState->status = fnvxr::shared::CommandStatusIdle;
-    }
-    g_lastCommandRequestId = g_commandState->requestId;
+    repairSharedCommandState(true);
+    g_lastCommandRequestId = g_commandState->status == fnvxr::shared::CommandStatusPending
+        ? 0
+        : g_commandState->requestId;
     logTelemetry("command shared ready state=%p mapping=%p existing=%d request=%lu status=%lu bytes=%zu\n",
         g_commandState,
         g_commandMapping,
@@ -1905,6 +2086,7 @@ void initSharedCommand()
         static_cast<unsigned long>(g_commandState->requestId),
         static_cast<unsigned long>(g_commandState->status),
         sizeof(SharedCommandState));
+    releaseSharedCommandWriter();
 }
 
 void initSharedInputEvents()
@@ -1936,6 +2118,32 @@ void initSharedInputEvents()
         return;
     }
 
+    g_inputEventWriterMutex = CreateMutexA(
+        nullptr,
+        FALSE,
+        fnvxr::shared::InputEventWriterMutexName);
+    if (!g_inputEventWriterMutex)
+    {
+        logTelemetry("input events writer mutex failed err=%lu\n", GetLastError());
+        UnmapViewOfFile(g_inputEvents);
+        g_inputEvents = nullptr;
+        CloseHandle(g_inputEventMapping);
+        g_inputEventMapping = nullptr;
+        return;
+    }
+    const DWORD writerWait = WaitForSingleObject(g_inputEventWriterMutex, 2000);
+    if (writerWait != WAIT_OBJECT_0 && writerWait != WAIT_ABANDONED)
+    {
+        logTelemetry("input events writer mutex wait failed result=%lu\n", writerWait);
+        CloseHandle(g_inputEventWriterMutex);
+        g_inputEventWriterMutex = nullptr;
+        UnmapViewOfFile(g_inputEvents);
+        g_inputEvents = nullptr;
+        CloseHandle(g_inputEventMapping);
+        g_inputEventMapping = nullptr;
+        return;
+    }
+
     const bool existingValid = createError == ERROR_ALREADY_EXISTS
         && g_inputEvents->magic == InputEventSharedMagic
         && g_inputEvents->version == InputEventSharedVersion;
@@ -1945,6 +2153,9 @@ void initSharedInputEvents()
         g_inputEvents->magic = InputEventSharedMagic;
         g_inputEvents->version = InputEventSharedVersion;
     }
+    // The role mutex transfers an abandoned writer transaction safely.
+    InterlockedExchange(&g_inputEvents->writeLock, 0);
+    ReleaseMutex(g_inputEventWriterMutex);
     logTelemetry("input events ready queue=%p mapping=%p existing=%d writeSeq=%ld bytes=%zu\n",
         g_inputEvents,
         g_inputEventMapping,
@@ -1956,25 +2167,25 @@ void initSharedInputEvents()
 bool publishInputEvent(UInt32 type, UInt32 code, std::int32_t value0 = 0, std::int32_t value1 = 0, UInt32 flags = 0, UInt64 frame = 0)
 {
     if (!g_inputEvents
+        || !g_inputEventWriterMutex
         || g_inputEvents->magic != InputEventSharedMagic
         || g_inputEvents->version != InputEventSharedVersion)
         return false;
 
-    UInt32 spins = 0;
-    while (InterlockedCompareExchange(&g_inputEvents->writeLock, 1, 0) != 0)
+    const DWORD writerWait = WaitForSingleObject(g_inputEventWriterMutex, 50);
+    if (writerWait != WAIT_OBJECT_0 && writerWait != WAIT_ABANDONED)
     {
-        if (++spins > 1024)
-        {
-            InterlockedIncrement(&g_inputEvents->droppedEvents);
-            return false;
-        }
-        Sleep(0);
+        InterlockedIncrement(&g_inputEvents->droppedEvents);
+        return false;
     }
+    InterlockedExchange(&g_inputEvents->writeLock, 1);
 
-    const LONG sequence = g_inputEvents->writeSequence + 1;
-    const UInt32 index = static_cast<UInt32>(sequence - 1) & (InputEventQueueLength - 1u);
+    UInt32 sequence = fnvxr::shared::sequencedValueBits(g_inputEvents->writeSequence) + 1u;
+    if (sequence == 0u)
+        sequence = 1u;
+    const UInt32 index = (sequence - 1u) & (InputEventQueueLength - 1u);
     auto& event = g_inputEvents->events[index];
-    event.sequence = 0;
+    InterlockedExchange(&event.sequence, 0);
     event.type = type;
     event.code = code;
     event.value0 = value0;
@@ -1982,18 +2193,23 @@ bool publishInputEvent(UInt32 type, UInt32 code, std::int32_t value0 = 0, std::i
     event.flags = flags;
     event.frame = frame;
     MemoryBarrier();
-    event.sequence = static_cast<UInt32>(sequence);
+    LONG publishedEventSequence = 0;
+    std::memcpy(&publishedEventSequence, &sequence, sizeof(publishedEventSequence));
+    InterlockedExchange(&event.sequence, publishedEventSequence);
     MemoryBarrier();
-    g_inputEvents->writeSequence = sequence;
+    LONG publishedSequence = 0;
+    std::memcpy(&publishedSequence, &sequence, sizeof(publishedSequence));
+    InterlockedExchange(&g_inputEvents->writeSequence, publishedSequence);
     InterlockedExchange(&g_inputEvents->writeLock, 0);
+    ReleaseMutex(g_inputEventWriterMutex);
 
     static UInt32 logged = 0;
     if (logged < 64)
     {
         ++logged;
         logTelemetry(
-            "inputEvent publish seq=%ld type=%lu code=%lu value=%ld,%ld flags=0x%lx frame=%llu\n",
-            sequence,
+            "inputEvent publish seq=%lu type=%lu code=%lu value=%ld,%ld flags=0x%lx frame=%llu\n",
+            static_cast<unsigned long>(sequence),
             static_cast<unsigned long>(type),
             static_cast<unsigned long>(code),
             static_cast<LONG>(value0),
@@ -2006,11 +2222,11 @@ bool publishInputEvent(UInt32 type, UInt32 code, std::int32_t value0 = 0, std::i
 
 void publishRuntimeState(UInt64 frame, UInt32 menuBits, RuntimePhase phase, bool uiInputAllowed)
 {
-    if (!g_runtimeState)
+    if (!g_runtimeState || !gamePluginProducerLeaseHeldByCurrentThread())
         return;
 
-    InterlockedIncrement(&g_runtimeState->sequence);
-    MemoryBarrier();
+    if (!fnvxr::shared::beginSequencedSharedWrite(g_runtimeState->sequence))
+        return;
     g_runtimeState->magic = RuntimeSharedMagic;
     g_runtimeState->version = RuntimeSharedVersion;
     g_runtimeState->frame = frame;
@@ -2022,15 +2238,15 @@ void publishRuntimeState(UInt64 frame, UInt32 menuBits, RuntimePhase phase, bool
     g_runtimeState->showroomPhase = static_cast<UInt32>(g_showroomPhase);
     g_runtimeState->showroomSceneIndex = g_showroomSceneIndex;
     g_runtimeState->showroomCellFormId = g_showroomCellFormId;
-    MemoryBarrier();
-    InterlockedIncrement(&g_runtimeState->sequence);
+    fnvxr::shared::endSequencedSharedWrite(g_runtimeState->sequence);
 }
 
 void updateSharedVrPose(const fnvxr::PoseFrame& pose)
 {
     if (!g_vrPoseState)
         return;
-    if (!envEnabled("FNVXR_NVSE_WRITES_VR_POSE", false))
+    if (!LegacyNvseInputProducerEnabled
+        || !envEnabled("FNVXR_NVSE_WRITES_VR_POSE", false))
         return;
 
     if (!fnvxr::shared::beginSequencedSharedWrite(g_vrPoseState->sequence))
@@ -2042,6 +2258,8 @@ void updateSharedVrPose(const fnvxr::PoseFrame& pose)
     g_vrPoseState->version = VrPoseSharedVersion;
     g_vrPoseState->referenceSpaceGeneration = 1;
     g_vrPoseState->producerEpoch = 1;
+    g_vrPoseState->recenterRequestId = 0;
+    g_vrPoseState->reserved = static_cast<UInt32>(GetTickCount64());
     g_vrPoseState->trackingFlags =
         fnvxr::shared::VrPoseTrackingHmd
         | fnvxr::shared::VrPoseTrackingLeftGripActive
@@ -2092,6 +2310,8 @@ void updateSharedVrPose(const fnvxr::PoseFrame& pose)
 void updateSharedXInput(const fnvxr::PoseFrame& pose)
 {
     if (!g_xinputState)
+        return;
+    if (!LegacyNvseInputProducerEnabled)
         return;
     if (retailSidecarProfile() && envEnabled("FNVXR_EXTERNAL_XINPUT_WRITER", true))
         return;
@@ -2201,6 +2421,8 @@ void updateSharedDInput(const fnvxr::PoseFrame& pose)
 {
     if (!g_dinputState)
         return;
+    if (!LegacyNvseInputProducerEnabled)
+        return;
     if (retailSidecarProfile() && envEnabled("FNVXR_EXTERNAL_DINPUT_WRITER", true))
         return;
 
@@ -2246,6 +2468,8 @@ void updateSharedDInput(const fnvxr::PoseFrame& pose)
 void publishDInputMouseClick()
 {
     if (!g_dinputState)
+        return;
+    if (!LegacyNvseInputProducerEnabled)
         return;
     if (retailSidecarProfile() && envEnabled("FNVXR_EXTERNAL_DINPUT_WRITER", true))
         return;
@@ -3364,11 +3588,11 @@ void cancelThirdPersonL3Control(const char* source, UInt64 frame)
 
 void updateSharedCamera(UInt64 frame, UInt32 menuBits)
 {
-    if (!g_cameraState)
+    if (!g_cameraState || !gamePluginProducerLeaseHeldByCurrentThread())
         return;
 
-    InterlockedIncrement(&g_cameraState->sequence);
-    MemoryBarrier();
+    if (!fnvxr::shared::beginSequencedSharedWrite(g_cameraState->sequence))
+        return;
     g_cameraState->magic = CameraSharedMagic;
     g_cameraState->version = CameraSharedVersion;
     g_cameraState->frame = frame;
@@ -3376,8 +3600,7 @@ void updateSharedCamera(UInt64 frame, UInt32 menuBits)
     if (!cameraAllowedForMenuBits(menuBits))
     {
         g_cameraState->active = 0;
-        MemoryBarrier();
-        InterlockedIncrement(&g_cameraState->sequence);
+        fnvxr::shared::endSequencedSharedWrite(g_cameraState->sequence);
         if (g_lastSharedCameraActive != 0 || g_lastSharedCameraReason != 1 || (frame % 300) == 0)
         {
             g_lastSharedCameraActive = 0;
@@ -3395,8 +3618,7 @@ void updateSharedCamera(UInt64 frame, UInt32 menuBits)
     if (!camera)
     {
         g_cameraState->active = 0;
-        MemoryBarrier();
-        InterlockedIncrement(&g_cameraState->sequence);
+        fnvxr::shared::endSequencedSharedWrite(g_cameraState->sequence);
         if (g_lastSharedCameraActive != 0 || g_lastSharedCameraReason != 2 || (frame % 120) == 0)
         {
             g_lastSharedCameraActive = 0;
@@ -3416,8 +3638,7 @@ void updateSharedCamera(UInt64 frame, UInt32 menuBits)
         ? readUInt8(reinterpret_cast<std::uintptr_t>(player) + PlayerCharacterIsThirdPersonOffset)
         : 0;
     readNiAvObjectWorldTransform(camera, g_cameraState->worldRot, g_cameraState->worldPos);
-    MemoryBarrier();
-    InterlockedIncrement(&g_cameraState->sequence);
+    fnvxr::shared::endSequencedSharedWrite(g_cameraState->sequence);
     if (g_lastSharedCameraActive != 1 || g_lastSharedCameraReason != 0 || (frame % 120) == 0)
     {
         g_lastSharedCameraActive = 1;
@@ -3446,11 +3667,11 @@ void updateSharedCamera(UInt64 frame, UInt32 menuBits)
 
 void updateSharedPlayer(UInt64 frame, RuntimePhase phase)
 {
-    if (!g_playerState)
+    if (!g_playerState || !gamePluginProducerLeaseHeldByCurrentThread())
         return;
 
-    InterlockedIncrement(&g_playerState->sequence);
-    MemoryBarrier();
+    if (!fnvxr::shared::beginSequencedSharedWrite(g_playerState->sequence))
+        return;
     g_playerState->magic = PlayerSharedMagic;
     g_playerState->version = PlayerSharedVersion;
     g_playerState->frame = frame;
@@ -3514,8 +3735,7 @@ void updateSharedPlayer(UInt64 frame, RuntimePhase phase)
     }
 
     g_playerState->flags = flags;
-    MemoryBarrier();
-    InterlockedIncrement(&g_playerState->sequence);
+    fnvxr::shared::endSequencedSharedWrite(g_playerState->sequence);
 
     if (g_lastSharedPlayerFlags != flags
         || g_lastSharedPlayerCell != g_playerState->currentCellFormId
@@ -3673,7 +3893,9 @@ void applyVrPoseToGameCamera()
     const float positionScale = getFloatFromEnv("FNVXR_CAMERA_POSITION_SCALE", 0.0f);
     if (applyTranslation && positionScale != 0.0f)
     {
-        const Vec3 gameDelta = xrDeltaToGamebryoVector(xrPositionDelta);
+        // NiCamera local axes already match OpenXR right/up/back. Actor-world
+        // right/forward/up permutation is only valid for gameplay world data.
+        const Vec3 gameDelta = xrPositionDelta;
         Vec3 localTranslate = g_cameraBaseLocalTranslation;
         localTranslate.x += gameDelta.x * positionScale;
         localTranslate.y += gameDelta.y * positionScale;
@@ -3770,9 +3992,15 @@ bool installCameraHook()
 {
     if (g_cameraHookInstalled)
         return true;
-    if (!envEnabled("FNVXR_INSTALL_CAMERA_HOOK", true))
+    const bool requested = envEnabled("FNVXR_INSTALL_CAMERA_HOOK", true);
+    if (!requested)
     {
         logTelemetry("cameraHook install disabled\n");
+        return true;
+    }
+    if (!fnvxr::safety::retailMutationAllowed(requested))
+    {
+        logTelemetry("cameraHook hard-blocked: retail mutation proof incomplete\n");
         return true;
     }
 
@@ -4340,29 +4568,30 @@ bool readLatestRetailRigPose(VrRigPoseSnapshot& pose)
             pose.trackingFlags = g_vrPoseState->trackingFlags;
             pose.referenceSpaceGeneration = g_vrPoseState->referenceSpaceGeneration;
             pose.producerEpoch = g_vrPoseState->producerEpoch;
-            pose.hmdRot = normalizeQuat({
+            pose.recenterRequestId = g_vrPoseState->recenterRequestId;
+            pose.hmdRot = {
                 g_vrPoseState->hmdRot[0], g_vrPoseState->hmdRot[1],
-                g_vrPoseState->hmdRot[2], g_vrPoseState->hmdRot[3] });
+                g_vrPoseState->hmdRot[2], g_vrPoseState->hmdRot[3] };
             pose.hmdPos = {
                 g_vrPoseState->hmdPos[0], g_vrPoseState->hmdPos[1], g_vrPoseState->hmdPos[2] };
-            pose.leftRot = normalizeQuat({
+            pose.leftRot = {
                 g_vrPoseState->leftRot[0], g_vrPoseState->leftRot[1],
-                g_vrPoseState->leftRot[2], g_vrPoseState->leftRot[3] });
+                g_vrPoseState->leftRot[2], g_vrPoseState->leftRot[3] };
             pose.leftPos = {
                 g_vrPoseState->leftPos[0], g_vrPoseState->leftPos[1], g_vrPoseState->leftPos[2] };
-            pose.rightRot = normalizeQuat({
+            pose.rightRot = {
                 g_vrPoseState->rightRot[0], g_vrPoseState->rightRot[1],
-                g_vrPoseState->rightRot[2], g_vrPoseState->rightRot[3] });
+                g_vrPoseState->rightRot[2], g_vrPoseState->rightRot[3] };
             pose.rightPos = {
                 g_vrPoseState->rightPos[0], g_vrPoseState->rightPos[1], g_vrPoseState->rightPos[2] };
-            pose.leftAimRot = normalizeQuat({
+            pose.leftAimRot = {
                 g_vrPoseState->leftAimRot[0], g_vrPoseState->leftAimRot[1],
-                g_vrPoseState->leftAimRot[2], g_vrPoseState->leftAimRot[3] });
+                g_vrPoseState->leftAimRot[2], g_vrPoseState->leftAimRot[3] };
             pose.leftAimPos = {
                 g_vrPoseState->leftAimPos[0], g_vrPoseState->leftAimPos[1], g_vrPoseState->leftAimPos[2] };
-            pose.rightAimRot = normalizeQuat({
+            pose.rightAimRot = {
                 g_vrPoseState->rightAimRot[0], g_vrPoseState->rightAimRot[1],
-                g_vrPoseState->rightAimRot[2], g_vrPoseState->rightAimRot[3] });
+                g_vrPoseState->rightAimRot[2], g_vrPoseState->rightAimRot[3] };
             pose.rightAimPos = {
                 g_vrPoseState->rightAimPos[0], g_vrPoseState->rightAimPos[1], g_vrPoseState->rightAimPos[2] };
         }
@@ -4371,10 +4600,17 @@ bool readLatestRetailRigPose(VrRigPoseSnapshot& pose)
             continue;
         }
         MemoryBarrier();
+        const UInt32 poseAgeMs = static_cast<UInt32>(GetTickCount64())
+            - g_vrPoseState->reserved;
+        const UInt32 maximumPoseAgeMs = static_cast<UInt32>((std::min)(
+            25,
+            (std::max)(1, getIntFromEnv("FNVXR_RETAIL_RIG_MAX_SHARED_POSE_AGE_MS", 25))));
         if (sequenceBefore == g_vrPoseState->sequence
             && (g_vrPoseState->sequence & 1) == 0
             && pose.referenceSpaceGeneration != 0
             && pose.producerEpoch != 0
+            && pose.predictedDisplayTime > 0
+            && poseAgeMs <= maximumPoseAgeMs
             && finiteVec3(pose.hmdPos)
             && finiteVec3(pose.leftPos)
             && finiteVec3(pose.rightPos)
@@ -4386,6 +4622,14 @@ bool readLatestRetailRigPose(VrRigPoseSnapshot& pose)
             && finiteUsableQuat(pose.leftAimRot)
             && finiteUsableQuat(pose.rightAimRot))
         {
+            // Validation must precede normalization: normalizeQuat deliberately
+            // maps zero/NaN input to identity for internal math, which is not
+            // an acceptable policy for an external shared-memory payload.
+            pose.hmdRot = normalizeQuat(pose.hmdRot);
+            pose.leftRot = normalizeQuat(pose.leftRot);
+            pose.rightRot = normalizeQuat(pose.rightRot);
+            pose.leftAimRot = normalizeQuat(pose.leftAimRot);
+            pose.rightAimRot = normalizeQuat(pose.rightAimRot);
             return true;
         }
     }
@@ -4433,32 +4677,62 @@ bool readAuthoritativeRetailVrOrigin(SharedVrOriginState& origin)
         }
         MemoryBarrier();
         Matrix33 renderCameraWorldRotation {};
-        std::memcpy(
-            &renderCameraWorldRotation.m[0][0],
-            origin.renderCameraWorldRot,
-            sizeof(origin.renderCameraWorldRot));
+        Matrix33 bodyRootWorldRotation {};
+        for (int row = 0; row < 3; ++row)
+        {
+            for (int column = 0; column < 3; ++column)
+            {
+                renderCameraWorldRotation.m[row][column] =
+                    origin.renderCameraWorldRot[row * 3 + column];
+            }
+        }
+        for (int row = 0; row < 3; ++row)
+        {
+            for (int column = 0; column < 3; ++column)
+            {
+                bodyRootWorldRotation.m[row][column] =
+                    origin.bodyRootWorldRot[row * 3 + column];
+            }
+        }
         const Vec3 renderCameraWorldPosition {
             origin.renderCameraWorldPos[0],
             origin.renderCameraWorldPos[1],
             origin.renderCameraWorldPos[2]
         };
+        const Vec3 bodyRootWorldPosition {
+            origin.bodyRootWorldPos[0],
+            origin.bodyRootWorldPos[1],
+            origin.bodyRootWorldPos[2]
+        };
+        const UInt32 originAgeMs = static_cast<UInt32>(GetTickCount64()) - origin.reserved;
+        const UInt32 maximumOriginAgeMs = static_cast<UInt32>((std::min)(
+            25,
+            (std::max)(1, getIntFromEnv("FNVXR_RETAIL_RIG_MAX_COMMITTED_ORIGIN_AGE_MS", 25))));
         if (sequenceBefore == g_vrOriginState->sequence
             && (g_vrOriginState->sequence & 1) == 0
             && origin.magic == fnvxr::shared::VrOriginSharedMagic
             && origin.version == fnvxr::shared::VrOriginSharedVersion
-            && (origin.active == fnvxr::shared::VrOriginStateRenderLease
-                || origin.active == fnvxr::shared::VrOriginStateCommitted)
+            && origin.active == fnvxr::shared::VrOriginStateCommitted
             && origin.generation != 0
             && origin.poseSequence != 0
             && origin.producerEpoch != 0
             && origin.renderPoseSequence != 0
             && origin.renderPoseFrame != 0
-            && origin.renderedDisplayTime != 0
+            && origin.renderedDisplayTime > 0
+            && originAgeMs <= maximumOriginAgeMs
+            && origin.reserved2 == GetCurrentProcessId()
             && origin.renderCameraWorldValid != 0
             && origin.renderCameraAddress >= 0x01000000u
             && looksLikeNiObject(reinterpret_cast<void*>(origin.renderCameraAddress))
             && finiteMatrix33(renderCameraWorldRotation)
             && finiteVec3(renderCameraWorldPosition)
+            && origin.bodyRootWorldValid != 0
+            && origin.bodyRootAddress >= 0x01000000u
+            && looksLikeNiObject(reinterpret_cast<void*>(origin.bodyRootAddress))
+            && finiteMatrix33(bodyRootWorldRotation)
+            && finiteVec3(bodyRootWorldPosition)
+            && std::isfinite(origin.bodyRootWorldScale)
+            && std::fabs(origin.bodyRootWorldScale) >= 0.0001f
             && finiteUsableQuat({
                 origin.originRot[0],
                 origin.originRot[1],
@@ -4507,17 +4781,26 @@ bool readCoherentRetailRigPoseAndOrigin(
     // transaction. The render camera and recenter origin remain locked by the
     // stable originBefore/originAfter transaction above; hands may consume the
     // newest pose from that same OpenXR epoch and reference-space generation.
-    const std::int64_t displayTimeDelta = pose.predictedDisplayTime
-        - originBefore.renderedDisplayTime;
-    const std::int64_t absoluteDisplayTimeDelta = displayTimeDelta >= 0
-        ? displayTimeDelta
-        : -displayTimeDelta;
-    const double maximumPoseSkewMilliseconds = (std::max)(
+    const auto orderedTime = [](std::int64_t value) {
+        std::uint64_t bits = 0;
+        std::memcpy(&bits, &value, sizeof(bits));
+        return bits ^ (std::uint64_t { 1 } << 63);
+    };
+    const std::uint64_t poseTimeOrdered = orderedTime(pose.predictedDisplayTime);
+    const std::uint64_t renderTimeOrdered = orderedTime(originBefore.renderedDisplayTime);
+    const std::uint64_t absoluteDisplayTimeDelta = poseTimeOrdered >= renderTimeOrdered
+        ? poseTimeOrdered - renderTimeOrdered
+        : renderTimeOrdered - poseTimeOrdered;
+    const double configuredPoseSkewMilliseconds = static_cast<double>(getFloatFromEnv(
+        "FNVXR_RETAIL_RIG_MAX_RENDER_POSE_SKEW_MS",
+        250.0f));
+    if (!std::isfinite(configuredPoseSkewMilliseconds))
+        return false;
+    const double maximumPoseSkewMilliseconds = std::clamp(
+        configuredPoseSkewMilliseconds,
         1.0,
-        static_cast<double>(getFloatFromEnv(
-            "FNVXR_RETAIL_RIG_MAX_RENDER_POSE_SKEW_MS",
-            250.0f)));
-    const std::int64_t maximumPoseSkewNanoseconds = static_cast<std::int64_t>(
+        60000.0);
+    const std::uint64_t maximumPoseSkewNanoseconds = static_cast<std::uint64_t>(
         maximumPoseSkewMilliseconds * 1000000.0);
     if (absoluteDisplayTimeDelta > maximumPoseSkewNanoseconds)
         return false;
@@ -4529,15 +4812,17 @@ bool readCoherentRetailRigPoseAndOrigin(
         if (count <= 12 || count % 300 == 0)
         {
             logTelemetry(
-                "retailRig pose handoff count=%ld latestSeq=%ld renderSeq=%lu latestFrame=%llu renderFrame=%llu skewMs=%.3f generation=%lu epoch=%lu\n",
+                "retailRig pose handoff count=%ld latestSeq=%ld renderSeq=%lu latestFrame=%llu renderFrame=%llu skewMs=%.3f generation=%lu epoch=%llu\n",
                 count,
                 pose.sequence,
                 static_cast<unsigned long>(originBefore.renderPoseSequence),
                 static_cast<unsigned long long>(pose.frame),
                 static_cast<unsigned long long>(originBefore.renderPoseFrame),
-                static_cast<double>(displayTimeDelta) / 1000000.0,
+                pose.predictedDisplayTime >= originBefore.renderedDisplayTime
+                    ? static_cast<double>(absoluteDisplayTimeDelta) / 1000000.0
+                    : -static_cast<double>(absoluteDisplayTimeDelta) / 1000000.0,
                 static_cast<unsigned long>(pose.referenceSpaceGeneration),
-                static_cast<unsigned long>(pose.producerEpoch));
+                static_cast<unsigned long long>(pose.producerEpoch));
         }
     }
 
@@ -4589,15 +4874,32 @@ bool readPublishedRetailCameraWorld(Vec3& cameraWorld)
 bool captureRetailRigOrigin(
     const VrRigPoseSnapshot& pose,
     const SharedVrOriginState& authoritativeOrigin,
-    void* bodyRoot,
-    const Matrix33& bodyWorldRotation,
-    Vec3 bodyWorldPosition,
-    Vec3 stableCameraWorld)
+    void* bodyRoot)
 {
+    Matrix33 bodyWorldRotation {};
+    for (int row = 0; row < 3; ++row)
+    {
+        for (int column = 0; column < 3; ++column)
+            bodyWorldRotation.m[row][column] = authoritativeOrigin.bodyRootWorldRot[row * 3 + column];
+    }
+    const Vec3 bodyWorldPosition {
+        authoritativeOrigin.bodyRootWorldPos[0],
+        authoritativeOrigin.bodyRootWorldPos[1],
+        authoritativeOrigin.bodyRootWorldPos[2]
+    };
+    const Vec3 stableCameraWorld {
+        authoritativeOrigin.renderCameraWorldPos[0],
+        authoritativeOrigin.renderCameraWorldPos[1],
+        authoritativeOrigin.renderCameraWorldPos[2]
+    };
+    const float bodyWorldScale = authoritativeOrigin.bodyRootWorldScale;
     if (!bodyRoot
+        || reinterpret_cast<std::uintptr_t>(bodyRoot) != authoritativeOrigin.bodyRootAddress
         || !finiteMatrix33(bodyWorldRotation)
         || !finiteVec3(bodyWorldPosition)
-        || !finiteVec3(stableCameraWorld))
+        || !finiteVec3(stableCameraWorld)
+        || !std::isfinite(bodyWorldScale)
+        || std::fabs(bodyWorldScale) < 0.0001f)
     {
         return false;
     }
@@ -4626,6 +4928,7 @@ bool captureRetailRigOrigin(
     g_retailRigBodyAnchorLocal = transformVec3(
         transposeMatrix33(bodyWorldRotation),
         subtractVec3(stableCameraWorld, bodyWorldPosition));
+    g_retailRigBodyAnchorLocal = scaleVec3(g_retailRigBodyAnchorLocal, 1.0f / bodyWorldScale);
     if (!finiteVec3(g_retailRigBodyAnchorLocal))
         return false;
     g_haveRetailRigOrigin = true;
@@ -5552,6 +5855,9 @@ void onRetailPostAnimation(void* animData)
         reinterpret_cast<std::uintptr_t>(bodyRoot) + NiAvObjectWorldRotationOffset);
     const Vec3 bodyWorldPosition = readVec3(
         reinterpret_cast<std::uintptr_t>(bodyRoot) + NiAvObjectWorldTranslationOffset);
+    const float bodyWorldScale = readFloat(
+        reinterpret_cast<std::uintptr_t>(bodyRoot) + NiAvObjectWorldScaleOffset,
+        0.0f);
     const Vec3 stableCameraWorld {
         authoritativeOrigin.renderCameraWorldPos[0],
         authoritativeOrigin.renderCameraWorldPos[1],
@@ -5559,7 +5865,10 @@ void onRetailPostAnimation(void* animData)
     };
     if (!finiteMatrix33(bodyWorldRotation)
         || !finiteVec3(bodyWorldPosition)
-        || !finiteVec3(stableCameraWorld))
+        || !finiteVec3(stableCameraWorld)
+        || !std::isfinite(bodyWorldScale)
+        || std::fabs(bodyWorldScale) < 0.0001f
+        || reinterpret_cast<std::uintptr_t>(bodyRoot) != authoritativeOrigin.bodyRootAddress)
     {
         static LONG loggedAnchorUnavailable = 0;
         const LONG count = InterlockedIncrement(&loggedAnchorUnavailable);
@@ -5581,10 +5890,7 @@ void onRetailPostAnimation(void* animData)
         && !captureRetailRigOrigin(
             pose,
             authoritativeOrigin,
-            bodyRoot,
-            bodyWorldRotation,
-            bodyWorldPosition,
-            stableCameraWorld))
+            bodyRoot))
     {
         return;
     }
@@ -5594,7 +5900,9 @@ void onRetailPostAnimation(void* animData)
     // already contain the HMD overlay during the Gamebryo render traversal.
     const Vec3 bodyAnchorWorld = addVec3(
         bodyWorldPosition,
-        transformVec3(bodyWorldRotation, g_retailRigBodyAnchorLocal));
+        transformVec3(
+            bodyWorldRotation,
+            scaleVec3(g_retailRigBodyAnchorLocal, bodyWorldScale)));
     if (!finiteVec3(bodyAnchorWorld))
         return;
 
@@ -5987,9 +6295,15 @@ bool installRetailRigHook()
 {
     if (g_retailRigHookInstalled)
         return true;
-    if (!envEnabled("FNVXR_RETAIL_RIG_ENABLE", false))
+    const bool requested = envEnabled("FNVXR_RETAIL_RIG_ENABLE", false);
+    if (!requested)
     {
         logTelemetry("retailRig hook install disabled\n");
+        return true;
+    }
+    if (!fnvxr::safety::retailMutationAllowed(requested))
+    {
+        logTelemetry("retailRig hook hard-blocked: retail mutation proof incomplete\n");
         return true;
     }
 #if !defined(_M_IX86)
@@ -6906,12 +7220,31 @@ bool holdDirectInputKey(UInt32 keycode, bool held)
     if (g_publishedDirectInputHoldKnown[keycode]
         && g_publishedDirectInputHoldState[keycode] == held)
     {
+        if (held && !g_publishedDirectInputHoldViaHook[keycode])
+        {
+            const UInt64 nowMs = GetTickCount64();
+            const UInt64 lastHeartbeatMs = g_publishedDirectInputHoldHeartbeatMs[keycode];
+            if (lastHeartbeatMs == 0
+                || nowMs - lastHeartbeatMs >= DirectInputHoldHeartbeatMilliseconds)
+            {
+                const bool refreshed = keycode >= MouseButtonOffset
+                    && keycode < MouseButtonOffset + 8
+                    ? publishInputEvent(
+                        fnvxr::shared::InputEventTypeMouseButtonDown,
+                        keycode - MouseButtonOffset)
+                    : publishInputEvent(fnvxr::shared::InputEventTypeKeyDown, keycode);
+                if (!refreshed)
+                    return false;
+                g_publishedDirectInputHoldHeartbeatMs[keycode] = nowMs;
+            }
+        }
         return true;
     }
     if (!g_publishedDirectInputHoldKnown[keycode] && !held)
     {
         g_publishedDirectInputHoldKnown[keycode] = true;
         g_publishedDirectInputHoldState[keycode] = false;
+        g_publishedDirectInputHoldHeartbeatMs[keycode] = 0;
         return true;
     }
     if (g_publishedDirectInputHoldViaHook[keycode])
@@ -6921,6 +7254,7 @@ bool holdDirectInputKey(UInt32 keycode, bool held)
         g_directInputHook->keys[keycode].hold = held;
         g_publishedDirectInputHoldState[keycode] = held;
         g_publishedDirectInputHoldViaHook[keycode] = held;
+        g_publishedDirectInputHoldHeartbeatMs[keycode] = 0;
         return true;
     }
     const bool releasingQueuedHold =
@@ -6947,17 +7281,19 @@ bool holdDirectInputKey(UInt32 keycode, bool held)
         g_publishedDirectInputHoldKnown[keycode] = true;
         g_publishedDirectInputHoldState[keycode] = held;
         g_publishedDirectInputHoldViaHook[keycode] = false;
+        g_publishedDirectInputHoldHeartbeatMs[keycode] = held ? GetTickCount64() : 0;
         return true;
     }
     if (releasingQueuedHold)
         return false;
-    if (!g_directInputHook)
+    if (!LegacyInProcessDirectInputHoldFallbackEnabled || !g_directInputHook)
         return false;
 
     g_directInputHook->keys[keycode].hold = held;
     g_publishedDirectInputHoldKnown[keycode] = true;
     g_publishedDirectInputHoldState[keycode] = held;
     g_publishedDirectInputHoldViaHook[keycode] = held;
+    g_publishedDirectInputHoldHeartbeatMs[keycode] = 0;
     return true;
 }
 
@@ -8146,7 +8482,7 @@ bool readSharedCommandSnapshot(SharedCommandState& snapshot)
     return false;
 }
 
-void publishSharedCommandStatus(
+bool publishSharedCommandStatus(
     UInt32 requestId,
     UInt32 status,
     UInt64 frame,
@@ -8154,20 +8490,34 @@ void publishSharedCommandStatus(
     const char* command)
 {
     if (!g_commandState)
-        return;
+        return false;
 
-    InterlockedIncrement(&g_commandState->sequence);
-    MemoryBarrier();
+    if (!acquireSharedCommandWriter())
+        return false;
+    repairSharedCommandState();
+    const UInt32 currentStatus = g_commandState->status;
+    const bool validTransition = g_commandState->requestId == requestId
+        && ((status == fnvxr::shared::CommandStatusRunning
+                && currentStatus == fnvxr::shared::CommandStatusPending)
+            || ((status == fnvxr::shared::CommandStatusSucceeded
+                    || status == fnvxr::shared::CommandStatusFailed)
+                && currentStatus == fnvxr::shared::CommandStatusRunning));
+    if (!validTransition
+        || !fnvxr::shared::beginSequencedSharedWrite(g_commandState->sequence))
+    {
+        releaseSharedCommandWriter();
+        return false;
+    }
     g_commandState->magic = CommandSharedMagic;
     g_commandState->version = CommandSharedVersion;
-    g_commandState->requestId = requestId;
     g_commandState->status = status;
     g_commandState->completedFrame = frame;
     g_commandState->resultCode = resultCode;
     if (command && *command)
         strcpy_s(g_commandState->lastCommand, command);
-    MemoryBarrier();
-    InterlockedIncrement(&g_commandState->sequence);
+    fnvxr::shared::endSequencedSharedWrite(g_commandState->sequence);
+    releaseSharedCommandWriter();
+    return true;
 }
 
 void consumeSharedCommand(UInt64 frame)
@@ -8201,21 +8551,30 @@ void consumeSharedCommand(UInt64 frame)
         built ? "true" : "false",
         built ? command : "",
         static_cast<unsigned long long>(frame));
-    publishSharedCommandStatus(
+    if (!publishSharedCommandStatus(
         request.requestId,
         fnvxr::shared::CommandStatusRunning,
         frame,
         built ? 0u : 1u,
-        built ? command : "");
+        built ? command : ""))
+    {
+        logTelemetry(
+            "shared command request lost ownership before running request=%lu\n",
+            static_cast<unsigned long>(request.requestId));
+        return;
+    }
 
     const bool ok = built && runPluginConsoleCommand("fnvxrSharedCommand", command);
     g_lastCommandRequestId = request.requestId;
-    publishSharedCommandStatus(
+    const bool completionPublished = publishSharedCommandStatus(
         request.requestId,
         ok ? fnvxr::shared::CommandStatusSucceeded : fnvxr::shared::CommandStatusFailed,
         frame,
         ok ? 0u : 2u,
         built ? command : "");
+    if (!completionPublished)
+        logTelemetry("shared command completion ownership lost request=%lu\n",
+            static_cast<unsigned long>(request.requestId));
     logTelemetry(
         "{\"event\":\"fnvxrSharedCommandComplete\",\"requestId\":%lu,\"command\":\"%s\",\"ok\":%s,\"resultCode\":%lu,\"line\":\"%s\",\"frame\":%llu}\n",
         static_cast<unsigned long>(request.requestId),
@@ -9584,7 +9943,19 @@ void handleNvseMessage(NVSEMessagingInterface::Message* message)
         return;
 
     if (message->type == MessageMainGameLoop)
+    {
+        if (!fnvxr::safety::RetailMutationProofComplete)
+        {
+            static bool logged = false;
+            if (!logged)
+            {
+                logged = true;
+                logTelemetry("mainloop bridge hard-blocked: retail mutation proof incomplete\n");
+            }
+            return;
+        }
         processMainGameLoop();
+    }
 }
 
 void tapKey(WORD virtualKey)
@@ -10019,6 +10390,11 @@ extern "C" __declspec(dllexport) bool NVSEPlugin_Query(const NVSEInterface* nvse
     return isCompatibleRuntime(nvse);
 }
 
+extern "C" __declspec(dllexport) bool FNVXR_RetailMutationProofComplete()
+{
+    return fnvxr::safety::RetailMutationProofComplete;
+}
+
 extern "C" __declspec(dllexport) bool NVSEPlugin_Load(const NVSEInterface* nvse)
 {
     if (!isCompatibleRuntime(nvse))
@@ -10027,6 +10403,13 @@ extern "C" __declspec(dllexport) bool NVSEPlugin_Load(const NVSEInterface* nvse)
     g_nvse = nvse;
     if (nvse->GetPluginHandle)
         g_pluginHandle = nvse->GetPluginHandle();
+    if (!fnvxr::safety::RetailMutationProofComplete)
+    {
+        logTelemetry(
+            "plugin loaded inert: retail mutation proof incomplete runtime=%u\n",
+            nvse->runtimeVersion);
+        return g_pluginHandle != InvalidPluginHandle;
+    }
     if (nvse->QueryInterface)
     {
         g_console = static_cast<NVSEConsoleInterface*>(nvse->QueryInterface(InterfaceConsole));
@@ -10054,6 +10437,8 @@ extern "C" __declspec(dllexport) bool NVSEPlugin_Load(const NVSEInterface* nvse)
         g_console,
         g_playerControls);
     logInputConfig();
+    if (!acquireGamePluginProducerLease())
+        return false;
     initSharedXInput();
     initSharedDInput();
     initSharedVrPose();
@@ -10072,6 +10457,14 @@ BOOL APIENTRY DllMain(HMODULE, DWORD reason, LPVOID)
 {
     if (reason == DLL_PROCESS_DETACH)
     {
+        // NVSE loads this plugin for the lifetime of FalloutNV.exe. DllMain is
+        // under the loader lock and can run on a non-owner thread, so hook
+        // restoration, input publication, logging, unmapping, and mutex
+        // release are forbidden here. Process teardown reclaims all handles;
+        // dynamic unload without an explicit owner-thread shutdown protocol is
+        // intentionally unsupported.
+        return TRUE;
+#if 0
         restoreProjectileNodeConsumeHook();
         stopBridge();
         if (g_xinputState)
@@ -10144,6 +10537,21 @@ BOOL APIENTRY DllMain(HMODULE, DWORD reason, LPVOID)
             CloseHandle(g_playerMapping);
             g_playerMapping = nullptr;
         }
+        if (g_gamePluginProducerMutex)
+        {
+            // Win32 mutex ownership is thread-affine. Release only from the
+            // NVSE load/main thread that acquired the lifetime lease; process
+            // termination otherwise abandons it safely after all writers stop.
+            if (g_gamePluginProducerMutexOwned
+                && g_gamePluginProducerThreadId == GetCurrentThreadId())
+            {
+                ReleaseMutex(g_gamePluginProducerMutex);
+            }
+            g_gamePluginProducerMutexOwned = false;
+            g_gamePluginProducerThreadId = 0;
+            CloseHandle(g_gamePluginProducerMutex);
+            g_gamePluginProducerMutex = nullptr;
+        }
         if (g_commandState)
         {
             UnmapViewOfFile(g_commandState);
@@ -10153,6 +10561,11 @@ BOOL APIENTRY DllMain(HMODULE, DWORD reason, LPVOID)
         {
             CloseHandle(g_commandMapping);
             g_commandMapping = nullptr;
+        }
+        if (g_commandWriterMutex)
+        {
+            CloseHandle(g_commandWriterMutex);
+            g_commandWriterMutex = nullptr;
         }
         if (g_inputEvents)
         {
@@ -10164,11 +10577,17 @@ BOOL APIENTRY DllMain(HMODULE, DWORD reason, LPVOID)
             CloseHandle(g_inputEventMapping);
             g_inputEventMapping = nullptr;
         }
+        if (g_inputEventWriterMutex)
+        {
+            CloseHandle(g_inputEventWriterMutex);
+            g_inputEventWriterMutex = nullptr;
+        }
         g_nvse = nullptr;
         g_console = nullptr;
         g_messaging = nullptr;
         g_playerControls = nullptr;
         g_pluginHandle = InvalidPluginHandle;
+#endif
     }
 
     return TRUE;

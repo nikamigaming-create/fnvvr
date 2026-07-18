@@ -1,6 +1,6 @@
 {
   "schema": "fnvxr-6dof-numeric-proof-v1",
-  "generated_utc": "2026-07-15T02:54:39.210678+00:00",
+  "generated_utc": "2026-07-15T03:02:02.574286+00:00",
   "checks": [
     {
       "name": "Both declared basis maps are proper rotations",
@@ -139,27 +139,27 @@
     "total_trials": 22911
   },
   "offline_gate_results": "output/proof/offline_gate_results.json",
-  "offline_gate_results_sha256": "510326e6965cf6f65bd6fe9a3c89e6a2aa964825d52e9c65e8b7388aabc0a3ca",
+  "offline_gate_results_sha256": "d7a514db2e0a2f64246ed9ed703f891e85a725c6088e16dfeb5494093a735bd5",
   "traced_source_hashes": {
     "tools/generate_6dof_proof_artifacts.py": {
       "exists": true,
-      "bytes": 63867,
-      "sha256": "18d480972def0676a1a0602f8257b6b4716e3488e2d238397426741eee7dc5d1"
+      "bytes": 63998,
+      "sha256": "67b7b38aaee959f807485a4d4b6f6be050a24d066a8acc2714fe951eb905c62d"
     },
     "docs/6dof-coordinate-proof.md": {
       "exists": true,
-      "bytes": 5160,
-      "sha256": "8a89bc147b1285da9611db33d26e2457598af9b828875884f2e0a3aa806e73e3"
+      "bytes": 5163,
+      "sha256": "d0252ba0e9b351a7e70adde55ab2b5fdac069e0876200b4846ce0b142a43d02c"
     },
     "renderhook/fnvxr_stereo_math.h": {
       "exists": true,
-      "bytes": 32476,
-      "sha256": "5c9cfdae6b9bef964bd9e32c87d0e2d384e2487eb0444a39c401da3c0d73c3f5"
+      "bytes": 32803,
+      "sha256": "03ec253ebdc2b8a3d4f63ffb7c9bad68e852f77bb520f4e50115a75294744ae1"
     },
     "renderhook/fnvxr_d3d9_proxy.cpp": {
       "exists": true,
-      "bytes": 501667,
-      "sha256": "49ac89822ac1ad30acef4552337f45433c28ec6b86ffb4b3608e6ef8e32cac4b"
+      "bytes": 506660,
+      "sha256": "6aa33922d9d07758afdbfee8819234fd0fb1930481578cf7fb72d85db9eb6d46"
     },
     "host/fnvxr_openxr_pose_host.cpp": {
       "exists": true,
@@ -173,8 +173,8 @@
     },
     "tests/fnvxr_stereo_math_test.cpp": {
       "exists": true,
-      "bytes": 33667,
-      "sha256": "767925416c51dc6a6048924d964aea2788aa6980a77099c5cb13018d05dcbfc6"
+      "bytes": 34309,
+      "sha256": "0665cd9a5dde48114c54a9de092c8c4ccf95e17f45b241625779e8811b2205ac"
     },
     "scripts/get-verified-shader-wvp-contracts.ps1": {
       "exists": true,
@@ -188,15 +188,15 @@
     },
     "scripts/audit-launch-safety.ps1": {
       "exists": true,
-      "bytes": 129109,
-      "sha256": "387cf40a1db4c8884308ed27b886e75148aa84f5d55369fd9ff1269ffcbc59ae"
+      "bytes": 129534,
+      "sha256": "bc133b1700317b86db6cb7fa12ab3265ddfd09d4dc465bbb3c5d93aadf25e235"
     }
   },
   "traced_binary_hashes": {
     "build-win32/Release/d3d9.dll": {
       "exists": true,
-      "bytes": 243200,
-      "sha256": "439ceddc29d8420a98fd1ae8245ba8770632cc08a7d8e54eba5f7c32946840f7"
+      "bytes": 245248,
+      "sha256": "ed99e36a9ac177942f963ac72e0e087cacc4eb40517255198625655e7a001f98"
     },
     "build-win32/Release/nvse_fnvxr.dll": {
       "exists": true,
@@ -206,17 +206,17 @@
     "build-win32/Release/fnvxr_stereo_math_test.exe": {
       "exists": true,
       "bytes": 42496,
-      "sha256": "6af0d48be43c7d65f9e88eb1e057a54f7e954b4a3c6d16ca62d68f0f43f39000"
+      "sha256": "8c59a669446e3d205d9bd73b782eea269be44746c8c3f78af0f6f91c895f13e0"
     },
     "build/Release/fnvxr_openxr_pose_host.exe": {
       "exists": true,
       "bytes": 246784,
-      "sha256": "51e0a8b1306365166017528f60d33dba41e45460550b1263ef783cac645e5015"
+      "sha256": "ccfaf20af8b87dbdde98632a05222ec133a2c07a2f532b3c75ad39db67fa84ab"
     },
     "build/Release/fnvxr_stereo_math_test.exe": {
       "exists": true,
-      "bytes": 44544,
-      "sha256": "139f74a1eb1ecdfde689d465e6507ec17d359f15dab8124332a2122cf4b24386"
+      "bytes": 44032,
+      "sha256": "872b548426566bd3b2f1afe1095020d915a92de85089612efe28df731ae19547"
     }
   },
   "all_numeric_checks_passed": true,

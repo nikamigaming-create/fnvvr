@@ -327,25 +327,103 @@ bool validInputEvents(const SharedInputEventQueue* queue)
         && queue->writeLock == 0;
 }
 
-LONG inputEventStartSequence(LONG lastSequence, LONG writeSequence)
+std::uint32_t nextInputEventSequence(std::uint32_t sequence)
 {
-    if (writeSequence <= 0)
-        return 1;
-    const LONG oldestAvailable = std::max<LONG>(1, writeSequence - static_cast<LONG>(InputEventQueueLength) + 1);
-    if (lastSequence <= 0)
-        return writeSequence + 1;
-    return std::max<LONG>(lastSequence + 1, oldestAvailable);
+    ++sequence;
+    return sequence == 0u ? 1u : sequence;
 }
 
-bool readInputEvent(const SharedInputEventQueue* queue, LONG sequence, SharedInputEvent& event)
+std::uint32_t previousInputEventSequence(std::uint32_t sequence)
 {
-    if (!queue || sequence <= 0)
+    if (sequence == 1u)
+        return 0xffffffffu;
+    return sequence - 1u;
+}
+
+struct InputEventRange
+{
+    std::uint32_t first = 0;
+    std::uint32_t count = 0;
+};
+
+InputEventRange inputEventRange(LONG lastSequence, LONG writeSequence)
+{
+    InputEventRange result {};
+    const std::uint32_t write = fnvxr::shared::sequencedValueBits(writeSequence);
+    const std::uint32_t last = fnvxr::shared::sequencedValueBits(lastSequence);
+    if (write == 0u || last == 0u || last == write)
+        return result;
+
+    const std::uint64_t distance =
+        fnvxr::shared::nonzeroSharedCounterDistance(write, last);
+    if (distance == 0)
+        return result;
+    const std::uint32_t available = static_cast<std::uint32_t>(
+        std::min<std::uint64_t>(distance, InputEventQueueLength));
+    std::uint32_t oldest = write;
+    for (std::uint32_t index = 1; index < available; ++index)
+        oldest = previousInputEventSequence(oldest);
+
+    const std::uint32_t requested = nextInputEventSequence(last);
+    std::uint32_t candidate = oldest;
+    for (std::uint32_t index = 0; index < available; ++index)
+    {
+        if (candidate == requested)
+        {
+            result.first = candidate;
+            result.count = available - index;
+            return result;
+        }
+        candidate = nextInputEventSequence(candidate);
+    }
+    result.first = oldest;
+    result.count = available;
+    return result;
+}
+
+InputEventRange inputEventRangeForCursor(
+    LONG lastSequence,
+    LONG writeSequence,
+    bool& cursorInitialized)
+{
+    if (cursorInitialized)
+        return inputEventRange(lastSequence, writeSequence);
+
+    InputEventRange result {};
+    const std::uint32_t write = fnvxr::shared::sequencedValueBits(writeSequence);
+    if (write == 0u)
+        return result;
+    // The constructor establishes a baseline when a nonempty retained queue
+    // already exists. Therefore an uninitialized cursor here means this queue
+    // was empty/absent when the device was wrapped: every currently retained
+    // publication happened afterward and must be consumed, not only the newest
+    // edge. Limit the cold suffix to the physical ring capacity.
+    cursorInitialized = true;
+    result.count = (std::min)(write, InputEventQueueLength);
+    result.first = write;
+    for (std::uint32_t index = 1; index < result.count; ++index)
+        result.first = previousInputEventSequence(result.first);
+    return result;
+}
+
+bool readInputEvent(const SharedInputEventQueue* queue, std::uint32_t sequence, SharedInputEvent& event)
+{
+    if (!queue || sequence == 0u)
         return false;
 
-    const std::uint32_t index = static_cast<std::uint32_t>(sequence - 1) & (InputEventQueueLength - 1u);
-    std::memcpy(&event, &queue->events[index], sizeof(event));
+    const std::uint32_t index = (sequence - 1u) & (InputEventQueueLength - 1u);
+    const SharedInputEvent& sharedEvent = queue->events[index];
+    auto* sharedSequence = const_cast<volatile LONG*>(&sharedEvent.sequence);
+    const LONG sequenceBefore = InterlockedCompareExchange(sharedSequence, 0, 0);
+    if (fnvxr::shared::sequencedValueBits(sequenceBefore) != sequence)
+        return false;
     MemoryBarrier();
-    return event.sequence == static_cast<std::uint32_t>(sequence);
+    std::memcpy(&event, &sharedEvent, sizeof(event));
+    MemoryBarrier();
+    const LONG sequenceAfter = InterlockedCompareExchange(sharedSequence, 0, 0);
+    return fnvxr::shared::sequencedValueBits(sequenceBefore) == sequence
+        && fnvxr::shared::sequencedValueBits(sequenceAfter) == sequence
+        && fnvxr::shared::sequencedValueBits(event.sequence) == sequence;
 }
 
 bool validPointer(const SharedDInputState* shared)
@@ -390,6 +468,15 @@ float envFloat(const char* name, float fallback)
     char* end = nullptr;
     const float value = std::strtof(buffer, &end);
     return end && *end == '\0' ? value : fallback;
+}
+
+ULONGLONG inputEventHoldDeadline()
+{
+    const LONG holdMilliseconds = std::clamp<LONG>(
+        envLong("FNVXR_INPUT_EVENT_MAX_HOLD_MS", 500),
+        300,
+        2000);
+    return GetTickCount64() + static_cast<ULONGLONG>(holdMilliseconds);
 }
 
 bool headLookInputActive(const SharedDInputState* shared)
@@ -711,6 +798,10 @@ public:
         {
             m_lastStateInputEventSequence = queue->writeSequence;
             m_lastBufferedInputEventSequence = queue->writeSequence;
+            const bool queueHasPublication =
+                fnvxr::shared::sequencedValueBits(queue->writeSequence) != 0u;
+            m_stateInputEventCursorInitialized = queueHasPublication;
+            m_bufferedInputEventCursorInitialized = queueHasPublication;
         }
     }
 
@@ -1259,14 +1350,30 @@ private:
         if (!keys)
             return;
 
+        const ULONGLONG now = GetTickCount64();
+        for (std::uint32_t code = 0; code < 256; ++code)
+        {
+            if (m_forcedInputKeys[code]
+                && m_forcedInputKeyDeadline[code] != 0
+                && now >= m_forcedInputKeyDeadline[code])
+            {
+                m_forcedInputKeys[code] = false;
+                m_forcedInputKeyDeadline[code] = 0;
+            }
+        }
+
         const SharedInputEventQueue* queue = inputEventQueue();
         if (!validInputEvents(queue))
             return;
 
         const LONG writeSequence = queue->writeSequence;
-        for (LONG sequence = inputEventStartSequence(m_lastStateInputEventSequence, writeSequence);
-             sequence <= writeSequence;
-             ++sequence)
+        const InputEventRange range = inputEventRangeForCursor(
+            m_lastStateInputEventSequence,
+            writeSequence,
+            m_stateInputEventCursorInitialized);
+        std::uint32_t sequence = range.first;
+        for (std::uint32_t eventIndex = 0; eventIndex < range.count;
+             ++eventIndex, sequence = nextInputEventSequence(sequence))
         {
             SharedInputEvent event {};
             if (!readInputEvent(queue, sequence, event) || event.code >= 256)
@@ -1276,10 +1383,12 @@ private:
             {
                 case fnvxr::shared::InputEventTypeKeyDown:
                     m_forcedInputKeys[event.code] = true;
+                    m_forcedInputKeyDeadline[event.code] = inputEventHoldDeadline();
                     logInputEventOnce("state key down", event);
                     break;
                 case fnvxr::shared::InputEventTypeKeyUp:
                     m_forcedInputKeys[event.code] = false;
+                    m_forcedInputKeyDeadline[event.code] = 0;
                     logInputEventOnce("state key up", event);
                     break;
                 case fnvxr::shared::InputEventTypeKeyTap:
@@ -1304,14 +1413,29 @@ private:
         if (!buttons)
             return;
 
+        const ULONGLONG now = GetTickCount64();
+        for (std::uint32_t button = 0; button < 8; ++button)
+        {
+            if (m_forcedInputMouseButtons[button]
+                && m_forcedInputMouseDeadline[button] != 0
+                && now >= m_forcedInputMouseDeadline[button])
+            {
+                m_forcedInputMouseButtons[button] = false;
+                m_forcedInputMouseDeadline[button] = 0;
+            }
+        }
         const SharedInputEventQueue* queue = inputEventQueue();
         if (!validInputEvents(queue))
             return;
 
         const LONG writeSequence = queue->writeSequence;
-        for (LONG sequence = inputEventStartSequence(m_lastStateInputEventSequence, writeSequence);
-             sequence <= writeSequence;
-             ++sequence)
+        const InputEventRange range = inputEventRangeForCursor(
+            m_lastStateInputEventSequence,
+            writeSequence,
+            m_stateInputEventCursorInitialized);
+        std::uint32_t sequence = range.first;
+        for (std::uint32_t eventIndex = 0; eventIndex < range.count;
+             ++eventIndex, sequence = nextInputEventSequence(sequence))
         {
             SharedInputEvent event {};
             if (!readInputEvent(queue, sequence, event))
@@ -1323,6 +1447,7 @@ private:
                     if (event.code < 8)
                     {
                         m_forcedInputMouseButtons[event.code] = true;
+                        m_forcedInputMouseDeadline[event.code] = inputEventHoldDeadline();
                         logInputEventOnce("state mouse down", event);
                     }
                     break;
@@ -1330,6 +1455,7 @@ private:
                     if (event.code < 8)
                     {
                         m_forcedInputMouseButtons[event.code] = false;
+                        m_forcedInputMouseDeadline[event.code] = 0;
                         logInputEventOnce("state mouse up", event);
                     }
                     break;
@@ -1378,56 +1504,86 @@ private:
         }
 
         const SharedInputEventQueue* queue = inputEventQueue();
-        if (!validInputEvents(queue))
-            return;
-
-        const LONG writeSequence = queue->writeSequence;
-        LONG lastRepresentedSequence = m_lastBufferedInputEventSequence;
-        for (LONG sequence = inputEventStartSequence(m_lastBufferedInputEventSequence, writeSequence);
-             sequence <= writeSequence;
-             ++sequence)
+        if (validInputEvents(queue))
         {
-            SharedInputEvent event {};
-            if (!readInputEvent(queue, sequence, event) || event.code >= 256)
+            const LONG writeSequence = queue->writeSequence;
+            LONG lastRepresentedSequence = m_lastBufferedInputEventSequence;
+            const InputEventRange range = inputEventRangeForCursor(
+                m_lastBufferedInputEventSequence,
+                writeSequence,
+                m_bufferedInputEventCursorInitialized);
+            std::uint32_t sequence = range.first;
+            for (std::uint32_t eventIndex = 0; eventIndex < range.count;
+                 ++eventIndex, sequence = nextInputEventSequence(sequence))
             {
-                lastRepresentedSequence = sequence;
-                continue;
-            }
-
-            if (event.type == fnvxr::shared::InputEventTypeKeyDown)
-            {
-                if (written >= requested)
-                    break;
-                appendEvent(outData, requested, written, event.code, 0x80);
-                m_forcedInputKeys[event.code] = true;
-                logInputEventOnce("buffered key down", event);
-            }
-            else if (event.type == fnvxr::shared::InputEventTypeKeyUp)
-            {
-                if (written >= requested)
-                    break;
-                appendEvent(outData, requested, written, event.code, 0x00);
-                m_forcedInputKeys[event.code] = false;
-                logInputEventOnce("buffered key up", event);
-            }
-            else if (event.type == fnvxr::shared::InputEventTypeKeyTap)
-            {
-                if (written >= requested)
-                    break;
-                const DWORD before = written;
-                appendEvent(outData, requested, written, event.code, 0x80);
-                if (written > before)
+                SharedInputEvent event {};
+                if (!readInputEvent(queue, sequence, event) || event.code >= 256)
                 {
-                    if (written < requested)
-                        appendEvent(outData, requested, written, event.code, 0x00);
-                    else
-                        m_pendingBufferedInputKeyRelease[event.code] = true;
-                    logInputEventOnce("buffered key tap", event);
+                    std::memcpy(&lastRepresentedSequence, &sequence, sizeof(lastRepresentedSequence));
+                    continue;
                 }
+
+                if (event.type == fnvxr::shared::InputEventTypeKeyDown)
+                {
+                    if (!m_bufferedInputQueueKeys[event.code])
+                    {
+                        if (written >= requested)
+                            break;
+                        appendEvent(outData, requested, written, event.code, 0x80);
+                        m_bufferedInputQueueKeys[event.code] = true;
+                        logInputEventOnce("buffered key down", event);
+                    }
+                    m_bufferedInputQueueKeyDeadline[event.code] = inputEventHoldDeadline();
+                }
+                else if (event.type == fnvxr::shared::InputEventTypeKeyUp)
+                {
+                    if (m_bufferedInputQueueKeys[event.code])
+                    {
+                        if (written >= requested)
+                            break;
+                        appendEvent(outData, requested, written, event.code, 0x00);
+                        logInputEventOnce("buffered key up", event);
+                    }
+                    m_bufferedInputQueueKeys[event.code] = false;
+                    m_bufferedInputQueueKeyDeadline[event.code] = 0;
+                }
+                else if (event.type == fnvxr::shared::InputEventTypeKeyTap)
+                {
+                    if (written >= requested)
+                        break;
+                    const DWORD before = written;
+                    appendEvent(outData, requested, written, event.code, 0x80);
+                    if (written > before)
+                    {
+                        if (written < requested)
+                            appendEvent(outData, requested, written, event.code, 0x00);
+                        else
+                            m_pendingBufferedInputKeyRelease[event.code] = true;
+                        logInputEventOnce("buffered key tap", event);
+                    }
+                }
+                std::memcpy(&lastRepresentedSequence, &sequence, sizeof(lastRepresentedSequence));
             }
-            lastRepresentedSequence = sequence;
+            m_lastBufferedInputEventSequence = lastRepresentedSequence;
         }
-        m_lastBufferedInputEventSequence = lastRepresentedSequence;
+
+        // Apply the timeout only after queued heartbeats and explicit Up
+        // events have refreshed/closed their leases.  Expiring first would
+        // manufacture an Up/Down glitch after a long GetDeviceData pause.
+        const ULONGLONG now = GetTickCount64();
+        for (std::uint32_t code = 0; code < 256; ++code)
+        {
+            if (m_bufferedInputQueueKeys[code]
+                && m_bufferedInputQueueKeyDeadline[code] != 0
+                && now >= m_bufferedInputQueueKeyDeadline[code])
+            {
+                if (written >= requested)
+                    return;
+                appendEvent(outData, requested, written, code, 0x00);
+                m_bufferedInputQueueKeys[code] = false;
+                m_bufferedInputQueueKeyDeadline[code] = 0;
+            }
+        }
     }
 
     void appendInputQueueMouseEvents(LPDIDEVICEOBJECTDATA outData, DWORD requested, DWORD& written)
@@ -1444,76 +1600,133 @@ private:
                     return;
             }
         }
+        if (m_pendingBufferedInputMouseY)
+        {
+            if (written >= requested)
+                return;
+            appendEvent(
+                outData,
+                requested,
+                written,
+                DIMOFS_Y,
+                static_cast<DWORD>(m_pendingBufferedInputMouseYValue));
+            m_pendingBufferedInputMouseY = false;
+            m_pendingBufferedInputMouseYValue = 0;
+        }
 
         const SharedInputEventQueue* queue = inputEventQueue();
-        if (!validInputEvents(queue))
-            return;
-
-        const LONG writeSequence = queue->writeSequence;
-        LONG lastRepresentedSequence = m_lastBufferedInputEventSequence;
-        for (LONG sequence = inputEventStartSequence(m_lastBufferedInputEventSequence, writeSequence);
-             sequence <= writeSequence;
-             ++sequence)
+        if (validInputEvents(queue))
         {
-            SharedInputEvent event {};
-            if (!readInputEvent(queue, sequence, event))
+            const LONG writeSequence = queue->writeSequence;
+            LONG lastRepresentedSequence = m_lastBufferedInputEventSequence;
+            const InputEventRange range = inputEventRangeForCursor(
+                m_lastBufferedInputEventSequence,
+                writeSequence,
+                m_bufferedInputEventCursorInitialized);
+            std::uint32_t sequence = range.first;
+            for (std::uint32_t eventIndex = 0; eventIndex < range.count;
+                 ++eventIndex, sequence = nextInputEventSequence(sequence))
             {
-                lastRepresentedSequence = sequence;
-                continue;
-            }
-
-            if (event.type == fnvxr::shared::InputEventTypeMouseButtonDown && event.code < 8)
-            {
-                if (written >= requested)
-                    break;
-                appendEvent(outData, requested, written, DIMOFS_BUTTON0 + event.code, 0x80);
-                m_forcedInputMouseButtons[event.code] = true;
-                logInputEventOnce("buffered mouse down", event);
-            }
-            else if (event.type == fnvxr::shared::InputEventTypeMouseButtonUp && event.code < 8)
-            {
-                if (written >= requested)
-                    break;
-                appendEvent(outData, requested, written, DIMOFS_BUTTON0 + event.code, 0x00);
-                m_forcedInputMouseButtons[event.code] = false;
-                logInputEventOnce("buffered mouse up", event);
-            }
-            else if (event.type == fnvxr::shared::InputEventTypeMouseButtonTap && event.code < 8)
-            {
-                if (written >= requested)
-                    break;
-                const DWORD before = written;
-                appendEvent(outData, requested, written, DIMOFS_BUTTON0 + event.code, 0x80);
-                if (written > before)
+                SharedInputEvent event {};
+                if (!readInputEvent(queue, sequence, event))
                 {
-                    if (written < requested)
-                        appendEvent(outData, requested, written, DIMOFS_BUTTON0 + event.code, 0x00);
-                    else
-                        m_pendingBufferedInputMouseRelease[event.code] = true;
-                    logInputEventOnce("buffered mouse tap", event);
+                    std::memcpy(&lastRepresentedSequence, &sequence, sizeof(lastRepresentedSequence));
+                    continue;
                 }
-            }
-            else if (event.type == fnvxr::shared::InputEventTypeMouseMove)
-            {
-                const DWORD requiredSlots = (event.value0 != 0 ? 1u : 0u) + (event.value1 != 0 ? 1u : 0u);
-                if (requiredSlots > requested - written)
+
+                if (event.type == fnvxr::shared::InputEventTypeMouseButtonDown && event.code < 8)
+                {
+                    if (!m_bufferedInputQueueMouseButtons[event.code])
+                    {
+                        if (written >= requested)
+                            break;
+                        appendEvent(outData, requested, written, DIMOFS_BUTTON0 + event.code, 0x80);
+                        m_bufferedInputQueueMouseButtons[event.code] = true;
+                        logInputEventOnce("buffered mouse down", event);
+                    }
+                    m_bufferedInputQueueMouseDeadline[event.code] = inputEventHoldDeadline();
+                }
+                else if (event.type == fnvxr::shared::InputEventTypeMouseButtonUp && event.code < 8)
+                {
+                    if (m_bufferedInputQueueMouseButtons[event.code])
+                    {
+                        if (written >= requested)
+                            break;
+                        appendEvent(outData, requested, written, DIMOFS_BUTTON0 + event.code, 0x00);
+                        logInputEventOnce("buffered mouse up", event);
+                    }
+                    m_bufferedInputQueueMouseButtons[event.code] = false;
+                    m_bufferedInputQueueMouseDeadline[event.code] = 0;
+                }
+                else if (event.type == fnvxr::shared::InputEventTypeMouseButtonTap && event.code < 8)
+                {
+                    if (written >= requested)
+                        break;
+                    const DWORD before = written;
+                    appendEvent(outData, requested, written, DIMOFS_BUTTON0 + event.code, 0x80);
+                    if (written > before)
+                    {
+                        if (written < requested)
+                            appendEvent(outData, requested, written, DIMOFS_BUTTON0 + event.code, 0x00);
+                        else
+                            m_pendingBufferedInputMouseRelease[event.code] = true;
+                        logInputEventOnce("buffered mouse tap", event);
+                    }
+                }
+                else if (event.type == fnvxr::shared::InputEventTypeMouseMove)
+                {
+                    if (event.value0)
+                    {
+                        if (written >= requested)
+                            break;
+                        appendEvent(outData, requested, written, DIMOFS_X, static_cast<DWORD>(event.value0));
+                    }
+                    if (event.value1)
+                    {
+                        if (written < requested)
+                        {
+                            appendEvent(outData, requested, written, DIMOFS_Y, static_cast<DWORD>(event.value1));
+                        }
+                        else
+                        {
+                            // Preserve queue progress even when Fallout asks
+                            // for one buffered event: represent X now and Y on
+                            // the next poll instead of permanently blocking
+                            // every heartbeat behind this two-axis move.
+                            m_pendingBufferedInputMouseY = true;
+                            m_pendingBufferedInputMouseYValue = event.value1;
+                        }
+                    }
+                    logInputEventOnce("buffered mouse move", event);
+                }
+                else if (event.type == fnvxr::shared::InputEventTypeMouseWheel)
+                {
+                    if (written >= requested)
+                        break;
+                    appendEvent(outData, requested, written, DIMOFS_Z, static_cast<DWORD>(event.value0));
+                    logInputEventOnce("buffered mouse wheel", event);
+                }
+                std::memcpy(&lastRepresentedSequence, &sequence, sizeof(lastRepresentedSequence));
+                if (m_pendingBufferedInputMouseY)
                     break;
-                if (event.value0)
-                    appendEvent(outData, requested, written, DIMOFS_X, static_cast<DWORD>(event.value0));
-                if (event.value1)
-                    appendEvent(outData, requested, written, DIMOFS_Y, static_cast<DWORD>(event.value1));
-                logInputEventOnce("buffered mouse move", event);
             }
-            else if (event.type == fnvxr::shared::InputEventTypeMouseWheel)
+            m_lastBufferedInputEventSequence = lastRepresentedSequence;
+        }
+
+        const ULONGLONG now = GetTickCount64();
+        for (std::uint32_t button = 0; button < 8; ++button)
+        {
+            if (m_bufferedInputQueueMouseButtons[button]
+                && m_bufferedInputQueueMouseDeadline[button] != 0
+                && now >= m_bufferedInputQueueMouseDeadline[button])
             {
                 if (written >= requested)
-                    break;
-                appendEvent(outData, requested, written, DIMOFS_Z, static_cast<DWORD>(event.value0));
-                logInputEventOnce("buffered mouse wheel", event);
+                    return;
+                appendEvent(outData, requested, written, DIMOFS_BUTTON0 + button, 0x00);
+                m_bufferedInputQueueMouseButtons[button] = false;
+                m_bufferedInputQueueMouseDeadline[button] = 0;
             }
-            lastRepresentedSequence = sequence;
         }
-        m_lastBufferedInputEventSequence = lastRepresentedSequence;
     }
 
     void logInputEventOnce(const char* label, const SharedInputEvent& event)
@@ -1807,10 +2020,20 @@ private:
     // poll steal an edge from the other and makes menu presses nondeterministic.
     LONG m_lastStateInputEventSequence = 0;
     LONG m_lastBufferedInputEventSequence = 0;
+    bool m_stateInputEventCursorInitialized = false;
+    bool m_bufferedInputEventCursorInitialized = false;
     bool m_forcedInputKeys[256] {};
+    ULONGLONG m_forcedInputKeyDeadline[256] {};
+    bool m_bufferedInputQueueKeys[256] {};
+    ULONGLONG m_bufferedInputQueueKeyDeadline[256] {};
     bool m_pendingBufferedInputKeyRelease[256] {};
     bool m_forcedInputMouseButtons[8] {};
+    ULONGLONG m_forcedInputMouseDeadline[8] {};
+    bool m_bufferedInputQueueMouseButtons[8] {};
+    ULONGLONG m_bufferedInputQueueMouseDeadline[8] {};
     bool m_pendingBufferedInputMouseRelease[8] {};
+    bool m_pendingBufferedInputMouseY = false;
+    std::int32_t m_pendingBufferedInputMouseYValue = 0;
     bool m_pendingBufferedMouseButton0Release = false;
     int m_mouseClickHoldPolls = 0;
     bool m_pendingBufferedKeyboardAcceptRelease = false;

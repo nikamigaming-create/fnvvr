@@ -10,13 +10,20 @@ param(
     [int]$CommandWaitMs = 10000,
     [int]$GameExitTimeoutSeconds = 20,
     [int]$HostExitGraceSeconds = 3,
+    [int]$HostProgressTimeoutSeconds = 15,
     [string]$LiveAnalyzer = "",
+    [ValidateSet('full-vr','quad-2d-transport','diagnostic-producer')]
+    [string]$ExpectedProfile = 'full-vr',
     [string]$StereoCaptureScript = "",
     [int]$StereoCaptureIntervalSeconds = 15,
     [switch]$SaveQuitOnHostExit
 )
 
 $ErrorActionPreference = "Stop"
+
+if ($HostProgressTimeoutSeconds -lt 5 -or $HostProgressTimeoutSeconds -gt 120) {
+    throw "-HostProgressTimeoutSeconds must be between 5 and 120."
+}
 
 $LogPath = Join-Path $RunDir "sidecar-exit-watcher.log"
 
@@ -95,7 +102,8 @@ function Invoke-LiveAcceptanceAnalysis {
         -NoProfile `
         -ExecutionPolicy Bypass `
         -File $LiveAnalyzer `
-        -RunDir $RunDir 2>&1 |
+        -RunDir $RunDir `
+        -ExpectedProfile $ExpectedProfile 2>&1 |
         Set-Content -LiteralPath $analysisLog -Encoding UTF8
     $analysisExitCode = $LASTEXITCODE
     Write-WatcherLog ("live acceptance analysis exitCode={0} final={1}" -f $analysisExitCode,[bool]$Final)
@@ -113,6 +121,8 @@ function Invoke-LiveAcceptanceAnalysis {
     }
     if ($Final) {
         Set-ManifestAcceptance -State "rejected" -Accepted $false -Reason ("final live analyzer exitCode={0}" -f $analysisExitCode)
+    } else {
+        Set-ManifestAcceptance -State "observing" -Accepted $false -Reason ("current live analyzer exitCode={0}; acceptance is never sticky across a later failure" -f $analysisExitCode)
     }
 }
 
@@ -128,6 +138,7 @@ function Invoke-IndependentStereoCapture {
         -File $StereoCaptureScript `
         -OutputRoot $captureRoot `
         -SceneName $sceneName `
+        -ExpectedProducerProcessId $FalloutPid `
         -TimeoutSeconds 2 2>&1 |
         ForEach-Object { Write-WatcherLog ("stereo capture " + $_) }
     Write-WatcherLog ("independent stereo capture exitCode={0} scene={1}" -f $LASTEXITCODE,$sceneName)
@@ -139,9 +150,30 @@ try {
 
     $lastHeartbeat = Get-Date
     $lastStereoCapture = [DateTime]::MinValue
+    $hostProgressPath = Join-Path $RunDir "fnvxr_openxr_pose_host.out.log"
+    $lastHostProgress = Get-Date
+    $lastHostProgressSignature = ""
     while ($true) {
         $fallout = Get-Process -Id $FalloutPid -ErrorAction SilentlyContinue
         $hostProcess = Get-Process -Id $HostPid -ErrorAction SilentlyContinue
+
+        if ($hostProcess) {
+            $progressItem = Get-Item -LiteralPath $hostProgressPath -ErrorAction SilentlyContinue
+            if ($progressItem) {
+                $progressSignature = "{0}:{1}" -f $progressItem.Length,$progressItem.LastWriteTimeUtc.Ticks
+                if ($progressSignature -ne $lastHostProgressSignature) {
+                    $lastHostProgressSignature = $progressSignature
+                    $lastHostProgress = Get-Date
+                }
+            }
+            if (((Get-Date) - $lastHostProgress).TotalSeconds -ge $HostProgressTimeoutSeconds) {
+                Write-WatcherLog ("host progress watchdog expired hostPid={0} timeoutSeconds={1}; terminating hung host" -f $HostPid,$HostProgressTimeoutSeconds)
+                Set-ManifestAcceptance -State "rejected" -Accepted $false -Reason "OpenXR host progress heartbeat timed out"
+                Stop-Process -Id $HostPid -Force -ErrorAction SilentlyContinue
+                $hostProcess = $null
+                continue
+            }
+        }
 
         if (-not $hostProcess -and $fallout) {
             Write-WatcherLog ("host exited before fallout hostPid={0} falloutPid={1} hostStatus={2}" -f $HostPid, $FalloutPid, (Get-ExitCodeText -ProcessId $HostPid))

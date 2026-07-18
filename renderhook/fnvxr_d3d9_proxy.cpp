@@ -5,8 +5,8 @@
 #include <d3d9.h>
 #include <intrin.h>
 
-#include "fnvxr_stereo_math.h"
 #include "../protocol/fnvxr_shared_state.h"
+#include "fnvxr_stereo_math.h"
 
 #include <algorithm>
 #include <cfloat>
@@ -60,6 +60,7 @@ using UpdateSurfaceFn = HRESULT(WINAPI*)(
 using UpdateTextureFn = HRESULT(WINAPI*)(IDirect3DDevice9*, IDirect3DBaseTexture9*, IDirect3DBaseTexture9*);
 using StretchRectFn = HRESULT(WINAPI*)(
     IDirect3DDevice9*, IDirect3DSurface9*, const RECT*, IDirect3DSurface9*, const RECT*, D3DTEXTUREFILTERTYPE);
+using ColorFillFn = HRESULT(WINAPI*)(IDirect3DDevice9*, IDirect3DSurface9*, const RECT*, D3DCOLOR);
 using SetRenderTargetFn = HRESULT(WINAPI*)(IDirect3DDevice9*, DWORD, IDirect3DSurface9*);
 using SetDepthStencilSurfaceFn = HRESULT(WINAPI*)(IDirect3DDevice9*, IDirect3DSurface9*);
 using SetTextureFn = HRESULT(WINAPI*)(IDirect3DDevice9*, DWORD, IDirect3DBaseTexture9*);
@@ -69,6 +70,14 @@ using DrawIndexedPrimitiveFn = HRESULT(WINAPI*)(IDirect3DDevice9*, D3DPRIMITIVET
 using DrawPrimitiveUPFn = HRESULT(WINAPI*)(IDirect3DDevice9*, D3DPRIMITIVETYPE, UINT, const void*, UINT);
 using DrawIndexedPrimitiveUPFn = HRESULT(WINAPI*)(IDirect3DDevice9*, D3DPRIMITIVETYPE, UINT, UINT, UINT, const void*,
     D3DFORMAT, const void*, UINT);
+using MultiplyTransformFn = HRESULT(WINAPI*)(IDirect3DDevice9*, D3DTRANSFORMSTATETYPE, const D3DMATRIX*);
+using ProcessVerticesFn = HRESULT(WINAPI*)(
+    IDirect3DDevice9*, UINT, UINT, UINT, IDirect3DVertexBuffer9*, IDirect3DVertexDeclaration9*, DWORD);
+using DrawRectPatchFn = HRESULT(WINAPI*)(IDirect3DDevice9*, UINT, const float*, const D3DRECTPATCH_INFO*);
+using DrawTriPatchFn = HRESULT(WINAPI*)(IDirect3DDevice9*, UINT, const float*, const D3DTRIPATCH_INFO*);
+using BeginStateBlockFn = HRESULT(WINAPI*)(IDirect3DDevice9*);
+using EndStateBlockFn = HRESULT(WINAPI*)(IDirect3DDevice9*, IDirect3DStateBlock9**);
+using CreateQueryFn = HRESULT(WINAPI*)(IDirect3DDevice9*, D3DQUERYTYPE, IDirect3DQuery9**);
 PresentFn gRealPresent = nullptr;
 EndSceneFn gRealEndScene = nullptr;
 ResetFn gRealReset = nullptr;
@@ -83,6 +92,7 @@ CreateDepthStencilSurfaceFn gRealCreateDepthStencilSurface = nullptr;
 UpdateSurfaceFn gRealUpdateSurface = nullptr;
 UpdateTextureFn gRealUpdateTexture = nullptr;
 StretchRectFn gRealStretchRect = nullptr;
+ColorFillFn gRealColorFill = nullptr;
 SetRenderTargetFn gRealSetRenderTarget = nullptr;
 SetDepthStencilSurfaceFn gRealSetDepthStencilSurface = nullptr;
 SetTextureFn gRealSetTexture = nullptr;
@@ -91,6 +101,13 @@ DrawPrimitiveFn gRealDrawPrimitive = nullptr;
 DrawIndexedPrimitiveFn gRealDrawIndexedPrimitive = nullptr;
 DrawPrimitiveUPFn gRealDrawPrimitiveUP = nullptr;
 DrawIndexedPrimitiveUPFn gRealDrawIndexedPrimitiveUP = nullptr;
+MultiplyTransformFn gRealMultiplyTransform = nullptr;
+ProcessVerticesFn gRealProcessVertices = nullptr;
+DrawRectPatchFn gRealDrawRectPatch = nullptr;
+DrawTriPatchFn gRealDrawTriPatch = nullptr;
+BeginStateBlockFn gRealBeginStateBlock = nullptr;
+EndStateBlockFn gRealEndStateBlock = nullptr;
+CreateQueryFn gRealCreateQuery = nullptr;
 volatile LONG gPresentFrames = 0;
 volatile LONG gEndSceneFrames = 0;
 volatile LONG gSetTransformCalls = 0;
@@ -148,6 +165,18 @@ bool gNativeStereoEnabled = false;
 bool gNativeSingleTraversalReplayEnabled = false;
 bool gNativeStereoHookInstalled = false;
 bool gNativeStereoRuntimeDisabled = false;
+void** gHookedDeviceVtable = nullptr;
+IUnknown* gHookedDeviceIdentity = nullptr;
+std::uint64_t gCriticalDeviceHookMask = 0;
+std::uint64_t gExpectedCriticalDeviceHookMask = 0;
+bool gCriticalDeviceHooksReady = false;
+volatile LONG gRenderOwnerThreadId = 0;
+volatile LONG gRenderThreadViolation = 0;
+volatile LONG gRenderShutdownRequested = 0;
+SRWLOCK gRenderPublishCommitLock = SRWLOCK_INIT;
+volatile LONG gStateBlockRecording = 0;
+volatile LONG gD3DQueryObjectsObserved = 0;
+DWORD gDeviceBehaviorFlags = 0;
 bool gInNativeStereoHook = false;
 bool gNativePostprocessFanoutActive = false;
 bool gNativePipelineTraceThisPair = false;
@@ -159,6 +188,7 @@ IDirect3DDevice9* gNativeStereoDevice = nullptr;
 LONG gNativeStereoPairsThisPresent = 0;
 LONG gNativeSingleTraversalFramesThisPresent = 0;
 LONG gNativeStereoRenderPairSequence = 0;
+volatile LONG gNativeStereoAuditPairCount = 0;
 volatile LONG gNativeActiveEye = -1;
 float gNativeSingleTraversalIpdUnits = 0.0f;
 float gNativeSingleTraversalFov[2][4] {};
@@ -301,6 +331,12 @@ LONG gStrictEyeTargetClears = 0;
 LONG gStrictEyeTargetProvenBothEyeClears = 0;
 LONG gStrictEyeTargetCopies = 0;
 LONG gStrictEyeTargetProvenBothEyeCopies = 0;
+LONG gStrictEyeTargetFullInitializations = 0;
+LONG gStrictEyeTargetUnprovenWrites = 0;
+bool gStrictEquivalentClearSeenThisTraversal = false;
+bool gStrictDrawSeenThisTraversal = false;
+std::uint64_t gStereoReplayTransactionGeneration = 0;
+bool gPrimaryBackBufferLockable = false;
 LONG gShaderExcludedUserPrimitiveDraws = 0;
 LONG gShaderExcludedAuxiliaryTargetDraws = 0;
 struct ShaderWvpDiscoveryIdentity
@@ -336,7 +372,11 @@ struct StereoSurfaceTwin
     D3DSURFACE_DESC desc {};
     bool depth = false;
     LONG lastUsedFrame = 0;
-    LONG lastDepthPrimeFrame = 0;
+    LONG lastDepthPrimeFrame = -1;
+    StereoSurfaceTwin* lastDepthPrimeTwin = nullptr;
+    std::uint64_t equivalentInitializationGeneration = 0;
+    std::uint64_t leftValidGeneration = 0;
+    std::uint64_t rightValidGeneration = 0;
 };
 struct NativeFullSizeTargetCandidate
 {
@@ -409,6 +449,7 @@ constexpr LONG NativeDoRenderGatePose = 1 << 8;
 constexpr LONG NativeDoRenderGateCamera = 1 << 9;
 constexpr LONG NativeDoRenderGateTargets = 1 << 10;
 constexpr LONG NativeDoRenderGateCellTransition = 1 << 11;
+constexpr LONG NativeDoRenderGateHookIntegrity = 1 << 12;
 IDirect3DBaseTexture9* gActiveTextures[MaxTrackedSamplers] {};
 LONG gLoggedStereoSurfaceTwinCreated = 0;
 LONG gLoggedStereoSurfaceTwinFailed = 0;
@@ -450,8 +491,17 @@ using fnvxr::shared::SharedCameraState;
 using fnvxr::shared::SharedRuntimeState;
 using fnvxr::shared::SharedPlayerState;
 
+struct NamedProducerLease
+{
+    HANDLE mutex = nullptr;
+    HANDLE ownerThread = nullptr;
+    DWORD ownerThreadId = 0;
+    bool owned = false;
+};
+
 HANDLE gSharedVideoMapping = nullptr;
 std::uint8_t* gSharedVideoView = nullptr;
+NamedProducerLease gSharedVideoProducerLease {};
 IDirect3DSurface9* gSharedVideoReadback = nullptr;
 UINT gSharedVideoWidth = 0;
 UINT gSharedVideoHeight = 0;
@@ -462,15 +512,19 @@ LONG gSharedVideoPerfLogs = 0;
 LARGE_INTEGER gLastSharedVideoCaptureSample {};
 HANDLE gSharedStereoMapping = nullptr;
 std::uint8_t* gSharedStereoView = nullptr;
+NamedProducerLease gSharedStereoProducerLease {};
+std::uint64_t gSharedStereoRendererProducerEpoch = 0;
 LONG gSharedStereoCaptures = 0;
 LONG gSharedStereoPerfLogs = 0;
 HANDLE gSharedWorldVideoMapping = nullptr;
 std::uint8_t* gSharedWorldVideoView = nullptr;
+NamedProducerLease gSharedWorldVideoProducerLease {};
 LONG gSharedWorldVideoCaptures = 0;
 HANDLE gSharedVrPoseMapping = nullptr;
 SharedVrPoseState* gSharedVrPose = nullptr;
 HANDLE gSharedVrOriginMapping = nullptr;
 SharedVrOriginState* gSharedVrOrigin = nullptr;
+NamedProducerLease gSharedVrOriginProducerLease {};
 HANDLE gSharedCameraMapping = nullptr;
 SharedCameraState* gSharedCamera = nullptr;
 HANDLE gSharedRuntimeMapping = nullptr;
@@ -484,14 +538,14 @@ bool gSharedCameraMatrixUsable = false;
 bool gHaveVrPoseOrigin = false;
 bool gNativeGameplayPoseOriginLatched = false;
 bool gNativeViewOriginValid = false;
-bool gNativeViewRecenterHeld = false;
+std::uint32_t gNativeLastRecenterRequestId = 0;
 float gNativeViewOriginRot[4] { 0.0f, 0.0f, 0.0f, 1.0f };
 float gVrPoseOrigin[3] {};
 float gVrPoseOriginRot[4] { 0.0f, 0.0f, 0.0f, 1.0f };
 LONG gVrPoseOriginPoseSequence = 0;
 std::uint64_t gVrPoseOriginPoseFrame = 0;
 std::uint32_t gVrPoseOriginGeneration = 0;
-std::uint32_t gVrPoseOriginProducerEpoch = 0;
+std::uint64_t gVrPoseOriginProducerEpoch = 0;
 float gVrWorldYawCos = 1.0f;
 float gVrWorldYawSin = 0.0f;
 float gVrWorldYawHalfCos = 1.0f;
@@ -515,7 +569,7 @@ bool gNativeStereoRenderedPoseValid = false;
 LONG gLastVrPoseSequence = 0;
 std::uint64_t gLastVrPoseFrame = 0;
 std::uint32_t gLastVrReferenceSpaceGeneration = 0;
-std::uint32_t gLastVrProducerEpoch = 0;
+std::uint64_t gLastVrProducerEpoch = 0;
 std::uint32_t gPublishedVrOriginGeneration = 0;
 bool gPublishedVrOriginActive = false;
 bool gPublishedVrOriginCommitted = false;
@@ -525,6 +579,7 @@ LONG gLastRuntimeSequence = 0;
 SharedCameraState gLatestSharedCameraSnapshot {};
 LONG gLatestSharedCameraSnapshotSequence = 0;
 bool gLatestSharedCameraSnapshotValid = false;
+LARGE_INTEGER gLatestSharedCameraAcceptedAt {};
 SharedPlayerState gLatestSharedPlayerSnapshot {};
 LONG gLatestSharedPlayerSnapshotSequence = 0;
 bool gLatestSharedPlayerSnapshotValid = false;
@@ -543,10 +598,12 @@ LONG gLoggedSharedVrPoseInvalid = 0;
 LONG gLoggedNativeFirstPersonGate = 0;
 LONG gLoggedMatrixAudit = 0;
 LONG gLastMatrixAuditFrame = 0;
+INIT_ONCE gD3D9ProxyInitializeOnce = INIT_ONCE_STATIC_INIT;
 
 bool loadRealD3D9();
 void logLine(const char* text);
 void loadStereoConfig();
+bool ensureD3D9ProxyInitialized();
 float absFloat(float value);
 bool currentProjectionLooksScreenSpace();
 bool currentViewLooksScreenSpace();
@@ -557,11 +614,14 @@ bool telemetryHammerEnabled();
 bool shouldTelemetryHammerLog(LONG count, const char* strideEnv, LONG fallbackStride);
 void installNativeStereoEngineHook(IDirect3DDevice9* device);
 bool buildLogPath(char* path, size_t pathSize, const char* leafName);
+bool sameComIdentity(IUnknown* left, IUnknown* right);
+bool criticalDeviceHooksIntact(IDirect3DDevice9* device);
 
 bool stereoReplayTransactionAllowed()
 {
-    return !gNativeSingleTraversalReplayEnabled
-        || (gInNativeStereoHook && gNativeActiveEye == 2);
+    return InterlockedCompareExchange(&gStateBlockRecording, 0, 0) == 0
+        && (!gNativeSingleTraversalReplayEnabled
+            || (gInNativeStereoHook && gNativeActiveEye == 2));
 }
 
 double secondsBetween(const LARGE_INTEGER& start, const LARGE_INTEGER& end)
@@ -576,10 +636,12 @@ struct ScopedReplayStateBlock
 {
     IDirect3DStateBlock9* block = nullptr;
     bool captured = false;
+    bool restoreAttempted = false;
+    bool restored = false;
 
     ScopedReplayStateBlock(IDirect3DDevice9* device, const char* context)
     {
-        if (!device || !readEnvBool("FNVXR_D3D9_STEREO_STATEBLOCK_RESTORE", true))
+        if (!device)
             return;
 
         const HRESULT createResult = device->CreateStateBlock(D3DSBT_ALL, &block);
@@ -617,25 +679,38 @@ struct ScopedReplayStateBlock
         }
     }
 
-    void restore()
+    bool restore()
     {
-        if (captured && block)
+        restoreAttempted = true;
+        if (!captured || !block)
+            return false;
+        const HRESULT result = block->Apply();
+        if (SUCCEEDED(result))
         {
-            const HRESULT result = block->Apply();
-            if (FAILED(result))
-            {
-                char message[160] {};
-                sprintf_s(
-                    message,
-                    "stereo replay stateblock apply failed result=0x%08lx",
-                    static_cast<unsigned long>(result));
-                logLine(message);
-            }
+            restored = true;
+            return true;
         }
+        char message[160] {};
+        sprintf_s(
+            message,
+            "stereo replay stateblock apply failed result=0x%08lx",
+            static_cast<unsigned long>(result));
+        logLine(message);
+        return false;
     }
 
     ~ScopedReplayStateBlock()
     {
+        if (captured && block && !restoreAttempted)
+        {
+            restoreAttempted = true;
+            restored = SUCCEEDED(block->Apply());
+            if (!restored)
+            {
+                InterlockedIncrement(&gStrictEyeTargetUnprovenWrites);
+                logLine("stereo replay stateblock emergency restore failed");
+            }
+        }
         if (block)
             block->Release();
     }
@@ -807,9 +882,26 @@ bool shouldTelemetryHammerLog(LONG count, const char* strideEnv, LONG fallbackSt
     return stride > 0 && (count % stride) == 0;
 }
 
-bool stereoWorldRuntimeEnabled()
+constexpr bool StereoWorldProductionProofComplete = false;
+
+bool stereoWorldRuntimeRequested()
 {
     return !readRawEnvBool("FNVXR_DISABLE_STEREO_WORLD", false);
+}
+
+bool stereoWorldRuntimeEnabled()
+{
+    // This source-level gate is independent of launcher policy. Environment
+    // variables alone cannot activate the unsafe traversal/replay path.
+    return StereoWorldProductionProofComplete && stereoWorldRuntimeRequested();
+}
+
+bool stereoProofModeArmed()
+{
+    return StereoWorldProductionProofComplete
+        && (readRawEnvBool("FNVXR_D3D9_SHARED_STEREO", false)
+        || readRawEnvBool("FNVXR_D3D9_NATIVE_STEREO", false)
+        || readRawEnvBool("FNVXR_D3D9_NATIVE_SINGLE_TRAVERSAL_REPLAY", false));
 }
 
 bool runProfileIs(const char* expected)
@@ -863,6 +955,49 @@ bool readEnvBool(const char* name, bool fallback)
     }
 
     return value[0] == '1' || value[0] == 't' || value[0] == 'T' || value[0] == 'y' || value[0] == 'Y';
+}
+
+std::uint32_t nextNativeStereoPairBits()
+{
+    std::uint32_t next = fnvxr::shared::sequencedValueBits(gNativeStereoRenderPairSequence) + 1u;
+    return next == 0u ? 1u : next;
+}
+
+LONG nextNativeStereoPairSequence()
+{
+    const std::uint32_t bits = nextNativeStereoPairBits();
+    LONG value = 0;
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+LONG publishNativeStereoPairSequence()
+{
+    const LONG published = fnvxr::shared::incrementNonzeroSharedCounter(
+        gNativeStereoRenderPairSequence);
+    for (;;)
+    {
+        const LONG before = gNativeStereoAuditPairCount;
+        if (before >= 13)
+            break;
+        if (InterlockedCompareExchange(&gNativeStereoAuditPairCount, before + 1, before) == before)
+            break;
+    }
+    return published;
+}
+
+bool nativeStereoPairNeedsWarmupAudit(std::uint32_t firstCount)
+{
+    return static_cast<std::uint32_t>(gNativeStereoAuditPairCount) < firstCount;
+}
+
+LONG checkedInterlockedCounterDelta(LONG after, LONG before)
+{
+    const std::uint32_t delta = fnvxr::shared::sequencedValueBits(after)
+        - fnvxr::shared::sequencedValueBits(before);
+    return delta <= static_cast<std::uint32_t>(LONG_MAX)
+        ? static_cast<LONG>(delta)
+        : LONG_MAX;
 }
 
 void forceImmediatePresentation(D3DPRESENT_PARAMETERS* params, const char* source)
@@ -1821,64 +1956,14 @@ void captureVrWorldYawCorrection(const float hmdRot[4])
 
 bool invertMatrix(const fnvxr::stereo::Matrix4& input, fnvxr::stereo::Matrix4& inverse)
 {
-    float work[4][8] {};
-    for (int row = 0; row < 4; ++row)
-    {
-        for (int column = 0; column < 4; ++column)
-            work[row][column] = input.m[row][column];
-        work[row][row + 4] = 1.0f;
-    }
-
-    for (int column = 0; column < 4; ++column)
-    {
-        int pivot = column;
-        float pivotAbs = absFloat(work[pivot][column]);
-        for (int row = column + 1; row < 4; ++row)
-        {
-            const float candidateAbs = absFloat(work[row][column]);
-            if (candidateAbs > pivotAbs)
-            {
-                pivot = row;
-                pivotAbs = candidateAbs;
-            }
-        }
-
-        if (pivotAbs < 0.000001f)
-            return false;
-
-        if (pivot != column)
-        {
-            for (int i = 0; i < 8; ++i)
-            {
-                const float tmp = work[column][i];
-                work[column][i] = work[pivot][i];
-                work[pivot][i] = tmp;
-            }
-        }
-
-        const float pivotValue = work[column][column];
-        for (int i = 0; i < 8; ++i)
-            work[column][i] /= pivotValue;
-
-        for (int row = 0; row < 4; ++row)
-        {
-            if (row == column)
-                continue;
-
-            const float factor = work[row][column];
-            if (factor == 0.0f)
-                continue;
-
-            for (int i = 0; i < 8; ++i)
-                work[row][i] -= factor * work[column][i];
-        }
-    }
-
-    for (int row = 0; row < 4; ++row)
-    {
-        for (int column = 0; column < 4; ++column)
-            inverse.m[row][column] = work[row][column + 4];
-    }
+    fnvxr::stereo::Matrix4 identity {};
+    for (int axis = 0; axis < 4; ++axis)
+        identity.m[axis][axis] = 1.0f;
+    const fnvxr::stereo::ViewProjectionDelta certifiedInverse =
+        fnvxr::stereo::makeViewProjectionDelta(input, identity, true);
+    if (!certifiedInverse.valid)
+        return false;
+    inverse = certifiedInverse.matrix;
     return fnvxr::stereo::isFinite(inverse);
 }
 
@@ -1921,9 +2006,9 @@ fnvxr::stereo::Matrix4 makeLocalVrEyeView(
     float localGameMeters[3] {};
     composeLocalXrMeters(eyeLocalMeters, localXrMeters);
     xrMetersToGamebryoMeters(localXrMeters, localGameMeters);
-    result.m[3][0] += localGameMeters[0] * gGameUnitsPerMeter;
-    result.m[3][1] += localGameMeters[1] * gGameUnitsPerMeter;
-    result.m[3][2] += localGameMeters[2] * gGameUnitsPerMeter;
+    result.m[3][0] -= localGameMeters[0] * gGameUnitsPerMeter;
+    result.m[3][1] -= localGameMeters[1] * gGameUnitsPerMeter;
+    result.m[3][2] -= localGameMeters[2] * gGameUnitsPerMeter;
     return result;
 }
 
@@ -2124,10 +2209,97 @@ SharedVrPoseState* sharedVrPoseState()
     return gSharedVrPose;
 }
 
+bool namedProducerLeaseHeldByCurrentThread(const NamedProducerLease& lease)
+{
+    if (!lease.mutex
+        || !lease.ownerThread
+        || !lease.owned
+        || lease.ownerThreadId != GetCurrentThreadId())
+    {
+        return false;
+    }
+    // A thread id may be reused after its original thread exits.  The retained
+    // SYNCHRONIZE handle identifies the actual acquisition thread and must
+    // still be unsignaled, not merely have a matching numeric id.
+    return WaitForSingleObject(lease.ownerThread, 0) == WAIT_TIMEOUT;
+}
+
+bool acquireNamedProducerMutex(const char* name, NamedProducerLease& lease)
+{
+    if (lease.mutex)
+    {
+        if (namedProducerLeaseHeldByCurrentThread(lease))
+            return true;
+        if (!lease.ownerThread
+            || WaitForSingleObject(lease.ownerThread, 0) != WAIT_OBJECT_0)
+        {
+            return false;
+        }
+
+        // The original acquisition thread exited. Recover the abandoned
+        // mutex on this thread before allowing the retained mapping to be
+        // touched. If another process won the lease, fail closed.
+        const DWORD recovered = WaitForSingleObject(lease.mutex, 0);
+        if (recovered != WAIT_OBJECT_0 && recovered != WAIT_ABANDONED)
+            return false;
+        const DWORD ownerThreadId = GetCurrentThreadId();
+        HANDLE ownerThread = OpenThread(SYNCHRONIZE, FALSE, ownerThreadId);
+        if (!ownerThread)
+        {
+            ReleaseMutex(lease.mutex);
+            return false;
+        }
+        CloseHandle(lease.ownerThread);
+        lease.ownerThread = ownerThread;
+        lease.ownerThreadId = ownerThreadId;
+        lease.owned = true;
+        return true;
+    }
+
+    HANDLE mutex = CreateMutexA(nullptr, FALSE, name);
+    if (!mutex)
+        return false;
+    const DWORD wait = WaitForSingleObject(mutex, 0);
+    if (wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED)
+    {
+        CloseHandle(mutex);
+        return false;
+    }
+
+    const DWORD ownerThreadId = GetCurrentThreadId();
+    HANDLE ownerThread = OpenThread(SYNCHRONIZE, FALSE, ownerThreadId);
+    if (!ownerThread)
+    {
+        ReleaseMutex(mutex);
+        CloseHandle(mutex);
+        return false;
+    }
+
+    lease.mutex = mutex;
+    lease.ownerThread = ownerThread;
+    lease.ownerThreadId = ownerThreadId;
+    lease.owned = true;
+    return true;
+}
+
+void releaseNamedProducerMutex(NamedProducerLease& lease);
+
 SharedVrOriginState* sharedVrOriginState()
 {
     if (gSharedVrOrigin)
-        return gSharedVrOrigin;
+        return acquireNamedProducerMutex(
+            "Local\\FNVXR_VR_Origin_Producer_v6",
+            gSharedVrOriginProducerLease)
+            ? gSharedVrOrigin
+            : nullptr;
+
+    if (!acquireNamedProducerMutex(
+            "Local\\FNVXR_VR_Origin_Producer_v6",
+            gSharedVrOriginProducerLease))
+    {
+        logLine("shared VR origin publisher lease unavailable; refusing second producer");
+        return nullptr;
+    }
 
     gSharedVrOriginMapping = CreateFileMappingA(
         INVALID_HANDLE_VALUE,
@@ -2137,7 +2309,10 @@ SharedVrOriginState* sharedVrOriginState()
         sizeof(SharedVrOriginState),
         fnvxr::shared::VrOriginSharedMappingName);
     if (!gSharedVrOriginMapping)
+    {
+        releaseNamedProducerMutex(gSharedVrOriginProducerLease);
         return nullptr;
+    }
 
     gSharedVrOrigin = static_cast<SharedVrOriginState*>(MapViewOfFile(
         gSharedVrOriginMapping,
@@ -2149,20 +2324,53 @@ SharedVrOriginState* sharedVrOriginState()
     {
         CloseHandle(gSharedVrOriginMapping);
         gSharedVrOriginMapping = nullptr;
+        releaseNamedProducerMutex(gSharedVrOriginProducerLease);
         return nullptr;
     }
 
-    // This proxy is the sole writer. Reinitialize stale contents left alive by
-    // a consumer handle before publishing the first authoritative origin.
-    ZeroMemory(gSharedVrOrigin, sizeof(*gSharedVrOrigin));
+    // A consumer may retain the named mapping across a producer restart.
+    // Recover an abandoned odd sequence under the exclusive producer lease,
+    // then replace the record as one reader-visible invalid transaction while
+    // preserving the live synchronization word.
+    const bool recoveredAbandonedWrite =
+        (fnvxr::shared::sequencedValueBits(gSharedVrOrigin->sequence) & 1u) != 0u;
+    if (!recoveredAbandonedWrite
+        && !fnvxr::shared::beginSequencedSharedWrite(gSharedVrOrigin->sequence))
+    {
+        UnmapViewOfFile(gSharedVrOrigin);
+        gSharedVrOrigin = nullptr;
+        CloseHandle(gSharedVrOriginMapping);
+        gSharedVrOriginMapping = nullptr;
+        releaseNamedProducerMutex(gSharedVrOriginProducerLease);
+        return nullptr;
+    }
+    // If the prior owner died with an odd sequence, the exclusive producer
+    // lease transfers that already-open write transaction to us. Keep it odd
+    // while replacing every payload byte; never expose a temporary even view
+    // of the abandoned partial record.
+    MemoryBarrier();
+    std::memset(gSharedVrOrigin, 0, offsetof(SharedVrOriginState, sequence));
+    std::memset(
+        reinterpret_cast<std::uint8_t*>(gSharedVrOrigin) + offsetof(SharedVrOriginState, active),
+        0,
+        sizeof(*gSharedVrOrigin) - offsetof(SharedVrOriginState, active));
     gSharedVrOrigin->magic = fnvxr::shared::VrOriginSharedMagic;
     gSharedVrOrigin->version = fnvxr::shared::VrOriginSharedVersion;
-    MemoryBarrier();
+    gSharedVrOrigin->active = fnvxr::shared::VrOriginStateInvalid;
+    gSharedVrOrigin->originRot[3] = 1.0f;
+    gSharedVrOrigin->reserved = static_cast<std::uint32_t>(GetTickCount64());
+    gSharedVrOrigin->reserved2 = GetCurrentProcessId();
+    fnvxr::shared::endSequencedSharedWrite(gSharedVrOrigin->sequence);
     logLine("shared VR origin publisher mapped");
     return gSharedVrOrigin;
 }
 
 bool finiteArray(const float* values, int count);
+bool readNativePlayerBodyRoot(
+    std::uintptr_t& addressOut,
+    float rotationOut[9],
+    float positionOut[3],
+    float& scaleOut);
 
 void publishSharedVrOrigin(
     bool active,
@@ -2170,14 +2378,18 @@ void publishSharedVrOrigin(
     LONG poseSequence = 0,
     std::uintptr_t renderCameraAddress = 0,
     const float* renderCameraWorldRot = nullptr,
-    const float* renderCameraWorldPos = nullptr)
+    const float* renderCameraWorldPos = nullptr,
+    std::uintptr_t bodyRootAddress = 0,
+    const float* bodyRootWorldRot = nullptr,
+    const float* bodyRootWorldPos = nullptr,
+    float bodyRootWorldScale = 0.0f)
 {
     SharedVrOriginState* origin = sharedVrOriginState();
     if (!origin)
         return;
 
-    InterlockedIncrement(&origin->sequence);
-    MemoryBarrier();
+    if (!fnvxr::shared::beginSequencedSharedWrite(origin->sequence))
+        return;
     origin->magic = fnvxr::shared::VrOriginSharedMagic;
     origin->version = fnvxr::shared::VrOriginSharedVersion;
     origin->active = active
@@ -2185,7 +2397,8 @@ void publishSharedVrOrigin(
         : fnvxr::shared::VrOriginStateInvalid;
     origin->generation = active ? gVrPoseOriginGeneration
                                 : (pose ? pose->referenceSpaceGeneration : gLastVrReferenceSpaceGeneration);
-    origin->poseSequence = active && gVrPoseOriginPoseSequence > 0
+    origin->poseSequence = active
+        && fnvxr::shared::sequencedValueIsPublished(gVrPoseOriginPoseSequence)
         ? static_cast<std::uint32_t>(gVrPoseOriginPoseSequence)
         : 0u;
     origin->poseFrame = active ? gVrPoseOriginPoseFrame : 0u;
@@ -2195,7 +2408,8 @@ void publishSharedVrOrigin(
         origin->originPos[i] = active ? gVrPoseOrigin[i] : 0.0f;
     origin->producerEpoch = active ? gVrPoseOriginProducerEpoch
                                    : (pose ? pose->producerEpoch : gLastVrProducerEpoch);
-    origin->renderPoseSequence = active && poseSequence > 0
+    origin->renderPoseSequence = active
+        && fnvxr::shared::sequencedValueIsPublished(poseSequence)
         ? static_cast<std::uint32_t>(poseSequence)
         : 0u;
     origin->reserved = 0;
@@ -2215,39 +2429,53 @@ void publishSharedVrOrigin(
         origin->renderCameraWorldRot[i] = cameraWorldValid ? renderCameraWorldRot[i] : 0.0f;
     for (int i = 0; i < 3; ++i)
         origin->renderCameraWorldPos[i] = cameraWorldValid ? renderCameraWorldPos[i] : 0.0f;
-    MemoryBarrier();
-    InterlockedIncrement(&origin->sequence);
+    const bool bodyWorldValid = active
+        && bodyRootAddress != 0
+        && bodyRootWorldRot
+        && bodyRootWorldPos
+        && finiteArray(bodyRootWorldRot, 9)
+        && finiteArray(bodyRootWorldPos, 3)
+        && std::isfinite(bodyRootWorldScale)
+        && std::fabs(bodyRootWorldScale) >= 0.0001f;
+    origin->bodyRootAddress = bodyWorldValid
+        ? static_cast<std::uint32_t>(bodyRootAddress)
+        : 0u;
+    origin->bodyRootWorldValid = bodyWorldValid ? 1u : 0u;
+    for (int i = 0; i < 9; ++i)
+        origin->bodyRootWorldRot[i] = bodyWorldValid ? bodyRootWorldRot[i] : 0.0f;
+    for (int i = 0; i < 3; ++i)
+        origin->bodyRootWorldPos[i] = bodyWorldValid ? bodyRootWorldPos[i] : 0.0f;
+    origin->bodyRootWorldScale = bodyWorldValid ? bodyRootWorldScale : 0.0f;
+    origin->reserved2 = active ? GetCurrentProcessId() : 0u;
+    fnvxr::shared::endSequencedSharedWrite(origin->sequence);
 
     gPublishedVrOriginActive = active;
     gPublishedVrOriginCommitted = false;
     gPublishedVrOriginGeneration = active && pose ? pose->referenceSpaceGeneration : 0u;
 }
 
-void commitNativeStereoOriginLease()
+bool commitNativeStereoOriginLease()
 {
     if (!gPublishedVrOriginActive)
-        return;
+        return false;
     SharedVrOriginState* origin = sharedVrOriginState();
     if (!origin)
-        return;
+        return false;
 
-    InterlockedIncrement(&origin->sequence);
-    MemoryBarrier();
+    if (!fnvxr::shared::beginSequencedSharedWrite(origin->sequence))
+        return false;
     origin->active = fnvxr::shared::VrOriginStateCommitted;
-    MemoryBarrier();
-    InterlockedIncrement(&origin->sequence);
+    origin->reserved = static_cast<std::uint32_t>(GetTickCount64());
+    origin->reserved2 = GetCurrentProcessId();
+    fnvxr::shared::endSequencedSharedWrite(origin->sequence);
     gPublishedVrOriginActive = false;
     gPublishedVrOriginCommitted = true;
     logLine("native stereo origin committed for animation handoff");
+    return true;
 }
 
 void closeNativeStereoOriginLease(const char* reason)
 {
-    if (reason && std::strcmp(reason, "traversal-complete") == 0)
-    {
-        commitNativeStereoOriginLease();
-        return;
-    }
     if (!gPublishedVrOriginActive && !gPublishedVrOriginCommitted)
         return;
     publishSharedVrOrigin(false);
@@ -2262,18 +2490,31 @@ void openNativeStereoOriginLease(
     const float* renderCameraWorldRot,
     const float* renderCameraWorldPos)
 {
+    std::uintptr_t bodyRootAddress = 0;
+    float bodyRootWorldRot[9] {};
+    float bodyRootWorldPos[3] {};
+    float bodyRootWorldScale = 0.0f;
+    const bool bodyRootValid = readNativePlayerBodyRoot(
+        bodyRootAddress,
+        bodyRootWorldRot,
+        bodyRootWorldPos,
+        bodyRootWorldScale);
     publishSharedVrOrigin(
         true,
         &pose,
         gLatestVrPoseSnapshotSequence,
         renderCameraAddress,
         renderCameraWorldRot,
-        renderCameraWorldPos);
+        renderCameraWorldPos,
+        bodyRootValid ? bodyRootAddress : 0,
+        bodyRootValid ? bodyRootWorldRot : nullptr,
+        bodyRootValid ? bodyRootWorldPos : nullptr,
+        bodyRootValid ? bodyRootWorldScale : 0.0f);
     char message[512] {};
     sprintf_s(
         message,
-        "native stereo origin lease opened epoch=%lu generation=%lu originPoseSeq=%ld originPoseFrame=%llu renderPoseSeq=%ld renderPoseFrame=%llu originPos=(%.5f %.5f %.5f) originYawQuat=(%.6f %.6f %.6f %.6f) renderCamera=0x%08lx renderCameraWorld=(%.4f %.4f %.4f)",
-        static_cast<unsigned long>(gVrPoseOriginProducerEpoch),
+        "native stereo origin lease opened epoch=%llu generation=%lu originPoseSeq=%ld originPoseFrame=%llu renderPoseSeq=%ld renderPoseFrame=%llu originPos=(%.5f %.5f %.5f) originYawQuat=(%.6f %.6f %.6f %.6f) renderCamera=0x%08lx renderCameraWorld=(%.4f %.4f %.4f) bodyRoot=0x%08lx bodyValid=%d",
+        static_cast<unsigned long long>(gVrPoseOriginProducerEpoch),
         static_cast<unsigned long>(gVrPoseOriginGeneration),
         gVrPoseOriginPoseSequence,
         static_cast<unsigned long long>(gVrPoseOriginPoseFrame),
@@ -2284,7 +2525,9 @@ void openNativeStereoOriginLease(
         static_cast<unsigned long>(renderCameraAddress),
         renderCameraWorldPos ? renderCameraWorldPos[0] : 0.0f,
         renderCameraWorldPos ? renderCameraWorldPos[1] : 0.0f,
-        renderCameraWorldPos ? renderCameraWorldPos[2] : 0.0f);
+        renderCameraWorldPos ? renderCameraWorldPos[2] : 0.0f,
+        static_cast<unsigned long>(bodyRootAddress),
+        bodyRootValid ? 1 : 0);
     logLine(message);
 }
 
@@ -2702,35 +2945,69 @@ fnvxr::stereo::Matrix4 viewFromSharedCamera(const SharedCameraState& camera)
 
 void updateSharedCameraState()
 {
+    const auto invalidateCamera = []() {
+        gSharedCameraActive = false;
+        gSharedCameraRawActive = false;
+        gSharedCameraMatrixUsable = false;
+        gLatestSharedCameraSnapshotValid = false;
+    };
+    const auto expireCameraIfStale = [&invalidateCamera]() {
+        if (!gLatestSharedCameraSnapshotValid || gLatestSharedCameraAcceptedAt.QuadPart == 0)
+            return;
+        LARGE_INTEGER now {};
+        QueryPerformanceCounter(&now);
+        const double maximumAgeSeconds = (std::min)(
+            0.025,
+            (std::max)(
+                0.001,
+                static_cast<double>(readEnvFloat(
+                    "FNVXR_D3D9_SHARED_CAMERA_MAX_AGE_MS",
+                    25.0f)) / 1000.0));
+        if (secondsBetween(gLatestSharedCameraAcceptedAt, now) <= maximumAgeSeconds)
+            return;
+        invalidateCamera();
+        const LONG count = InterlockedIncrement(&gLoggedSharedCamera);
+        if (count <= 12 || count % 300 == 0)
+            logLine("shared camera invalidated: publisher sequence exceeded hard freshness bound");
+    };
     SharedCameraState* camera = sharedCameraState();
     if (!camera || camera->magic != SharedCameraMagic || camera->version != SharedCameraVersion)
     {
-        gSharedCameraActive = false;
+        invalidateCamera();
         return;
     }
 
     const LONG sequenceBefore = camera->sequence;
     if ((sequenceBefore & 1) != 0 || sequenceBefore == gLastCameraSequence)
+    {
+        expireCameraIfStale();
         return;
+    }
 
+    MemoryBarrier();
     const SharedCameraState snapshot = *camera;
+    MemoryBarrier();
     const LONG sequenceAfter = camera->sequence;
     if (sequenceBefore != sequenceAfter || (sequenceAfter & 1) != 0)
+    {
+        expireCameraIfStale();
         return;
-
-    gLastCameraSequence = sequenceAfter;
-    gLatestSharedCameraSnapshot = snapshot;
-    gLatestSharedCameraSnapshotSequence = sequenceAfter;
-    gLatestSharedCameraSnapshotValid = true;
+    }
 
     const bool rawCameraActive = snapshot.active != 0;
     const bool thirdPersonAllowed = readEnvBool("FNVXR_D3D9_ALLOW_THIRD_PERSON_STEREO", false);
     const bool firstPersonAccepted = snapshot.thirdPerson == 0 || thirdPersonAllowed;
-    const bool strictUsableCameraMatrix = matrix33LooksUsable(snapshot.worldRot);
+    const bool strictUsableCameraMatrix = matrix33LooksUsable(snapshot.worldRot)
+        && finiteArray(snapshot.worldPos, 3);
     const bool usableCameraMatrix = strictUsableCameraMatrix && firstPersonAccepted;
+    gLastCameraSequence = sequenceAfter;
+    gLatestSharedCameraSnapshot = snapshot;
+    gLatestSharedCameraSnapshotSequence = sequenceAfter;
+    gLatestSharedCameraSnapshotValid = snapshot.frame != 0 && strictUsableCameraMatrix;
+    QueryPerformanceCounter(&gLatestSharedCameraAcceptedAt);
     gSharedCameraRawActive = rawCameraActive;
     gSharedCameraMatrixUsable = usableCameraMatrix;
-    gSharedCameraActive = rawCameraActive && usableCameraMatrix;
+    gSharedCameraActive = gLatestSharedCameraSnapshotValid && rawCameraActive && usableCameraMatrix;
     if (gSharedCameraActive)
         gSharedCameraView = viewFromSharedCamera(snapshot);
 
@@ -2824,22 +3101,29 @@ void updateSharedVrPose()
     }
 
     const bool poseSequenceAdvanced = sequence != gLastVrPoseSequence;
-    if ((gLastVrReferenceSpaceGeneration != 0
-            && pose.referenceSpaceGeneration != gLastVrReferenceSpaceGeneration)
-        || (gLastVrProducerEpoch != 0 && pose.producerEpoch != gLastVrProducerEpoch))
+    const bool producerEpochChanged = gLastVrProducerEpoch != 0
+        && pose.producerEpoch != gLastVrProducerEpoch;
+    const bool referenceGenerationChanged = gLastVrReferenceSpaceGeneration != 0
+        && pose.referenceSpaceGeneration != gLastVrReferenceSpaceGeneration;
+    if (referenceGenerationChanged || producerEpochChanged)
     {
         gHaveVrPoseOrigin = false;
         gHaveVrBodyFrame = false;
         gNativeGameplayPoseOriginLatched = false;
         gNativeViewOriginValid = false;
-        gNativeViewRecenterHeld = false;
+        // A new producer owns a fresh mailbox namespace. A generation change
+        // from the same producer already relatches the reference space, so
+        // acknowledge its current request instead of replaying that edge.
+        gNativeLastRecenterRequestId = producerEpochChanged
+            ? 0u
+            : pose.recenterRequestId;
         publishSharedVrOrigin(false, &pose, sequence);
         char message[192] {};
         sprintf_s(
             message,
-            "shared VR producer/reference changed epoch=%lu->%lu generation=%lu->%lu; invalidating camera and rig origin",
-            static_cast<unsigned long>(gLastVrProducerEpoch),
-            static_cast<unsigned long>(pose.producerEpoch),
+            "shared VR producer/reference changed epoch=%llu->%llu generation=%lu->%lu; invalidating camera and rig origin",
+            static_cast<unsigned long long>(gLastVrProducerEpoch),
+            static_cast<unsigned long long>(pose.producerEpoch),
             static_cast<unsigned long>(gLastVrReferenceSpaceGeneration),
             static_cast<unsigned long>(pose.referenceSpaceGeneration));
         logLine(message);
@@ -2853,7 +3137,9 @@ void updateSharedVrPose()
         gHaveVrBodyFrame = false;
         gNativeGameplayPoseOriginLatched = false;
         gNativeViewOriginValid = false;
-        gNativeViewRecenterHeld = false;
+        // Frame regression forces the same relatch; do not consume the same
+        // monotonic recenter request twice after the reset.
+        gNativeLastRecenterRequestId = pose.recenterRequestId;
         publishSharedVrOrigin(false, &pose, sequence);
         logLine("shared VR pose frame regressed; resetting origin");
     }
@@ -2875,7 +3161,8 @@ void updateSharedVrPose()
         fnvxr::stereo::validateEyeBaseline(
             { pose.hmdRot[0], pose.hmdRot[1], pose.hmdRot[2], pose.hmdRot[3] },
             { pose.leftEyePos[0], pose.leftEyePos[1], pose.leftEyePos[2] },
-            { pose.rightEyePos[0], pose.rightEyePos[1], pose.rightEyePos[2] });
+            { pose.rightEyePos[0], pose.rightEyePos[1], pose.rightEyePos[2] },
+            { pose.hmdPos[0], pose.hmdPos[1], pose.hmdPos[2] });
     if (!eyeBaseline.valid)
     {
         gLatestVrPoseSnapshotValid = false;
@@ -3282,7 +3569,11 @@ float matrixMaxAbsDifference(
     {
         for (int column = 0; column < 4; ++column)
         {
+            if (!std::isfinite(a.m[row][column]) || !std::isfinite(b.m[row][column]))
+                return std::numeric_limits<float>::infinity();
             const float difference = absFloat(a.m[row][column] - b.m[row][column]);
+            if (!std::isfinite(difference))
+                return std::numeric_limits<float>::infinity();
             if (difference > maxDifference)
                 maxDifference = difference;
         }
@@ -3723,6 +4014,10 @@ void setEyeShaderConstants(IDirect3DDevice9* device, float eyeSign)
 {
     if (!device)
         return;
+    // The generic constant scanner has no bytecode-level semantic contract.
+    // Production proof mode uses setEyeShaderWvpConstants exclusively.
+    if (stereoProofModeArmed())
+        return;
     if (!readEnvBool("FNVXR_D3D9_SHADER_STEREO", false))
         return;
     if (!currentVertexShaderAllowedForStereoPatch())
@@ -3953,6 +4248,8 @@ bool setWideWorldShaderConstants(
     const fnvxr::stereo::Matrix4& wideWorldProjection)
 {
     if (!device)
+        return false;
+    if (stereoProofModeArmed())
         return false;
     if (!readEnvBool("FNVXR_D3D9_WIDE_WORLD_SHADER_MATRIX_DELTA", true))
         return false;
@@ -4683,12 +4980,74 @@ void releaseSharedVideo()
         CloseHandle(gSharedVideoMapping);
         gSharedVideoMapping = nullptr;
     }
+    releaseNamedProducerMutex(gSharedVideoProducerLease);
+}
+
+void writeInvalidSharedStereoRecord(SharedStereoHeader* header, bool uiActive)
+{
+    if (!header)
+        return;
+    InterlockedExchange(&header->writing, 1);
+    MemoryBarrier();
+    header->magic = SharedStereoMagic;
+    header->version = fnvxr::shared::D3D9StereoFrameSharedVersion;
+    header->headerBytes = sizeof(SharedStereoHeader);
+    header->width = 0;
+    header->height = 0;
+    header->pitchBytes = 0;
+    header->format = 0;
+    header->separated = 0;
+    header->worldCandidate = 0;
+    header->uiActive = uiActive ? 1 : 0;
+    header->poseValid = 0;
+    header->poseSequence = 0;
+    header->renderedDisplayTime = 0;
+    std::memset(header->leftEyeRot, 0, sizeof(header->leftEyeRot));
+    std::memset(header->leftEyePos, 0, sizeof(header->leftEyePos));
+    std::memset(header->rightEyeRot, 0, sizeof(header->rightEyeRot));
+    std::memset(header->rightEyePos, 0, sizeof(header->rightEyePos));
+    std::memset(header->leftFov, 0, sizeof(header->leftFov));
+    std::memset(header->rightFov, 0, sizeof(header->rightFov));
+    header->producerMode = fnvxr::shared::StereoProducerUnknown;
+    header->renderPairSequence = 0;
+    header->leftPayloadOffset = sizeof(SharedStereoHeader);
+    header->rightPayloadOffset = sizeof(SharedStereoHeader);
+    header->totalMappingBytes = sizeof(SharedStereoHeader)
+        + SharedVideoMaxWidth * SharedVideoMaxHeight * 4 * 2
+            * fnvxr::shared::D3D9StereoFrameSlotCount;
+    header->referenceSpaceGeneration = 0;
+    header->producerEpoch = 0;
+    header->rendererProducerEpoch = gSharedStereoRendererProducerEpoch;
+    header->producerProcessId = GetCurrentProcessId();
+    MemoryBarrier();
+    if (InterlockedIncrement64(&header->publicationGeneration) == 0)
+        InterlockedIncrement64(&header->publicationGeneration);
+    MemoryBarrier();
+    fnvxr::shared::incrementNonzeroSharedCounter(header->sequence);
+    MemoryBarrier();
+    InterlockedExchange(&header->writing, 0);
+}
+
+void releaseNamedProducerMutex(NamedProducerLease& lease)
+{
+    if (lease.mutex)
+    {
+        if (namedProducerLeaseHeldByCurrentThread(lease))
+            ReleaseMutex(lease.mutex);
+        CloseHandle(lease.mutex);
+    }
+    if (lease.ownerThread)
+        CloseHandle(lease.ownerThread);
+    lease = {};
 }
 
 void releaseSharedStereo()
 {
     if (gSharedStereoView)
     {
+        writeInvalidSharedStereoRecord(
+            reinterpret_cast<SharedStereoHeader*>(gSharedStereoView),
+            false);
         UnmapViewOfFile(gSharedStereoView);
         gSharedStereoView = nullptr;
     }
@@ -4697,6 +5056,8 @@ void releaseSharedStereo()
         CloseHandle(gSharedStereoMapping);
         gSharedStereoMapping = nullptr;
     }
+    releaseNamedProducerMutex(gSharedStereoProducerLease);
+    gSharedStereoRendererProducerEpoch = 0;
 }
 
 void releaseSharedWorldVideo()
@@ -4711,6 +5072,7 @@ void releaseSharedWorldVideo()
         CloseHandle(gSharedWorldVideoMapping);
         gSharedWorldVideoMapping = nullptr;
     }
+    releaseNamedProducerMutex(gSharedWorldVideoProducerLease);
 }
 
 void releaseSharedVrPose()
@@ -4728,7 +5090,7 @@ void releaseSharedVrPose()
     gHaveVrPoseOrigin = false;
     gNativeGameplayPoseOriginLatched = false;
     gNativeViewOriginValid = false;
-    gNativeViewRecenterHeld = false;
+    gNativeLastRecenterRequestId = 0;
     gLatestVrPoseSnapshotValid = false;
     gNativeStereoRenderedPoseValid = false;
     gLatestVrPoseSnapshotSequence = 0;
@@ -4789,6 +5151,11 @@ void releaseSharedCamera()
         gSharedCameraMapping = nullptr;
     }
     gSharedCameraActive = false;
+    gSharedCameraRawActive = false;
+    gSharedCameraMatrixUsable = false;
+    gLatestSharedCameraSnapshotValid = false;
+    gLatestSharedCameraAcceptedAt = {};
+    gLastCameraSequence = 0;
 }
 
 void releaseSharedRuntime()
@@ -4821,6 +5188,7 @@ void releaseSharedVrOriginPublisher()
     gPublishedVrOriginActive = false;
     gPublishedVrOriginCommitted = false;
     gPublishedVrOriginGeneration = 0;
+    releaseNamedProducerMutex(gSharedVrOriginProducerLease);
 }
 
 void releaseSharedPlayer()
@@ -4862,7 +5230,17 @@ bool sharedStereoEnabled()
 bool ensureSharedVideo()
 {
     if (gSharedVideoView)
-        return true;
+        return acquireNamedProducerMutex(
+            "Local\\FNVXR_D3D9_Frame_Producer_v1",
+            gSharedVideoProducerLease);
+
+    if (!acquireNamedProducerMutex(
+            "Local\\FNVXR_D3D9_Frame_Producer_v1",
+            gSharedVideoProducerLease))
+    {
+        logLine("shared video publisher lease unavailable; refusing second producer");
+        return false;
+    }
 
     constexpr DWORD mappingSize =
         sizeof(SharedVideoHeader) + SharedVideoMaxWidth * SharedVideoMaxHeight * 4;
@@ -4876,8 +5254,10 @@ bool ensureSharedVideo()
     if (!gSharedVideoMapping)
     {
         logLine("shared video CreateFileMapping failed");
+        releaseNamedProducerMutex(gSharedVideoProducerLease);
         return false;
     }
+    const bool createdNewMapping = GetLastError() != ERROR_ALREADY_EXISTS;
 
     gSharedVideoView = static_cast<std::uint8_t*>(
         MapViewOfFile(gSharedVideoMapping, FILE_MAP_ALL_ACCESS, 0, 0, mappingSize));
@@ -4886,12 +5266,29 @@ bool ensureSharedVideo()
         logLine("shared video MapViewOfFile failed");
         CloseHandle(gSharedVideoMapping);
         gSharedVideoMapping = nullptr;
+        releaseNamedProducerMutex(gSharedVideoProducerLease);
         return false;
     }
 
     auto* header = reinterpret_cast<SharedVideoHeader*>(gSharedVideoView);
-    std::memset(header, 0, sizeof(*header));
+    // A consumer may keep this page mapped across a producer restart. Raise
+    // writing before relabeling retained storage, then publish a distinct
+    // invalid record. Readers that were copying old pixels must reject when
+    // they perform their final writing/sequence check.
+    InterlockedExchange(&header->writing, 1);
+    MemoryBarrier();
+    const LONG previousSequence = !createdNewMapping && header->magic == SharedVideoMagic
+        ? InterlockedCompareExchange(&header->sequence, 0, 0)
+        : 0;
     header->magic = SharedVideoMagic;
+    header->width = 0;
+    header->height = 0;
+    header->pitchBytes = 0;
+    header->format = 0;
+    InterlockedExchange(&header->sequence, previousSequence);
+    fnvxr::shared::incrementNonzeroSharedCounter(header->sequence);
+    MemoryBarrier();
+    InterlockedExchange(&header->writing, 0);
     logLine("shared D3D9 video frame mapping ready");
     return true;
 }
@@ -4899,10 +5296,21 @@ bool ensureSharedVideo()
 bool ensureSharedStereo()
 {
     if (gSharedStereoView)
-        return true;
+        return acquireNamedProducerMutex(
+            "Local\\FNVXR_D3D9_Stereo_Producer_v7",
+            gSharedStereoProducerLease);
+
+    if (!acquireNamedProducerMutex(
+            "Local\\FNVXR_D3D9_Stereo_Producer_v7",
+            gSharedStereoProducerLease))
+    {
+        logLine("shared stereo publisher lease unavailable; refusing second producer");
+        return false;
+    }
 
     constexpr DWORD mappingSize =
-        sizeof(SharedStereoHeader) + SharedVideoMaxWidth * SharedVideoMaxHeight * 4 * 2;
+        sizeof(SharedStereoHeader) + SharedVideoMaxWidth * SharedVideoMaxHeight * 4 * 2
+            * fnvxr::shared::D3D9StereoFrameSlotCount;
     gSharedStereoMapping = CreateFileMappingA(
         INVALID_HANDLE_VALUE,
         nullptr,
@@ -4913,8 +5321,11 @@ bool ensureSharedStereo()
     if (!gSharedStereoMapping)
     {
         logLine("shared stereo CreateFileMapping failed");
+        releaseNamedProducerMutex(gSharedStereoProducerLease);
+        gSharedStereoRendererProducerEpoch = 0;
         return false;
     }
+    const bool createdNewMapping = GetLastError() != ERROR_ALREADY_EXISTS;
 
     gSharedStereoView = static_cast<std::uint8_t*>(
         MapViewOfFile(gSharedStereoMapping, FILE_MAP_ALL_ACCESS, 0, 0, mappingSize));
@@ -4923,16 +5334,50 @@ bool ensureSharedStereo()
         logLine("shared stereo MapViewOfFile failed");
         CloseHandle(gSharedStereoMapping);
         gSharedStereoMapping = nullptr;
+        releaseNamedProducerMutex(gSharedStereoProducerLease);
+        gSharedStereoRendererProducerEpoch = 0;
         return false;
     }
 
     auto* header = reinterpret_cast<SharedStereoHeader*>(gSharedStereoView);
-    std::memset(header, 0, sizeof(*header));
-    header->magic = SharedStereoMagic;
-    header->version = fnvxr::shared::D3D9StereoFrameSharedVersion;
-    header->headerBytes = sizeof(SharedStereoHeader);
-    header->leftPayloadOffset = sizeof(SharedStereoHeader);
-    header->totalMappingBytes = mappingSize;
+    const bool existingValid = !createdNewMapping
+        && header->magic == SharedStereoMagic
+        && header->version == fnvxr::shared::D3D9StereoFrameSharedVersion
+        && header->headerBytes == sizeof(SharedStereoHeader);
+    const std::uint64_t previousRendererEpoch = existingValid
+        ? static_cast<std::uint64_t>(InterlockedCompareExchange64(
+            reinterpret_cast<volatile LONG64*>(&header->rendererProducerEpoch), 0, 0))
+        : 0;
+    if (existingValid
+        && previousRendererEpoch == (std::numeric_limits<std::uint64_t>::max)())
+    {
+        logLine("shared stereo renderer epoch exhausted; refusing wrapped restart identity");
+        releaseSharedStereo();
+        return false;
+    }
+    gSharedStereoRendererProducerEpoch = existingValid
+        ? previousRendererEpoch + 1u
+        : 1u;
+    // Close the retained-record relabeling window before changing lifetime
+    // identity. Readers must see writing=1 until one complete invalid record
+    // carrying the new epoch and a new generation/sequence is committed.
+    InterlockedExchange(&header->writing, 1);
+    MemoryBarrier();
+    InterlockedExchange64(
+        reinterpret_cast<volatile LONG64*>(&header->rendererProducerEpoch),
+        static_cast<LONG64>(gSharedStereoRendererProducerEpoch));
+    if (!existingValid)
+    {
+        InterlockedExchange(&header->publishedSlot, -1);
+        for (std::uint32_t lane = 0;
+             lane < fnvxr::shared::D3D9StereoFrameReaderLaneCount;
+             ++lane)
+        {
+            InterlockedExchange(&header->readerSlots[lane], -1);
+        }
+        InterlockedExchange64(&header->publicationGeneration, 0);
+    }
+    writeInvalidSharedStereoRecord(header, false);
     logLine("shared D3D9 stereo frame mapping ready");
     return true;
 }
@@ -4940,7 +5385,17 @@ bool ensureSharedStereo()
 bool ensureSharedWorldVideo()
 {
     if (gSharedWorldVideoView)
-        return true;
+        return acquireNamedProducerMutex(
+            "Local\\FNVXR_D3D9_WorldFrame_Producer_v1",
+            gSharedWorldVideoProducerLease);
+
+    if (!acquireNamedProducerMutex(
+            "Local\\FNVXR_D3D9_WorldFrame_Producer_v1",
+            gSharedWorldVideoProducerLease))
+    {
+        logLine("shared world video publisher lease unavailable; refusing second producer");
+        return false;
+    }
 
     constexpr DWORD mappingSize =
         sizeof(SharedVideoHeader) + SharedVideoMaxWidth * SharedVideoMaxHeight * 4;
@@ -4957,8 +5412,10 @@ bool ensureSharedWorldVideo()
     if (!gSharedWorldVideoMapping)
     {
         logLine("shared world video CreateFileMapping failed");
+        releaseNamedProducerMutex(gSharedWorldVideoProducerLease);
         return false;
     }
+    const bool createdNewMapping = GetLastError() != ERROR_ALREADY_EXISTS;
 
     gSharedWorldVideoView = static_cast<std::uint8_t*>(
         MapViewOfFile(gSharedWorldVideoMapping, FILE_MAP_ALL_ACCESS, 0, 0, mappingSize));
@@ -4967,12 +5424,25 @@ bool ensureSharedWorldVideo()
         logLine("shared world video MapViewOfFile failed");
         CloseHandle(gSharedWorldVideoMapping);
         gSharedWorldVideoMapping = nullptr;
+        releaseNamedProducerMutex(gSharedWorldVideoProducerLease);
         return false;
     }
 
     auto* header = reinterpret_cast<SharedVideoHeader*>(gSharedWorldVideoView);
-    std::memset(header, 0, sizeof(*header));
+    InterlockedExchange(&header->writing, 1);
+    MemoryBarrier();
+    const LONG previousSequence = !createdNewMapping && header->magic == SharedVideoMagic
+        ? InterlockedCompareExchange(&header->sequence, 0, 0)
+        : 0;
     header->magic = SharedVideoMagic;
+    header->width = 0;
+    header->height = 0;
+    header->pitchBytes = 0;
+    header->format = 0;
+    InterlockedExchange(&header->sequence, previousSequence);
+    fnvxr::shared::incrementNonzeroSharedCounter(header->sequence);
+    MemoryBarrier();
+    InterlockedExchange(&header->writing, 0);
     char message[160] {};
     sprintf_s(message, "shared D3D9 wide world frame mapping ready name=%s", mappingName);
     logLine(message);
@@ -5108,7 +5578,7 @@ void captureSharedVideoFrame(IDirect3DDevice9* device)
     QueryPerformanceCounter(&copyEnd);
 
     gSharedVideoReadback->UnlockRect();
-    InterlockedIncrement(&header->sequence);
+    fnvxr::shared::incrementNonzeroSharedCounter(header->sequence);
     InterlockedExchange(&header->writing, 0);
     releaseSurface(backBuffer);
     LARGE_INTEGER captureEnd {};
@@ -5170,16 +5640,28 @@ void releaseTexture(IDirect3DTexture9*& texture)
 
 void releaseStereoSurfaceTwin(StereoSurfaceTwin& twin)
 {
+    for (UINT index = 0; index < MaxStereoSurfaceTwins; ++index)
+    {
+        if (gStereoSurfaceTwins[index].lastDepthPrimeTwin == &twin)
+        {
+            gStereoSurfaceTwins[index].lastDepthPrimeTwin = nullptr;
+            gStereoSurfaceTwins[index].lastDepthPrimeFrame = -1;
+        }
+    }
     releaseSurface(twin.left);
     releaseSurface(twin.right);
     releaseTexture(twin.leftTexture);
     releaseTexture(twin.rightTexture);
     releaseTexture(twin.originalTexture);
-    twin.original = nullptr;
+    releaseSurface(twin.original);
     std::memset(&twin.desc, 0, sizeof(twin.desc));
     twin.depth = false;
     twin.lastUsedFrame = 0;
-    twin.lastDepthPrimeFrame = 0;
+    twin.lastDepthPrimeFrame = -1;
+    twin.lastDepthPrimeTwin = nullptr;
+    twin.equivalentInitializationGeneration = 0;
+    twin.leftValidGeneration = 0;
+    twin.rightValidGeneration = 0;
 }
 
 void releaseStereoSurfaceTwins()
@@ -5223,7 +5705,7 @@ HRESULT createTwinRenderSurface(
                 desc.Format,
                 desc.MultiSampleType,
                 desc.MultiSampleQuality,
-                TRUE,
+                FALSE,
                 surface,
                 nullptr);
         }
@@ -5233,7 +5715,7 @@ HRESULT createTwinRenderSurface(
             desc.Format,
             desc.MultiSampleType,
             desc.MultiSampleQuality,
-            TRUE,
+            FALSE,
             surface,
             nullptr);
     }
@@ -5327,10 +5809,41 @@ StereoSurfaceTwin* findSurfaceTwin(IDirect3DSurface9* original, bool depth)
     for (UINT index = 0; index < MaxStereoSurfaceTwins; ++index)
     {
         StereoSurfaceTwin& twin = gStereoSurfaceTwins[index];
-        if (twin.original == original && twin.depth == depth && twin.left && twin.right)
+        if (twin.original
+            && sameComIdentity(twin.original, original)
+            && twin.depth == depth
+            && twin.left
+            && twin.right)
             return &twin;
     }
     return nullptr;
+}
+
+bool stereoSurfaceTwinPinned(const StereoSurfaceTwin* twin)
+{
+    if (!twin)
+        return true;
+    if (gNativeResolvedTwinForEye[0] == twin || gNativeResolvedTwinForEye[1] == twin)
+        return true;
+    for (UINT index = 0; index < MaxNativeFullSizeTargetCandidates; ++index)
+    {
+        if (gNativeFullSizeTargetCandidates[index].twin == twin)
+            return true;
+    }
+    for (UINT index = 0; index < MaxNativePostprocessDrawRecords; ++index)
+    {
+        if (gNativePostprocessDrawRecords[index].targetTwin == twin
+            || gNativePostprocessDrawRecords[index].depthTwin == twin)
+        {
+            return true;
+        }
+    }
+    if (gStereoTargetsAliasTwin
+        && (twin->left == gLeftEyeSurface || twin->right == gRightEyeSurface))
+    {
+        return true;
+    }
+    return false;
 }
 
 StereoSurfaceTwin* ensureSurfaceTwin(IDirect3DDevice9* device, IDirect3DSurface9* original, bool depth)
@@ -5345,7 +5858,7 @@ StereoSurfaceTwin* ensureSurfaceTwin(IDirect3DDevice9* device, IDirect3DSurface9
     for (UINT i = 0; i < MaxStereoSurfaceTwins; ++i)
     {
         StereoSurfaceTwin& twin = gStereoSurfaceTwins[i];
-        if (twin.original == original)
+        if (twin.original && sameComIdentity(twin.original, original))
         {
             if (twin.left && twin.right && twin.depth == depth && surfaceDescMatches(twin.desc, desc))
             {
@@ -5369,10 +5882,35 @@ StereoSurfaceTwin* ensureSurfaceTwin(IDirect3DDevice9* device, IDirect3DSurface9
 
     if (!slot)
     {
-        const LONG failLog = InterlockedIncrement(&gLoggedStereoSurfaceTwinFailed);
-        if (failLog <= 8 || failLog % 120 == 0)
-            logLine("stereo surface twin table full");
-        return nullptr;
+        const std::uint32_t currentFrame =
+            static_cast<std::uint32_t>(static_cast<LONG>(gPresentFrames));
+        std::uint32_t greatestAge = 0;
+        for (UINT i = 0; i < MaxStereoSurfaceTwins; ++i)
+        {
+            StereoSurfaceTwin& candidate = gStereoSurfaceTwins[i];
+            const std::uint32_t usedFrame =
+                static_cast<std::uint32_t>(candidate.lastUsedFrame);
+            const std::uint32_t age = currentFrame - usedFrame;
+            if (age != 0u
+                && age < 0x80000000u
+                && age >= greatestAge
+                && !stereoSurfaceTwinPinned(&candidate))
+            {
+                greatestAge = age;
+                slot = &candidate;
+            }
+        }
+        if (slot)
+        {
+            releaseStereoSurfaceTwin(*slot);
+        }
+        else
+        {
+            const LONG failLog = InterlockedIncrement(&gLoggedStereoSurfaceTwinFailed);
+            if (failLog <= 8 || failLog % 120 == 0)
+                logLine("stereo surface twin table full with every entry live in the current transaction");
+            return nullptr;
+        }
     }
 
     IDirect3DSurface9* left = nullptr;
@@ -5410,6 +5948,7 @@ StereoSurfaceTwin* ensureSurfaceTwin(IDirect3DDevice9* device, IDirect3DSurface9
         return nullptr;
     }
 
+    original->AddRef();
     slot->original = original;
     slot->left = left;
     slot->right = right;
@@ -5472,7 +6011,10 @@ IDirect3DBaseTexture9* stereoTextureFor(IDirect3DBaseTexture9* original, bool le
         if (!twin.originalTexture || !twin.leftTexture || !twin.rightTexture)
             continue;
         if (sameComObject(original, twin.originalTexture))
+        {
+            twin.lastUsedFrame = static_cast<LONG>(gPresentFrames);
             return leftEye ? twin.leftTexture : twin.rightTexture;
+        }
     }
     return nullptr;
 }
@@ -5501,6 +6043,28 @@ const char* nativePipelineTracePhaseName(int phase)
     default:
         return "inactive";
     }
+}
+
+void replaceTrackedTexture(UINT sampler, IDirect3DBaseTexture9* texture, bool adoptReference)
+{
+    if (sampler >= MaxTrackedSamplers)
+    {
+        if (adoptReference && texture)
+            texture->Release();
+        return;
+    }
+    if (texture && !adoptReference)
+        texture->AddRef();
+    IDirect3DBaseTexture9* previous = gActiveTextures[sampler];
+    gActiveTextures[sampler] = texture;
+    if (previous)
+        previous->Release();
+}
+
+void releaseTrackedTextures()
+{
+    for (UINT sampler = 0; sampler < MaxTrackedSamplers; ++sampler)
+        replaceTrackedTexture(sampler, nullptr, false);
 }
 
 bool claimNativePipelineTraceEvent(int& phase, LONG& event)
@@ -5681,10 +6245,11 @@ void snapshotNativeFullSizeTargets(IDirect3DDevice9* device, int eye)
     for (UINT index = 0; index < MaxNativeFullSizeTargetCandidates; ++index)
     {
         NativeFullSizeTargetCandidate& candidate = gNativeFullSizeTargetCandidates[index];
-        const LONG pairSequence = static_cast<LONG>(gNativeStereoRenderPairSequence + 1);
+        const LONG pairSequence = nextNativeStereoPairSequence();
+        const std::uint32_t pairBits = fnvxr::shared::sequencedValueBits(pairSequence);
         const bool auditSnapshot = gNativePipelineTraceThisPair
-            || pairSequence <= 3
-            || pairSequence % 120 == 0;
+            || nativeStereoPairNeedsWarmupAudit(3)
+            || pairBits % 120u == 0u;
         const bool requiredNonMsaaSource = candidate.desc.Format == D3DFMT_A16B16G16R16F
             && candidate.desc.MultiSampleType == D3DMULTISAMPLE_NONE;
         const bool shouldSnapshot = candidate.original
@@ -5717,7 +6282,7 @@ void snapshotNativeFullSizeTargets(IDirect3DDevice9* device, int eye)
             sprintf_s(
                 message,
                 "native pipeline target snapshot pair=%ld eye=%s candidate=%u original=%p result=0x%08lx size=%ux%u format=%lu usage=0x%lx ms=%u lastSet=%ld textureBacked=%d",
-                static_cast<LONG>(gNativeStereoRenderPairSequence + 1),
+                nextNativeStereoPairSequence(),
                 eye == 0 ? "left" : "right",
                 index,
                 reinterpret_cast<void*>(candidate.original),
@@ -5862,8 +6427,9 @@ bool captureNativePostprocessDraw(
     }
 
     InterlockedIncrement(&gNativePostprocessRecordedDrawCount);
-    const LONG pairSequence = static_cast<LONG>(gNativeStereoRenderPairSequence + 1);
-    if (pairSequence <= 3 || pairSequence % 120 == 0)
+    const LONG pairSequence = nextNativeStereoPairSequence();
+    if (nativeStereoPairNeedsWarmupAudit(3)
+        || fnvxr::shared::sequencedValueBits(pairSequence) % 120u == 0u)
     {
         char message[576] {};
         sprintf_s(
@@ -6027,9 +6593,11 @@ bool replayNativePostprocessCommandStreamForRightEye(IDirect3DDevice9* device)
         InterlockedExchange(&gNativePostprocessFinalWritesThisPresent, finalWrites);
     }
 
-    const LONG pairSequence = static_cast<LONG>(gNativeStereoRenderPairSequence + 1);
+    const LONG pairSequence = nextNativeStereoPairSequence();
     const bool success = allSucceeded && replayed == recordCount && finalWrites > 0;
-    if (!success || pairSequence <= 12 || pairSequence % 120 == 0)
+    if (!success
+        || nativeStereoPairNeedsWarmupAudit(12)
+        || fnvxr::shared::sequencedValueBits(pairSequence) % 120u == 0u)
     {
         char message[384] {};
         sprintf_s(
@@ -6194,52 +6762,131 @@ bool formatHasStencil(D3DFORMAT format)
         || format == D3DFMT_D24FS8;
 }
 
-void primeStereoReplayTarget(
+bool depthSurfaceIsProofNonLockable(const D3DSURFACE_DESC& desc)
+{
+    const bool standardNonLockableFormat = desc.Format == D3DFMT_D32
+        || desc.Format == D3DFMT_D15S1
+        || desc.Format == D3DFMT_D24S8
+        || desc.Format == D3DFMT_D24X8
+        || desc.Format == D3DFMT_D24X4S4
+        || desc.Format == D3DFMT_D16
+        || desc.Format == D3DFMT_D24FS8;
+    return standardNonLockableFormat
+        && desc.Type == D3DRTYPE_SURFACE
+        && desc.Pool == D3DPOOL_DEFAULT
+        && (desc.Usage & D3DUSAGE_DEPTHSTENCIL) != 0;
+}
+
+bool primeStereoReplayTarget(
     IDirect3DDevice9* device,
     StereoSurfaceTwin* targetTwin,
     StereoSurfaceTwin* depthTwin,
     const char* context)
 {
-    if (!device || !targetTwin || !targetTwin->left || !targetTwin->right || !gRealClear)
-        return;
-    if (!readEnvBool("FNVXR_D3D9_STEREO_PRIME_REPLAY_TARGETS", true))
-        return;
+    if (!device
+        || !targetTwin
+        || !targetTwin->left
+        || !targetTwin->right
+        || !gRealClear
+        || !gRealSetRenderTarget
+        || !gRealSetDepthStencilSurface)
+        return false;
 
+    (void)context;
+    // Never invent a black/color/depth prestate immediately before replay.
+    // The only accepted initialization is the exact full clear already
+    // mirrored by hookedClear for this transaction, on both the actual color
+    // and depth twins. This makes a late depth rebind fail closed.
+    return depthTwin
+        && depthTwin->left
+        && depthTwin->right
+        && targetTwin->equivalentInitializationGeneration
+            == gStereoReplayTransactionGeneration
+        && targetTwin->leftValidGeneration == gStereoReplayTransactionGeneration
+        && targetTwin->rightValidGeneration == gStereoReplayTransactionGeneration
+        && depthTwin->equivalentInitializationGeneration
+            == gStereoReplayTransactionGeneration
+        && depthTwin->leftValidGeneration == gStereoReplayTransactionGeneration
+        && depthTwin->rightValidGeneration == gStereoReplayTransactionGeneration;
+
+#if 0
+    // Obsolete pre-proof implementation retained temporarily for forensic
+    // comparison. It must never compile or execute: it invented a black
+    // prestate instead of preserving the application's exact clear.
     const LONG frame = static_cast<LONG>(gPresentFrames);
-    if (targetTwin->lastDepthPrimeFrame == frame)
-        return;
+    if (targetTwin->lastDepthPrimeFrame == frame
+        && targetTwin->lastDepthPrimeTwin == depthTwin)
+        return true;
 
-    DWORD clearFlags = 0;
-    if (readEnvBool("FNVXR_D3D9_STEREO_PRIME_COLOR", true))
-        clearFlags |= D3DCLEAR_TARGET;
-    if (depthTwin && readEnvBool("FNVXR_D3D9_STEREO_PRIME_DEPTH", true))
-    {
-        clearFlags |= D3DCLEAR_ZBUFFER;
-        if (formatHasStencil(depthTwin->desc.Format))
-            clearFlags |= D3DCLEAR_STENCIL;
-    }
-    if (clearFlags == 0)
-        return;
+    if (!depthTwin || !depthTwin->left || !depthTwin->right)
+        return false;
+    DWORD clearFlags = D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER;
+    if (formatHasStencil(depthTwin->desc.Format))
+        clearFlags |= D3DCLEAR_STENCIL;
 
     IDirect3DSurface9* originalTarget = nullptr;
     IDirect3DSurface9* originalDepth = nullptr;
-    device->GetRenderTarget(0, &originalTarget);
-    device->GetDepthStencilSurface(&originalDepth);
+    const HRESULT getTargetResult = device->GetRenderTarget(0, &originalTarget);
+    const HRESULT getDepthResult = device->GetDepthStencilSurface(&originalDepth);
+    const bool hadOriginalTarget = originalTarget != nullptr;
+    const bool hadOriginalDepth = originalDepth != nullptr;
+    D3DVIEWPORT9 fullViewport {};
+    fullViewport.Width = targetTwin->desc.Width;
+    fullViewport.Height = targetTwin->desc.Height;
+    fullViewport.MinZ = 0.0f;
+    fullViewport.MaxZ = 1.0f;
 
-    device->SetRenderTarget(0, targetTwin->left);
-    device->SetDepthStencilSurface(depthTwin ? depthTwin->left : nullptr);
-    const HRESULT leftResult = gRealClear(device, 0, nullptr, clearFlags, 0x00000000, 1.0f, 0);
+    const HRESULT leftTargetResult = gRealSetRenderTarget
+        ? gRealSetRenderTarget(device, 0, targetTwin->left)
+        : D3DERR_INVALIDCALL;
+    const HRESULT leftDepthResult = gRealSetDepthStencilSurface
+        ? gRealSetDepthStencilSurface(device, depthTwin->left)
+        : D3DERR_INVALIDCALL;
+    const HRESULT leftViewportResult = device->SetViewport(&fullViewport);
+    const HRESULT leftScissorStateResult = device->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE);
+    const HRESULT leftResult = SUCCEEDED(leftTargetResult)
+        && SUCCEEDED(leftDepthResult)
+        && SUCCEEDED(leftViewportResult)
+        && SUCCEEDED(leftScissorStateResult)
+        ? gRealClear(device, 0, nullptr, clearFlags, 0x00000000, 1.0f, 0)
+        : D3DERR_INVALIDCALL;
 
-    device->SetRenderTarget(0, targetTwin->right);
-    device->SetDepthStencilSurface(depthTwin ? depthTwin->right : nullptr);
-    const HRESULT rightResult = gRealClear(device, 0, nullptr, clearFlags, 0x00000000, 1.0f, 0);
+    const HRESULT rightTargetResult = gRealSetRenderTarget
+        ? gRealSetRenderTarget(device, 0, targetTwin->right)
+        : D3DERR_INVALIDCALL;
+    const HRESULT rightDepthResult = gRealSetDepthStencilSurface
+        ? gRealSetDepthStencilSurface(device, depthTwin->right)
+        : D3DERR_INVALIDCALL;
+    const HRESULT rightViewportResult = device->SetViewport(&fullViewport);
+    const HRESULT rightScissorStateResult = device->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE);
+    const HRESULT rightResult = SUCCEEDED(rightTargetResult)
+        && SUCCEEDED(rightDepthResult)
+        && SUCCEEDED(rightViewportResult)
+        && SUCCEEDED(rightScissorStateResult)
+        ? gRealClear(device, 0, nullptr, clearFlags, 0x00000000, 1.0f, 0)
+        : D3DERR_INVALIDCALL;
 
-    device->SetRenderTarget(0, originalTarget);
-    device->SetDepthStencilSurface(originalDepth);
+    const HRESULT restoreTargetResult = originalTarget && gRealSetRenderTarget
+        ? gRealSetRenderTarget(device, 0, originalTarget)
+        : D3DERR_INVALIDCALL;
+    const HRESULT restoreDepthResult = gRealSetDepthStencilSurface
+        ? gRealSetDepthStencilSurface(device, originalDepth)
+        : D3DERR_INVALIDCALL;
+    const bool initialized = SUCCEEDED(getTargetResult)
+        && SUCCEEDED(getDepthResult)
+        && hadOriginalTarget
+        && hadOriginalDepth
+        && SUCCEEDED(leftResult)
+        && SUCCEEDED(rightResult)
+        && SUCCEEDED(restoreTargetResult)
+        && SUCCEEDED(restoreDepthResult);
     releaseSurface(originalTarget);
     releaseSurface(originalDepth);
-
-    targetTwin->lastDepthPrimeFrame = frame;
+    if (initialized)
+    {
+        targetTwin->lastDepthPrimeFrame = frame;
+        targetTwin->lastDepthPrimeTwin = depthTwin;
+    }
     const LONG logCount = InterlockedIncrement(&gLoggedStereoReplayDepthPrime);
     const bool hammerLog =
         shouldTelemetryHammerLog(logCount, "FNVXR_D3D9_REPLAY_TARGET_TELEMETRY_STRIDE", 1);
@@ -6284,6 +6931,8 @@ void primeStereoReplayTarget(
             static_cast<unsigned long>(targetTwin->desc.Format));
         logLine(event);
     }
+    return initialized;
+#endif
 }
 
 void primeWideWorldReplayTarget(IDirect3DDevice9* device)
@@ -6420,6 +7069,8 @@ constexpr std::uintptr_t FalloutWorldSceneGraphAddress = 0x011DEB7C;
 constexpr std::uintptr_t FalloutNiCameraSetViewFrustumAddress = 0x00A6FAF0;
 constexpr std::uintptr_t FalloutNiCameraUpdateWorldToCameraAddress = 0x00A70BA0;
 constexpr std::uintptr_t FalloutImageSpaceGeometrySubmitAddress = 0x00A74600;
+constexpr std::uintptr_t FalloutPlayerCharacterAddress = 0x011DEA3C;
+constexpr std::uintptr_t FalloutPlayerRetrieveRootNodeAddress = 0x00950BB0;
 constexpr std::size_t NiAvObjectParentOffset = 0x18;
 constexpr std::size_t NiAvObjectLocalTransformOffset = 0x34;
 constexpr std::size_t NiAvObjectWorldTransformOffset = 0x68;
@@ -6614,6 +7265,48 @@ bool nativeTransformLooksUsable(const NativeNiTransform& transform)
     return maxAbs > 0.01f && maxAbs < 4.0f;
 }
 
+bool readNativePlayerBodyRoot(
+    std::uintptr_t& addressOut,
+    float rotationOut[9],
+    float positionOut[3],
+    float& scaleOut)
+{
+    addressOut = 0;
+    std::memset(rotationOut, 0, sizeof(float) * 9);
+    std::memset(positionOut, 0, sizeof(float) * 3);
+    scaleOut = 0.0f;
+    __try
+    {
+        void* player = *reinterpret_cast<void**>(FalloutPlayerCharacterAddress);
+        if (!player)
+            return false;
+        using RetrieveRootNodeFn = void* (__thiscall*)(void*, bool);
+        void* bodyRoot = reinterpret_cast<RetrieveRootNodeFn>(
+            FalloutPlayerRetrieveRootNodeAddress)(player, false);
+        if (!bodyRoot)
+            return false;
+        NativeNiTransform world {};
+        std::memcpy(
+            &world,
+            reinterpret_cast<void*>(
+                reinterpret_cast<std::uintptr_t>(bodyRoot) + NiAvObjectWorldTransformOffset),
+            sizeof(world));
+        if (!nativeTransformLooksUsable(world))
+            return false;
+        addressOut = reinterpret_cast<std::uintptr_t>(bodyRoot);
+        std::memcpy(rotationOut, &world.rotation.m[0][0], sizeof(float) * 9);
+        positionOut[0] = world.translation.x;
+        positionOut[1] = world.translation.y;
+        positionOut[2] = world.translation.z;
+        scaleOut = world.scale;
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
 bool readNativeWorldCamera(NativeCameraSnapshot& snapshot)
 {
     snapshot = {};
@@ -6638,9 +7331,16 @@ bool readNativeWorldCamera(NativeCameraSnapshot& snapshot)
         std::memcpy(&snapshot.frustum, reinterpret_cast<void*>(address + NiCameraFrustumOffset), sizeof(snapshot.frustum));
         return nativeTransformLooksUsable(snapshot.local)
             && nativeTransformLooksUsable(snapshot.world)
+            && finiteArray(&snapshot.worldToCamera[0][0], 16)
             && !snapshot.frustum.orthographic
+            && std::isfinite(snapshot.frustum.left)
+            && std::isfinite(snapshot.frustum.right)
+            && std::isfinite(snapshot.frustum.top)
+            && std::isfinite(snapshot.frustum.bottom)
             && std::isfinite(snapshot.frustum.nearDistance)
             && std::isfinite(snapshot.frustum.farDistance)
+            && snapshot.frustum.left < snapshot.frustum.right
+            && snapshot.frustum.bottom < snapshot.frustum.top
             && snapshot.frustum.nearDistance > 0.0f
             && snapshot.frustum.farDistance > snapshot.frustum.nearDistance;
     }
@@ -6752,7 +7452,7 @@ bool prepareNativeStereoRig(NativeStereoRig& rig)
     if ((!gNativeStereoEnabled && !gNativeSingleTraversalReplayEnabled)
         || !gHaveVrBodyFrame
         || !gLatestVrPoseSnapshotValid
-        || gLatestVrPoseSnapshotSequence <= 0
+        || !fnvxr::shared::sequencedValueIsPublished(gLatestVrPoseSnapshotSequence)
         || gLatestVrPoseDisplayTime <= 0)
     {
         return false;
@@ -6762,9 +7462,9 @@ bool prepareNativeStereoRig(NativeStereoRig& rig)
     rig.poseSequence = gLatestVrPoseSnapshotSequence;
     rig.displayTime = gLatestVrPoseDisplayTime;
 
-    const bool recenterRequested =
-        (rig.pose.trackingFlags & fnvxr::shared::VrPoseTrackingRecenterRequested) != 0;
-    if (recenterRequested && !gNativeViewRecenterHeld)
+    const std::uint32_t recenterRequestId = rig.pose.recenterRequestId;
+    if (recenterRequestId != 0
+        && recenterRequestId != gNativeLastRecenterRequestId)
     {
         // Recenter is one rigid-frame transaction. Relatch position and the
         // gravity-aligned yaw from this same pose before deriving rotation;
@@ -6780,8 +7480,8 @@ bool prepareNativeStereoRig(NativeStereoRig& rig)
         rig.poseSequence = gLatestVrPoseSnapshotSequence;
         rig.displayTime = gLatestVrPoseDisplayTime;
         captureNativeViewOrigin(rig.pose, "controller-chord-rigid-frame");
+        gNativeLastRecenterRequestId = rig.pose.recenterRequestId;
     }
-    gNativeViewRecenterHeld = recenterRequested;
 
     const fnvxr::stereo::Quaternion currentHead {
         rig.pose.hmdRot[0], rig.pose.hmdRot[1], rig.pose.hmdRot[2], rig.pose.hmdRot[3]
@@ -7162,7 +7862,7 @@ void __fastcall hookedNativeImageSpaceGeometrySubmit(void* renderer, void*, void
                 message,
                 "native image-space geometry rearmed count=%ld pair=%ld eye=right geometry=%p mode=%lu active=%u->%u samplerMask=0x%04lx",
                 logCount,
-                static_cast<LONG>(gNativeStereoRenderPairSequence + 1),
+                nextNativeStereoPairSequence(),
                 geometry,
                 static_cast<unsigned long>(submitMode),
                 static_cast<unsigned>(active),
@@ -7259,11 +7959,15 @@ void callOriginalDoRenderFrame(
 float nativeFloatArrayMaxDelta(const float* a, const float* b, std::size_t count)
 {
     if (!a || !b)
-        return 0.0f;
+        return std::numeric_limits<float>::infinity();
     float maximum = 0.0f;
     for (std::size_t index = 0; index < count; ++index)
     {
+        if (!std::isfinite(a[index]) || !std::isfinite(b[index]))
+            return std::numeric_limits<float>::infinity();
         const float delta = absFloat(a[index] - b[index]);
+        if (!std::isfinite(delta))
+            return std::numeric_limits<float>::infinity();
         if (delta > maximum)
             maximum = delta;
     }
@@ -7599,6 +8303,32 @@ void logNativePassEquivalenceRecovery(
 
 void publishSharedStereoInvalid(bool uiActive, const char* reason);
 
+void requestRenderOwnerShutdown()
+{
+    AcquireSRWLockExclusive(&gRenderPublishCommitLock);
+    InterlockedIncrement(&gRenderThreadViolation);
+    InterlockedExchange(&gRenderShutdownRequested, 1);
+    ReleaseSRWLockExclusive(&gRenderPublishCommitLock);
+}
+
+bool serviceRenderOwnerShutdown(const char* reason)
+{
+    if (InterlockedCompareExchange(&gRenderShutdownRequested, 0, 0) == 0)
+        return false;
+
+    // Only the render-owner thread may touch producer/origin state.  A second
+    // thread merely raises the interlocked request above, avoiding concurrent
+    // header commits and origin-lease mutation.
+    gNativeStereoRuntimeDisabled = true;
+    gHavePublishedValidStereoWorldFrame = false;
+    closeNativeStereoOriginLease(reason);
+    if (gSharedStereoView)
+        writeInvalidSharedStereoRecord(
+            reinterpret_cast<SharedStereoHeader*>(gSharedStereoView),
+            false);
+    return true;
+}
+
 void __fastcall hookedDoRenderFrame(
     void* osGlobals,
     void*,
@@ -7606,6 +8336,17 @@ void __fastcall hookedDoRenderFrame(
     std::uint8_t arg1,
     std::uint8_t arg2)
 {
+    const LONG currentThread = static_cast<LONG>(GetCurrentThreadId());
+    const LONG renderOwner = InterlockedCompareExchange(
+        &gRenderOwnerThreadId, currentThread, 0);
+    if (renderOwner != 0 && renderOwner != currentThread)
+    {
+        requestRenderOwnerShutdown();
+        logLine("stereo shutdown requested: DoRenderFrame moved to a second thread");
+        callOriginalDoRenderFrame(osGlobals, renderer, arg1, arg2);
+        return;
+    }
+    serviceRenderOwnerShutdown("render-thread-mismatch");
     InterlockedIncrement(&gNativeDoRenderHookEntriesThisPresent);
     InterlockedExchange(&gNativeLastDoRenderHookPresentFrame, static_cast<LONG>(gPresentFrames));
 
@@ -7624,6 +8365,8 @@ void __fastcall hookedDoRenderFrame(
         gateMask |= NativeDoRenderGateUi;
     if (gNativeStereoPairsThisPresent > 0 || gNativeSingleTraversalFramesThisPresent > 0)
         gateMask |= NativeDoRenderGateAlreadyPaired;
+    if (!criticalDeviceHooksIntact(gNativeStereoDevice))
+        gateMask |= NativeDoRenderGateHookIntegrity;
     if (gateMask != 0)
     {
         InterlockedOr(&gNativeDoRenderGateMaskThisPresent, gateMask);
@@ -7703,6 +8446,10 @@ void __fastcall hookedDoRenderFrame(
         const LONG strictEyeTargetProvenClearsBefore = static_cast<LONG>(gStrictEyeTargetProvenBothEyeClears);
         const LONG strictEyeTargetCopiesBefore = static_cast<LONG>(gStrictEyeTargetCopies);
         const LONG strictEyeTargetProvenCopiesBefore = static_cast<LONG>(gStrictEyeTargetProvenBothEyeCopies);
+        const LONG strictEyeTargetInitializationsBefore =
+            static_cast<LONG>(gStrictEyeTargetFullInitializations);
+        const LONG strictEyeTargetUnprovenWritesBefore =
+            static_cast<LONG>(gStrictEyeTargetUnprovenWrites);
         const LONG shaderExcludedUserPrimitiveDrawsBefore =
             static_cast<LONG>(gShaderExcludedUserPrimitiveDraws);
         const LONG shaderExcludedAuxiliaryTargetDrawsBefore =
@@ -7721,6 +8468,11 @@ void __fastcall hookedDoRenderFrame(
         std::memcpy(gNativeSingleTraversalFov, rig.fov, sizeof(gNativeSingleTraversalFov));
         gNativeActiveCamera = camera;
         gNativeActiveRig = rig;
+        ++gStereoReplayTransactionGeneration;
+        if (gStereoReplayTransactionGeneration == 0)
+            gStereoReplayTransactionGeneration = 1;
+        gStrictEquivalentClearSeenThisTraversal = false;
+        gStrictDrawSeenThisTraversal = false;
         gInNativeStereoHook = true;
         InterlockedExchange(&gNativeActiveEye, 2);
         const NativeNiTransform expectedCenterWorld = nativeCenterWorldTransform(camera, rig);
@@ -7766,7 +8518,8 @@ void __fastcall hookedDoRenderFrame(
         }
         if (centerApplied)
             callOriginalDoRenderFrame(osGlobals, renderer, arg1, arg2);
-        closeNativeStereoOriginLease(centerApplied ? "traversal-complete" : "center-camera-apply-failed");
+        if (!centerApplied)
+            closeNativeStereoOriginLease("center-camera-apply-failed");
 
         NativeCameraSnapshot cameraAfter {};
         const bool cameraAfterValid = centerApplied && readNativeWorldCamera(cameraAfter);
@@ -7859,30 +8612,42 @@ void __fastcall hookedDoRenderFrame(
             return;
         }
 
-        const LONG replayDraws = static_cast<LONG>(gStereoReplayDrawsThisPresent) - replayDrawsBefore;
+        const LONG replayDraws = checkedInterlockedCounterDelta(
+            static_cast<LONG>(gStereoReplayDrawsThisPresent), replayDrawsBefore);
         const LONG shaderWorldCandidates =
-            static_cast<LONG>(gShaderWorldDrawCandidates) - shaderWorldCandidatesBefore;
-        const LONG shaderWorldDraws = static_cast<LONG>(gShaderWorldDraws) - shaderWorldDrawsBefore;
+            checkedInterlockedCounterDelta(gShaderWorldDrawCandidates, shaderWorldCandidatesBefore);
+        const LONG shaderWorldDraws = checkedInterlockedCounterDelta(
+            gShaderWorldDraws, shaderWorldDrawsBefore);
         const LONG shaderCoveredDraws =
-            static_cast<LONG>(gShaderContractCoveredWorldDraws) - shaderCoveredDrawsBefore;
+            checkedInterlockedCounterDelta(
+                gShaderContractCoveredWorldDraws, shaderCoveredDrawsBefore);
         const LONG strictEyeTargetDraws =
-            static_cast<LONG>(gStrictEyeTargetDraws) - strictEyeTargetDrawsBefore;
+            checkedInterlockedCounterDelta(gStrictEyeTargetDraws, strictEyeTargetDrawsBefore);
         const LONG strictEyeTargetProvenBothEyeDraws =
-            static_cast<LONG>(gStrictEyeTargetProvenBothEyeDraws) - strictEyeTargetProvenBefore;
+            checkedInterlockedCounterDelta(
+                gStrictEyeTargetProvenBothEyeDraws, strictEyeTargetProvenBefore);
         const LONG strictEyeTargetClears =
-            static_cast<LONG>(gStrictEyeTargetClears) - strictEyeTargetClearsBefore;
+            checkedInterlockedCounterDelta(gStrictEyeTargetClears, strictEyeTargetClearsBefore);
         const LONG strictEyeTargetProvenBothEyeClears =
-            static_cast<LONG>(gStrictEyeTargetProvenBothEyeClears) - strictEyeTargetProvenClearsBefore;
+            checkedInterlockedCounterDelta(
+                gStrictEyeTargetProvenBothEyeClears, strictEyeTargetProvenClearsBefore);
         const LONG strictEyeTargetCopies =
-            static_cast<LONG>(gStrictEyeTargetCopies) - strictEyeTargetCopiesBefore;
+            checkedInterlockedCounterDelta(gStrictEyeTargetCopies, strictEyeTargetCopiesBefore);
         const LONG strictEyeTargetProvenBothEyeCopies =
-            static_cast<LONG>(gStrictEyeTargetProvenBothEyeCopies) - strictEyeTargetProvenCopiesBefore;
+            checkedInterlockedCounterDelta(
+                gStrictEyeTargetProvenBothEyeCopies, strictEyeTargetProvenCopiesBefore);
+        const LONG strictEyeTargetFullInitializations =
+            checkedInterlockedCounterDelta(
+                gStrictEyeTargetFullInitializations, strictEyeTargetInitializationsBefore);
+        const LONG strictEyeTargetUnprovenWrites =
+            checkedInterlockedCounterDelta(
+                gStrictEyeTargetUnprovenWrites, strictEyeTargetUnprovenWritesBefore);
         const LONG shaderExcludedUserPrimitiveDraws =
-            static_cast<LONG>(gShaderExcludedUserPrimitiveDraws)
-            - shaderExcludedUserPrimitiveDrawsBefore;
+            checkedInterlockedCounterDelta(
+                gShaderExcludedUserPrimitiveDraws, shaderExcludedUserPrimitiveDrawsBefore);
         const LONG shaderExcludedAuxiliaryTargetDraws =
-            static_cast<LONG>(gShaderExcludedAuxiliaryTargetDraws)
-            - shaderExcludedAuxiliaryTargetDrawsBefore;
+            checkedInterlockedCounterDelta(
+                gShaderExcludedAuxiliaryTargetDraws, shaderExcludedAuxiliaryTargetDrawsBefore);
         const double shaderContractCoverage = shaderWorldCandidates > 0
             ? static_cast<double>(shaderCoveredDraws) / static_cast<double>(shaderWorldCandidates)
             : 0.0;
@@ -7900,14 +8665,24 @@ void __fastcall hookedDoRenderFrame(
             fnvxr::stereo::strictEyeTargetOptionalWriteLedgerComplete(
                 strictEyeTargetCopies,
                 strictEyeTargetProvenBothEyeCopies);
-        const bool shaderCoverageReady = gShaderWvpContractCount > 0
+        const bool shaderCoverageReady = gCriticalDeviceHooksReady
+            && gCriticalDeviceHookMask == gExpectedCriticalDeviceHookMask
+            && InterlockedCompareExchange(&gRenderThreadViolation, 0, 0) == 0
+            && InterlockedCompareExchange(&gStateBlockRecording, 0, 0) == 0
+            && InterlockedCompareExchange(&gD3DQueryObjectsObserved, 0, 0) == 0
+            && gShaderWvpContractCount > 0
             && shaderWorldCandidates > 0
             && shaderWorldDraws == shaderWorldCandidates
             && shaderCoveredDraws == shaderWorldCandidates
             && shaderContractCoverage >= requiredShaderCoverage
             && strictEyeTargetDrawLedgerReady
             && strictEyeTargetClearLedgerReady
-            && strictEyeTargetCopyLedgerReady;
+            && strictEyeTargetCopyLedgerReady
+            && strictEyeTargetFullInitializations > 0
+            && gStrictEquivalentClearSeenThisTraversal
+            && strictEyeTargetUnprovenWrites == 0
+            && shaderExcludedUserPrimitiveDraws == 0
+            && shaderExcludedAuxiliaryTargetDraws == 0;
         if (!shaderCoverageReady)
         {
             closeNativeStereoOriginLease("shader-contract-coverage");
@@ -7918,7 +8693,7 @@ void __fastcall hookedDoRenderFrame(
                 char rejected[1024] {};
                 sprintf_s(
                     rejected,
-                    "single-traversal stereo rejected: shader contract coverage replayDraws=%ld strictDraws=%ld/%ld drawsReady=%d strictClears=%ld/%ld clearsReady=%d strictCopies=%ld/%ld copiesReady=%d programmableCandidates=%ld replayedWorldDraws=%ld covered=%ld excludedImmediatePrimitives=%ld excludedAuxiliaryTargets=%ld fraction=%.8f required=%.8f contracts=%ld",
+                    "single-traversal stereo rejected: shader contract coverage replayDraws=%ld strictDraws=%ld/%ld drawsReady=%d strictClears=%ld/%ld clearsReady=%d strictCopies=%ld/%ld copiesReady=%d fullInitializations=%ld unprovenWrites=%ld programmableCandidates=%ld replayedWorldDraws=%ld covered=%ld excludedImmediatePrimitives=%ld excludedAuxiliaryTargets=%ld fraction=%.8f required=%.8f contracts=%ld",
                     replayDraws,
                     strictEyeTargetProvenBothEyeDraws,
                     strictEyeTargetDraws,
@@ -7929,6 +8704,8 @@ void __fastcall hookedDoRenderFrame(
                     strictEyeTargetProvenBothEyeCopies,
                     strictEyeTargetCopies,
                     strictEyeTargetCopyLedgerReady ? 1 : 0,
+                    strictEyeTargetFullInitializations,
+                    strictEyeTargetUnprovenWrites,
                     shaderWorldCandidates,
                     shaderWorldDraws,
                     shaderCoveredDraws,
@@ -7942,7 +8719,18 @@ void __fastcall hookedDoRenderFrame(
             return;
         }
 
-        const LONG pairSequence = InterlockedIncrement(&gNativeStereoRenderPairSequence);
+        // The animation consumer accepts Committed only. Keep the candidate
+        // lease private through every camera/target/shader proof gate so a
+        // subsequently rejected traversal can never mutate the retail rig.
+        if (!commitNativeStereoOriginLease())
+        {
+            closeNativeStereoOriginLease("origin-commit-failed");
+            gNativeStereoRenderedPoseValid = false;
+            logLine("single-traversal stereo rejected: authoritative origin commit failed");
+            return;
+        }
+
+        const LONG pairSequence = publishNativeStereoPairSequence();
         gNativeStereoRenderedPoseSnapshot = rig.pose;
         gNativeStereoRenderedPoseSequence = rig.poseSequence;
         gNativeStereoRenderedDisplayTime = rig.displayTime;
@@ -7997,10 +8785,13 @@ void __fastcall hookedDoRenderFrame(
 
     const bool skipEyeCopiesForPerfProbe =
         readEnvBool("FNVXR_D3D9_NATIVE_PERF_SKIP_EYE_COPIES", false);
-    const LONG nextPairSequence = static_cast<LONG>(gNativeStereoRenderPairSequence + 1);
+    const LONG nextPairSequence = nextNativeStereoPairSequence();
     const LONG traceStride = static_cast<LONG>(readEnvFloat("FNVXR_D3D9_NATIVE_PIPELINE_TRACE_STRIDE", 120.0f));
     gNativePipelineTraceThisPair = readEnvBool("FNVXR_D3D9_NATIVE_PIPELINE_TRACE", true)
-        && (nextPairSequence <= 3 || (traceStride > 0 && nextPairSequence % traceStride == 0));
+        && (nativeStereoPairNeedsWarmupAudit(3)
+            || (traceStride > 0
+                && fnvxr::shared::sequencedValueBits(nextPairSequence)
+                    % static_cast<std::uint32_t>(traceStride) == 0u));
     gNativePipelineTracePostprocessWindow = false;
     for (int phase = 0; phase < 3; ++phase)
         InterlockedExchange(&gNativePipelineTraceEvents[phase], 0);
@@ -8141,7 +8932,7 @@ void __fastcall hookedDoRenderFrame(
         return;
     }
 
-    const LONG pairSequence = InterlockedIncrement(&gNativeStereoRenderPairSequence);
+    const LONG pairSequence = publishNativeStereoPairSequence();
     logNativeCameraBasisIfChanged(
         rig,
         camera,
@@ -9261,7 +10052,8 @@ void auditNativeResolvedStereo(IDirect3DDevice9* device)
     if (!readEnvBool("FNVXR_D3D9_NATIVE_RESOLVED_AUDIT", true))
         return;
     const LONG pair = gNativeStereoRenderPairSequence;
-    if (pair > 3 && pair % 120 != 0)
+    if (!nativeStereoPairNeedsWarmupAudit(4)
+        && fnvxr::shared::sequencedValueBits(pair) % 120u != 0u)
         return;
 
     StereoSurfaceTwin* leftTwin = gNativeResolvedTwinForEye[0];
@@ -9478,7 +10270,9 @@ void auditNativeFullSizeTargetCandidates(IDirect3DDevice9* device)
     if (!device || !gNativeStereoEnabled || gNativeStereoPairsThisPresent <= 0)
         return;
     const LONG pair = gNativeStereoRenderPairSequence;
-    if (!gNativePipelineTraceThisPair && pair > 3 && pair % 120 != 0)
+    if (!gNativePipelineTraceThisPair
+        && !nativeStereoPairNeedsWarmupAudit(4)
+        && fnvxr::shared::sequencedValueBits(pair) % 120u != 0u)
         return;
 
     for (UINT index = 0; index < MaxNativeFullSizeTargetCandidates; ++index)
@@ -9721,24 +10515,7 @@ void publishSharedStereoInvalid(bool uiActive, const char* reason)
         gHavePublishedValidStereoWorldFrame = false;
 
     auto* header = reinterpret_cast<SharedStereoHeader*>(gSharedStereoView);
-    InterlockedExchange(&header->writing, 1);
-    header->magic = SharedStereoMagic;
-    header->width = 0;
-    header->height = 0;
-    header->pitchBytes = 0;
-    header->format = 0;
-    header->separated = 0;
-    header->worldCandidate = 0;
-    header->uiActive = uiActive ? 1 : 0;
-    header->poseValid = 0;
-    header->poseSequence = 0;
-    header->renderedDisplayTime = 0;
-    header->referenceSpaceGeneration = 0;
-    header->producerEpoch = 0;
-    header->producerMode = fnvxr::shared::StereoProducerUnknown;
-    header->renderPairSequence = 0;
-    InterlockedIncrement(&header->sequence);
-    InterlockedExchange(&header->writing, 0);
+    writeInvalidSharedStereoRecord(header, uiActive);
 
     const LONG captures = InterlockedIncrement(&gSharedStereoCaptures);
     if (captures <= 3 || captures % 300 == 0)
@@ -9803,11 +10580,20 @@ void publishSharedWorldVideoFrame(IDirect3DDevice9* device)
     header->format = static_cast<LONG>(gStereoTargetFormat);
     if (!copySurfaceToSharedPlane(gWideWorldReadback, pixels, gStereoTargetWidth, gStereoTargetHeight, pitchBytes))
     {
+        header->width = 0;
+        header->height = 0;
+        header->pitchBytes = 0;
+        header->format = 0;
+        MemoryBarrier();
+        fnvxr::shared::incrementNonzeroSharedCounter(header->sequence);
+        MemoryBarrier();
         InterlockedExchange(&header->writing, 0);
         logLine("shared wide world copy failed; not publishing frame");
         return;
     }
-    InterlockedIncrement(&header->sequence);
+    MemoryBarrier();
+    fnvxr::shared::incrementNonzeroSharedCounter(header->sequence);
+    MemoryBarrier();
     InterlockedExchange(&header->writing, 0);
 
     const LONG captures = InterlockedIncrement(&gSharedWorldVideoCaptures);
@@ -9835,6 +10621,22 @@ void publishSharedWorldVideoFrame(IDirect3DDevice9* device)
 
 void publishSharedStereoFrame(IDirect3DDevice9* device)
 {
+    if (serviceRenderOwnerShutdown("render-thread-mismatch-before-publish"))
+    {
+        logLine("shared stereo publication aborted by render-thread violation");
+        return;
+    }
+    if (!criticalDeviceHooksIntact(device))
+    {
+        gHavePublishedValidStereoWorldFrame = false;
+        if (gSharedStereoView)
+            writeInvalidSharedStereoRecord(
+                reinterpret_cast<SharedStereoHeader*>(gSharedStereoView),
+                false);
+        logLine("shared stereo publication rejected: critical D3D9 hook integrity failed");
+        return;
+    }
+
     if (suppressStereoForUiMode())
     {
         InterlockedExchange(&gConsecutiveStereoVisualCoverageFrames, 0);
@@ -10070,20 +10872,84 @@ void publishSharedStereoFrame(IDirect3DDevice9* device)
 
     const UINT pitchBytes = gStereoTargetWidth * 4;
     auto* header = reinterpret_cast<SharedStereoHeader*>(gSharedStereoView);
-    const std::uint32_t leftPayloadOffset = sizeof(SharedStereoHeader);
+    constexpr std::uint32_t slotBytes =
+        SharedVideoMaxWidth * SharedVideoMaxHeight * 4 * 2;
+    const LONG publishedSlot = InterlockedCompareExchange(
+        &header->publishedSlot, 0, 0);
+    const LONG hostReaderSlot =
+        InterlockedCompareExchange(
+            &header->readerSlots[fnvxr::shared::D3D9StereoHostReaderLane], 0, 0);
+    const LONG captureReaderSlot =
+        InterlockedCompareExchange(
+            &header->readerSlots[fnvxr::shared::D3D9StereoCaptureReaderLane], 0, 0);
+    const LONG writeSlot = fnvxr::shared::selectWritableStereoFrameSlot(
+        publishedSlot, hostReaderSlot, captureReaderSlot);
+    if (writeSlot < 0)
+    {
+        writeInvalidSharedStereoRecord(header, false);
+        logLine("shared stereo ring has no writable slot");
+        return;
+    }
+    const std::uint32_t leftPayloadOffset = sizeof(SharedStereoHeader)
+        + static_cast<std::uint32_t>(writeSlot) * slotBytes;
     const std::uint32_t rightPayloadOffset = leftPayloadOffset + pitchBytes * gStereoTargetHeight;
     auto* leftPixels = gSharedStereoView + leftPayloadOffset;
     auto* rightPixels = gSharedStereoView + rightPayloadOffset;
+    const SharedVrPoseState& renderedPose = coherentPair
+        ? gNativeStereoRenderedPoseSnapshot
+        : gLatestVrPoseSnapshot;
+    const LONG renderedPoseSequence = coherentPair
+        ? gNativeStereoRenderedPoseSequence
+        : gLatestVrPoseSnapshotSequence;
+    const std::int64_t renderedDisplayTime = coherentPair
+        ? gNativeStereoRenderedDisplayTime
+        : gLatestVrPoseDisplayTime;
+    const bool renderedPoseValid = coherentPair
+        ? gNativeStereoRenderedPoseValid
+        : gLatestVrPoseSnapshotValid;
+    QueryPerformanceCounter(&stereoCopyStart);
+    const bool copiedLeft =
+        copySurfaceToSharedPlane(publishLeft, leftPixels, gStereoTargetWidth, gStereoTargetHeight, pitchBytes);
+    const bool copiedRight =
+        copySurfaceToSharedPlane(publishRight, rightPixels, gStereoTargetWidth, gStereoTargetHeight, pitchBytes);
+    QueryPerformanceCounter(&stereoCopyEnd);
+    if (!copiedLeft || !copiedRight)
+    {
+        // Keep ownership of the same transaction while replacing the partial
+        // payload metadata with a complete invalid record.  There is never a
+        // reader-visible old sequence with writing==0 between these steps.
+        writeInvalidSharedStereoRecord(header, false);
+        logLine("shared stereo copy failed; not publishing frame");
+        return;
+    }
 
+    if (serviceRenderOwnerShutdown("render-thread-mismatch-after-copy"))
+    {
+        logLine("shared stereo commit aborted after payload copy by render-thread violation");
+        return;
+    }
+    if (!criticalDeviceHooksIntact(device))
+    {
+        gHavePublishedValidStereoWorldFrame = false;
+        writeInvalidSharedStereoRecord(header, false);
+        logLine("shared stereo commit rejected after copy: critical D3D9 hook integrity failed");
+        return;
+    }
+
+    // The large payload is now immutable in a slot that was neither published
+    // nor reader-owned. Hold the header transaction only for this small
+    // metadata commit, then atomically select the completed slot.
     InterlockedExchange(&header->writing, 1);
+    MemoryBarrier();
     header->magic = SharedStereoMagic;
     header->version = fnvxr::shared::D3D9StereoFrameSharedVersion;
     header->headerBytes = sizeof(SharedStereoHeader);
     header->leftPayloadOffset = leftPayloadOffset;
     header->rightPayloadOffset = rightPayloadOffset;
     header->totalMappingBytes = sizeof(SharedStereoHeader)
-        + SharedVideoMaxWidth * SharedVideoMaxHeight * 4 * 2;
-    header->reserved = 0;
+        + slotBytes * fnvxr::shared::D3D9StereoFrameSlotCount;
+    header->rendererProducerEpoch = gSharedStereoRendererProducerEpoch;
+    header->producerProcessId = GetCurrentProcessId();
     header->width = static_cast<LONG>(gStereoTargetWidth);
     header->height = static_cast<LONG>(gStereoTargetHeight);
     header->pitchBytes = static_cast<LONG>(pitchBytes);
@@ -10100,18 +10966,6 @@ void publishSharedStereoFrame(IDirect3DDevice9* device)
             ? fnvxr::shared::StereoProducerSingleTraversal
             : fnvxr::shared::StereoProducerDrawReplay);
     header->renderPairSequence = coherentPair ? gNativeStereoRenderPairSequence : 0;
-    const SharedVrPoseState& renderedPose = coherentPair
-        ? gNativeStereoRenderedPoseSnapshot
-        : gLatestVrPoseSnapshot;
-    const LONG renderedPoseSequence = coherentPair
-        ? gNativeStereoRenderedPoseSequence
-        : gLatestVrPoseSnapshotSequence;
-    const std::int64_t renderedDisplayTime = coherentPair
-        ? gNativeStereoRenderedDisplayTime
-        : gLatestVrPoseDisplayTime;
-    const bool renderedPoseValid = coherentPair
-        ? gNativeStereoRenderedPoseValid
-        : gLatestVrPoseSnapshotValid;
     if (renderedPoseValid && renderedDisplayTime != 0)
     {
         header->referenceSpaceGeneration = renderedPose.referenceSpaceGeneration;
@@ -10125,22 +10979,6 @@ void publishSharedStereoFrame(IDirect3DDevice9* device)
         header->poseSequence = renderedPoseSequence;
         header->renderedDisplayTime = renderedDisplayTime;
         header->poseValid = 1;
-    }
-    QueryPerformanceCounter(&stereoCopyStart);
-    const bool copiedLeft =
-        copySurfaceToSharedPlane(publishLeft, leftPixels, gStereoTargetWidth, gStereoTargetHeight, pitchBytes);
-    const bool copiedRight =
-        copySurfaceToSharedPlane(publishRight, rightPixels, gStereoTargetWidth, gStereoTargetHeight, pitchBytes);
-    QueryPerformanceCounter(&stereoCopyEnd);
-    if (!copiedLeft || !copiedRight)
-    {
-        header->separated = 0;
-        header->worldCandidate = 0;
-        header->uiActive = suppressStereoForUiMode() ? 1 : 0;
-        InterlockedExchange(&header->writing, 0);
-        logLine("shared stereo copy failed; not publishing frame");
-        publishSharedStereoInvalid(false, "copy-failed");
-        return;
     }
     header->separated = separated ? 1 : 0;
     const fnvxr::stereo::Matrix4& stereoBaseView = baseViewForStereo();
@@ -10197,8 +11035,32 @@ void publishSharedStereoFrame(IDirect3DDevice9* device)
         header->worldCandidate = 0;
         header->poseValid = 0;
     }
-    InterlockedIncrement(&header->sequence);
+    AcquireSRWLockExclusive(&gRenderPublishCommitLock);
+    if (InterlockedCompareExchange(&gRenderShutdownRequested, 0, 0) != 0)
+    {
+        ReleaseSRWLockExclusive(&gRenderPublishCommitLock);
+        serviceRenderOwnerShutdown("render-thread-mismatch-before-commit");
+        logLine("shared stereo commit aborted at final publication boundary by render-thread violation");
+        return;
+    }
+    if (!criticalDeviceHooksIntact(device))
+    {
+        gHavePublishedValidStereoWorldFrame = false;
+        writeInvalidSharedStereoRecord(header, false);
+        ReleaseSRWLockExclusive(&gRenderPublishCommitLock);
+        logLine("shared stereo commit rejected at publication boundary: critical D3D9 hook integrity failed");
+        return;
+    }
+    MemoryBarrier();
+    InterlockedExchange(&header->publishedSlot, writeSlot);
+    MemoryBarrier();
+    if (InterlockedIncrement64(&header->publicationGeneration) == 0)
+        InterlockedIncrement64(&header->publicationGeneration);
+    MemoryBarrier();
+    fnvxr::shared::incrementNonzeroSharedCounter(header->sequence);
+    MemoryBarrier();
     InterlockedExchange(&header->writing, 0);
+    ReleaseSRWLockExclusive(&gRenderPublishCommitLock);
 
     const LONG captures = InterlockedIncrement(&gSharedStereoCaptures);
     const double leftReadbackMs = secondsBetween(stereoPublishStart, leftReadbackEnd) * 1000.0;
@@ -10268,7 +11130,7 @@ void publishSharedStereoFrame(IDirect3DDevice9* device)
         logLine(message);
     }
     const LONG eyeTargetLogCount = InterlockedIncrement(&gLoggedD3d9EyeTarget);
-    if (eyeTargetLogCount <= 20 || eyeTargetLogCount % 300 == 0)
+    if (telemetryHammerEnabled() || eyeTargetLogCount <= 20 || eyeTargetLogCount % 300 == 0)
     {
         const float leftActiveFraction = visualCoverage.left.samples == 0
             ? 0.0f
@@ -10289,7 +11151,7 @@ void publishSharedStereoFrame(IDirect3DDevice9* device)
         char proof[1792] {};
         sprintf_s(
             proof,
-            "{\"event\":\"fnvxrD3d9EyeTarget\",\"stage\":\"shared-stereo-publish\",\"frame\":%ld,\"ready\":%s,\"diagnosticSnapshot\":%s,\"bestSnapshot\":%s,\"bestSnapshotAsWorld\":%s,\"finalSeparated\":%s,\"leftRendered\":true,\"rightRendered\":true,\"width\":%u,\"height\":%u,\"format\":%lu,\"sequence\":%ld,\"producerMode\":%ld,\"renderPairSequence\":%ld,\"worldCandidate\":%s,\"rawWorldCandidate\":%s,\"separated\":%s,\"uiActive\":%s,\"poseValid\":%s,\"rawPoseValid\":%s,\"visualCoverageGate\":%s,\"visualCoverageReady\":%s,\"visualCoverageMeasured\":%s,\"visualCoverageFrames\":%ld,\"leftActiveFraction\":%.6f,\"rightActiveFraction\":%.6f,\"leftActiveTiles\":%u,\"rightActiveTiles\":%u,\"leftDominantFraction\":%.6f,\"rightDominantFraction\":%.6f,\"leftDominantBucket\":%u,\"rightDominantBucket\":%u,\"poseSequence\":%ld,\"diffSamples\":%u,\"samples\":%u,\"differentTiles\":%u,\"finalDiffSamples\":%u,\"finalSamples\":%u,\"finalDifferentTiles\":%u,\"leftHash\":\"0x%08x\",\"rightHash\":\"0x%08x\",\"finalLeftHash\":\"0x%08x\",\"finalRightHash\":\"0x%08x\"}",
+            "{\"event\":\"fnvxrD3d9EyeTarget\",\"stage\":\"shared-stereo-publish\",\"frame\":%ld,\"ready\":%s,\"diagnosticSnapshot\":%s,\"bestSnapshot\":%s,\"bestSnapshotAsWorld\":%s,\"finalSeparated\":%s,\"leftRendered\":true,\"rightRendered\":true,\"width\":%u,\"height\":%u,\"format\":%lu,\"sequence\":%ld,\"producerMode\":%ld,\"renderPairSequence\":%ld,\"referenceSpaceGeneration\":%lu,\"poseProducerEpoch\":\"%llu\",\"rendererProducerEpoch\":\"%llu\",\"producerProcessId\":%lu,\"renderedDisplayTime\":%lld,\"worldCandidate\":%s,\"rawWorldCandidate\":%s,\"separated\":%s,\"uiActive\":%s,\"poseValid\":%s,\"rawPoseValid\":%s,\"visualCoverageGate\":%s,\"visualCoverageReady\":%s,\"visualCoverageMeasured\":%s,\"visualCoverageFrames\":%ld,\"leftActiveFraction\":%.6f,\"rightActiveFraction\":%.6f,\"leftActiveTiles\":%u,\"rightActiveTiles\":%u,\"leftDominantFraction\":%.6f,\"rightDominantFraction\":%.6f,\"leftDominantBucket\":%u,\"rightDominantBucket\":%u,\"poseSequence\":%ld,\"diffSamples\":%u,\"samples\":%u,\"differentTiles\":%u,\"finalDiffSamples\":%u,\"finalSamples\":%u,\"finalDifferentTiles\":%u,\"leftHash\":\"0x%08x\",\"rightHash\":\"0x%08x\",\"finalLeftHash\":\"0x%08x\",\"finalRightHash\":\"0x%08x\"}",
             static_cast<LONG>(gPresentFrames),
             (separated && header->worldCandidate && !header->uiActive && header->poseValid) ? "true" : "false",
             publishIsDiagnosticSnapshot ? "true" : "false",
@@ -10302,6 +11164,11 @@ void publishSharedStereoFrame(IDirect3DDevice9* device)
             static_cast<LONG>(header->sequence),
             static_cast<LONG>(header->producerMode),
             static_cast<LONG>(header->renderPairSequence),
+            static_cast<unsigned long>(header->referenceSpaceGeneration),
+            static_cast<unsigned long long>(header->producerEpoch),
+            static_cast<unsigned long long>(header->rendererProducerEpoch),
+            static_cast<unsigned long>(header->producerProcessId),
+            static_cast<long long>(header->renderedDisplayTime),
             header->worldCandidate ? "true" : "false",
             worldCandidate ? "true" : "false",
             separated ? "true" : "false",
@@ -10365,6 +11232,28 @@ bool configuredStereoDimensions(IDirect3DDevice9* device, UINT& width, UINT& hei
     width = desc.Width;
     height = desc.Height;
     return true;
+}
+
+bool sameComIdentity(IUnknown* left, IUnknown* right)
+{
+    if (!left || !right)
+        return false;
+    IUnknown* leftIdentity = nullptr;
+    IUnknown* rightIdentity = nullptr;
+    const HRESULT leftResult = left->QueryInterface(
+        __uuidof(IUnknown),
+        reinterpret_cast<void**>(&leftIdentity));
+    const HRESULT rightResult = right->QueryInterface(
+        __uuidof(IUnknown),
+        reinterpret_cast<void**>(&rightIdentity));
+    const bool same = SUCCEEDED(leftResult)
+        && SUCCEEDED(rightResult)
+        && leftIdentity == rightIdentity;
+    if (leftIdentity)
+        leftIdentity->Release();
+    if (rightIdentity)
+        rightIdentity->Release();
+    return same;
 }
 
 void logStrictStereoTargetGate(
@@ -10445,6 +11334,25 @@ bool targetHasFullResolutionDepth(
         return false;
     }
 
+    IDirect3DSurface9* canonicalBackBuffer = nullptr;
+    const bool canonicalTarget = !gPrimaryBackBufferLockable
+        && SUCCEEDED(device->GetBackBuffer(
+            0, 0, D3DBACKBUFFER_TYPE_MONO, &canonicalBackBuffer))
+        && canonicalBackBuffer
+        && sameComIdentity(target, canonicalBackBuffer);
+    releaseSurface(canonicalBackBuffer);
+    if (!canonicalTarget)
+    {
+        logStrictStereoTargetGate(
+            context,
+            gPrimaryBackBufferLockable ? "lockable-backbuffer-rejected" : "not-canonical-primary-backbuffer",
+            &targetDesc,
+            nullptr,
+            configuredWidth,
+            configuredHeight);
+        return false;
+    }
+
     if (!depth)
     {
         logStrictStereoTargetGate(context, "missing-depth", &targetDesc, nullptr, configuredWidth, configuredHeight);
@@ -10463,6 +11371,49 @@ bool targetHasFullResolutionDepth(
         return false;
     }
 
+    if (!depthSurfaceIsProofNonLockable(depthDesc))
+    {
+        logStrictStereoTargetGate(
+            context,
+            "depth-cpu-mutation-not-excluded",
+            &targetDesc,
+            &depthDesc,
+            configuredWidth,
+            configuredHeight);
+        return false;
+    }
+
+    return true;
+}
+
+bool noAdditionalRenderTargetsBound(IDirect3DDevice9* device, const char* context)
+{
+    if (!device)
+        return false;
+    D3DCAPS9 caps {};
+    if (FAILED(device->GetDeviceCaps(&caps))
+        || caps.NumSimultaneousRTs == 0
+        || caps.NumSimultaneousRTs > 4)
+    {
+        logStrictStereoTargetGate(
+            context, "mrt-caps-unknown", nullptr, nullptr,
+            gStereoTargetWidth, gStereoTargetHeight);
+        return false;
+    }
+    for (DWORD index = 1; index < caps.NumSimultaneousRTs; ++index)
+    {
+        IDirect3DSurface9* auxiliaryTarget = nullptr;
+        const HRESULT result = device->GetRenderTarget(index, &auxiliaryTarget);
+        const bool clear = SUCCEEDED(result) && auxiliaryTarget == nullptr;
+        releaseSurface(auxiliaryTarget);
+        if (!clear)
+        {
+            logStrictStereoTargetGate(
+                context, "additional-render-target-bound", nullptr, nullptr,
+                gStereoTargetWidth, gStereoTargetHeight);
+            return false;
+        }
+    }
     return true;
 }
 
@@ -10476,24 +11427,11 @@ bool currentTargetPassesStrictStereoGate(
         return true;
     if (gStereoFrameReadyToPublish)
     {
-        if (target && currentDrawSamplesStereoTwin())
-        {
-            D3DSURFACE_DESC targetDesc {};
-            if (SUCCEEDED(target->GetDesc(&targetDesc)) && targetDesc.Width > 0 && targetDesc.Height > 0)
-            {
-                logStrictStereoTargetGate(
-                    context,
-                    "frame-ready-texture-composite",
-                    &targetDesc,
-                    nullptr,
-                    gStereoTargetWidth,
-                    gStereoTargetHeight);
-                return true;
-            }
-        }
         logStrictStereoTargetGate(context, "frame-already-ready", nullptr, nullptr, gStereoTargetWidth, gStereoTargetHeight);
         return false;
     }
+    if (!noAdditionalRenderTargetsBound(device, context))
+        return false;
 
     D3DSURFACE_DESC targetDesc {};
     D3DSURFACE_DESC depthDesc {};
@@ -10511,7 +11449,7 @@ bool currentTargetPassesStrictStereoGate(
 
     if (gIsMain3DSceneActive
         && gMain3DSceneRenderTarget
-        && target != gMain3DSceneRenderTarget)
+        && !sameComIdentity(target, gMain3DSceneRenderTarget))
     {
         logStrictStereoTargetGate(context, "not-active-main-target", &targetDesc, &depthDesc, configuredWidth, configuredHeight);
         return false;
@@ -10660,6 +11598,16 @@ HRESULT WINAPI hookedPresent(
     LARGE_INTEGER realPresentStart {};
     LARGE_INTEGER realPresentEnd {};
     QueryPerformanceCounter(&presentHookStart);
+    const LONG currentThread = static_cast<LONG>(GetCurrentThreadId());
+    const LONG renderOwner = InterlockedCompareExchange(
+        &gRenderOwnerThreadId, currentThread, 0);
+    if (renderOwner != 0 && renderOwner != currentThread)
+    {
+        requestRenderOwnerShutdown();
+        logLine("stereo shutdown requested: Present moved to a second thread");
+        return gRealPresent(device, sourceRect, destRect, destWindowOverride, dirtyRegion);
+    }
+    serviceRenderOwnerShutdown("present-thread-mismatch");
     const LONG originalRenderCalls = gOriginalDoRenderCallsThisPresent;
     const LONGLONG originalRenderTicks = gOriginalDoRenderTicksThisPresent;
     const LONG nativeHookEntries = InterlockedExchange(&gNativeDoRenderHookEntriesThisPresent, 0);
@@ -10762,6 +11710,19 @@ HRESULT WINAPI hookedPresent(
     QueryPerformanceCounter(&realPresentStart);
     const HRESULT result = gRealPresent(device, sourceRect, destRect, destWindowOverride, dirtyRegion);
     QueryPerformanceCounter(&realPresentEnd);
+    if (FAILED(result))
+    {
+        // A device-loss/failed Present is a discontinuity.  Do not let a
+        // previously published eye pair survive as if the desktop render
+        // transaction had completed.
+        gHavePublishedValidStereoWorldFrame = false;
+        closeNativeStereoOriginLease("present-failed");
+        if (gSharedStereoView)
+            writeInvalidSharedStereoRecord(
+                reinterpret_cast<SharedStereoHeader*>(gSharedStereoView),
+                false);
+        logLine("shared stereo invalidated: IDirect3DDevice9::Present failed");
+    }
     if (readEnvBool("FNVXR_D3D9_PRESENT_PERF", true))
     {
         const LONG logCount = InterlockedIncrement(&gLoggedPresentPerf);
@@ -10793,6 +11754,10 @@ HRESULT WINAPI hookedPresent(
 
 HRESULT WINAPI hookedReset(IDirect3DDevice9* device, D3DPRESENT_PARAMETERS* presentationParameters)
 {
+    closeNativeStereoOriginLease("device-reset");
+    publishSharedStereoInvalid(false, "device-reset");
+    gPrimaryBackBufferLockable = presentationParameters
+        && (presentationParameters->Flags & D3DPRESENTFLAG_LOCKABLE_BACKBUFFER) != 0;
     gNativeEquivalentPairsInSequence = 0;
     gNativeEquivalentLastPresentFrame = -2;
     gNativePassEquivalenceWasBlocked = true;
@@ -10804,11 +11769,18 @@ HRESULT WINAPI hookedReset(IDirect3DDevice9* device, D3DPRESENT_PARAMETERS* pres
     gNativeHookSilentGameplayFrames = 0;
     resetNativePostprocessCommandStream();
     resetNativeFullSizeTargetCandidates();
+    releaseTrackedTextures();
     releaseStereoTargets();
     releaseSharedVideoReadback();
     forceImmediatePresentation(presentationParameters, "Reset");
     logLine("IDirect3DDevice9::Reset");
-    return gRealReset(device, presentationParameters);
+    const HRESULT result = gRealReset(device, presentationParameters);
+    if (SUCCEEDED(result))
+    {
+        InterlockedExchange(&gStateBlockRecording, 0);
+        InterlockedExchange(&gD3DQueryObjectsObserved, 0);
+    }
+    return result;
 }
 
 HRESULT WINAPI hookedEndScene(IDirect3DDevice9* device)
@@ -10832,22 +11804,79 @@ HRESULT WINAPI hookedClear(
         return result;
     IDirect3DSurface9* originalTarget = nullptr;
     IDirect3DSurface9* originalDepth = nullptr;
-    device->GetRenderTarget(0, &originalTarget);
-    device->GetDepthStencilSurface(&originalDepth);
+    const HRESULT getOriginalTargetResult = device->GetRenderTarget(0, &originalTarget);
+    const HRESULT getOriginalDepthResult = device->GetDepthStencilSurface(&originalDepth);
+    bool noAdditionalRenderTargets = true;
+    for (DWORD targetIndex = 1; targetIndex < 4; ++targetIndex)
+    {
+        IDirect3DSurface9* extraTarget = nullptr;
+        const HRESULT extraTargetResult = device->GetRenderTarget(targetIndex, &extraTarget);
+        if (FAILED(extraTargetResult) || extraTarget)
+            noAdditionalRenderTargets = false;
+        if (extraTarget)
+            extraTarget->Release();
+    }
+    D3DSURFACE_DESC originalTargetDesc {};
+    D3DSURFACE_DESC originalDepthDesc {};
+    D3DVIEWPORT9 clearViewport {};
+    DWORD scissorEnabled = TRUE;
+    RECT clearScissor {};
+    const bool haveOriginalTargetDesc = originalTarget
+        && SUCCEEDED(originalTarget->GetDesc(&originalTargetDesc));
+    const bool haveOriginalDepthDesc = originalDepth
+        && SUCCEEDED(originalDepth->GetDesc(&originalDepthDesc));
+    const bool haveClearViewport = SUCCEEDED(device->GetViewport(&clearViewport));
+    const bool haveScissorState = SUCCEEDED(device->GetRenderState(
+        D3DRS_SCISSORTESTENABLE, &scissorEnabled));
+    const bool haveClearScissor = SUCCEEDED(device->GetScissorRect(&clearScissor));
+    const bool fullEquivalentClear = count == 0
+        && (flags & (D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER))
+            == (D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER)
+        && haveOriginalTargetDesc
+        && haveOriginalDepthDesc
+        && haveClearViewport
+        && clearViewport.X == 0
+        && clearViewport.Y == 0
+        && clearViewport.Width == originalTargetDesc.Width
+        && clearViewport.Height == originalTargetDesc.Height
+        && clearViewport.MinZ == 0.0f
+        && clearViewport.MaxZ == 1.0f
+        && haveScissorState
+        && haveClearScissor
+        && (scissorEnabled == FALSE
+            || (clearScissor.left == 0
+                && clearScissor.top == 0
+                && clearScissor.right == static_cast<LONG>(originalTargetDesc.Width)
+                && clearScissor.bottom == static_cast<LONG>(originalTargetDesc.Height)))
+        && (!formatHasStencil(originalDepthDesc.Format)
+            || (flags & D3DCLEAR_STENCIL) != 0);
+    const bool clearStateKnown = SUCCEEDED(getOriginalTargetResult)
+        && SUCCEEDED(getOriginalDepthResult)
+        && haveClearViewport
+        && haveScissorState
+        && haveClearScissor
+        && noAdditionalRenderTargets;
     const bool strictTargetAllowed =
         currentTargetPassesStrictStereoGate(device, originalTarget, originalDepth, "Clear");
     const bool strictEyeTargetLedgerClear = gInNativeStereoHook
         && gNativeActiveEye == 2
+        && SUCCEEDED(result)
         && strictTargetAllowed
         && (flags & (D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL)) != 0;
     if (strictEyeTargetLedgerClear)
         InterlockedIncrement(&gStrictEyeTargetClears);
     const bool replayStereo = gStereoReplayEnabled
+        && SUCCEEDED(result)
         && stereoReplayTransactionAllowed()
         && strictTargetAllowed
+        && clearStateKnown
+        && fullEquivalentClear
         && ensureStereoTargets(device);
     const bool replayWide = gWideWorldReplayEnabled
+        && InterlockedCompareExchange(&gStateBlockRecording, 0, 0) == 0
         && strictTargetAllowed
+        && clearStateKnown
+        && fullEquivalentClear
         && shouldReplayCurrentDrawToWideWorld()
         && ensureWideWorldTargets(device);
     if (!replayStereo && !replayWide)
@@ -10869,15 +11898,41 @@ HRESULT WINAPI hookedClear(
     HRESULT leftClearResult = D3DERR_INVALIDCALL;
     HRESULT rightClearResult = D3DERR_INVALIDCALL;
     HRESULT wideClearResult = D3DERR_INVALIDCALL;
+    HRESULT leftTargetResult = D3DERR_INVALIDCALL;
+    HRESULT leftDepthResult = D3DERR_INVALIDCALL;
+    HRESULT rightTargetResult = D3DERR_INVALIDCALL;
+    HRESULT rightDepthResult = D3DERR_INVALIDCALL;
+    HRESULT leftViewportResult = D3DERR_INVALIDCALL;
+    HRESULT leftScissorResult = D3DERR_INVALIDCALL;
+    HRESULT leftScissorStateResult = D3DERR_INVALIDCALL;
+    HRESULT rightViewportResult = D3DERR_INVALIDCALL;
+    HRESULT rightScissorResult = D3DERR_INVALIDCALL;
+    HRESULT rightScissorStateResult = D3DERR_INVALIDCALL;
     if (replayStereo)
     {
-        device->SetRenderTarget(0, targetTwin->left);
-        device->SetDepthStencilSurface(depthTwin ? depthTwin->left : nullptr);
-        leftClearResult = gRealClear(device, count, rects, flags, color, z, stencil);
+        leftTargetResult = device->SetRenderTarget(0, targetTwin->left);
+        leftDepthResult = device->SetDepthStencilSurface(depthTwin ? depthTwin->left : nullptr);
+        leftViewportResult = device->SetViewport(&clearViewport);
+        leftScissorResult = device->SetScissorRect(&clearScissor);
+        leftScissorStateResult = device->SetRenderState(D3DRS_SCISSORTESTENABLE, scissorEnabled);
+        if (SUCCEEDED(leftTargetResult)
+            && SUCCEEDED(leftDepthResult)
+            && SUCCEEDED(leftViewportResult)
+            && SUCCEEDED(leftScissorResult)
+            && SUCCEEDED(leftScissorStateResult))
+            leftClearResult = gRealClear(device, count, rects, flags, color, z, stencil);
 
-        device->SetRenderTarget(0, targetTwin->right);
-        device->SetDepthStencilSurface(depthTwin ? depthTwin->right : nullptr);
-        rightClearResult = gRealClear(device, count, rects, flags, color, z, stencil);
+        rightTargetResult = device->SetRenderTarget(0, targetTwin->right);
+        rightDepthResult = device->SetDepthStencilSurface(depthTwin ? depthTwin->right : nullptr);
+        rightViewportResult = device->SetViewport(&clearViewport);
+        rightScissorResult = device->SetScissorRect(&clearScissor);
+        rightScissorStateResult = device->SetRenderState(D3DRS_SCISSORTESTENABLE, scissorEnabled);
+        if (SUCCEEDED(rightTargetResult)
+            && SUCCEEDED(rightDepthResult)
+            && SUCCEEDED(rightViewportResult)
+            && SUCCEEDED(rightScissorResult)
+            && SUCCEEDED(rightScissorStateResult))
+            rightClearResult = gRealClear(device, count, rects, flags, color, z, stencil);
     }
     if (replayWide && gWideWorldSurface)
     {
@@ -10886,9 +11941,20 @@ HRESULT WINAPI hookedClear(
         wideClearResult = gRealClear(device, count, rects, flags, color, z, stencil);
     }
 
-    device->SetRenderTarget(0, originalTarget);
-    device->SetDepthStencilSurface(originalDepth);
+    const HRESULT restoreTargetResult = device->SetRenderTarget(0, originalTarget);
+    const HRESULT restoreDepthResult = device->SetDepthStencilSurface(originalDepth);
+    const HRESULT restoreViewportResult = haveClearViewport
+        ? device->SetViewport(&clearViewport)
+        : D3DERR_INVALIDCALL;
+    const HRESULT restoreScissorResult = haveClearScissor
+        ? device->SetScissorRect(&clearScissor)
+        : D3DERR_INVALIDCALL;
     gInStereoReplay = false;
+    if (FAILED(restoreTargetResult)
+        || FAILED(restoreDepthResult)
+        || FAILED(restoreViewportResult)
+        || FAILED(restoreScissorResult))
+        InterlockedIncrement(&gStrictEyeTargetUnprovenWrites);
 
     const LONG clearLog = InterlockedIncrement(&gLoggedStereoClearMirror);
     const bool hammerLog = shouldTelemetryHammerLog(clearLog, "FNVXR_D3D9_CLEAR_TELEMETRY_STRIDE", 1);
@@ -10897,10 +11963,39 @@ HRESULT WINAPI hookedClear(
         || (replayWide && FAILED(wideClearResult));
     if (strictEyeTargetLedgerClear
         && replayStereo
+        && SUCCEEDED(leftTargetResult)
+        && SUCCEEDED(leftDepthResult)
+        && SUCCEEDED(leftViewportResult)
+        && SUCCEEDED(leftScissorResult)
+        && SUCCEEDED(leftScissorStateResult)
         && SUCCEEDED(leftClearResult)
-        && SUCCEEDED(rightClearResult))
+        && SUCCEEDED(rightTargetResult)
+        && SUCCEEDED(rightDepthResult)
+        && SUCCEEDED(rightViewportResult)
+        && SUCCEEDED(rightScissorResult)
+        && SUCCEEDED(rightScissorStateResult)
+        && SUCCEEDED(rightClearResult)
+        && SUCCEEDED(restoreTargetResult)
+        && SUCCEEDED(restoreDepthResult)
+        && SUCCEEDED(restoreViewportResult)
+        && SUCCEEDED(restoreScissorResult))
     {
         InterlockedIncrement(&gStrictEyeTargetProvenBothEyeClears);
+        if (fullEquivalentClear && !gStrictDrawSeenThisTraversal)
+        {
+            gStrictEquivalentClearSeenThisTraversal = true;
+            targetTwin->equivalentInitializationGeneration =
+                gStereoReplayTransactionGeneration;
+            targetTwin->leftValidGeneration = gStereoReplayTransactionGeneration;
+            targetTwin->rightValidGeneration = gStereoReplayTransactionGeneration;
+            depthTwin->equivalentInitializationGeneration =
+                gStereoReplayTransactionGeneration;
+            depthTwin->leftValidGeneration = gStereoReplayTransactionGeneration;
+            depthTwin->rightValidGeneration = gStereoReplayTransactionGeneration;
+            targetTwin->lastDepthPrimeFrame = static_cast<LONG>(gPresentFrames);
+            targetTwin->lastDepthPrimeTwin = depthTwin;
+            InterlockedIncrement(&gStrictEyeTargetFullInitializations);
+        }
     }
     if (hammerLog || clearFailed)
     {
@@ -10942,6 +12037,9 @@ HRESULT WINAPI hookedSetTransform(IDirect3DDevice9* device, D3DTRANSFORMSTATETYP
 {
     const LONG call = InterlockedIncrement(&gSetTransformCalls);
     logHookCadence("IDirect3DDevice9::SetTransform", call, gLastTransformSample, gLastTransformCallSample, 5.0);
+    const HRESULT result = gRealSetTransform(device, state, matrix);
+    if (FAILED(result))
+        return result;
 
     const LONG nativeEye = gNativeActiveEye;
     if (gInNativeStereoHook && matrix && nativeEye >= 0 && nativeEye <= 1)
@@ -10978,7 +12076,7 @@ HRESULT WINAPI hookedSetTransform(IDirect3DDevice9* device, D3DTRANSFORMSTATETYP
         updateEyeMatrices();
     }
 
-    return gRealSetTransform(device, state, matrix);
+    return result;
 }
 
 HRESULT WINAPI hookedSetVertexShader(IDirect3DDevice9* device, IDirect3DVertexShader9* shader)
@@ -11036,9 +12134,115 @@ HRESULT WINAPI hookedSetPixelShader(IDirect3DDevice9* device, IDirect3DPixelShad
     return result;
 }
 
+bool refreshAuthoritativeDrawState(IDirect3DDevice9* device)
+{
+    if (!device)
+        return false;
+
+    IDirect3DVertexShader9* vertexShader = nullptr;
+    if (FAILED(device->GetVertexShader(&vertexShader)))
+        return false;
+    const ShaderFingerprint vertexFingerprint =
+        fingerprintD3DShaderBytecode(vertexShader, "vs-authoritative", false);
+    gActiveVertexShader = vertexShader;
+    gActiveVertexShaderHash = vertexFingerprint.fnv1a32;
+    gActiveVertexShaderByteCount = vertexFingerprint.byteCount;
+    std::memcpy(
+        gActiveVertexShaderSha256,
+        vertexFingerprint.sha256,
+        sizeof(gActiveVertexShaderSha256));
+    if (vertexShader)
+        vertexShader->Release();
+
+    IDirect3DPixelShader9* pixelShader = nullptr;
+    if (FAILED(device->GetPixelShader(&pixelShader)))
+        return false;
+    const ShaderFingerprint pixelFingerprint =
+        fingerprintD3DShaderBytecode(pixelShader, "ps-authoritative", false);
+    gActivePixelShader = pixelShader;
+    gActivePixelShaderHash = pixelFingerprint.fnv1a32;
+    if (pixelShader)
+        pixelShader->Release();
+
+    D3DMATRIX view {};
+    D3DMATRIX projection {};
+    if (FAILED(device->GetTransform(D3DTS_VIEW, &view))
+        || FAILED(device->GetTransform(D3DTS_PROJECTION, &projection)))
+    {
+        return false;
+    }
+    gBaseView = toStereoMatrix(view);
+    gBaseProjection = toStereoMatrix(projection);
+    gHaveView = fnvxr::stereo::isFinite(gBaseView);
+    gHaveProjection = fnvxr::stereo::isFinite(gBaseProjection);
+    if (!gHaveView || !gHaveProjection)
+        return false;
+
+    DWORD clipPlaneMask = 0;
+    if (FAILED(device->GetRenderState(D3DRS_CLIPPLANEENABLE, &clipPlaneMask))
+        || clipPlaneMask != 0)
+    {
+        return false;
+    }
+
+    for (UINT sampler = 0; sampler < MaxTrackedSamplers; ++sampler)
+    {
+        IDirect3DBaseTexture9* texture = nullptr;
+        if (FAILED(device->GetTexture(sampler, &texture)))
+        {
+            if (texture)
+                texture->Release();
+            return false;
+        }
+        // GetTexture returns an owning reference. Retain it through twin binds
+        // and restoration so application-side release cannot invalidate the
+        // authoritative binding snapshot.
+        replaceTrackedTexture(sampler, texture, true);
+    }
+
+    // Replay only swaps RT0. Any active MRT makes the original draw's pixel
+    // effects different from the replayed eye transaction and therefore
+    // cannot be admitted.
+    for (DWORD targetIndex = 1; targetIndex < 4; ++targetIndex)
+    {
+        IDirect3DSurface9* extraTarget = nullptr;
+        const HRESULT targetResult = device->GetRenderTarget(targetIndex, &extraTarget);
+        if (FAILED(targetResult) || extraTarget)
+        {
+            if (extraTarget)
+                extraTarget->Release();
+            return false;
+        }
+    }
+
+    if (const ShaderWvpContract* contract = currentShaderWvpContract())
+    {
+        float rows[16] {};
+        if (contract->startRegister > MaxTrackedVsConstants - 4
+            || FAILED(device->GetVertexShaderConstantF(contract->startRegister, rows, 4)))
+        {
+            return false;
+        }
+        for (UINT row = 0; row < 4; ++row)
+        {
+            std::memcpy(gVsConstants[contract->startRegister + row], rows + row * 4, sizeof(float) * 4);
+            gHaveVsConstants[contract->startRegister + row] = true;
+        }
+    }
+    return true;
+}
+
 template <typename DrawFn, typename... Args>
 HRESULT replayDrawToStereoTargets(IDirect3DDevice9* device, bool userPrimitiveDraw, DrawFn draw, Args... args)
 {
+    const bool nativeCenterTraversal = gInNativeStereoHook
+        && gNativeActiveEye == 2
+        && !gInStereoReplay;
+    if (nativeCenterTraversal && !refreshAuthoritativeDrawState(device))
+    {
+        InterlockedIncrement(&gStrictEyeTargetUnprovenWrites);
+        return D3DERR_INVALIDCALL;
+    }
     // Shader discovery is diagnostic and must observe the programmable draw
     // stream even when Fallout leaves stale fixed-function VIEW/PROJECTION
     // state behind. Those stale screen-space transforms are not evidence that
@@ -11058,9 +12262,6 @@ HRESULT replayDrawToStereoTargets(IDirect3DDevice9* device, bool userPrimitiveDr
     // programmable shaders consume their own ModelViewProj constants.  Count
     // every non-composite programmable draw before replay filters so an
     // unknown or skipped world shader makes the transaction fail closed.
-    const bool nativeCenterTraversal = gInNativeStereoHook
-        && gNativeActiveEye == 2
-        && !gInStereoReplay;
     const bool uiSuppressed = suppressStereoForUiMode();
     const bool screenSpaceProjection = currentProjectionLooksScreenSpace();
     // A fixed-function projection left behind while a programmable shader is
@@ -11070,7 +12271,19 @@ HRESULT replayDrawToStereoTargets(IDirect3DDevice9* device, bool userPrimitiveDr
     // the proof ledger through stale D3DTS_PROJECTION state.
     const bool provenScreenSpaceDraw = false;
     const bool samplesStereoTwin = currentDrawSamplesStereoTwin();
-    const bool configuredSkip = currentShaderPairIsConfiguredStereoSkip();
+    if (nativeCenterTraversal && !uiSuppressed && samplesStereoTwin)
+    {
+        // No bytecode/target-stage contract currently proves that a draw
+        // sampling a twinned render texture is a screen-space composite. A
+        // world reflection draw can otherwise escape every WVP obligation.
+        InterlockedIncrement(&gStrictEyeTargetUnprovenWrites);
+    }
+    // Weak FNV shader-pair skip lists are diagnostic only. They cannot remove
+    // a draw from the production proof denominator without an exact
+    // SHA/byte-count/stage semantics contract.
+    const bool configuredSkip = stereoProofModeArmed()
+        ? false
+        : currentShaderPairIsConfiguredStereoSkip();
     const bool replayUserPrimitiveDraws = readEnvBool(
         "FNVXR_D3D9_STEREO_REPLAY_UP_DRAWS",
         false);
@@ -11101,7 +12314,17 @@ HRESULT replayDrawToStereoTargets(IDirect3DDevice9* device, bool userPrimitiveDr
         releaseSurface(ledgerTarget);
         releaseSurface(ledgerDepth);
         if (strictEyeTargetLedgerDraw)
+        {
+            gStrictDrawSeenThisTraversal = true;
             InterlockedIncrement(&gStrictEyeTargetDraws);
+        }
+        else
+        {
+            // Every center-traversal target write needs an eye-equivalent
+            // resource path. Unknown auxiliary/fixed-function targets cannot
+            // disappear from the denominator.
+            InterlockedIncrement(&gStrictEyeTargetUnprovenWrites);
+        }
     }
     if (nativeCenterTraversal
         && !uiSuppressed
@@ -11207,10 +12430,11 @@ HRESULT replayDrawToStereoTargets(IDirect3DDevice9* device, bool userPrimitiveDr
 
     const bool nativePostprocessComposite = gNativePostprocessFanoutActive
         && currentDrawSamplesStereoTwin();
-    const bool stereoReplayRequested =
-        (gStereoReplayEnabled && stereoReplayTransactionAllowed())
-        || nativePostprocessComposite;
-    if ((!stereoReplayRequested && !gWideWorldReplayEnabled)
+    const bool stereoReplayRequested = stereoReplayTransactionAllowed()
+        && (gStereoReplayEnabled || nativePostprocessComposite);
+    const bool wideReplayRequested = gWideWorldReplayEnabled
+        && InterlockedCompareExchange(&gStateBlockRecording, 0, 0) == 0;
+    if ((!stereoReplayRequested && !wideReplayRequested)
         || gInStereoReplay
         || suppressStereoForUiMode()
         || !gHaveView
@@ -11249,7 +12473,7 @@ HRESULT replayDrawToStereoTargets(IDirect3DDevice9* device, bool userPrimitiveDr
     const bool replayStereo = stereoReplayRequested
         && strictTargetAllowed
         && ensureStereoTargets(device);
-    const bool replayWide = gWideWorldReplayEnabled
+    const bool replayWide = wideReplayRequested
         && strictTargetAllowed
         && ensureWideWorldTargets(device);
     if (!replayStereo && !replayWide)
@@ -11270,12 +12494,32 @@ HRESULT replayDrawToStereoTargets(IDirect3DDevice9* device, bool userPrimitiveDr
     const bool haveScissor = SUCCEEDED(device->GetScissorRect(&originalScissor));
     const bool haveOriginalView = SUCCEEDED(device->GetTransform(D3DTS_VIEW, &originalView));
     const bool haveOriginalProjection = SUCCEEDED(device->GetTransform(D3DTS_PROJECTION, &originalProjection));
+    if (!haveViewport || !haveScissor || !haveOriginalView || !haveOriginalProjection)
+    {
+        InterlockedIncrement(&gStrictEyeTargetUnprovenWrites);
+        releaseSurface(originalTarget);
+        releaseSurface(originalDepth);
+        return D3DERR_INVALIDCALL;
+    }
     ScopedReplayStateBlock replayState(device, "draw-replay");
+    if (!replayState.captured)
+    {
+        InterlockedIncrement(&gStrictEyeTargetUnprovenWrites);
+        releaseSurface(originalTarget);
+        releaseSurface(originalDepth);
+        return D3DERR_INVALIDCALL;
+    }
 
     updateSharedVrPose();
     updateEyeMatrices();
-    if (replayStereo)
-        primeStereoReplayTarget(device, targetTwin, depthTwin, "draw-replay");
+    if (replayStereo
+        && !primeStereoReplayTarget(device, targetTwin, depthTwin, "draw-replay"))
+    {
+        InterlockedIncrement(&gStrictEyeTargetUnprovenWrites);
+        releaseSurface(originalTarget);
+        releaseSurface(originalDepth);
+        return D3DERR_INVALIDCALL;
+    }
     if (replayWide)
         primeWideWorldReplayTarget(device);
 
@@ -11401,22 +12645,46 @@ HRESULT replayDrawToStereoTargets(IDirect3DDevice9* device, bool userPrimitiveDr
         }
     }
 
-    replayState.restore();
+    bool restorationComplete = replayState.restore();
     if (haveOriginalView)
-        gRealSetTransform(device, D3DTS_VIEW, &originalView);
+        restorationComplete = SUCCEEDED(gRealSetTransform(device, D3DTS_VIEW, &originalView))
+            && restorationComplete;
     if (haveOriginalProjection)
-        gRealSetTransform(device, D3DTS_PROJECTION, &originalProjection);
-    restoreTrackedTextures(device);
-    restoreShaderConstants(device);
-    device->SetRenderTarget(0, originalTarget);
-    device->SetDepthStencilSurface(originalDepth);
+        restorationComplete = SUCCEEDED(gRealSetTransform(device, D3DTS_PROJECTION, &originalProjection))
+            && restorationComplete;
+    restorationComplete = SUCCEEDED(device->SetRenderTarget(0, originalTarget))
+        && restorationComplete;
+    restorationComplete = SUCCEEDED(device->SetDepthStencilSurface(originalDepth))
+        && restorationComplete;
     if (haveViewport)
-        device->SetViewport(&originalViewport);
+        restorationComplete = SUCCEEDED(device->SetViewport(&originalViewport))
+            && restorationComplete;
     if (haveScissor)
-        device->SetScissorRect(&originalScissor);
+        restorationComplete = SUCCEEDED(device->SetScissorRect(&originalScissor))
+            && restorationComplete;
     gInStereoReplay = false;
+    if (!restorationComplete)
+        InterlockedIncrement(&gStrictEyeTargetUnprovenWrites);
 
-    if (programmableWorldDraw && SUCCEEDED(leftReplayResult) && SUCCEEDED(result))
+    const bool targetPrestateProven = !replayStereo
+        || (targetTwin
+            && depthTwin
+            && targetTwin->equivalentInitializationGeneration
+                == gStereoReplayTransactionGeneration
+            && targetTwin->leftValidGeneration == gStereoReplayTransactionGeneration
+            && targetTwin->rightValidGeneration == gStereoReplayTransactionGeneration
+            && depthTwin->equivalentInitializationGeneration
+                == gStereoReplayTransactionGeneration
+            && depthTwin->leftValidGeneration == gStereoReplayTransactionGeneration
+            && depthTwin->rightValidGeneration == gStereoReplayTransactionGeneration);
+    if (replayStereo && strictEyeTargetLedgerDraw && !targetPrestateProven)
+        InterlockedIncrement(&gStrictEyeTargetUnprovenWrites);
+
+    if (restorationComplete
+        && targetPrestateProven
+        && programmableWorldDraw
+        && SUCCEEDED(leftReplayResult)
+        && SUCCEEDED(result))
     {
         InterlockedIncrement(&gShaderWorldDraws);
         if (leftWvpPatched && rightWvpPatched)
@@ -11425,6 +12693,15 @@ HRESULT replayDrawToStereoTargets(IDirect3DDevice9* device, bool userPrimitiveDr
             if (strictEyeTargetLedgerDraw)
                 InterlockedIncrement(&gStrictEyeTargetProvenBothEyeDraws);
         }
+    }
+    if (restorationComplete
+        && targetPrestateProven
+        && replayStereo
+        && SUCCEEDED(leftReplayResult)
+        && SUCCEEDED(result))
+    {
+        targetTwin->leftValidGeneration = gStereoReplayTransactionGeneration;
+        targetTwin->rightValidGeneration = gStereoReplayTransactionGeneration;
     }
 
     const LONG replayResultLog = InterlockedIncrement(&gLoggedStereoReplayDrawResult);
@@ -11654,7 +12931,8 @@ HRESULT WINAPI hookedDrawPrimitive(
             0,
             0);
     }
-    replayDrawToStereoTargets(device, false, gRealDrawPrimitive, primitiveType, startVertex, primitiveCount);
+    if (SUCCEEDED(result))
+        replayDrawToStereoTargets(device, false, gRealDrawPrimitive, primitiveType, startVertex, primitiveCount);
     return result;
 }
 
@@ -11688,16 +12966,19 @@ HRESULT WINAPI hookedDrawIndexedPrimitive(
             numVertices,
             startIndex);
     }
-    replayDrawToStereoTargets(
-        device,
-        false,
-        gRealDrawIndexedPrimitive,
-        primitiveType,
-        baseVertexIndex,
-        minVertexIndex,
-        numVertices,
-        startIndex,
-        primitiveCount);
+    if (SUCCEEDED(result))
+    {
+        replayDrawToStereoTargets(
+            device,
+            false,
+            gRealDrawIndexedPrimitive,
+            primitiveType,
+            baseVertexIndex,
+            minVertexIndex,
+            numVertices,
+            startIndex,
+            primitiveCount);
+    }
     return result;
 }
 
@@ -11726,14 +13007,17 @@ HRESULT WINAPI hookedDrawPrimitiveUP(
             logLine("native delayed postprocess rejected: DrawPrimitiveUP appeared in the command stream");
         gNativePostprocessRecordUnsupported = true;
     }
-    replayDrawToStereoTargets(
-        device,
-        true,
-        gRealDrawPrimitiveUP,
-        primitiveType,
-        primitiveCount,
-        vertexStreamZeroData,
-        vertexStreamZeroStride);
+    if (SUCCEEDED(result))
+    {
+        replayDrawToStereoTargets(
+            device,
+            true,
+            gRealDrawPrimitiveUP,
+            primitiveType,
+            primitiveCount,
+            vertexStreamZeroData,
+            vertexStreamZeroStride);
+    }
     return result;
 }
 
@@ -11774,18 +13058,21 @@ HRESULT WINAPI hookedDrawIndexedPrimitiveUP(
             logLine("native delayed postprocess rejected: DrawIndexedPrimitiveUP appeared in the command stream");
         gNativePostprocessRecordUnsupported = true;
     }
-    replayDrawToStereoTargets(
-        device,
-        true,
-        gRealDrawIndexedPrimitiveUP,
-        primitiveType,
-        minVertexIndex,
-        numVertices,
-        primitiveCount,
-        indexData,
-        indexDataFormat,
-        vertexStreamZeroData,
-        vertexStreamZeroStride);
+    if (SUCCEEDED(result))
+    {
+        replayDrawToStereoTargets(
+            device,
+            true,
+            gRealDrawIndexedPrimitiveUP,
+            primitiveType,
+            minVertexIndex,
+            numVertices,
+            primitiveCount,
+            indexData,
+            indexDataFormat,
+            vertexStreamZeroData,
+            vertexStreamZeroStride);
+    }
     return result;
 }
 
@@ -11798,6 +13085,10 @@ HRESULT WINAPI hookedSetVertexShaderConstantF(
     const LONG call = InterlockedIncrement(&gVertexShaderConstantFCalls);
     logHookCadence(
         "IDirect3DDevice9::SetVertexShaderConstantF", call, gLastVsConstSample, gLastVsConstCallSample, 5.0);
+    const HRESULT result = gRealSetVertexShaderConstantF(
+        device, startRegister, constantData, vector4fCount);
+    if (FAILED(result))
+        return result;
 
     const LONG nativeEye = gNativeActiveEye;
     if (gInNativeStereoHook
@@ -11856,7 +13147,7 @@ HRESULT WINAPI hookedSetVertexShaderConstantF(
         }
     }
 
-    return gRealSetVertexShaderConstantF(device, startRegister, constantData, vector4fCount);
+    return result;
 }
 
 HRESULT WINAPI hookedCreateTexture(
@@ -11982,6 +13273,13 @@ HRESULT WINAPI hookedUpdateSurface(
     const POINT* destPoint)
 {
     const HRESULT result = gRealUpdateSurface(device, sourceSurface, sourceRect, destinationSurface, destPoint);
+    if (SUCCEEDED(result)
+        && gInNativeStereoHook
+        && gNativeActiveEye == 2
+        && !gInStereoReplay)
+    {
+        InterlockedIncrement(&gStrictEyeTargetUnprovenWrites);
+    }
     const LONG call = InterlockedIncrement(&gUpdateSurfaceCalls);
     if (shouldLogResourceGraphCall(call))
     {
@@ -12012,6 +13310,13 @@ HRESULT WINAPI hookedUpdateTexture(
     IDirect3DBaseTexture9* destinationTexture)
 {
     const HRESULT result = gRealUpdateTexture(device, sourceTexture, destinationTexture);
+    if (SUCCEEDED(result)
+        && gInNativeStereoHook
+        && gNativeActiveEye == 2
+        && !gInStereoReplay)
+    {
+        InterlockedIncrement(&gStrictEyeTargetUnprovenWrites);
+    }
     const LONG call = InterlockedIncrement(&gUpdateTextureCalls);
     if (shouldLogResourceGraphCall(call))
     {
@@ -12050,7 +13355,7 @@ HRESULT WINAPI hookedStretchRect(
         && !gInStereoReplay
         && destinationSurface
         && gMain3DSceneRenderTarget
-        && destinationSurface == gMain3DSceneRenderTarget;
+        && sameComIdentity(destinationSurface, gMain3DSceneRenderTarget);
     if (strictEyeTargetLedgerCopy)
         InterlockedIncrement(&gStrictEyeTargetCopies);
 
@@ -12163,7 +13468,8 @@ HRESULT WINAPI hookedStretchRect(
         : nullptr;
     const bool nativeFanoutMirror = nativeFanoutSourceTwin != nullptr;
     if (SUCCEEDED(result)
-        && ((gStereoReplayEnabled && stereoReplayTransactionAllowed()) || nativeFanoutMirror)
+        && stereoReplayTransactionAllowed()
+        && (gStereoReplayEnabled || nativeFanoutMirror)
         && !gInStereoReplay
         && !suppressStereoForUiMode()
         && sourceSurface
@@ -12171,9 +13477,21 @@ HRESULT WINAPI hookedStretchRect(
     {
         StereoSurfaceTwin* sourceTwin = nativeFanoutMirror
             ? nativeFanoutSourceTwin
-            : ensureSurfaceTwin(device, sourceSurface, false);
+            : findSurfaceTwin(sourceSurface, false);
         StereoSurfaceTwin* destinationTwin = ensureSurfaceTwin(device, destinationSurface, false);
-        if (sourceTwin && destinationTwin && sourceTwin->left && sourceTwin->right && destinationTwin->left && destinationTwin->right)
+        const bool sourceProven = nativeFanoutMirror
+            || (sourceTwin
+                && sourceTwin->leftValidGeneration == gStereoReplayTransactionGeneration
+                && sourceTwin->rightValidGeneration == gStereoReplayTransactionGeneration);
+        if (strictEyeTargetLedgerCopy && !sourceProven)
+            InterlockedIncrement(&gStrictEyeTargetUnprovenWrites);
+        if (sourceProven
+            && sourceTwin
+            && destinationTwin
+            && sourceTwin->left
+            && sourceTwin->right
+            && destinationTwin->left
+            && destinationTwin->right)
         {
             gInStereoReplay = true;
             const HRESULT leftCopy = gRealStretchRect(
@@ -12220,7 +13538,11 @@ HRESULT WINAPI hookedStretchRect(
                 probeStereoSurfacePair(device, destinationTwin, "stretch-dst", call);
             }
             if (strictEyeTargetLedgerCopy && SUCCEEDED(leftCopy) && SUCCEEDED(rightCopy))
+            {
+                destinationTwin->leftValidGeneration = gStereoReplayTransactionGeneration;
+                destinationTwin->rightValidGeneration = gStereoReplayTransactionGeneration;
                 InterlockedIncrement(&gStrictEyeTargetProvenBothEyeCopies);
+            }
         }
     }
 
@@ -12262,6 +13584,21 @@ HRESULT WINAPI hookedSetRenderTarget(IDirect3DDevice9* device, DWORD renderTarge
     if (inspectNativeHdrTransition)
         device->GetRenderTarget(0, &previousRenderTarget);
     const HRESULT result = gRealSetRenderTarget(device, renderTargetIndex, renderTarget);
+    if (SUCCEEDED(result)
+        && renderTargetIndex > 0
+        && renderTarget != nullptr
+        && strictStereoTargetGateEnabled()
+        && !gInStereoReplay
+        && gInNativeStereoHook)
+    {
+        // RT1-RT3 are not twinned by the replay transaction.  Any binding is
+        // therefore an auxiliary write path that invalidates the proof even if
+        // it is later unbound before publication.
+        InterlockedIncrement(&gStrictEyeTargetUnprovenWrites);
+        logStrictStereoTargetGate(
+            "SetRenderTarget", "unmodeled-mrt-binding", nullptr, nullptr,
+            gStereoTargetWidth, gStereoTargetHeight);
+    }
     NativeFullSizeTargetCandidate* nativeCandidate = nullptr;
     const LONG nativeEye = gNativeActiveEye;
     if (SUCCEEDED(result)
@@ -12297,8 +13634,9 @@ HRESULT WINAPI hookedSetRenderTarget(IDirect3DDevice9* device, DWORD renderTarge
         if (previousIsFullHdr && nextIsNativePostprocessTarget)
         {
             gNativePostprocessRecording = true;
-            const LONG pairSequence = static_cast<LONG>(gNativeStereoRenderPairSequence + 1);
-            if (pairSequence <= 3 || pairSequence % 120 == 0)
+            const LONG pairSequence = nextNativeStereoPairSequence();
+            if (nativeStereoPairNeedsWarmupAudit(3)
+                || fnvxr::shared::sequencedValueBits(pairSequence) % 120u == 0u)
             {
                 char message[320] {};
                 sprintf_s(
@@ -12373,6 +13711,140 @@ HRESULT WINAPI hookedSetRenderTarget(IDirect3DDevice9* device, DWORD renderTarge
     return result;
 }
 
+HRESULT WINAPI hookedColorFill(
+    IDirect3DDevice9* device,
+    IDirect3DSurface9* surface,
+    const RECT* rect,
+    D3DCOLOR color)
+{
+    const HRESULT result = gRealColorFill(device, surface, rect, color);
+    if (SUCCEEDED(result)
+        && gInNativeStereoHook
+        && gNativeActiveEye == 2
+        && !gInStereoReplay)
+    {
+        InterlockedIncrement(&gStrictEyeTargetUnprovenWrites);
+    }
+    return result;
+}
+
+HRESULT WINAPI hookedMultiplyTransform(
+    IDirect3DDevice9* device,
+    D3DTRANSFORMSTATETYPE state,
+    const D3DMATRIX* matrix)
+{
+    const HRESULT result = gRealMultiplyTransform(device, state, matrix);
+    if (SUCCEEDED(result)
+        && gInNativeStereoHook
+        && gNativeActiveEye == 2
+        && !gInStereoReplay)
+    {
+        InterlockedIncrement(&gStrictEyeTargetUnprovenWrites);
+    }
+    return result;
+}
+
+HRESULT WINAPI hookedProcessVertices(
+    IDirect3DDevice9* device,
+    UINT sourceStartIndex,
+    UINT destinationIndex,
+    UINT vertexCount,
+    IDirect3DVertexBuffer9* destinationBuffer,
+    IDirect3DVertexDeclaration9* declaration,
+    DWORD flags)
+{
+    const HRESULT result = gRealProcessVertices(
+        device,
+        sourceStartIndex,
+        destinationIndex,
+        vertexCount,
+        destinationBuffer,
+        declaration,
+        flags);
+    if (SUCCEEDED(result)
+        && gInNativeStereoHook
+        && gNativeActiveEye == 2
+        && !gInStereoReplay)
+    {
+        InterlockedIncrement(&gStrictEyeTargetUnprovenWrites);
+    }
+    return result;
+}
+
+HRESULT WINAPI hookedDrawRectPatch(
+    IDirect3DDevice9* device,
+    UINT handle,
+    const float* segments,
+    const D3DRECTPATCH_INFO* info)
+{
+    const HRESULT result = gRealDrawRectPatch(device, handle, segments, info);
+    if (SUCCEEDED(result)
+        && gInNativeStereoHook
+        && gNativeActiveEye == 2
+        && !gInStereoReplay)
+    {
+        InterlockedIncrement(&gStrictEyeTargetUnprovenWrites);
+    }
+    return result;
+}
+
+HRESULT WINAPI hookedDrawTriPatch(
+    IDirect3DDevice9* device,
+    UINT handle,
+    const float* segments,
+    const D3DTRIPATCH_INFO* info)
+{
+    const HRESULT result = gRealDrawTriPatch(device, handle, segments, info);
+    if (SUCCEEDED(result)
+        && gInNativeStereoHook
+        && gNativeActiveEye == 2
+        && !gInStereoReplay)
+    {
+        InterlockedIncrement(&gStrictEyeTargetUnprovenWrites);
+    }
+    return result;
+}
+
+HRESULT WINAPI hookedBeginStateBlock(IDirect3DDevice9* device)
+{
+    const HRESULT result = gRealBeginStateBlock(device);
+    if (SUCCEEDED(result))
+    {
+        InterlockedExchange(&gStateBlockRecording, 1);
+        if (gInNativeStereoHook && gNativeActiveEye == 2)
+            InterlockedIncrement(&gStrictEyeTargetUnprovenWrites);
+        if (stereoProofModeArmed())
+            logLine("BeginStateBlock observed: stereo replay is suspended until a successful EndStateBlock");
+    }
+    return result;
+}
+
+HRESULT WINAPI hookedEndStateBlock(
+    IDirect3DDevice9* device,
+    IDirect3DStateBlock9** stateBlock)
+{
+    const HRESULT result = gRealEndStateBlock(device, stateBlock);
+    if (SUCCEEDED(result))
+        InterlockedExchange(&gStateBlockRecording, 0);
+    return result;
+}
+
+HRESULT WINAPI hookedCreateQuery(
+    IDirect3DDevice9* device,
+    D3DQUERYTYPE type,
+    IDirect3DQuery9** query)
+{
+    const HRESULT result = gRealCreateQuery(device, type, query);
+    if (SUCCEEDED(result) && query && *query && stereoProofModeArmed())
+    {
+        InterlockedExchange(&gD3DQueryObjectsObserved, 1);
+        if (gInNativeStereoHook && gNativeActiveEye == 2)
+            InterlockedIncrement(&gStrictEyeTargetUnprovenWrites);
+        logLine("CreateQuery preserved for retail semantics; stereo proof remains fail-closed while query objects exist");
+    }
+    return result;
+}
+
 HRESULT WINAPI hookedSetDepthStencilSurface(IDirect3DDevice9* device, IDirect3DSurface9* depthStencilSurface)
 {
     const HRESULT result = gRealSetDepthStencilSurface(device, depthStencilSurface);
@@ -12411,13 +13883,14 @@ HRESULT WINAPI hookedSetDepthStencilSurface(IDirect3DDevice9* device, IDirect3DS
 HRESULT WINAPI hookedSetTexture(IDirect3DDevice9* device, DWORD sampler, IDirect3DBaseTexture9* texture)
 {
     const HRESULT result = gRealSetTexture(device, sampler, texture);
-    if (!gInStereoReplay && sampler < MaxTrackedSamplers)
-        gActiveTextures[sampler] = texture;
+    if (SUCCEEDED(result) && !gInStereoReplay && sampler < MaxTrackedSamplers)
+        replaceTrackedTexture(static_cast<UINT>(sampler), texture, false);
     const LONG call = InterlockedIncrement(&gSetTextureCalls);
     const int currentTracePhase = !gInStereoReplay ? nativePipelineTracePhase() : -1;
     IDirect3DBaseTexture9* leftTwinTexture = nullptr;
     IDirect3DBaseTexture9* rightTwinTexture = nullptr;
-    if (!gInStereoReplay
+    if (SUCCEEDED(result)
+        && !gInStereoReplay
         && sampler < MaxTrackedSamplers
         && (gInNativeStereoHook || gNativePostprocessFanoutActive || currentTracePhase >= 0))
     {
@@ -12429,7 +13902,7 @@ HRESULT WINAPI hookedSetTexture(IDirect3DDevice9* device, DWORD sampler, IDirect
         else
             gNativePipelineStereoSamplerMask &= ~samplerBit;
     }
-    if (!gInStereoReplay)
+    if (SUCCEEDED(result) && !gInStereoReplay)
     {
         if (currentTracePhase >= 0)
         {
@@ -12519,12 +13992,116 @@ HRESULT WINAPI hookedSetTextureStageState(
     return result;
 }
 
-void installDeviceHooks(IDirect3DDevice9* device)
+bool criticalDeviceHooksIntact(IDirect3DDevice9* device)
+{
+    if (!device || !gHookedDeviceIdentity || !gHookedDeviceVtable)
+        return false;
+
+    IUnknown* identity = nullptr;
+    if (FAILED(device->QueryInterface(__uuidof(IUnknown), reinterpret_cast<void**>(&identity)))
+        || !identity)
+    {
+        gCriticalDeviceHooksReady = false;
+        return false;
+    }
+    const bool identityMatches = identity == gHookedDeviceIdentity;
+    identity->Release();
+    void** vtable = *reinterpret_cast<void***>(device);
+    if (!identityMatches || vtable != gHookedDeviceVtable)
+    {
+        gCriticalDeviceHooksReady = false;
+        return false;
+    }
+
+    struct RequiredHook
+    {
+        UINT slot;
+        void* function;
+    };
+    const RequiredHook required[] {
+        { 16, reinterpret_cast<void*>(&hookedReset) },
+        { 17, reinterpret_cast<void*>(&hookedPresent) },
+        { 23, reinterpret_cast<void*>(&hookedCreateTexture) },
+        { 28, reinterpret_cast<void*>(&hookedCreateRenderTarget) },
+        { 29, reinterpret_cast<void*>(&hookedCreateDepthStencilSurface) },
+        { 30, reinterpret_cast<void*>(&hookedUpdateSurface) },
+        { 31, reinterpret_cast<void*>(&hookedUpdateTexture) },
+        { 34, reinterpret_cast<void*>(&hookedStretchRect) },
+        { 35, reinterpret_cast<void*>(&hookedColorFill) },
+        { 37, reinterpret_cast<void*>(&hookedSetRenderTarget) },
+        { 39, reinterpret_cast<void*>(&hookedSetDepthStencilSurface) },
+        { 60, reinterpret_cast<void*>(&hookedBeginStateBlock) },
+        { 61, reinterpret_cast<void*>(&hookedEndStateBlock) },
+        { 42, reinterpret_cast<void*>(&hookedEndScene) },
+        { 43, reinterpret_cast<void*>(&hookedClear) },
+        { 44, reinterpret_cast<void*>(&hookedSetTransform) },
+        { 46, reinterpret_cast<void*>(&hookedMultiplyTransform) },
+        { 65, reinterpret_cast<void*>(&hookedSetTexture) },
+        { 67, reinterpret_cast<void*>(&hookedSetTextureStageState) },
+        { 81, reinterpret_cast<void*>(&hookedDrawPrimitive) },
+        { 82, reinterpret_cast<void*>(&hookedDrawIndexedPrimitive) },
+        { 83, reinterpret_cast<void*>(&hookedDrawPrimitiveUP) },
+        { 84, reinterpret_cast<void*>(&hookedDrawIndexedPrimitiveUP) },
+        { 85, reinterpret_cast<void*>(&hookedProcessVertices) },
+        { 92, reinterpret_cast<void*>(&hookedSetVertexShader) },
+        { 94, reinterpret_cast<void*>(&hookedSetVertexShaderConstantF) },
+        { 107, reinterpret_cast<void*>(&hookedSetPixelShader) },
+        { 115, reinterpret_cast<void*>(&hookedDrawRectPatch) },
+        { 116, reinterpret_cast<void*>(&hookedDrawTriPatch) },
+        { 118, reinterpret_cast<void*>(&hookedCreateQuery) }
+    };
+    static_assert(sizeof(required) / sizeof(required[0]) < 64, "critical hook mask overflow");
+    std::uint64_t currentMask = 0;
+    __try
+    {
+        for (UINT index = 0; index < sizeof(required) / sizeof(required[0]); ++index)
+        {
+            if (vtable[required[index].slot] == required[index].function)
+                currentMask |= (std::uint64_t { 1 } << index);
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        currentMask = 0;
+    }
+    const std::uint64_t expectedMask =
+        (std::uint64_t { 1 } << (sizeof(required) / sizeof(required[0]))) - 1u;
+    gCriticalDeviceHookMask = currentMask;
+    gExpectedCriticalDeviceHookMask = expectedMask;
+    gCriticalDeviceHooksReady = currentMask == expectedMask;
+    return gCriticalDeviceHooksReady;
+}
+
+bool installDeviceHooks(IDirect3DDevice9* device)
 {
     if (!device)
-        return;
+        return false;
 
     void** vtable = *reinterpret_cast<void***>(device);
+    IUnknown* deviceIdentity = nullptr;
+    if (FAILED(device->QueryInterface(
+            __uuidof(IUnknown), reinterpret_cast<void**>(&deviceIdentity)))
+        || !deviceIdentity)
+    {
+        return false;
+    }
+    if (gHookedDeviceIdentity && gHookedDeviceIdentity != deviceIdentity)
+    {
+        deviceIdentity->Release();
+        gCriticalDeviceHooksReady = false;
+        logLine("critical D3D9 hook install rejected: a second device identity appeared");
+        return false;
+    }
+    if (!gHookedDeviceIdentity)
+        gHookedDeviceIdentity = deviceIdentity;
+    else
+        deviceIdentity->Release();
+    if (gHookedDeviceVtable && gHookedDeviceVtable != vtable)
+    {
+        gCriticalDeviceHooksReady = false;
+        logLine("critical D3D9 hook install rejected: a second device vtable appeared");
+        return false;
+    }
     if (!gRealReset
         && patchVTableSlot(vtable, 16, reinterpret_cast<void*>(&hookedReset), reinterpret_cast<void**>(&gRealReset)))
     {
@@ -12585,6 +14162,13 @@ void installDeviceHooks(IDirect3DDevice9* device)
         logLine("hooked IDirect3DDevice9::StretchRect");
     }
 
+    if (!gRealColorFill
+        && patchVTableSlot(
+            vtable, 35, reinterpret_cast<void*>(&hookedColorFill), reinterpret_cast<void**>(&gRealColorFill)))
+    {
+        logLine("hooked IDirect3DDevice9::ColorFill");
+    }
+
     if (!gRealSetRenderTarget
         && patchVTableSlot(
             vtable, 37, reinterpret_cast<void*>(&hookedSetRenderTarget), reinterpret_cast<void**>(&gRealSetRenderTarget)))
@@ -12600,6 +14184,26 @@ void installDeviceHooks(IDirect3DDevice9* device)
             reinterpret_cast<void**>(&gRealSetDepthStencilSurface)))
     {
         logLine("hooked IDirect3DDevice9::SetDepthStencilSurface");
+    }
+
+    if (!gRealBeginStateBlock
+        && patchVTableSlot(
+            vtable,
+            60,
+            reinterpret_cast<void*>(&hookedBeginStateBlock),
+            reinterpret_cast<void**>(&gRealBeginStateBlock)))
+    {
+        logLine("hooked IDirect3DDevice9::BeginStateBlock");
+    }
+
+    if (!gRealEndStateBlock
+        && patchVTableSlot(
+            vtable,
+            61,
+            reinterpret_cast<void*>(&hookedEndStateBlock),
+            reinterpret_cast<void**>(&gRealEndStateBlock)))
+    {
+        logLine("hooked IDirect3DDevice9::EndStateBlock");
     }
 
     if (!gRealEndScene
@@ -12619,6 +14223,16 @@ void installDeviceHooks(IDirect3DDevice9* device)
             vtable, 44, reinterpret_cast<void*>(&hookedSetTransform), reinterpret_cast<void**>(&gRealSetTransform)))
     {
         logLine("hooked IDirect3DDevice9::SetTransform");
+    }
+
+    if (!gRealMultiplyTransform
+        && patchVTableSlot(
+            vtable,
+            46,
+            reinterpret_cast<void*>(&hookedMultiplyTransform),
+            reinterpret_cast<void**>(&gRealMultiplyTransform)))
+    {
+        logLine("hooked IDirect3DDevice9::MultiplyTransform");
     }
 
     if (!gRealSetVertexShader
@@ -12695,7 +14309,108 @@ void installDeviceHooks(IDirect3DDevice9* device)
         logLine("hooked IDirect3DDevice9::DrawIndexedPrimitiveUP");
     }
 
+
+    if (!gRealProcessVertices
+        && patchVTableSlot(
+            vtable,
+            85,
+            reinterpret_cast<void*>(&hookedProcessVertices),
+            reinterpret_cast<void**>(&gRealProcessVertices)))
+    {
+        logLine("hooked IDirect3DDevice9::ProcessVertices");
+    }
+
+    if (!gRealDrawRectPatch
+        && patchVTableSlot(
+            vtable,
+            115,
+            reinterpret_cast<void*>(&hookedDrawRectPatch),
+            reinterpret_cast<void**>(&gRealDrawRectPatch)))
+    {
+        logLine("hooked IDirect3DDevice9::DrawRectPatch");
+    }
+
+    if (!gRealDrawTriPatch
+        && patchVTableSlot(
+            vtable,
+            116,
+            reinterpret_cast<void*>(&hookedDrawTriPatch),
+            reinterpret_cast<void**>(&gRealDrawTriPatch)))
+    {
+        logLine("hooked IDirect3DDevice9::DrawTriPatch");
+    }
+
+    if (!gRealCreateQuery
+        && patchVTableSlot(
+            vtable,
+            118,
+            reinterpret_cast<void*>(&hookedCreateQuery),
+            reinterpret_cast<void**>(&gRealCreateQuery)))
+    {
+        logLine("hooked IDirect3DDevice9::CreateQuery");
+    }
+
     installNativeStereoEngineHook(device);
+
+    struct RequiredHook
+    {
+        UINT slot;
+        void* function;
+    };
+    const RequiredHook required[] {
+        { 16, reinterpret_cast<void*>(&hookedReset) },
+        { 17, reinterpret_cast<void*>(&hookedPresent) },
+        { 23, reinterpret_cast<void*>(&hookedCreateTexture) },
+        { 28, reinterpret_cast<void*>(&hookedCreateRenderTarget) },
+        { 29, reinterpret_cast<void*>(&hookedCreateDepthStencilSurface) },
+        { 30, reinterpret_cast<void*>(&hookedUpdateSurface) },
+        { 31, reinterpret_cast<void*>(&hookedUpdateTexture) },
+        { 34, reinterpret_cast<void*>(&hookedStretchRect) },
+        { 35, reinterpret_cast<void*>(&hookedColorFill) },
+        { 37, reinterpret_cast<void*>(&hookedSetRenderTarget) },
+        { 39, reinterpret_cast<void*>(&hookedSetDepthStencilSurface) },
+        { 60, reinterpret_cast<void*>(&hookedBeginStateBlock) },
+        { 61, reinterpret_cast<void*>(&hookedEndStateBlock) },
+        { 42, reinterpret_cast<void*>(&hookedEndScene) },
+        { 43, reinterpret_cast<void*>(&hookedClear) },
+        { 44, reinterpret_cast<void*>(&hookedSetTransform) },
+        { 46, reinterpret_cast<void*>(&hookedMultiplyTransform) },
+        { 65, reinterpret_cast<void*>(&hookedSetTexture) },
+        { 67, reinterpret_cast<void*>(&hookedSetTextureStageState) },
+        { 81, reinterpret_cast<void*>(&hookedDrawPrimitive) },
+        { 82, reinterpret_cast<void*>(&hookedDrawIndexedPrimitive) },
+        { 83, reinterpret_cast<void*>(&hookedDrawPrimitiveUP) },
+        { 84, reinterpret_cast<void*>(&hookedDrawIndexedPrimitiveUP) },
+        { 85, reinterpret_cast<void*>(&hookedProcessVertices) },
+        { 92, reinterpret_cast<void*>(&hookedSetVertexShader) },
+        { 94, reinterpret_cast<void*>(&hookedSetVertexShaderConstantF) },
+        { 107, reinterpret_cast<void*>(&hookedSetPixelShader) },
+        { 115, reinterpret_cast<void*>(&hookedDrawRectPatch) },
+        { 116, reinterpret_cast<void*>(&hookedDrawTriPatch) },
+        { 118, reinterpret_cast<void*>(&hookedCreateQuery) }
+    };
+    static_assert(sizeof(required) / sizeof(required[0]) < 64, "critical hook mask overflow");
+    std::uint64_t installedMask = 0;
+    for (UINT index = 0; index < sizeof(required) / sizeof(required[0]); ++index)
+    {
+        if (vtable[required[index].slot] == required[index].function)
+            installedMask |= (std::uint64_t { 1 } << index);
+    }
+    const std::uint64_t expectedMask =
+        (std::uint64_t { 1 } << (sizeof(required) / sizeof(required[0]))) - 1u;
+    gHookedDeviceVtable = vtable;
+    gCriticalDeviceHookMask = installedMask;
+    gExpectedCriticalDeviceHookMask = expectedMask;
+    gCriticalDeviceHooksReady = installedMask == expectedMask;
+    char integrity[256] {};
+    sprintf_s(
+        integrity,
+        "critical D3D9 hook mask installed=0x%016llx expected=0x%016llx ready=%d",
+        static_cast<unsigned long long>(installedMask),
+        static_cast<unsigned long long>(expectedMask),
+        gCriticalDeviceHooksReady ? 1 : 0);
+    logLine(integrity);
+    return gCriticalDeviceHooksReady;
 }
 
 bool buildLogPath(char* path, size_t pathSize, const char* leafName)
@@ -12768,6 +14483,10 @@ void loadStereoConfig()
     if (gIpdGameUnits <= 0.0f || gIpdGameUnits > 12.0f)
         gIpdGameUnits = gIpdMeters * gGameUnitsPerMeter;
     const bool stereoWorldEnabled = stereoWorldRuntimeEnabled();
+    if (stereoWorldRuntimeRequested() && !StereoWorldProductionProofComplete)
+    {
+        logLine("stereo world runtime hard-blocked in D3D9: structural production proof incomplete");
+    }
     gNativeSingleTraversalReplayEnabled =
         stereoWorldEnabled
         && readEnvBool("FNVXR_D3D9_NATIVE_SINGLE_TRAVERSAL_REPLAY", true);
@@ -12832,8 +14551,26 @@ void loadStereoConfig()
     }
 }
 
+BOOL CALLBACK initializeD3D9ProxyOnce(PINIT_ONCE, PVOID, PVOID*)
+{
+    loadStereoConfig();
+    logLine("fnvxr d3d9 proxy initialized outside loader lock");
+    return TRUE;
+}
+
+bool ensureD3D9ProxyInitialized()
+{
+    return InitOnceExecuteOnce(
+        &gD3D9ProxyInitializeOnce,
+        initializeD3D9ProxyOnce,
+        nullptr,
+        nullptr) != FALSE;
+}
+
 bool loadRealD3D9()
 {
+    if (!ensureD3D9ProxyInitialized())
+        return false;
     if (gRealD3D9)
         return true;
 
@@ -12890,6 +14627,11 @@ public:
             return S_OK;
         }
 
+        if (stereoProofModeArmed())
+        {
+            logLine("Direct3D9 QueryInterface rejected: interface is outside the stereo proof");
+            return E_NOINTERFACE;
+        }
         return mReal->QueryInterface(riid, out);
     }
 
@@ -13008,6 +14750,16 @@ public:
         IDirect3DDevice9** returnedDevice) override
     {
         forceImmediatePresentation(presentationParameters, "CreateDevice");
+        gDeviceBehaviorFlags = behaviorFlags;
+        if (stereoProofModeArmed() && (behaviorFlags & D3DCREATE_MULTITHREADED) != 0)
+        {
+            if (returnedDevice)
+                *returnedDevice = nullptr;
+            logLine("CreateDevice rejected: D3DCREATE_MULTITHREADED is outside the single-owner stereo proof");
+            return D3DERR_NOTAVAILABLE_RESULT;
+        }
+        gPrimaryBackBufferLockable = presentationParameters
+            && (presentationParameters->Flags & D3DPRESENTFLAG_LOCKABLE_BACKBUFFER) != 0;
         char message[256] {};
         if (presentationParameters)
         {
@@ -13031,8 +14783,15 @@ public:
         const HRESULT result = mReal->CreateDevice(
             adapter, deviceType, focusWindow, behaviorFlags, presentationParameters, returnedDevice);
         logLine(SUCCEEDED(result) ? "CreateDevice succeeded" : "CreateDevice failed");
-        if (SUCCEEDED(result) && returnedDevice && *returnedDevice)
-            installDeviceHooks(*returnedDevice);
+        if (SUCCEEDED(result) && returnedDevice && *returnedDevice
+            && !installDeviceHooks(*returnedDevice)
+            && stereoProofModeArmed())
+        {
+            (*returnedDevice)->Release();
+            *returnedDevice = nullptr;
+            logLine("CreateDevice rejected: critical stereo hook mask incomplete");
+            return D3DERR_NOTAVAILABLE_RESULT;
+        }
         return result;
     }
 
@@ -13044,6 +14803,8 @@ private:
 
 extern "C" IDirect3D9* WINAPI FNVXR_Direct3DCreate9(UINT sdkVersion)
 {
+    if (!ensureD3D9ProxyInitialized())
+        return nullptr;
     logLine("Direct3DCreate9 called");
     if (!loadRealD3D9())
         return nullptr;
@@ -13069,10 +14830,18 @@ extern "C" IDirect3D9* WINAPI FNVXR_Direct3DCreate9(UINT sdkVersion)
 
 extern "C" HRESULT WINAPI FNVXR_Direct3DCreate9Ex(UINT sdkVersion, IDirect3D9Ex** out)
 {
+    if (!ensureD3D9ProxyInitialized())
+        return D3DERR_NOTAVAILABLE_RESULT;
     logLine("Direct3DCreate9Ex called");
     if (!out)
         return E_POINTER;
     *out = nullptr;
+
+    if (stereoProofModeArmed())
+    {
+        logLine("Direct3DCreate9Ex rejected: Ex vtable is not covered by the stereo proof");
+        return D3DERR_NOTAVAILABLE_RESULT;
+    }
 
     if (!loadRealD3D9() || !gRealDirect3DCreate9Ex)
         return D3DERR_NOTAVAILABLE_RESULT;
@@ -13148,6 +14917,13 @@ extern "C" void WINAPI FNVXR_Direct3D9EnableMaximizedWindowedModeShim(BOOL enabl
 
 extern "C" HRESULT WINAPI FNVXR_Direct3DCreate9On12(UINT sdkVersion, void* overrideList, UINT overrideCount, IDirect3D9** out)
 {
+    if (stereoProofModeArmed())
+    {
+        if (out)
+            *out = nullptr;
+        logLine("Direct3DCreate9On12 rejected: On12 is not covered by the stereo proof");
+        return D3DERR_NOTAVAILABLE_RESULT;
+    }
     if (auto fn = resolve<Direct3DCreate9On12Fn>("Direct3DCreate9On12"))
         return fn(sdkVersion, overrideList, overrideCount, out);
     if (out)
@@ -13157,6 +14933,13 @@ extern "C" HRESULT WINAPI FNVXR_Direct3DCreate9On12(UINT sdkVersion, void* overr
 
 extern "C" HRESULT WINAPI FNVXR_Direct3DCreate9On12Ex(UINT sdkVersion, void* overrideList, UINT overrideCount, IDirect3D9Ex** out)
 {
+    if (stereoProofModeArmed())
+    {
+        if (out)
+            *out = nullptr;
+        logLine("Direct3DCreate9On12Ex rejected: On12Ex is not covered by the stereo proof");
+        return D3DERR_NOTAVAILABLE_RESULT;
+    }
     if (auto fn = resolve<Direct3DCreate9On12ExFn>("Direct3DCreate9On12Ex"))
         return fn(sdkVersion, overrideList, overrideCount, out);
     if (out)
@@ -13189,21 +14972,15 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
     {
         DisableThreadLibraryCalls(module);
         QueryPerformanceFrequency(&gPerfFrequency);
-        logLine("fnvxr d3d9 proxy attached");
-        loadStereoConfig();
     }
     else if (reason == DLL_PROCESS_DETACH)
     {
-        releaseStereoTargets();
-        releaseSharedVideo();
-        releaseSharedStereo();
-        releaseSharedWorldVideo();
-        releaseSharedVrOriginPublisher();
-        releaseSharedVrPose();
-        releaseSharedCamera();
-        releaseSharedRuntime();
-        releaseSharedPlayer();
-        logLine("fnvxr d3d9 proxy detached");
+        // DllMain runs under the loader lock and may be called on a thread
+        // other than the render/producer owner. COM release, logging, mapping
+        // publication, and ReleaseMutex are all forbidden here. This proxy is
+        // process-lifetime; Windows reclaims handles/address space on process
+        // termination, and retained mappings are invalidated transactionally
+        // by the next named-lease owner.
     }
     return TRUE;
 }

@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <string>
 
 namespace
@@ -136,6 +137,24 @@ int main(int argc, char** argv)
     options.periodMs = (std::max)(1, options.periodMs);
     options.durationSeconds = (std::max)(0, options.durationSeconds);
 
+    HANDLE producerMutex = CreateMutexA(
+        nullptr, TRUE, fnvxr::shared::InputCoreProducerMutexName);
+    if (!producerMutex)
+    {
+        std::cerr << "CreateMutex failed error=" << GetLastError() << "\n";
+        return 1;
+    }
+    if (GetLastError() == ERROR_ALREADY_EXISTS)
+    {
+        const DWORD wait = WaitForSingleObject(producerMutex, 0);
+        if (wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED)
+        {
+            std::cerr << "live host owns the input/pose producer lease\n";
+            CloseHandle(producerMutex);
+            return 1;
+        }
+    }
+
     HANDLE mapping = CreateFileMappingA(
         INVALID_HANDLE_VALUE,
         nullptr,
@@ -146,6 +165,8 @@ int main(int argc, char** argv)
     if (!mapping)
     {
         std::cerr << "CreateFileMapping failed error=" << GetLastError() << "\n";
+        ReleaseMutex(producerMutex);
+        CloseHandle(producerMutex);
         return 1;
     }
     const bool mappingAlreadyExisted = GetLastError() == ERROR_ALREADY_EXISTS;
@@ -155,6 +176,8 @@ int main(int argc, char** argv)
     {
         std::cerr << "MapViewOfFile failed error=" << GetLastError() << "\n";
         CloseHandle(mapping);
+        ReleaseMutex(producerMutex);
+        CloseHandle(producerMutex);
         return 1;
     }
 
@@ -174,18 +197,36 @@ int main(int argc, char** argv)
         state->leftEyeRot[3] = 1.0f;
         state->rightEyeRot[3] = 1.0f;
     }
-    else if ((state->sequence & 1) != 0)
+    const bool inheritedOddWrite = existingStateUsable && (state->sequence & 1) != 0;
+    const std::uint64_t previousProducerEpoch = existingStateUsable
+        ? static_cast<std::uint64_t>(InterlockedCompareExchange64(
+            reinterpret_cast<volatile LONG64*>(&state->producerEpoch), 0, 0))
+        : 0;
+    if (previousProducerEpoch == (std::numeric_limits<std::uint64_t>::max)())
     {
-        // The previous synthetic writer may have been terminated inside a
-        // write.  Restore the even/stable convention without resetting the
-        // consumer's already-latched origin or monotonic frame number.
-        InterlockedIncrement(&state->sequence);
+        std::cerr << "pose fixture producer epoch exhausted\n";
+        UnmapViewOfFile(state);
+        CloseHandle(mapping);
+        ReleaseMutex(producerMutex);
+        CloseHandle(producerMutex);
+        return 1;
     }
+    const std::uint64_t producerEpoch = existingStateUsable
+        ? previousProducerEpoch + 1u
+        : 1u;
     float rotation[4] {};
     quaternionFromEuler(options, rotation);
     const float halfIpd = static_cast<float>(options.ipdMeters * 0.5);
     const ULONGLONG started = GetTickCount64();
-    std::uint64_t frame = existingStateUsable ? state->frame : 0;
+    // An inherited odd sequence means the previous producer may have torn any
+    // payload field, including frame.  The first recovery write owns that odd
+    // sequence until the complete payload is replaced, so it must not derive
+    // the new lineage from a possibly torn frame value.
+    std::uint64_t frame = existingStateUsable && !inheritedOddWrite
+        ? static_cast<std::uint64_t>(InterlockedCompareExchange64(
+            reinterpret_cast<volatile LONG64*>(&state->frame), 0, 0))
+        : 0;
+    bool ownsInheritedOddWrite = inheritedOddWrite;
 
     std::cout
         << "pose fixture ready mapping=" << MappingName
@@ -199,12 +240,20 @@ int main(int argc, char** argv)
     while (options.durationSeconds == 0
         || GetTickCount64() - started < static_cast<ULONGLONG>(options.durationSeconds) * 1000ull)
     {
-        InterlockedIncrement(&state->sequence);
-        MemoryBarrier();
+        if (!ownsInheritedOddWrite
+            && !fnvxr::shared::beginSequencedSharedWrite(state->sequence))
+        {
+            std::cerr << "pose fixture could not acquire shared write sequence\n";
+            break;
+        }
         state->magic = fnvxr::shared::VrPoseSharedMagic;
         state->version = fnvxr::shared::VrPoseSharedVersion;
         state->referenceSpaceGeneration = 1;
-        state->producerEpoch = 1;
+        InterlockedExchange64(
+            reinterpret_cast<volatile LONG64*>(&state->producerEpoch),
+            static_cast<LONG64>(producerEpoch));
+        state->recenterRequestId = 0;
+        state->reserved = static_cast<std::uint32_t>(GetTickCount64());
         state->trackingFlags =
             fnvxr::shared::VrPoseTrackingHmd
             | fnvxr::shared::VrPoseTrackingLeftGripActive
@@ -238,12 +287,14 @@ int main(int argc, char** argv)
         const float fov[4] { -0.9f, 0.9f, 0.9f, -0.9f };
         std::memcpy(state->leftFov, fov, sizeof(fov));
         std::memcpy(state->rightFov, fov, sizeof(fov));
-        MemoryBarrier();
-        InterlockedIncrement(&state->sequence);
+        fnvxr::shared::endSequencedSharedWrite(state->sequence);
+        ownsInheritedOddWrite = false;
         Sleep(static_cast<DWORD>(options.periodMs));
     }
 
     UnmapViewOfFile(state);
     CloseHandle(mapping);
+    ReleaseMutex(producerMutex);
+    CloseHandle(producerMutex);
     return 0;
 }

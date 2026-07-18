@@ -28,21 +28,53 @@ function Test-ShaderClipPositionDataFlow {
     # to a tracked temporary/oPos component clears that component, so dead
     # writes and later overwrites cannot accidentally certify a shader.
     $provenance = @{}
+    $registerGeneration = @{}
     foreach ($rawLine in ($Dump -split "`r?`n")) {
         $line = $rawLine.Trim()
         if ([string]::IsNullOrWhiteSpace($line) -or $line.StartsWith('//')) {
             continue
         }
 
+        # This verifier deliberately proves only straight-line shader code.
+        # Any predicate/control flow would require a CFG must-definition proof;
+        # accepting it with linear provenance lets an untaken branch or later
+        # predicated overwrite counterfeit a complete oPos chain.
+        if ($line -match '^(?:\(p\d+\)\s*)' -or
+            $line -match '^(?:if|ifc|else|endif|loop|endloop|rep|endrep|call|callnz|label|ret|break|breakc|breakp)\b' -or
+            $line -match '\bc\s*\[') {
+            return $false
+        }
+
+        # A shader-local float constant overrides the corresponding value from
+        # SetVertexShaderConstantF. Reject only declarations overlapping the
+        # claimed four-row range; unrelated c#, integer i#, and boolean b#
+        # declarations cannot shadow these float rows.
+        $localFloat = [regex]::Match($line, '^def\s+c(?<register>\d+)\s*,')
+        if ($localFloat.Success) {
+            $localRegister = [int]$localFloat.Groups['register'].Value
+            if ($localRegister -ge $StartRegister -and
+                $localRegister -lt ($StartRegister + 4)) {
+                return $false
+            }
+        }
+
         $instruction = [regex]::Match(
             $line,
             '^(?<opcode>[a-zA-Z][a-zA-Z0-9_]*)\s+(?<register>oPos|r\d+)(?:\.(?<mask>[xyzw]{1,4}))?(?:\s*,\s*(?<operands>.*))?$')
         if (-not $instruction.Success) {
+            # A syntactically unsupported destination write cannot be ignored:
+            # it may overwrite a tracked temporary or clip position.
+            if ($line -match '^[+\-]?[a-zA-Z][a-zA-Z0-9_]*\s+(?:oPos|r\d+)(?:\.[xyzw]{1,4})?\s*,') {
+                return $false
+            }
             continue
         }
 
         $opcode = $instruction.Groups['opcode'].Value.ToLowerInvariant()
         $destination = $instruction.Groups['register'].Value.ToLowerInvariant()
+        if ($destination -match '^r\d+$') {
+            $registerGeneration[$destination] = 1 + [int]($registerGeneration[$destination])
+        }
         $mask = $instruction.Groups['mask'].Value
         $destinationComponents = @(Get-ShaderDestinationComponents -Mask $mask)
         foreach ($component in $destinationComponents) {
@@ -60,7 +92,7 @@ function Test-ShaderClipPositionDataFlow {
             for ($index = 0; $index -lt 2; $index++) {
                 $constant = [regex]::Match(
                     $operands[$index],
-                    '^c(?<register>\d+)(?:\.[xyzw]{1,4})?$')
+                    '^c(?<register>\d+)$')
                 if ($constant.Success) {
                     if ($constantIndex -ge 0) {
                         $constantIndex = -2
@@ -74,10 +106,14 @@ function Test-ShaderClipPositionDataFlow {
             if ($constantIndex -ge $StartRegister -and
                 $constantIndex -lt ($StartRegister + 4) -and
                 $sourceIndex -ge 0) {
-                $source = $operands[$sourceIndex].ToLowerInvariant() -replace '\.xyzw$', ''
+                $source = $operands[$sourceIndex].ToLowerInvariant()
                 if ($source -match '^(?:v\d+|r\d+)$') {
+                    $sourceGeneration = if ($source -match '^r\d+$') {
+                        [int]$registerGeneration[$source]
+                    }
+                    else { 0 }
                     $component = $destinationComponents[0]
-                    $provenance["$destination.$component"] = "row:$row|source:$source"
+                    $provenance["$destination.$component"] = "row:$row|source:$source@$sourceGeneration"
                 }
             }
             continue
@@ -137,6 +173,26 @@ function Test-ShaderClipPositionDataFlow {
     return $true
 }
 
+function Get-UnmodeledShaderFloatConstants {
+    param(
+        [Parameter(Mandatory = $true)] [string]$Dump,
+        [Parameter(Mandatory = $true)] [string]$ClaimedName,
+        [Parameter(Mandatory = $true)] [int]$ClaimedStartRegister
+    )
+    $unmodeled = [System.Collections.Generic.List[string]]::new()
+    foreach ($match in [regex]::Matches(
+        $Dump,
+        '(?m)^\s*//\s+(?<name>[A-Za-z_][A-Za-z0-9_]*)\s+c(?<register>\d+)\s+(?<count>\d+)\s*$')) {
+        $name = $match.Groups['name'].Value
+        $register = [int]$match.Groups['register'].Value
+        $count = [int]$match.Groups['count'].Value
+        if ($name -ne $ClaimedName -or $register -ne $ClaimedStartRegister -or $count -ne 4) {
+            $unmodeled.Add("$name@c$register+$count")
+        }
+    }
+    return @($unmodeled)
+}
+
 # Adversarial parser fixtures execute on every invocation. They prevent a
 # future regex simplification from accepting unrelated temporaries, partial
 # xy writes, or an oPos overwrite after a seemingly valid matrix multiply.
@@ -165,11 +221,72 @@ dp4 oPos.z, c6, v0
 dp4 oPos.w, c7, v0
 mov oPos, r9
 '@
+$conditionalFixture = @'
+if b0
+dp4 oPos.x, c4, v0
+dp4 oPos.y, c5, v0
+dp4 oPos.z, c6, v0
+dp4 oPos.w, c7, v0
+endif
+'@
+$predicatedOverwriteFixture = @'
+dp4 oPos.x, c4, v0
+dp4 oPos.y, c5, v0
+dp4 oPos.z, c6, v0
+dp4 oPos.w, c7, v0
+(p0) mov oPos, r9
+'@
+$rowSwizzleFixture = @'
+dp4 oPos.x, c4.xxxx, v0
+dp4 oPos.y, c5.yyyy, v0
+dp4 oPos.z, c6.zzzz, v0
+dp4 oPos.w, c7.wwww, v0
+'@
+$sourceRedefinitionFixture = @'
+dp4 oPos.x, c4, r0
+mov r0, v1
+dp4 oPos.y, c5, r0
+dp4 oPos.z, c6, r0
+dp4 oPos.w, c7, r0
+'@
+$localConstantFixture = @'
+def c4, 1.0, 0.0, 0.0, 0.0
+def c5, 0.0, 1.0, 0.0, 0.0
+def c6, 0.0, 0.0, 1.0, 0.0
+def c7, 0.0, 0.0, 0.0, 1.0
+dp4 oPos.x, c4, v0
+dp4 oPos.y, c5, v0
+dp4 oPos.z, c6, v0
+dp4 oPos.w, c7, v0
+'@
+$viewDependentConstantFixture = @'
+// ModelViewProj c4 4
+// EyePosition c16 1
+// WorldView c36 3
+dp4 oPos.x, c4, v0
+dp4 oPos.y, c5, v0
+dp4 oPos.z, c6, v0
+dp4 oPos.w, c7, v0
+add r1.xyz, -v0, c16
+dp3 oT3.x, r1, c36
+'@
 if (-not (Test-ShaderClipPositionDataFlow -Dump $positiveDataFlowFixture -StartRegister 4) -or
     (Test-ShaderClipPositionDataFlow -Dump $unrelatedTemporaryFixture -StartRegister 4) -or
     (Test-ShaderClipPositionDataFlow -Dump $partialFixture -StartRegister 4) -or
-    (Test-ShaderClipPositionDataFlow -Dump $overwriteFixture -StartRegister 4)) {
+    (Test-ShaderClipPositionDataFlow -Dump $overwriteFixture -StartRegister 4) -or
+    (Test-ShaderClipPositionDataFlow -Dump $conditionalFixture -StartRegister 4) -or
+    (Test-ShaderClipPositionDataFlow -Dump $predicatedOverwriteFixture -StartRegister 4) -or
+    (Test-ShaderClipPositionDataFlow -Dump $rowSwizzleFixture -StartRegister 4) -or
+    (Test-ShaderClipPositionDataFlow -Dump $sourceRedefinitionFixture -StartRegister 4) -or
+    (Test-ShaderClipPositionDataFlow -Dump $localConstantFixture -StartRegister 4)) {
     throw "Internal shader oPos xyzw data-flow fixtures failed"
+}
+$unmodeledViewConstants = @(Get-UnmodeledShaderFloatConstants `
+    -Dump $viewDependentConstantFixture -ClaimedName 'ModelViewProj' -ClaimedStartRegister 4)
+if ($unmodeledViewConstants.Count -ne 2 -or
+    $unmodeledViewConstants -notcontains 'EyePosition@c16+1' -or
+    $unmodeledViewConstants -notcontains 'WorldView@c36+3') {
+    throw "Internal unmodeled view-dependent constant fixture failed"
 }
 if ($SelfTestOnly) {
     [pscustomobject]@{
@@ -178,6 +295,13 @@ if ($SelfTestOnly) {
         UnrelatedTemporariesRejected = $true
         PartialXyRejected = $true
         FinalOverwriteRejected = $true
+        ConditionalWriteRejected = $true
+        PredicatedOverwriteRejected = $true
+        ConstantRowSwizzleRejected = $true
+        SourceRedefinitionRejected = $true
+        LocalShaderConstantsRejected = $true
+        UnmodeledViewConstantsRejected = $true
+        ProductionVsPsPairGateClosed = $true
     }
     return
 }
@@ -314,8 +438,12 @@ foreach ($discovery in $discoveries) {
         if (-not (Test-ShaderClipPositionDataFlow -Dump $dump -StartRegister $register)) {
             throw "Shader $sha declares $name at c$register but does not prove a complete, unoverwritten oPos.xyzw data-flow chain from c$register-c$($register + 3)"
         }
-        $contracts.Add(("{0}/{1}/{2}@{3}@column" -f $fnv, $sha, $expectedBytes, $register))
-        continue
+        $unmodeledConstants = @(Get-UnmodeledShaderFloatConstants `
+            -Dump $dump -ClaimedName $name -ClaimedStartRegister $register)
+        if ($unmodeledConstants.Count -gt 0) {
+            throw "Shader $sha has unmodeled float constants ($($unmodeledConstants -join ', ')); clip-position WVP patching cannot certify per-eye shading"
+        }
+        throw "Shader $sha proves only clip-position data flow. Production contracts require exact VS+PS pair identity, all view-dependent varying semantics, and engine camera/model upload provenance; refusing an unsafe WVP-only contract."
     }
 
     $isScreenGeometry = $dump -match '(?m)^\s*//\s+float4\s+geometryOffset;\s*$' -and

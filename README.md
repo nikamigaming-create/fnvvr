@@ -19,47 +19,51 @@ ignored directories.
 
 - `FalloutNV.exe` owns simulation, saves, quests, collision, menus, weapons,
   projectiles, hit tests, and animation state.
-- `nvse_fnvxr.dll` owns in-process engine discovery, guarded transform/input
-  changes, runtime/UI classification, and retail telemetry.
-- `d3d9.dll` owns retail frame capture and the work toward complete same-frame
-  left/right world rendering.
+- The in-process engine backend owns exact-version discovery, guarded world
+  scheduling, retail camera/weapon application, UI classification, and
+  authoritative telemetry.
+- `d3d9.dll` retains mono retail UI capture and graphics interop. Per-draw D3D
+  replay is not the production stereo renderer.
 - The standalone OpenXR host owns headset/controller actions, frame timing,
-  VR composition, the flat retail UI surface, and debug visualization.
+  VR composition, the stable retail UI quad, and debug visualization. It opens
+  accepted GPU-shared eye color/depth resources; it does not receive a CPU
+  pixel ring.
 - Same-machine fixed-size shared mappings carry poses, input intent, retail
-  state, commands, and complete frame surfaces. There is no second game
-  runtime and no network transport.
+  state, commands, and versioned transaction/resource metadata. There is no
+  second game runtime and no network transport.
 
 The presentation contract has two modes:
 
-- Gameplay may enter native stereo only when retail reports an unobstructed
-  world state and the render hook publishes a valid complete eye pair.
-- Startup menus, pause/menu mode, inventory, Pip-Boy, dialogue, VATS, loading,
-  and any other retail UI state stay on a flat mono surface. Native stereo is
-  suppressed until retail proves it is safely back in gameplay.
+- All non-blocking gameplay, exploration, combat, and world interaction require
+  true binocular 3D, independent 6DoF head motion, a tracked retail weapon,
+  and no persistent gameplay HUD. Mono gameplay is never accepted as success.
+- Startup, pause, inventory, barter, terminals, dialogue, VATS, loading,
+  Pip-Boy, and other blocking retail UI use the stable mono quad. The
+  controller ray drives the ordinary retail mouse pointer and click path.
+- Leaving UI holds the last valid quad until one fresh, complete, pose-matched
+  stereo transaction is ready, then changes to world stereo atomically.
 
 ## Current Status
 
-The repository includes the playable retail flat-screen-in-headset baseline,
-live OpenXR pose streaming, xNVSE state/input plumbing, controller mappings,
-flat retail UI presentation and input plumbing, D3D9 capture/replay
-diagnostics, FABRIK arm work, and retail skeleton/weapon-node discovery.
+The retained per-D3D-draw replay and CPU readback/ring work is diagnostic only;
+it is a production NO-GO. **Every live OpenXR presentation path and every
+retail mutation path is currently source-blocked.** The installed plugin is
+inert by default, and config or environment variables cannot bypass the fuse.
 
-Three headset-critical behaviors are not signed off yet:
+Read-only inspection of the loaded retail `1.4.0.525` executable has verified
+the world-render boundary, explicit visible-array culling, and separate
+accumulator render/finalize primitives. The clean replacement is therefore a
+bounded engine transaction: build one conservative union visible set, render
+it through fresh non-aliased left/right accumulators with each eye's complete
+camera/color/depth/auxiliary state bound before population, restore retail
+state, then publish GPU-native resources atomically.
 
-- The native camera now composes the fully recentered HMD transform on the
-  body-local side and renders one union-frustum Gamebryo traversal. This needs
-  one live headset acceptance run; the previous flat run is not 3D evidence.
-- The right OpenXR aim pose now reaches right-hand IK as a separate,
-  validity-flagged orientation source. It does not yet drive the weapon node,
-  muzzle, projectile, or hit ray.
-- Retained cell-transition telemetry proves that two stateful full-engine eye
-  traversals can submit materially different scene work. Production stereo no
-  longer uses that path: one exact D3D9 draw stream is replayed into both eyes,
-  with explicit single-traversal provenance and live acceptance gates.
-
-Native same-frame stereo world presentation also remains active development.
-See `docs/status.md` and `docs/next-steps.md` for the current proof boundary and
-acceptance gates.
+The remaining implementation is the production engine backend, GPU-native
+color/depth transport and OpenXR submission, authoritative weapon/muzzle
+alignment, and full retail/headset acceptance. The launcher remains blocked
+until those gates pass. See `docs/architecture-v2.md` for the production
+contract, `docs/status.md` for the verified boundary, and `docs/next-steps.md`
+for acceptance gates.
 
 ## Layout
 
@@ -69,6 +73,7 @@ acceptance gates.
 - `host/` - standalone OpenXR host and probes.
 - `scripts/` - build, staging, retail launch, probe, and audit entrypoints.
 - `docs/experiment-brief.md` - process split and authority boundary.
+- `docs/architecture-v2.md` - production stereo transaction and GPU transport.
 - `docs/next-steps.md` - practical retail camera, weapon, UI, and stereo plan.
 - `docs/status.md` - current proof results and live-test blockers.
 - `docs/prop-layer-plan.md` - retail hands, weapon, pointer, and UI plan.
@@ -112,10 +117,12 @@ Write a combined local preflight report:
 .\scripts\preflight-fnvxr.ps1
 ```
 
-Launch the retail/OpenXR path through the guarded launcher:
+Only stage or validate artifacts through the guarded launcher; there is no
+authorized headset launch command in the current tree:
 
 ```powershell
-.\scripts\start-openxr-retail-sidecar.ps1
+.\scripts\start-openxr-retail-sidecar.ps1 -StageOnly
+.\scripts\start-openxr-retail-sidecar.ps1 -ValidateOnly
 ```
 
 ## Design Rules

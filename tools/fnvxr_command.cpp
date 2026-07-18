@@ -16,11 +16,10 @@ namespace
 {
 using fnvxr::shared::SharedCommandState;
 
-constexpr const char* CommandMapName = "Local\\FNVXR_Command_State";
-
 struct CommandMapping
 {
     HANDLE handle = nullptr;
+    HANDLE writerMutex = nullptr;
     SharedCommandState* state = nullptr;
 
     ~CommandMapping()
@@ -29,8 +28,45 @@ struct CommandMapping
             UnmapViewOfFile(state);
         if (handle)
             CloseHandle(handle);
+        if (writerMutex)
+            CloseHandle(writerMutex);
     }
 };
+
+bool acquireCommandWriter(const CommandMapping& mapping, DWORD timeoutMilliseconds = 2000)
+{
+    if (!mapping.writerMutex)
+        return false;
+    const DWORD wait = WaitForSingleObject(mapping.writerMutex, timeoutMilliseconds);
+    return wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED;
+}
+
+void releaseCommandWriter(const CommandMapping& mapping)
+{
+    if (mapping.writerMutex)
+        ReleaseMutex(mapping.writerMutex);
+}
+
+void repairOrInitializeCommandState(SharedCommandState* state)
+{
+    if (!state)
+        return;
+    if (state->magic != fnvxr::shared::CommandSharedMagic
+        || state->version != fnvxr::shared::CommandSharedVersion)
+    {
+        std::memset(state, 0, sizeof(*state));
+        state->magic = fnvxr::shared::CommandSharedMagic;
+        state->version = fnvxr::shared::CommandSharedVersion;
+        state->status = fnvxr::shared::CommandStatusIdle;
+        return;
+    }
+    if ((state->sequence & 1) != 0)
+    {
+        state->status = fnvxr::shared::CommandStatusFailed;
+        state->resultCode = ERROR_OPERATION_ABORTED;
+        fnvxr::shared::endSequencedSharedWrite(state->sequence);
+    }
+}
 
 int fail(const char* message)
 {
@@ -109,29 +145,34 @@ std::string sanitizedConsoleLine(const std::string& input)
 
 bool openCommandMapping(CommandMapping& mapping)
 {
+    mapping.writerMutex = CreateMutexA(
+        nullptr, FALSE, fnvxr::shared::CommandWriterMutexName);
+    if (!mapping.writerMutex || !acquireCommandWriter(mapping))
+        return false;
+
     mapping.handle = CreateFileMappingA(
         INVALID_HANDLE_VALUE,
         nullptr,
         PAGE_READWRITE,
         0,
         sizeof(SharedCommandState),
-        CommandMapName);
+        fnvxr::shared::CommandSharedMappingName);
     if (!mapping.handle)
+    {
+        releaseCommandWriter(mapping);
         return false;
+    }
 
     mapping.state = static_cast<SharedCommandState*>(
         MapViewOfFile(mapping.handle, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(SharedCommandState)));
     if (!mapping.state)
-        return false;
-
-    if (mapping.state->magic != fnvxr::shared::CommandSharedMagic
-        || mapping.state->version != fnvxr::shared::CommandSharedVersion)
     {
-        std::memset(mapping.state, 0, sizeof(*mapping.state));
-        mapping.state->magic = fnvxr::shared::CommandSharedMagic;
-        mapping.state->version = fnvxr::shared::CommandSharedVersion;
-        mapping.state->status = fnvxr::shared::CommandStatusIdle;
+        releaseCommandWriter(mapping);
+        return false;
     }
+
+    repairOrInitializeCommandState(mapping.state);
+    releaseCommandWriter(mapping);
     return true;
 }
 
@@ -162,12 +203,35 @@ std::uint32_t submitCommand(
     std::uint32_t command,
     const std::string& saveName)
 {
+    if (!acquireCommandWriter(mapping))
+    {
+        std::cerr << "command writer mutex timed out\n";
+        return 0;
+    }
+    repairOrInitializeCommandState(mapping.state);
     SharedCommandState snapshot {};
-    readSnapshot(mapping.state, snapshot);
+    if (!readSnapshot(mapping.state, snapshot))
+    {
+        releaseCommandWriter(mapping);
+        std::cerr << "command mailbox snapshot was unstable\n";
+        return 0;
+    }
+    if (snapshot.status == fnvxr::shared::CommandStatusPending
+        || snapshot.status == fnvxr::shared::CommandStatusRunning)
+    {
+        releaseCommandWriter(mapping);
+        std::cerr << "command mailbox is busy requestId=" << snapshot.requestId
+                  << " status=" << statusName(snapshot.status) << "\n";
+        return 0;
+    }
 
     const std::uint32_t requestId = nextRequestId(snapshot.requestId);
-    InterlockedIncrement(&mapping.state->sequence);
-    MemoryBarrier();
+    if (!fnvxr::shared::beginSequencedSharedWrite(mapping.state->sequence))
+    {
+        releaseCommandWriter(mapping);
+        std::cerr << "command mailbox write sequence could not be acquired\n";
+        return 0;
+    }
     mapping.state->magic = fnvxr::shared::CommandSharedMagic;
     mapping.state->version = fnvxr::shared::CommandSharedVersion;
     mapping.state->requestId = requestId;
@@ -183,9 +247,9 @@ std::uint32_t submitCommand(
         strcpy_s(mapping.state->saveName, sanitizedSaveName(saveName).c_str());
     else if (command == fnvxr::shared::CommandTypeConsole)
         strcpy_s(mapping.state->saveName, sanitizedConsoleLine(saveName).c_str());
-    MemoryBarrier();
-    InterlockedIncrement(&mapping.state->sequence);
+    fnvxr::shared::endSequencedSharedWrite(mapping.state->sequence);
     FlushViewOfFile(mapping.state, sizeof(*mapping.state));
+    releaseCommandWriter(mapping);
 
     std::cout
         << "requested command=" << commandName(command)
@@ -230,6 +294,8 @@ int sendAndMaybeWait(
     DWORD waitMs)
 {
     const std::uint32_t requestId = submitCommand(mapping, command, saveName);
+    if (requestId == 0)
+        return 5;
     return waitForCompletion(mapping, requestId, waitMs);
 }
 }
@@ -277,7 +343,7 @@ int main(int argc, char** argv)
 
     CommandMapping mapping;
     if (!openCommandMapping(mapping))
-        return fail("failed to open Local\\FNVXR_Command_State");
+        return fail("failed to open versioned FNVXR command mailbox");
 
     if (verb == "save")
         return sendAndMaybeWait(mapping, fnvxr::shared::CommandTypeSave, payload, waitMs);

@@ -18,6 +18,7 @@ constexpr const char* InputMapName = "Local\\FNVXR_Input_Events";
 struct InputMapping
 {
     HANDLE handle = nullptr;
+    HANDLE writerMutex = nullptr;
     SharedInputEventQueue* queue = nullptr;
 
     ~InputMapping()
@@ -26,6 +27,8 @@ struct InputMapping
             UnmapViewOfFile(queue);
         if (handle)
             CloseHandle(handle);
+        if (writerMutex)
+            CloseHandle(writerMutex);
     }
 };
 
@@ -47,6 +50,16 @@ void usage()
 
 bool openInputMapping(InputMapping& mapping)
 {
+    mapping.writerMutex = CreateMutexA(
+        nullptr,
+        FALSE,
+        fnvxr::shared::InputEventWriterMutexName);
+    if (!mapping.writerMutex)
+        return false;
+    const DWORD writerWait = WaitForSingleObject(mapping.writerMutex, 2000);
+    if (writerWait != WAIT_OBJECT_0 && writerWait != WAIT_ABANDONED)
+        return false;
+
     mapping.handle = CreateFileMappingA(
         INVALID_HANDLE_VALUE,
         nullptr,
@@ -55,12 +68,18 @@ bool openInputMapping(InputMapping& mapping)
         sizeof(SharedInputEventQueue),
         InputMapName);
     if (!mapping.handle)
+    {
+        ReleaseMutex(mapping.writerMutex);
         return false;
+    }
 
     mapping.queue = static_cast<SharedInputEventQueue*>(
         MapViewOfFile(mapping.handle, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(SharedInputEventQueue)));
     if (!mapping.queue)
+    {
+        ReleaseMutex(mapping.writerMutex);
         return false;
+    }
 
     if (mapping.queue->magic != fnvxr::shared::InputEventSharedMagic
         || mapping.queue->version != fnvxr::shared::InputEventSharedVersion)
@@ -69,6 +88,8 @@ bool openInputMapping(InputMapping& mapping)
         mapping.queue->magic = fnvxr::shared::InputEventSharedMagic;
         mapping.queue->version = fnvxr::shared::InputEventSharedVersion;
     }
+    InterlockedExchange(&mapping.queue->writeLock, 0);
+    ReleaseMutex(mapping.writerMutex);
     return true;
 }
 
@@ -82,22 +103,30 @@ bool publishInputEvent(
     if (!queue)
         return false;
 
-    std::uint32_t spins = 0;
-    while (InterlockedCompareExchange(&queue->writeLock, 1, 0) != 0)
+    // Every writer holds the same abandoned-detecting role mutex, so a dead
+    // process cannot leave the queue permanently locked.
+    HANDLE writerMutex = CreateMutexA(
+        nullptr,
+        FALSE,
+        fnvxr::shared::InputEventWriterMutexName);
+    if (!writerMutex)
+        return false;
+    const DWORD writerWait = WaitForSingleObject(writerMutex, 2000);
+    if (writerWait != WAIT_OBJECT_0 && writerWait != WAIT_ABANDONED)
     {
-        if (++spins > 1024)
-        {
-            InterlockedIncrement(&queue->droppedEvents);
-            return false;
-        }
-        Sleep(0);
+        CloseHandle(writerMutex);
+        InterlockedIncrement(&queue->droppedEvents);
+        return false;
     }
+    InterlockedExchange(&queue->writeLock, 1);
 
-    const LONG sequence = queue->writeSequence + 1;
+    std::uint32_t sequence = fnvxr::shared::sequencedValueBits(queue->writeSequence) + 1u;
+    if (sequence == 0u)
+        sequence = 1u;
     const std::uint32_t index =
-        static_cast<std::uint32_t>(sequence - 1) & (fnvxr::shared::InputEventQueueLength - 1u);
+        (sequence - 1u) & (fnvxr::shared::InputEventQueueLength - 1u);
     auto& event = queue->events[index];
-    event.sequence = 0;
+    InterlockedExchange(&event.sequence, 0);
     event.type = type;
     event.code = code;
     event.value0 = value0;
@@ -105,14 +134,18 @@ bool publishInputEvent(
     event.flags = 0;
     event.frame = 0;
     MemoryBarrier();
-    event.sequence = static_cast<std::uint32_t>(sequence);
+    LONG publishedSequence = 0;
+    std::memcpy(&publishedSequence, &sequence, sizeof(publishedSequence));
+    InterlockedExchange(&event.sequence, publishedSequence);
     MemoryBarrier();
-    queue->writeSequence = sequence;
+    InterlockedExchange(&queue->writeSequence, publishedSequence);
     InterlockedExchange(&queue->writeLock, 0);
+    ReleaseMutex(writerMutex);
+    CloseHandle(writerMutex);
     FlushViewOfFile(queue, sizeof(*queue));
 
     std::cout
-        << "published seq=" << sequence
+        << "published seq=" << static_cast<unsigned long>(sequence)
         << " type=" << type
         << " code=" << code
         << " value=" << value0 << "," << value1 << "\n";

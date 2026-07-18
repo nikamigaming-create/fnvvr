@@ -5,6 +5,7 @@
 #include "fnvxr_shared_state.h"
 
 #include <cstdlib>
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
@@ -66,6 +67,15 @@ bool validateSharedHeader(const char* mapName, UInt32 expectedMagic, UInt32 expe
     return header.magic == expectedMagic && header.version == expectedVersion;
 }
 
+bool mappingAbsent(const char* mapName)
+{
+    HANDLE mapping = OpenFileMappingA(FILE_MAP_READ, FALSE, mapName);
+    if (!mapping)
+        return GetLastError() == ERROR_FILE_NOT_FOUND;
+    CloseHandle(mapping);
+    return false;
+}
+
 PluginHandle testPluginHandle()
 {
     return 11;
@@ -76,6 +86,51 @@ int fail(const char* message)
     std::cerr << message << "\n";
     return 1;
 }
+
+template <typename State>
+bool createHostOwnedFixture(
+    const char* mapName,
+    UInt32 magic,
+    UInt32 version,
+    HANDLE& mapping,
+    State*& view,
+    std::array<std::uint8_t, sizeof(State)>& before)
+{
+    mapping = CreateFileMappingA(
+        INVALID_HANDLE_VALUE,
+        nullptr,
+        PAGE_READWRITE,
+        0,
+        sizeof(State),
+        mapName);
+    if (!mapping)
+        return false;
+    view = static_cast<State*>(MapViewOfFile(
+        mapping,
+        FILE_MAP_READ | FILE_MAP_WRITE,
+        0,
+        0,
+        sizeof(State)));
+    if (!view)
+        return false;
+
+    std::memset(view, 0, sizeof(State));
+    view->magic = magic;
+    view->version = version;
+    view->sequence = 2;
+    std::memset(
+        reinterpret_cast<std::uint8_t*>(view) + sizeof(State) / 2,
+        0x5a,
+        sizeof(State) - sizeof(State) / 2);
+    std::memcpy(before.data(), view, sizeof(State));
+    return true;
+}
+
+template <typename State>
+bool fixtureUnchanged(const State* view, const std::array<std::uint8_t, sizeof(State)>& before)
+{
+    return view && std::memcmp(view, before.data(), sizeof(State)) == 0;
+}
 }
 
 int main(int argc, char** argv)
@@ -85,6 +140,44 @@ int main(int argc, char** argv)
 
     try
     {
+        // XInput, DInput, and VR pose are host-owned. The plugin is a reader
+        // and must neither create nor initialize them. Supply sentinel records
+        // exactly as the host would and prove plugin load leaves every byte
+        // unchanged.
+        HANDLE xinputMapping = nullptr;
+        HANDLE dinputMapping = nullptr;
+        HANDLE poseMapping = nullptr;
+        SharedXInputState* xinputView = nullptr;
+        SharedDInputState* dinputView = nullptr;
+        SharedVrPoseState* poseView = nullptr;
+        std::array<std::uint8_t, sizeof(SharedXInputState)> xinputBefore {};
+        std::array<std::uint8_t, sizeof(SharedDInputState)> dinputBefore {};
+        std::array<std::uint8_t, sizeof(SharedVrPoseState)> poseBefore {};
+        if (!createHostOwnedFixture(
+                fnvxr::shared::XInputSharedMappingName,
+                fnvxr::shared::XInputSharedMagic,
+                fnvxr::shared::XInputSharedVersion,
+                xinputMapping,
+                xinputView,
+                xinputBefore)
+            || !createHostOwnedFixture(
+                fnvxr::shared::DInputSharedMappingName,
+                fnvxr::shared::DInputSharedMagic,
+                fnvxr::shared::DInputSharedVersion,
+                dinputMapping,
+                dinputView,
+                dinputBefore)
+            || !createHostOwnedFixture(
+                fnvxr::shared::VrPoseSharedMappingName,
+                fnvxr::shared::VrPoseSharedMagic,
+                fnvxr::shared::VrPoseSharedVersion,
+                poseMapping,
+                poseView,
+                poseBefore))
+        {
+            return fail("host-owned fixture creation failed");
+        }
+
         HMODULE plugin = LoadLibraryA(argv[1]);
         if (!plugin)
             return fail("LoadLibraryA failed");
@@ -109,25 +202,32 @@ int main(int argc, char** argv)
         if (!load(&nvse))
             return fail("load failed");
 
+        if (!fixtureUnchanged(xinputView, xinputBefore)
+            || !fixtureUnchanged(dinputView, dinputBefore)
+            || !fixtureUnchanged(poseView, poseBefore))
+        {
+            return fail("plugin mutated a host-owned input/pose mapping");
+        }
+
         if (!validateSharedHeader<SharedXInputState>(fnvxr::shared::XInputSharedMappingName, fnvxr::shared::XInputSharedMagic, fnvxr::shared::XInputSharedVersion))
             return fail("xinput shared map missing or invalid");
         if (!validateSharedHeader<SharedDInputState>(fnvxr::shared::DInputSharedMappingName, fnvxr::shared::DInputSharedMagic, fnvxr::shared::DInputSharedVersion))
             return fail("dinput shared map missing or invalid");
         if (!validateSharedHeader<SharedVrPoseState>(fnvxr::shared::VrPoseSharedMappingName, fnvxr::shared::VrPoseSharedMagic, fnvxr::shared::VrPoseSharedVersion))
             return fail("vr pose shared map missing or invalid");
-        if (!validateSharedHeader<SharedCameraState>("Local\\FNVXR_Camera_State", fnvxr::shared::CameraSharedMagic, fnvxr::shared::CameraSharedVersion))
-            return fail("camera shared map missing or invalid");
-        if (!validateSharedHeader<SharedRuntimeState>("Local\\FNVXR_Runtime_State", fnvxr::shared::RuntimeSharedMagic, fnvxr::shared::RuntimeSharedVersion))
-            return fail("runtime shared map missing or invalid");
-        if (!validateSharedHeader<SharedPlayerState>("Local\\FNVXR_Player_State", fnvxr::shared::PlayerSharedMagic, fnvxr::shared::PlayerSharedVersion))
-            return fail("player shared map missing or invalid");
-        if (!validateSharedHeader<SharedCommandState>("Local\\FNVXR_Command_State", fnvxr::shared::CommandSharedMagic, fnvxr::shared::CommandSharedVersion))
-            return fail("command shared map missing or invalid");
-        if (!validateSharedHeader<SharedInputEventQueue>("Local\\FNVXR_Input_Events", fnvxr::shared::InputEventSharedMagic, fnvxr::shared::InputEventSharedVersion))
-            return fail("input event shared map missing or invalid");
+        if (!mappingAbsent("Local\\FNVXR_Camera_State")
+            || !mappingAbsent("Local\\FNVXR_Runtime_State")
+            || !mappingAbsent("Local\\FNVXR_Player_State")
+            || !mappingAbsent(fnvxr::shared::CommandSharedMappingName)
+            || !mappingAbsent("Local\\FNVXR_Input_Events"))
+        {
+            return fail("source-fused plugin created a plugin-owned shared mapping");
+        }
 
-        FreeLibrary(plugin);
-        std::cout << "nvse bridge shared-memory init ok\n";
+        // The plugin is process-lifetime and deliberately does no loader-lock
+        // cleanup. Do not dynamically unload it; normal process teardown owns
+        // all handles and mappings.
+        std::cout << "nvse plugin is inert while retail mutation is source-fused\n";
         return 0;
     }
     catch (const std::exception& error)

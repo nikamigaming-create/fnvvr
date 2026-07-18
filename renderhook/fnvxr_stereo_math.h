@@ -1,12 +1,44 @@
 #pragma once
 
+#include "../protocol/fnvxr_shared_state.h"
+
+#ifdef min
+#undef min
+#endif
+#ifdef max
+#undef max
+#endif
+
 #include <algorithm>
 #include <cstdint>
 #include <cmath>
 #include <limits>
+#if defined(_MSC_VER) && (defined(_M_IX86) || defined(_M_X64))
+#include <xmmintrin.h>
+#endif
 
 namespace fnvxr::stereo
 {
+struct ScopedIeeeSubnormalMode
+{
+#if defined(_MSC_VER) && (defined(_M_IX86) || defined(_M_X64))
+    unsigned int saved = 0;
+    ScopedIeeeSubnormalMode()
+        : saved(_mm_getcsr())
+    {
+        // Clear DAZ (bit 6) and FTZ (bit 15). The outward interval proof is
+        // valid for IEEE subnormal arithmetic, not process-global flush mode.
+        _mm_setcsr(saved & ~(0x0040u | 0x8000u));
+    }
+    ~ScopedIeeeSubnormalMode()
+    {
+        _mm_setcsr(saved);
+    }
+#else
+    ScopedIeeeSubnormalMode() = default;
+#endif
+};
+
 constexpr float DefaultIpdMeters = 0.064f;
 // Fallout 3/New Vegas GECK geometry uses approximately 7 units per 10 cm
 // (64 units per yard), not one unit per inch.
@@ -79,9 +111,14 @@ struct ViewProjectionDelta
 {
     Matrix4 matrix {};
     double referenceMatrix[4][4] {};
+    double centerMatrix[4][4] {};
+    double eyeMatrix[4][4] {};
+    double inverseCenterMatrix[4][4] {};
     double inverseResidual = std::numeric_limits<double>::infinity();
+    double inverseResidualNorm = std::numeric_limits<double>::infinity();
     double reconstructionResidual = std::numeric_limits<double>::infinity();
     double normalizedReconstructionResidual = std::numeric_limits<double>::infinity();
+    bool exactIdentity = false;
     bool valid = false;
 };
 
@@ -96,6 +133,7 @@ struct EyeBaselineValidation
 {
     Vector3 headLocalMeters {};
     float lengthMeters = 0.0f;
+    float midpointDistanceMeters = 0.0f;
     bool valid = false;
 };
 
@@ -110,6 +148,18 @@ inline bool isFinite(const Matrix4& matrix)
         }
     }
     return true;
+}
+
+inline bool certifiedStereoTextureMayBeSampled(
+    bool drawFullscreen,
+    bool useCertifiedStereoTextures,
+    bool hasStereoFrame,
+    bool stereoFrameSeparated)
+{
+    return drawFullscreen
+        && useCertifiedStereoTextures
+        && hasStereoFrame
+        && stereoFrameSeparated;
 }
 
 inline Quaternion normalized(Quaternion value)
@@ -338,9 +388,11 @@ inline EyeBaselineValidation validateEyeBaseline(
     const Quaternion& currentHeadOrientation,
     const Vector3& leftEyePosition,
     const Vector3& rightEyePosition,
+    const Vector3& headPosition = {},
     float minimumMeters = 0.03f,
     float maximumMeters = 0.12f,
-    float minimumLateralFraction = 0.8f)
+    float minimumLateralFraction = 0.8f,
+    float maximumMidpointDistanceMeters = 0.25f)
 {
     EyeBaselineValidation result {};
     result.headLocalMeters = vectorInOriginFrame(currentHeadOrientation, {
@@ -352,9 +404,20 @@ inline EyeBaselineValidation validateEyeBaseline(
         result.headLocalMeters.x * result.headLocalMeters.x
         + result.headLocalMeters.y * result.headLocalMeters.y
         + result.headLocalMeters.z * result.headLocalMeters.z);
+    const Vector3 midpointOffset {
+        (leftEyePosition.x + rightEyePosition.x) * 0.5f - headPosition.x,
+        (leftEyePosition.y + rightEyePosition.y) * 0.5f - headPosition.y,
+        (leftEyePosition.z + rightEyePosition.z) * 0.5f - headPosition.z
+    };
+    result.midpointDistanceMeters = std::sqrt(
+        midpointOffset.x * midpointOffset.x
+        + midpointOffset.y * midpointOffset.y
+        + midpointOffset.z * midpointOffset.z);
     result.valid = std::isfinite(result.lengthMeters)
+        && std::isfinite(result.midpointDistanceMeters)
         && result.lengthMeters >= minimumMeters
         && result.lengthMeters <= maximumMeters
+        && result.midpointDistanceMeters <= maximumMidpointDistanceMeters
         && result.headLocalMeters.x > 0.0f
         && result.headLocalMeters.x >= result.lengthMeters * minimumLateralFraction;
     return result;
@@ -424,13 +487,57 @@ inline PerspectiveCullFrustum conservativeCenterCullFrustum(
     float farDistance)
 {
     PerspectiveCullFrustum result {};
-    if (!std::isfinite(nearDistance)
+    constexpr double MaximumInputMagnitude = 1000000.0;
+    if (!eyes
+        || !std::isfinite(nearDistance)
         || !std::isfinite(farDistance)
-        || nearDistance <= 0.0f
-        || farDistance <= nearDistance)
+        || nearDistance < 0.01f
+        || farDistance <= nearDistance
+        || farDistance > MaximumInputMagnitude)
     {
         return result;
     }
+
+    const auto finiteBoundedVector = [=](const Vector3& value) {
+        return std::isfinite(value.x) && std::isfinite(value.y) && std::isfinite(value.z)
+            && std::fabs(static_cast<double>(value.x)) <= MaximumInputMagnitude
+            && std::fabs(static_cast<double>(value.y)) <= MaximumInputMagnitude
+            && std::fabs(static_cast<double>(value.z)) <= MaximumInputMagnitude;
+    };
+    const auto properRotation = [](const Matrix3& value) {
+        for (const auto& row : value.m)
+            for (float entry : row)
+                if (!std::isfinite(entry) || std::fabs(entry) > 1.0001f)
+                    return false;
+        constexpr double OrthonormalTolerance = 0.002;
+        for (int row = 0; row < 3; ++row)
+        {
+            for (int other = 0; other < 3; ++other)
+            {
+                double dot = 0.0;
+                for (int column = 0; column < 3; ++column)
+                    dot += static_cast<double>(value.m[row][column])
+                        * static_cast<double>(value.m[other][column]);
+                const double expected = row == other ? 1.0 : 0.0;
+                if (std::fabs(dot - expected) > OrthonormalTolerance)
+                    return false;
+            }
+        }
+        const double determinant =
+            static_cast<double>(value.m[0][0])
+                * (static_cast<double>(value.m[1][1]) * value.m[2][2]
+                    - static_cast<double>(value.m[1][2]) * value.m[2][1])
+            - static_cast<double>(value.m[0][1])
+                * (static_cast<double>(value.m[1][0]) * value.m[2][2]
+                    - static_cast<double>(value.m[1][2]) * value.m[2][0])
+            + static_cast<double>(value.m[0][2])
+                * (static_cast<double>(value.m[1][0]) * value.m[2][1]
+                    - static_cast<double>(value.m[1][1]) * value.m[2][0]);
+        return std::isfinite(determinant)
+            && std::fabs(determinant - 1.0) <= 0.004;
+    };
+    if (!properRotation(centerRotation) || !finiteBoundedVector(centerPosition))
+        return result;
 
     double left = std::numeric_limits<double>::infinity();
     double right = -std::numeric_limits<double>::infinity();
@@ -446,12 +553,21 @@ inline PerspectiveCullFrustum conservativeCenterCullFrustum(
     for (int eyeIndex = 0; eyeIndex < 2; ++eyeIndex)
     {
         const EyeCullFrustum& eye = eyes[eyeIndex];
-        if (!std::isfinite(eye.left)
+        if (!properRotation(eye.rotation)
+            || !finiteBoundedVector(eye.position)
+            || !std::isfinite(eye.left)
             || !std::isfinite(eye.right)
             || !std::isfinite(eye.top)
             || !std::isfinite(eye.bottom)
             || eye.right <= eye.left
-            || eye.top <= eye.bottom)
+            || eye.top <= eye.bottom
+            || std::fabs(eye.left) > 10.0f
+            || std::fabs(eye.right) > 10.0f
+            || std::fabs(eye.top) > 10.0f
+            || std::fabs(eye.bottom) > 10.0f
+            || std::fabs(static_cast<double>(eye.position.x) - centerPosition.x) > 1000.0
+            || std::fabs(static_cast<double>(eye.position.y) - centerPosition.y) > 1000.0
+            || std::fabs(static_cast<double>(eye.position.z) - centerPosition.z) > 1000.0)
         {
             return result;
         }
@@ -497,10 +613,18 @@ inline PerspectiveCullFrustum conservativeCenterCullFrustum(
                     const double x = originInCenter[0] + rotated[0];
                     const double y = originInCenter[1] + rotated[1];
                     const double forward = -(originInCenter[2] + rotated[2]);
+                    // A corner whose forward component is arbitrarily close
+                    // to zero has an unbounded, ill-conditioned perspective
+                    // slope.  Real headset frusta stay well inside this 0.01
+                    // cosine floor; rejecting the singular fringe supplies a
+                    // denominator bound for the outward-rounding proof below.
+                    const double minimumConditionedForward = (std::max)(
+                        0.000001,
+                        std::fabs(static_cast<double>(depth)) * 0.01);
                     if (!std::isfinite(x)
                         || !std::isfinite(y)
                         || !std::isfinite(forward)
-                        || forward <= 0.000001)
+                        || forward <= minimumConditionedForward)
                     {
                         return result;
                     }
@@ -531,8 +655,21 @@ inline PerspectiveCullFrustum conservativeCenterCullFrustum(
         return result;
     }
 
-    const float negativeInfinity = -std::numeric_limits<float>::infinity();
-    const float positiveInfinity = std::numeric_limits<float>::infinity();
+    constexpr float negativeInfinity = -std::numeric_limits<float>::infinity();
+    constexpr float positiveInfinity = std::numeric_limits<float>::infinity();
+    // Double-precision dot products can suffer cancellation even though every
+    // source value is a float. Expand by a bounded relative envelope before
+    // the final outward float rounding. The input magnitude limits above make
+    // this envelope far larger than the worst accumulated roundoff of these
+    // fixed-size (three-term) products while remaining visually negligible.
+    const double maximumSlopeMagnitude = (std::max)(
+        (std::max)(std::fabs(left), std::fabs(right)),
+        (std::max)(std::fabs(top), std::fabs(bottom)));
+    const double slopeEnvelope = 0.00001 * (1.0 + maximumSlopeMagnitude);
+    left -= slopeEnvelope;
+    right += slopeEnvelope;
+    bottom -= slopeEnvelope;
+    top += slopeEnvelope;
     // Round every float boundary outward. Round-to-nearest can move a bound
     // inward by one ULP and invalidate the word "conservative."
     result.left = std::nextafter(static_cast<float>(left), negativeInfinity);
@@ -541,7 +678,16 @@ inline PerspectiveCullFrustum conservativeCenterCullFrustum(
     result.bottom = std::nextafter(static_cast<float>(bottom), negativeInfinity);
     result.nearDistance = std::nextafter(static_cast<float>(minimumForward), 0.0f);
     result.farDistance = std::nextafter(static_cast<float>(maximumForward), positiveInfinity);
-    result.valid = true;
+    result.valid = std::isfinite(result.left)
+        && std::isfinite(result.right)
+        && std::isfinite(result.top)
+        && std::isfinite(result.bottom)
+        && std::isfinite(result.nearDistance)
+        && std::isfinite(result.farDistance)
+        && result.left < result.right
+        && result.bottom < result.top
+        && result.nearDistance > 0.0f
+        && result.nearDistance < result.farDistance;
     return result;
 }
 
@@ -595,6 +741,7 @@ inline ViewProjectionDelta makeViewProjectionDelta(
     const Matrix4& eyeViewProjection,
     bool columnVector)
 {
+    const ScopedIeeeSubnormalMode ieeeSubnormalMode {};
     ViewProjectionDelta result {};
     bool identical = true;
     for (int row = 0; row < 4; ++row)
@@ -608,13 +755,19 @@ inline ViewProjectionDelta makeViewProjectionDelta(
             {
                 return result;
             }
+            result.centerMatrix[row][column] =
+                static_cast<double>(centerViewProjection.m[row][column]);
+            result.eyeMatrix[row][column] =
+                static_cast<double>(eyeViewProjection.m[row][column]);
             identical = identical
                 && centerViewProjection.m[row][column] == eyeViewProjection.m[row][column];
         }
     }
     if (identical)
     {
+        result.exactIdentity = true;
         result.inverseResidual = 0.0;
+        result.inverseResidualNorm = 0.0;
         result.reconstructionResidual = 0.0;
         result.normalizedReconstructionResidual = 0.0;
         result.valid = true;
@@ -675,7 +828,10 @@ inline ViewProjectionDelta makeViewProjectionDelta(
     double inverse[4][4] {};
     for (int row = 0; row < 4; ++row)
         for (int column = 0; column < 4; ++column)
+        {
             inverse[row][column] = work[row][column + 4];
+            result.inverseCenterMatrix[row][column] = inverse[row][column];
+        }
 
     double inverseResidual = 0.0;
     for (int order = 0; order < 2; ++order)
@@ -739,12 +895,15 @@ inline ViewProjectionDelta makeViewProjectionDelta(
     }
 
     result.inverseResidual = inverseResidual;
+    result.inverseResidualNorm = inverseResidual * 4.0;
     result.reconstructionResidual = reconstructionResidual;
     result.normalizedReconstructionResidual = reconstructionResidual / (std::max)(1.0, eyeScale);
     result.valid = std::isfinite(result.inverseResidual)
         && std::isfinite(result.reconstructionResidual)
+        && std::isfinite(result.inverseResidualNorm)
         && std::isfinite(result.normalizedReconstructionResidual)
         && result.inverseResidual <= 0.00001
+        && result.inverseResidualNorm < 1.0
         && result.reconstructionResidual <= 0.01
         && result.normalizedReconstructionResidual <= 0.000001;
     return result;
@@ -759,6 +918,7 @@ inline Matrix4 applyViewProjectionDelta(
     const Matrix4& viewProjectionDelta,
     bool columnVector)
 {
+    const ScopedIeeeSubnormalMode ieeeSubnormalMode {};
     if (columnVector)
         return multiply(viewProjectionDelta, originalMvp);
     return multiply(originalMvp, viewProjectionDelta);
@@ -766,8 +926,9 @@ inline Matrix4 applyViewProjectionDelta(
 
 // The D*C ~= E gate above proves the camera factor, but a large draw-local
 // model matrix can amplify float error when the actual D*O (or O*D) upload is
-// formed. Compare that final float upload to the same operation using the
-// retained double-precision delta and reject before touching shader state.
+// formed. Recover the draw-local model factor, reconstruct it through C, and
+// carry the inverse-residual uncertainty through E. Comparing only against
+// the same approximate inverse would launder its error.
 inline ViewProjectionPatchValidation validateAppliedViewProjectionDelta(
     const Matrix4& originalMvp,
     const Matrix4& patchedMvp,
@@ -776,39 +937,233 @@ inline ViewProjectionPatchValidation validateAppliedViewProjectionDelta(
     double maximumAbsoluteErrorAllowed = 0.01,
     double normalizedErrorAllowed = 0.0000001)
 {
+    const ScopedIeeeSubnormalMode ieeeSubnormalMode {};
     ViewProjectionPatchValidation result {};
     if (!delta.valid
+        || !std::isfinite(maximumAbsoluteErrorAllowed)
+        || !std::isfinite(normalizedErrorAllowed)
         || maximumAbsoluteErrorAllowed < 0.0
         || normalizedErrorAllowed < 0.0)
     {
         return result;
     }
 
+    // Certify the exact semantic target without comparing against the same
+    // approximate inverse used to form the patch. Every primitive operation
+    // below is enclosed with nextafter, so the interval contains the exact
+    // real operation on the binary input values under IEEE round-to-nearest.
+    struct OutwardInterval
+    {
+        double lower = 0.0;
+        double upper = 0.0;
+    };
+    const double negativeInfinity = -std::numeric_limits<double>::infinity();
+    const double positiveInfinity = std::numeric_limits<double>::infinity();
+    const auto downward = [negativeInfinity](double value) {
+        return std::isfinite(value) ? std::nextafter(value, negativeInfinity) : value;
+    };
+    const auto upward = [positiveInfinity](double value) {
+        return std::isfinite(value) ? std::nextafter(value, positiveInfinity) : value;
+    };
+    const auto exactInterval = [](double value) {
+        return OutwardInterval { value, value };
+    };
+    const auto addIntervals = [&](OutwardInterval lhs, OutwardInterval rhs) {
+        return OutwardInterval {
+            downward(lhs.lower + rhs.lower),
+            upward(lhs.upper + rhs.upper)
+        };
+    };
+    const auto subtractIntervals = [&](OutwardInterval lhs, OutwardInterval rhs) {
+        return OutwardInterval {
+            downward(lhs.lower - rhs.upper),
+            upward(lhs.upper - rhs.lower)
+        };
+    };
+    const auto multiplyIntervals = [&](OutwardInterval lhs, OutwardInterval rhs) {
+        const double products[4] {
+            lhs.lower * rhs.lower,
+            lhs.lower * rhs.upper,
+            lhs.upper * rhs.lower,
+            lhs.upper * rhs.upper
+        };
+        double lower = positiveInfinity;
+        double upper = negativeInfinity;
+        for (double product : products)
+        {
+            if (!std::isfinite(product))
+                return OutwardInterval { negativeInfinity, positiveInfinity };
+            lower = (std::min)(lower, downward(product));
+            upper = (std::max)(upper, upward(product));
+        }
+        return OutwardInterval { lower, upper };
+    };
+    const auto divideIntervals = [&](OutwardInterval numerator, OutwardInterval denominator) {
+        if (denominator.lower <= 0.0 && denominator.upper >= 0.0)
+            return OutwardInterval { negativeInfinity, positiveInfinity };
+        const OutwardInterval reciprocal {
+            downward(1.0 / denominator.upper),
+            upward(1.0 / denominator.lower)
+        };
+        return multiplyIntervals(numerator, reciprocal);
+    };
+    const auto multiplyIntervalMatrices = [&](
+        const OutwardInterval lhs[4][4],
+        const OutwardInterval rhs[4][4],
+        OutwardInterval output[4][4]) {
+        for (int row = 0; row < 4; ++row)
+        {
+            for (int column = 0; column < 4; ++column)
+            {
+                OutwardInterval sum = exactInterval(0.0);
+                for (int inner = 0; inner < 4; ++inner)
+                    sum = addIntervals(sum, multiplyIntervals(lhs[row][inner], rhs[inner][column]));
+                output[row][column] = sum;
+            }
+        }
+    };
+    const auto intervalInfinityNormUpper = [&](const OutwardInterval matrix[4][4]) {
+        double maximum = 0.0;
+        for (int row = 0; row < 4; ++row)
+        {
+            OutwardInterval rowSum = exactInterval(0.0);
+            for (int column = 0; column < 4; ++column)
+            {
+                const double magnitude = (std::max)(
+                    std::fabs(matrix[row][column].lower),
+                    std::fabs(matrix[row][column].upper));
+                rowSum = addIntervals(rowSum, exactInterval(magnitude));
+            }
+            maximum = (std::max)(maximum, rowSum.upper);
+        }
+        return maximum;
+    };
+
+    OutwardInterval expectedMatrix[4][4] {};
+    if (delta.exactIdentity)
+    {
+        for (int row = 0; row < 4; ++row)
+            for (int column = 0; column < 4; ++column)
+                expectedMatrix[row][column] = exactInterval(originalMvp.m[row][column]);
+    }
+    else
+    {
+        OutwardInterval center[4][4] {};
+        OutwardInterval eye[4][4] {};
+        OutwardInterval inverse[4][4] {};
+        OutwardInterval original[4][4] {};
+        for (int row = 0; row < 4; ++row)
+        {
+            for (int column = 0; column < 4; ++column)
+            {
+                center[row][column] = exactInterval(delta.centerMatrix[row][column]);
+                eye[row][column] = exactInterval(delta.eyeMatrix[row][column]);
+                inverse[row][column] = exactInterval(delta.inverseCenterMatrix[row][column]);
+                original[row][column] = exactInterval(originalMvp.m[row][column]);
+            }
+        }
+
+        OutwardInterval inverseResidual[4][4] {};
+        if (columnVector)
+            multiplyIntervalMatrices(center, inverse, inverseResidual);
+        else
+            multiplyIntervalMatrices(inverse, center, inverseResidual);
+        for (int axis = 0; axis < 4; ++axis)
+        {
+            inverseResidual[axis][axis] = subtractIntervals(
+                inverseResidual[axis][axis], exactInterval(1.0));
+        }
+
+        OutwardInterval cameraDelta[4][4] {};
+        if (columnVector)
+            multiplyIntervalMatrices(eye, inverse, cameraDelta);
+        else
+            multiplyIntervalMatrices(inverse, eye, cameraDelta);
+
+        OutwardInterval reconstructionResidual[4][4] {};
+        if (columnVector)
+            multiplyIntervalMatrices(inverseResidual, original, reconstructionResidual);
+        else
+            multiplyIntervalMatrices(original, inverseResidual, reconstructionResidual);
+
+        OutwardInterval approximateExpected[4][4] {};
+        OutwardInterval firstCorrection[4][4] {};
+        if (columnVector)
+        {
+            multiplyIntervalMatrices(cameraDelta, original, approximateExpected);
+            multiplyIntervalMatrices(cameraDelta, reconstructionResidual, firstCorrection);
+        }
+        else
+        {
+            multiplyIntervalMatrices(original, cameraDelta, approximateExpected);
+            multiplyIntervalMatrices(reconstructionResidual, cameraDelta, firstCorrection);
+        }
+
+        const double residualNorm = intervalInfinityNormUpper(inverseResidual);
+        const double cameraDeltaNorm = intervalInfinityNormUpper(cameraDelta);
+        const double reconstructionNorm = intervalInfinityNormUpper(reconstructionResidual);
+        if (!std::isfinite(residualNorm)
+            || !std::isfinite(cameraDeltaNorm)
+            || !std::isfinite(reconstructionNorm)
+            || residualNorm >= 1.0)
+        {
+            return result;
+        }
+        const OutwardInterval neumannRatio = divideIntervals(
+            exactInterval(residualNorm),
+            subtractIntervals(exactInterval(1.0), exactInterval(residualNorm)));
+        const OutwardInterval remainderInterval = multiplyIntervals(
+            multiplyIntervals(exactInterval(cameraDeltaNorm), neumannRatio),
+            exactInterval(reconstructionNorm));
+        const double remainder = remainderInterval.upper;
+        if (!std::isfinite(remainder) || remainder < 0.0)
+            return result;
+
+        const OutwardInterval remainderWidth { -remainder, remainder };
+        for (int row = 0; row < 4; ++row)
+        {
+            for (int column = 0; column < 4; ++column)
+            {
+                expectedMatrix[row][column] = addIntervals(
+                    subtractIntervals(approximateExpected[row][column], firstCorrection[row][column]),
+                    remainderWidth);
+            }
+        }
+    }
+
     double maximumError = 0.0;
-    double expectedScale = 0.0;
+    double expectedScaleLowerBound = 0.0;
     for (int row = 0; row < 4; ++row)
     {
         for (int column = 0; column < 4; ++column)
         {
-            double expected = 0.0;
-            for (int inner = 0; inner < 4; ++inner)
-            {
-                expected += columnVector
-                    ? delta.referenceMatrix[row][inner]
-                        * static_cast<double>(originalMvp.m[inner][column])
-                    : static_cast<double>(originalMvp.m[row][inner])
-                        * delta.referenceMatrix[inner][column];
-            }
             const double actual = static_cast<double>(patchedMvp.m[row][column]);
-            if (!std::isfinite(expected) || !std::isfinite(actual))
+            const OutwardInterval expected = expectedMatrix[row][column];
+            if (!std::isfinite(expected.lower)
+                || !std::isfinite(expected.upper)
+                || !std::isfinite(actual)
+                || expected.lower > expected.upper)
+            {
                 return result;
-            maximumError = (std::max)(maximumError, std::fabs(actual - expected));
-            expectedScale = (std::max)(expectedScale, std::fabs(expected));
+            }
+            const double errorUpper = upward((std::max)(
+                std::fabs(actual - expected.lower),
+                std::fabs(actual - expected.upper)));
+            maximumError = (std::max)(
+                maximumError,
+                errorUpper);
+            const double entryMagnitudeLowerBound = expected.lower > 0.0
+                ? expected.lower
+                : (expected.upper < 0.0 ? -expected.upper : 0.0);
+            expectedScaleLowerBound = (std::max)(
+                expectedScaleLowerBound,
+                entryMagnitudeLowerBound);
         }
     }
 
     result.maximumAbsoluteError = maximumError;
-    result.normalizedError = maximumError / (std::max)(1.0, expectedScale);
+    result.normalizedError = upward(
+        maximumError / (std::max)(1.0, expectedScaleLowerBound));
     result.valid = std::isfinite(result.maximumAbsoluteError)
         && std::isfinite(result.normalizedError)
         && result.maximumAbsoluteError <= maximumAbsoluteErrorAllowed
@@ -895,6 +1250,58 @@ inline bool strictEyeTargetOptionalWriteLedgerComplete(long totalWrites, long pr
 inline bool singleTraversalPublishAllowed(bool singleTraversalEnabled, bool completePair)
 {
     return !singleTraversalEnabled || completePair;
+}
+
+// Count only one uninterrupted producer stream toward the stereo handoff.
+// A restarted producer can reuse a sequence value or jump backwards, and a
+// reference-space reset changes the meaning of every cached eye pose.  The
+// first coherent frame after either event starts a new run at one; it must not
+// inherit warm-up credit from the previous coordinate system.
+inline std::uint64_t nextStereoStableFrameCount(
+    std::uint64_t previousCount,
+    std::int32_t previousSequence,
+    std::int32_t currentSequence,
+    std::uint64_t previousProducerEpoch,
+    std::uint64_t currentProducerEpoch,
+    std::uint64_t previousRendererProducerEpoch,
+    std::uint64_t currentRendererProducerEpoch,
+    std::uint32_t previousReferenceGeneration,
+    std::uint32_t currentReferenceGeneration,
+    std::uint32_t previousProducerProcessId,
+    std::uint32_t currentProducerProcessId)
+{
+    if (fnvxr::shared::sequencedValueBits(currentSequence) == 0u
+        || currentProducerEpoch == 0
+        || currentRendererProducerEpoch == 0
+        || currentReferenceGeneration == 0
+        || currentProducerProcessId == 0)
+    {
+        return 0;
+    }
+
+    const bool havePreviousIdentity = previousProducerEpoch != 0
+        && previousRendererProducerEpoch != 0
+        && previousReferenceGeneration != 0
+        && previousProducerProcessId != 0;
+    const bool identityChanged = havePreviousIdentity
+        && (previousProducerEpoch != currentProducerEpoch
+            || previousRendererProducerEpoch != currentRendererProducerEpoch
+            || previousReferenceGeneration != currentReferenceGeneration
+            || previousProducerProcessId != currentProducerProcessId);
+    const bool havePreviousSequence =
+        fnvxr::shared::sequencedValueBits(previousSequence) != 0u;
+    if (!havePreviousSequence
+        || !havePreviousIdentity
+        || identityChanged
+        || !fnvxr::shared::nonzeroSharedCounterAdvanced(
+            currentSequence, previousSequence))
+    {
+        return 1;
+    }
+
+    return previousCount == (std::numeric_limits<std::uint64_t>::max)()
+        ? previousCount
+        : previousCount + 1;
 }
 
 // A projection layer without depth can only use the compositor's rotational

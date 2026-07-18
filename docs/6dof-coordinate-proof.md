@@ -110,8 +110,8 @@ Before headset use, the project still needs:
 1. A complete exact-bytecode contract set that passes the new conservative
    `xyzw` def-use trace to `oPos`, including the missing and legacy-rejected
    shader forms.
-2. Extend the new fail-closed strict-eye-target draw ledger to every clear,
-   copy, and other final-target write, with reviewed eye-invariant exclusions.
+2. Enumerate any remaining final-target write APIs and add them to the new
+   fail-closed draw/clear/copy ledgers, with reviewed eye-invariant exclusions.
 3. Strong SHA-256 plus byte-length identities and semantic evidence for any
    configured skip.
 4. Producer-only evidence that pixels stay inside the source-pose age budget.

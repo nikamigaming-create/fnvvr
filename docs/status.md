@@ -1,6 +1,6 @@
 # FNVVR Retail Status
 
-Last updated: 2026-07-12
+Last updated: 2026-07-18
 
 ## Direction Locked
 
@@ -8,11 +8,15 @@ The product path is one retail `FalloutNV.exe`, one standalone OpenXR host, the
 FNVVR xNVSE plugin, and the retail proxy DLLs. There is no alternate game
 runtime or world handoff in the shipping architecture.
 
-Retail UI is intentionally flat for this phase. Startup/menu mode, inventory,
-Pip-Boy, dialogue, VATS, loading, pause, and unknown/non-gameplay states must
-present the normal retail mono frame on the OpenXR UI surface. Stereo world
-presentation may resume only after runtime state and a valid retail eye pair
-both prove unobstructed gameplay.
+All non-blocking gameplay, exploration, combat, and world interaction require
+true binocular 3D, independent 6DoF head motion, a tracked retail weapon, and
+no persistent gameplay HUD. Mono gameplay cannot satisfy acceptance.
+
+Startup, pause, inventory, barter, terminals, dialogue, VATS, loading,
+Pip-Boy, and other blocking retail UI use the stable mono quad. The controller
+ray drives retail mouse pointer/click input. On UI exit, the last valid quad is
+held until one fresh complete pose-matched stereo transaction is ready, then
+the compositor changes to world stereo atomically.
 
 ## Proven Foundation
 
@@ -21,7 +25,11 @@ both prove unobstructed gameplay.
 - The 32-bit xNVSE plugin and D3D9/DirectInput/XInput proxies build for retail
   FNV `1.4.0.525`.
 - Retail FNV loads the plugin and proxy DLLs through the normal xNVSE/game
-  process.
+  process. Exact standard-retail runtime identity is required; the no-gore and
+  editor runtimes are rejected.
+- Retail mutation remains hard source-fused. The current plugin returns inert
+  before creating mappings/listeners or applying camera, input, rig, or code
+  hooks. Config and environment values cannot bypass that fuse.
 - The standalone host creates a real OpenXR session and samples HMD, grip, aim,
   buttons, triggers, squeeze, and thumbsticks.
 - Shared pose ABI v5 carries independent left/right grip and aim poses with
@@ -41,14 +49,19 @@ both prove unobstructed gameplay.
   even when its ID is mod-added or its TileMenu pointer lags. The raw engine
   MenuMode bit is retained as a diagnostic because live gameplay can report it
   continuously.
-- The retail D3D9 proxy captures mono frames and contains replay/readback and
-  complete-eye-pair diagnostics.
+- The retail D3D9 proxy's mono UI capture remains useful. Its per-draw replay
+  and CPU readback/ring are historical diagnostics and a production NO-GO.
 - Retail player rig discovery searches for and logs arm-chain, hand, weapon,
   projectile, and muzzle-flash nodes; retained runs have not proved a complete
   non-null weapon/projectile/muzzle chain. FABRIK solver tests cover the arm
   math foundation.
 
 ## Current Headset Boundary
+
+All live OpenXR presentation is source-blocked in both the host executable and
+the guarded launcher. This includes the former flat-compositor baseline. The
+retained live observations below explain the boundary; they are not a current
+authorization to launch the game or headset.
 
 ### Head tracking
 
@@ -103,28 +116,32 @@ It could not restore every culling, portal, occlusion, visibility, effect, and
 render-list side effect consumed by the first traversal. That path remains
 disabled in the production stereo environment.
 
-The working tree now implements a coherent single-traversal producer:
+The per-D3D-draw producer is rejected as the production path. Read-only loaded-
+process inspection now establishes a bounded engine-level replacement:
 
-- the verified `DoRenderFrame` boundary at `0x008706B0` receives one
-  body-local HMD camera and the union of both OpenXR eye frusta;
-- Gamebryo culls and submits one scene exactly once;
-- each exact submitted D3D9 draw is replayed to left and right eye targets,
-  with fixed-function view/projection updates and validated shader WVP deltas;
-- shared stereo provenance is `StereoProducerSingleTraversal`, with the
-  rendered pose sequence and display time attached to the pixels;
-- runtime telemetry rejects camera drift, invalid rotation matrices, missing
-  eye replay, non-separated images, legacy double traversal, head/body
-  coupling, and gameplay flat-plane transitions.
+- `RenderWorldSceneGraph` at `0x00873200` is a complete function boundary;
+- `AccumulateScene` at `0x00B6BEE0` invokes the world culler, whose
+  `ProcessAlt` path can temporarily consume an explicit `NiVisibleArray`;
+- the accumulator `SetCamera`, `AddVisibleArray`, render, and finalize methods
+  have complete instruction-aligned loaded-memory hashes;
+- `AddVisibleArray` may draw some geometry immediately, so an eye's exact
+  camera, color, depth, and auxiliary targets must be bound before population;
+- `RenderAccumulatorWithoutFinalize` at `0x00B6BA20` and the finalize wrapper
+  at `0x00B6B930` expose the split needed for separate eye accumulators; and
+- the SceneGraph camera at `+0xAC` and world culler at `+0xB4` were observed
+  live and non-null after initialization.
 
-The union frustum prevents ordinary left/right eye culling loss, although D3D9
-replay cannot recover geometry that Gamebryo omitted before submission. A live
-headset run is still required to prove the new boundary visually.
+The required schedule is snapshot, one conservative union visible set, fresh
+left accumulator with all left-eye state bound before populate/render/finalize,
+fresh right accumulator with the exact same visible set and right-eye state,
+then complete restoration and atomic publication. Failure discards isolated
+outputs. The backend must handle both stock world-accumulation branches and
+must not globally hook helpers shared by auxiliary passes.
 
-Loaded-process inspection verified `AccumulateScene` at `0x00B6BEE0`,
-`RenderScene` at `0x00B6C0D0`, the SceneGraph camera at `+0xAC`, and the world
-culler at `+0xB4`. It did not verify the previously proposed TESMain `+0x88`
-accumulator pointer; that claim is withdrawn, and no guessed accumulator
-virtual methods are called by the production path.
+All selected functions were byte-identical across two independent loaded-memory
+dumps and a fresh default flat launch. The exact PE identity and function hashes
+are now a tested manifest and read-only runtime probe. This is a GO for the
+bounded engine renderer implementation, not proof that headset VR is finished.
 
 ## xNVSE Extraction Boundary
 
@@ -137,21 +154,25 @@ That is not a blanket promise that every engine behavior can be copied out and
 replayed externally. Gameplay-critical changes should remain in-process:
 weapon transforms, muzzle/projectile direction, hit tests, activation, and
 animation state must be applied or confirmed by retail FNV. The standalone
-host should publish desired poses/input and compose the returned retail frames.
-Unknown layouts need executable-version checks, pointer validation, logging,
-and a fail-closed fallback.
+host should publish desired poses/input, open accepted GPU resources, and
+compose only complete color/depth transactions. Unknown layouts need exact
+executable checks, pointer validation, logging, and fail-closed rejection.
 
 ## Immediate Blockers
 
-1. Run one guarded exterior/interior/head-turn headset test and require the live
-   analyzer to pass single traversal, camera matrix, WVP, provenance,
-   separation, head/body decoupling, and no-gameplay-2D-transition checks.
-2. Keep retail IK, synthetic hands, and weapon writes disabled during that
-   camera/stereo acceptance run.
-3. Equip the deterministic ranged-weapon loadout, prove right-arm/weapon/muzzle
-   discovery, and calibrate controller-to-weapon visual alignment.
-4. Align the retail muzzle/projectile/hit ray to the same controller transform
-   and verify impacts while retail retains combat authority.
+1. Implement the exact-version/hash-validated world-boundary backend for both
+   stock accumulation branches with complete authoritative state restoration.
+2. Prove center/center, then distinct-eye transactions using one conservative
+   visible set and fresh non-aliased per-eye accumulators.
+3. Implement GPU-native D3D9Ex-to-D3D11/OpenXR color and encoded-depth sharing
+   with handles, adapter identity, completion sequencing, and transaction IDs;
+   no CPU eye-pixel ring.
+4. Prove the authoritative retail weapon, muzzle, projectile/hit, recoil, and
+   reload chain against the right-controller aim pose.
+5. Pass retail/headset acceptance across UI transitions, exterior/interior cell
+   changes, first-person geometry, particles/transparency, twelve-direction
+   pose motion, and performance. Invalid gameplay stereo is a visible reject,
+   never a successful mono fallback.
 
 ## Safe Local Artifacts
 
@@ -160,4 +181,7 @@ and a fail-closed fallback.
 - retail probe at `local/fnv-probe.json`;
 - combined preflight at `local/preflight-fnvxr.json`;
 - run manifests and telemetry under ignored `local/` directories or the local
-  retail game root.
+  retail game root;
+- recoverable backups of the stale installed mutators under
+  `local/installed-artifact-backups/20260718-050105-432/`. The live game-root
+  copies were replaced by current source-fused/inert builds.

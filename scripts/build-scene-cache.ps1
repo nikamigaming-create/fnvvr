@@ -10,6 +10,8 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+throw "Legacy live scene-cache capture is intentionally blocked: it force-stops processes and requests the incomplete stereo producer. Use retained offline captures until the production render proof is complete."
+
 $Root = Split-Path -Parent $PSScriptRoot
 $CacheRoot = Join-Path $Root "local\scene-cache"
 

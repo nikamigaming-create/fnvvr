@@ -18,6 +18,7 @@ param(
     [int]$MaxHostRestarts = 0,
     [switch]$AllowFiniteHostRun,
     [switch]$DisableStereoWorld,
+    [string[]]$VerifiedShaderDiscoveryRunDir = @(),
     [switch]$StageOnly,
     [switch]$ValidateOnly
 )
@@ -50,6 +51,18 @@ $launchArgs = @{
     UiWidth = $UiSharedWidth
     UiHeight = $UiSharedHeight
     EnableStereoWorld = $true
+}
+
+if (-not $DisableStereoWorld) {
+    $verifiedDirs = @($VerifiedShaderDiscoveryRunDir |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($verifiedDirs.Count -eq 0 -and -not ($StageOnly -or $ValidateOnly)) {
+        throw "Stereo launch requires -VerifiedShaderDiscoveryRunDir; raw or missing shader contracts are rejected."
+    }
+    if ($verifiedDirs.Count -gt 0) {
+        $launchArgs.EnableD3D9ShaderStereo = $true
+        $launchArgs.VerifiedShaderDiscoveryRunDir = $verifiedDirs
+    }
 }
 
 if ($DisableStereoWorld) {

@@ -11,7 +11,7 @@ OpenXR headset and controllers
 standalone FNVXR OpenXR host
 tracking, input intent, frame timing, flat UI surface, VR composition
               |
-              | fixed shared state / complete frame surfaces
+              | fixed shared state / GPU handles, fences, transaction metadata
               v
 retail FalloutNV.exe
 xNVSE plugin + D3D9/DirectInput/XInput proxies
@@ -64,8 +64,8 @@ Host-to-retail state includes HMD/eye/controller poses, tracking validity,
 buttons, triggers, grips, thumbsticks, pointer position, and input intent.
 
 Retail-to-host state includes runtime/UI phase, player/body and camera
-transforms, weapon classification and rig diagnostics, and mono/stereo frame
-surfaces.
+transforms, weapon classification and rig diagnostics, plus versioned mono-UI
+or stereo GPU resource metadata. Eye pixels do not travel through a CPU ring.
 
 ## Presentation Contract
 
@@ -73,9 +73,10 @@ The normal retail mono frame is the UI source. Any startup/menu, pause,
 Pip-Boy/inventory, dialogue, VATS, loading, or unknown state is shown flat in
 the headset. UI input remains ordinary retail mouse/keyboard/controller input.
 
-Only proven unobstructed gameplay may use native stereo. A world transition
-requires a fresh, complete, pose-matched same-frame eye pair. Any UI transition
-or invalid/stale pair returns to the flat retail surface.
+All non-blocking gameplay requires native stereo with no persistent gameplay
+HUD. A world transition requires a fresh, complete, pose-matched same-frame
+color/depth pair. A UI transition enters the flat retail surface; an invalid or
+stale gameplay transaction is rejected and is not reported as mono VR.
 
 ## Current Milestone
 

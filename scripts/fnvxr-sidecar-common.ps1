@@ -698,6 +698,18 @@ function Set-FnvxrSidecarEnvironment {
     $env:FNVXR_MENU_TILE_HEIGHT = "480"
     $env:FNVXR_GAME_TEXTURE_WIDTH = [string]$HostGameTextureWidth
     $env:FNVXR_GAME_TEXTURE_HEIGHT = [string]$HostGameTextureHeight
+    $env:FNVXR_GAME_PLANE_MAX_STALE_MS = "250"
+    $env:FNVXR_WORLD_PLANE_MAX_STALE_MS = "250"
+    $env:FNVXR_STEREO_STATE_MAX_STALE_MS = "250"
+    $env:FNVXR_STEREO_PROGRESS_WATCHDOG_MS = "1000"
+    $env:FNVXR_RUNTIME_STATE_MAX_STALE_MS = "250"
+    $env:FNVXR_PLAYER_STATE_MAX_STALE_MS = "250"
+    $env:FNVXR_GAME_PLANE_WINDOW_FALLBACK_ON_STALE = "0"
+    $env:FNVXR_GAME_PLANE_WINDOW_FALLBACK_ON_BLACK = "0"
+    $env:FNVXR_GAME_PLANE_SOURCE = "shared"
+    $env:FNVXR_RENDER_WHEN_SHOULD_RENDER_FALSE = "0"
+    $env:FNVXR_RENDER_OUTPUT_PROOF = "1"
+    $env:FNVXR_INPUT_EVENT_MAX_HOLD_MS = "500"
     $env:FNVXR_GAME_PLANE_WIDTH = "3.15"
     $env:FNVXR_GAME_PLANE_HEIGHT = "2.15"
     $env:FNVXR_GAME_PLANE_OFFSET_Z = "-3.35"
@@ -1102,7 +1114,7 @@ function Set-FnvxrStereoWorldRuntimeEnvironment {
     $env:FNVXR_D3D9_STEREO_MIN_ACTIVE_FRACTION = "0.50"
     $env:FNVXR_D3D9_STEREO_MIN_ACTIVE_SPAN_X = "0.35"
     $env:FNVXR_D3D9_STEREO_MIN_ACTIVE_SPAN_Y = "0.35"
-    $env:FNVXR_D3D9_STEREO_RETAIN_LAST_VALID_ON_INVALID = "1"
+    $env:FNVXR_D3D9_STEREO_RETAIN_LAST_VALID_ON_INVALID = "0"
     $env:FNVXR_D3D9_STEREO_CLEAR_ON_UI_INVALID = "0"
     $env:FNVXR_D3D9_STEREO_STRICT_TARGET_GATE = "1"
     $env:FNVXR_D3D9_STEREO_AUTO_ACTIVATE_TARGET_ON_DRAW = "1"
@@ -1119,13 +1131,14 @@ function Set-FnvxrStereoWorldRuntimeEnvironment {
     $env:FNVXR_REQUIRE_WORLD_STEREO_BEFORE_GAMEPLAY_UI = "0"
     $env:FNVXR_GAME_FULLSCREEN_IN_XR = "1"
     $env:FNVXR_USE_STEREO_GAME_TEXTURES = "1"
-    $env:FNVXR_STEREO_FALLBACK_MONO_FULLSCREEN = "0"
-    # Never change dimensional presentation during gameplay. A transient
-    # producer miss retains the last coherent stereo frame; a sustained fault
-    # goes dark instead of snapping the user back to a head-locked 2D plane.
-    $env:FNVXR_ALLOW_STEREO_WORLD_2D_FALLBACK = "0"
-    $env:FNVXR_SHOW_GAME_PLANE_ON_STEREO_LOSS = "0"
-    $env:FNVXR_SHOW_GAME_PLANE_IN_GAME = "0"
+    $env:FNVXR_STEREO_FALLBACK_MONO_FULLSCREEN = "1"
+    # A proof rejection must be unmistakable but never leave the headset on a
+    # stale stereo frame or unexplained black output. Fall back immediately to
+    # the live, world-anchored retail plane; it is explicitly not certified as
+    # 6DoF and cannot be mistaken for a passing stereo transaction.
+    $env:FNVXR_ALLOW_STEREO_WORLD_2D_FALLBACK = "1"
+    $env:FNVXR_SHOW_GAME_PLANE_ON_STEREO_LOSS = "1"
+    $env:FNVXR_SHOW_GAME_PLANE_IN_GAME = "1"
     # The D3D9 producer has already required 12 consecutive visually valid
     # single-traversal pairs before advertising world-ready. Consume the first
     # producer-certified pair so a transient menu/focus edge cannot restart a
@@ -1147,7 +1160,7 @@ function Set-FnvxrStereoWorldRuntimeEnvironment {
     # The host distinguishes an ordinary faster-consumer poll from a producer
     # rejection. Keep a coherent unchanged sequence, but never retain a pair
     # after the producer invalidates it; use the live retail quad instead.
-    $env:FNVXR_STEREO_RETAIN_LAST_VALID_ON_REJECT = "1"
+    $env:FNVXR_STEREO_RETAIN_LAST_VALID_ON_REJECT = "0"
 }
 
 function Get-FnvxrCurrentProcessExclusionIds {

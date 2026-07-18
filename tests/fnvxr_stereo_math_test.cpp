@@ -2,6 +2,7 @@
 
 #include <cmath>
 #include <iostream>
+#include <limits>
 
 namespace
 {
@@ -44,7 +45,9 @@ bool matrixNear(
     {
         for (int column = 0; column < 4; ++column)
         {
-            if (std::fabs(lhs.m[row][column] - rhs.m[row][column]) >= epsilon)
+            if (!std::isfinite(lhs.m[row][column])
+                || !std::isfinite(rhs.m[row][column])
+                || std::fabs(lhs.m[row][column] - rhs.m[row][column]) >= epsilon)
                 return false;
         }
     }
@@ -72,6 +75,11 @@ int main()
         || !nearlyEqual(fnvxr::stereo::DefaultIpdGameUnits, 4.48f))
     {
         return fail("FNV physical scale must be 70 units/m and 64 mm IPD must be 4.48 units");
+    }
+    if (fnvxr::stereo::certifiedStereoTextureMayBeSampled(true, false, true, true)
+        || !fnvxr::stereo::certifiedStereoTextureMayBeSampled(true, true, true, true))
+    {
+        return fail("mono fullscreen fallback must never sample a rejected or stale per-eye texture");
     }
 
     if (!nearlyEqual(eyes.leftView.m[3][0], 12.0f + halfIpd))
@@ -215,6 +223,22 @@ int main()
         0.000001);
     if (!matrixNear(retailPatched, retailExpected, 0.02f) || !retailPatchValidation.valid)
         return fail("captured retail matrix delta must reproduce the eye WVP within the gated float tolerance");
+#if defined(_MSC_VER) && (defined(_M_IX86) || defined(_M_X64))
+    const unsigned int savedMxcsr = _mm_getcsr();
+    const unsigned int forcedFlushMxcsr = savedMxcsr | 0x0040u | 0x8000u;
+    _mm_setcsr(forcedFlushMxcsr);
+    const auto flushModeDelta = fnvxr::stereo::makeViewProjectionDelta(retailCenter, retailEye, true);
+    const auto flushModePatched = fnvxr::stereo::applyViewProjectionDelta(
+        retailOriginal, flushModeDelta.matrix, true);
+    const auto flushModeValidation = fnvxr::stereo::validateAppliedViewProjectionDelta(
+        retailOriginal, flushModePatched, flushModeDelta, true, 0.02, 0.000001);
+    const bool callerMxcsrRestored = _mm_getcsr() == forcedFlushMxcsr;
+    _mm_setcsr(savedMxcsr);
+    if (!flushModeDelta.valid || !flushModeValidation.valid || !callerMxcsrRestored)
+    {
+        return fail("WVP certification must temporarily disable FTZ/DAZ and restore the caller MXCSR");
+    }
+#endif
 
     fnvxr::stereo::Matrix4 amplifiedRetailWvp {};
     for (int row = 0; row < 4; ++row)
@@ -233,6 +257,38 @@ int main()
         || amplifiedPatchValidation.maximumAbsoluteError <= 0.01)
     {
         return fail("draw-local amplification above the final patched-WVP precision budget must fail closed");
+    }
+
+    const fnvxr::stereo::Matrix4 inverseUncertaintyWitness {{
+        { -2.5619666e4f, -45.183163f, 158.06393f, 9.8419256f },
+        { -4.3579812f, 9.2319419e5f, 23.570318f, -9.1408789e4f },
+        { 471.71097f, 6.9220777f, -3.2614128e8f, 1.2684435e6f },
+        { -36.367538f, 9.2181453e8f, -1.5004458e6f, -2.0689106e7f }
+    }};
+    const auto inverseUncertaintyPatched = fnvxr::stereo::applyViewProjectionDelta(
+        inverseUncertaintyWitness,
+        recoveredRetailDelta.matrix,
+        true);
+    const auto inverseUncertaintyValidation =
+        fnvxr::stereo::validateAppliedViewProjectionDelta(
+            inverseUncertaintyWitness,
+            inverseUncertaintyPatched,
+            recoveredRetailDelta,
+            true);
+    if (inverseUncertaintyValidation.valid
+        || inverseUncertaintyValidation.maximumAbsoluteError <= 0.01)
+    {
+        return fail("inverse uncertainty amplified by a draw-local WVP must fail the exact semantic budget");
+    }
+    if (fnvxr::stereo::validateAppliedViewProjectionDelta(
+            retailOriginal,
+            retailPatched,
+            recoveredRetailDelta,
+            true,
+            std::numeric_limits<double>::infinity(),
+            0.000001).valid)
+    {
+        return fail("nonfinite patched-WVP tolerance must fail closed");
     }
 
     constexpr float Pi = 3.14159265358979323846f;
@@ -276,6 +332,13 @@ int main()
         { 0.0f, 0.032f, 0.0f });
     if (swappedEyeBaseline.valid || verticalEyeBaseline.valid)
         return fail("swapped or non-lateral eye baselines must fail closed");
+    const auto displacedEyeBaseline = fnvxr::stereo::validateEyeBaseline(
+        {},
+        { 49.968f, 0.0f, 0.0f },
+        { 50.032f, 0.0f, 0.0f },
+        {});
+    if (displacedEyeBaseline.valid)
+        return fail("eye midpoint must remain close to the current HMD position");
     const float validFov[4] { -0.9f, 1.0f, 0.95f, -1.05f };
     const float wrappedFov[4] { -3.0f, 3.0f, 1.0f, -1.0f };
     if (!fnvxr::stereo::openXrFovAnglesUsable(validFov)
@@ -473,6 +536,76 @@ int main()
         || std::fabs(centerCull.farDistance - 1000.0f) > 0.001f)
     {
         return fail("center traversal cull must include displaced eye origins, not only raw FOV tangents");
+    }
+    if (fnvxr::stereo::conservativeCenterCullFrustum(
+            identity3, {}, nullptr, 5.0f, 1000.0f).valid)
+    {
+        return fail("null cull-eye input must fail closed");
+    }
+    const auto unboundedCull = fnvxr::stereo::conservativeCenterCullFrustum(
+        identity3,
+        {},
+        cullEyes,
+        5.0f,
+        std::numeric_limits<float>::max());
+    if (unboundedCull.valid)
+        return fail("unbounded cull distance must not round to an infinite published frustum");
+
+    fnvxr::stereo::Matrix3 shearedCenter {{
+        { 1.0f, 0.0f, 2.0f },
+        { 0.0f, 1.0f, 2.0f },
+        { 0.0f, 0.0f, 2.0f }
+    }};
+    fnvxr::stereo::EyeCullFrustum cancellationEyes[2] {};
+    for (auto& eye : cancellationEyes)
+    {
+        eye.rotation = {{
+            { 1.9368603229522705f, -1.9368603229522705f, 0.00011821657244581729f },
+            { 1.6135408878326416f, -1.6135408878326416f, 0.000098482720204629f },
+            { 1.662406325340271f, -1.662406325340271f, 0.00010146522981813177f }
+        }};
+        eye.left = 998.9999389648438f;
+        eye.right = 999.0f;
+        eye.bottom = 998.9999389648438f;
+        eye.top = 999.0f;
+    }
+    if (fnvxr::stereo::conservativeCenterCullFrustum(
+            shearedCenter,
+            {},
+            cancellationEyes,
+            838520.125f,
+            838520.1875f).valid)
+    {
+        return fail("non-rotation matrices must not exploit a cancelled forward denominator");
+    }
+
+    fnvxr::stereo::EyeCullFrustum grazingEyes[2] {};
+    const fnvxr::stereo::Matrix3 grazingYaw {{
+        { 0.9070694446563721f, 0.0f, 0.42098110914230347f },
+        { 0.0f, 1.0f, 0.0f },
+        { -0.42098110914230347f, 0.0f, 0.9070694446563721f }
+    }};
+    for (int eye = 0; eye < 2; ++eye)
+    {
+        grazingEyes[eye].rotation = grazingYaw;
+        grazingEyes[eye].position = {
+            eye == 0 ? -1.2365703582763672f : 1.2365703582763672f,
+            0.0f,
+            0.0f
+        };
+        grazingEyes[eye].left = -2.154655933380127f;
+        grazingEyes[eye].right = 0.5463024973869324f;
+        grazingEyes[eye].bottom = -0.5463024973869324f;
+        grazingEyes[eye].top = 0.5463024973869324f;
+    }
+    if (fnvxr::stereo::conservativeCenterCullFrustum(
+            identity3,
+            {},
+            grazingEyes,
+            999999.9375f,
+            1000000.0f).valid)
+    {
+        return fail("near-grazing eye corners must fail the perspective conditioning floor");
     }
 
     // Independently recompute long-range canted-eye sample points in double.
@@ -726,6 +859,65 @@ int main()
         return fail("single-traversal mode must never downgrade an incomplete pair to generic replay");
     }
 
+    constexpr std::uint64_t producerEpoch = 0x1122334455667788ull;
+    constexpr std::uint64_t rendererProducerEpoch = 0x8877665544332211ull;
+    constexpr std::uint32_t referenceGeneration = 7u;
+    constexpr std::uint32_t producerProcessId = 4242u;
+    if (fnvxr::stereo::nextStereoStableFrameCount(
+            0, 0, 1, 0, producerEpoch,
+            0, rendererProducerEpoch,
+            0, referenceGeneration, 0, producerProcessId) != 1
+        || fnvxr::stereo::nextStereoStableFrameCount(
+            5, 10, 11, producerEpoch, producerEpoch,
+            rendererProducerEpoch, rendererProducerEpoch,
+            referenceGeneration, referenceGeneration,
+            producerProcessId, producerProcessId) != 6
+        || fnvxr::stereo::nextStereoStableFrameCount(
+            5, 10, 3, producerEpoch, producerEpoch,
+            rendererProducerEpoch, rendererProducerEpoch,
+            referenceGeneration, referenceGeneration,
+            producerProcessId, producerProcessId) != 1
+        || fnvxr::stereo::nextStereoStableFrameCount(
+            5, 10, 11, producerEpoch, producerEpoch + 1,
+            rendererProducerEpoch, rendererProducerEpoch,
+            referenceGeneration, referenceGeneration,
+            producerProcessId, producerProcessId) != 1
+        || fnvxr::stereo::nextStereoStableFrameCount(
+            5, 10, 11, producerEpoch, producerEpoch,
+            rendererProducerEpoch, rendererProducerEpoch + 1,
+            referenceGeneration, referenceGeneration,
+            producerProcessId, producerProcessId) != 1
+        || fnvxr::stereo::nextStereoStableFrameCount(
+            5, 10, 11, producerEpoch, producerEpoch,
+            rendererProducerEpoch, rendererProducerEpoch,
+            referenceGeneration, referenceGeneration + 1,
+            producerProcessId, producerProcessId) != 1
+        || fnvxr::stereo::nextStereoStableFrameCount(
+            5, 10, 11, producerEpoch, producerEpoch,
+            rendererProducerEpoch, rendererProducerEpoch,
+            referenceGeneration, referenceGeneration,
+            producerProcessId, producerProcessId + 1) != 1
+        || fnvxr::stereo::nextStereoStableFrameCount(
+            5, -2, 1, producerEpoch, producerEpoch,
+            rendererProducerEpoch, rendererProducerEpoch,
+            referenceGeneration, referenceGeneration,
+            producerProcessId, producerProcessId) != 6
+        || fnvxr::stereo::nextStereoStableFrameCount(
+            5, 10, 0, producerEpoch, producerEpoch,
+            rendererProducerEpoch, rendererProducerEpoch,
+            referenceGeneration, referenceGeneration,
+            producerProcessId, producerProcessId) != 0
+        || fnvxr::stereo::nextStereoStableFrameCount(
+            (std::numeric_limits<std::uint64_t>::max)(), 10, 11,
+            producerEpoch, producerEpoch,
+            rendererProducerEpoch, rendererProducerEpoch,
+            referenceGeneration, referenceGeneration,
+            producerProcessId, producerProcessId)
+            != (std::numeric_limits<std::uint64_t>::max)())
+    {
+        return fail("stereo warm-up must reset on sequence or producer identity discontinuities");
+    }
+
     constexpr std::int64_t displayTime = 1000000000LL;
     constexpr std::int64_t maximumAge = 25000000LL;
     constexpr std::int64_t futureTolerance = 5000000LL;
@@ -745,6 +937,28 @@ int main()
             displayTime, displayTime + 10000000LL, maximumAge, futureTolerance))
     {
         return fail("a source pose 10 ms in the future must exceed the 5 ms tolerance");
+    }
+    if (!fnvxr::stereo::sourcePoseAgeWithinBudget(
+            displayTime, displayTime - maximumAge, maximumAge, futureTolerance)
+        || fnvxr::stereo::sourcePoseAgeWithinBudget(
+            displayTime, displayTime - maximumAge - 1, maximumAge, futureTolerance)
+        || !fnvxr::stereo::sourcePoseAgeWithinBudget(
+            displayTime, displayTime + futureTolerance, maximumAge, futureTolerance)
+        || fnvxr::stereo::sourcePoseAgeWithinBudget(
+            displayTime, displayTime + futureTolerance + 1, maximumAge, futureTolerance))
+    {
+        return fail("source-pose age and future-tolerance boundaries must be inclusive and fail one tick outside");
+    }
+    if (fnvxr::stereo::sourcePoseAgeWithinBudget(0, 1, maximumAge, futureTolerance)
+        || fnvxr::stereo::sourcePoseAgeWithinBudget(1, 0, maximumAge, futureTolerance)
+        || fnvxr::stereo::sourcePoseAgeWithinBudget(1, 1, -1, futureTolerance)
+        || fnvxr::stereo::sourcePoseAgeWithinBudget(1, 1, maximumAge, -1)
+        || fnvxr::stereo::sourcePoseAgeWithinBudget(
+            std::numeric_limits<std::int64_t>::max(), 1, maximumAge, futureTolerance)
+        || fnvxr::stereo::sourcePoseAgeWithinBudget(
+            1, std::numeric_limits<std::int64_t>::max(), maximumAge, futureTolerance))
+    {
+        return fail("invalid and extreme source-pose timestamps must fail without overflow");
     }
 
     std::cout << "stereo math ok\n";

@@ -33,6 +33,14 @@ $ErrorActionPreference = "Stop"
 
 . (Join-Path $PSScriptRoot "fnvxr-sidecar-common.ps1")
 
+if (-not [string]::IsNullOrWhiteSpace($D3D9ShaderWvpContracts)) {
+    throw "Raw -D3D9ShaderWvpContracts text is not accepted. WVP-only contracts are non-certifying and disabled until exact VS+PS semantic/camera provenance exists."
+}
+if (-not ($StageOnly -or $ValidateOnly) -and
+    ($EnableStereoWorld -or $EnableD3D9ShaderStereo -or $StereoProducerProofOnly)) {
+    throw "Stereo producer launch is intentionally blocked off-headset too: the traversal/resource/shader proof prerequisites are incomplete. Flat 2D capture remains available."
+}
+
 $Root = Split-Path -Parent $PSScriptRoot
 $RunRoot = Join-Path $Root "local\retail-sidecar-runs"
 $Stamp = Get-Date -Format "yyyyMMdd-HHmmss-fff"
@@ -263,9 +271,7 @@ if ($EnableStereoWorld -or $EnableD3D9ShaderStereo -or $StereoProducerProofOnly)
     Write-FnvxrCheckpoint -Path $DebugLog -Message "quad 2D runtime enabled; stereo world disabled by default"
 }
 if ($EnableD3D9ShaderStereo) {
-    if ([string]::IsNullOrWhiteSpace($D3D9ShaderWvpContracts)) {
-        throw "-EnableD3D9ShaderStereo requires verified -D3D9ShaderWvpContracts entries in fnv8/sha256/byteCount@register@column-or-row form."
-    }
+    throw "D3D9 shader stereo is disabled: exact VS+PS semantic and engine camera provenance contracts are not implemented."
     $env:FNVXR_D3D9_SHADER_STEREO = "0"
     $env:FNVXR_D3D9_SHADER_MATRIX_DELTA = "0"
     $env:FNVXR_D3D9_SHADER_MATRIX_ORDER = "column"
@@ -358,7 +364,7 @@ $manifest = [ordered]@{
         applied = [bool]$activationReachApplied
     }
     mapping = "Local\FNVXR_D3D9_Frame_v1"
-    stereoMapping = "Local\FNVXR_D3D9_StereoFrame_v3"
+    stereoMapping = "Local\FNVXR_D3D9_StereoFrame_v7"
     openXrHostLaunched = $false
     forcedMenuAction = $false
     uiGrid = "${UiWidth}x${UiHeight}"

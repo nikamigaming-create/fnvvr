@@ -6,6 +6,8 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+throw "Direct OpenXR host launch is intentionally blocked: it bypasses the heartbeat watchdog and bounded sidecar cleanup. Use start-openxr-retail-sidecar.ps1."
+
 if ($Frames -gt 0 -and -not $AllowFiniteHostRun) {
     throw "Unsafe host run refused: finite runs (-Frames $Frames) require -AllowFiniteHostRun so they cannot be mistaken for a stable PCVR launch."
 }

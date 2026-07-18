@@ -1396,7 +1396,7 @@ def build_pdf(
     blockers = [
         "A historical run introduced vertex shaders 0x5999d5b0 and 0x83e14aae without verified WVP contracts. Coverage fell to 391/392, the producer retained then lost its last frame, and the host submitted no visible fallback layer. This deterministically explains the black screen.",
         "The contract generator now requires a complete, unoverwritten oPos.xyzw provenance chain, and therefore rejects parts of the legacy 45-contract corpus. No replacement full contract set exists for all observed shader forms or the missing shaders.",
-        "The new strict-eye-target draw ledger rejects any draw not proven on both eyes, including fixed-function, UP, configured-skip, and unknown shader draws. Equivalent complete ownership gates are still needed for every clear/copy/final-target write and reviewed eye-invariant exclusions.",
+        "The new strict-eye-target ledgers reject any draw, clear, or copy not proven on both eyes, including fixed-function, UP, configured-skip, and unknown shader draws. Remaining final-target write APIs still need enumeration plus reviewed eye-invariant exclusions.",
         "Configured skip pairs use 32-bit FNV pairs rather than a strong SHA-256 plus byte-length semantic manifest.",
         "A projection layer without depth cannot exactly reproject translated old pixels. The new 25 ms gate fails closed, but production performance inside that budget is not yet evidenced.",
         "There is no new live binary evidence after these repairs. Existing logs are evidence of the old failures only.",

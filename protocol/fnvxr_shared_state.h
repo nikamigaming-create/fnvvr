@@ -16,11 +16,11 @@ constexpr std::uint32_t DInputSharedVersion = 9;
 inline constexpr char DInputSharedMappingName[] = "Local\\FNVXR_DInput_State_v9";
 inline constexpr char InputCoreProducerMutexName[] = "Local\\FNVXR_Input_Core_Producer_v2_v9";
 constexpr std::uint32_t VrPoseSharedMagic = 0x52505646; // FVPR
-constexpr std::uint32_t VrPoseSharedVersion = 7;
-inline constexpr char VrPoseSharedMappingName[] = "Local\\FNVXR_VR_Pose_State_v7";
+constexpr std::uint32_t VrPoseSharedVersion = 8;
+inline constexpr char VrPoseSharedMappingName[] = "Local\\FNVXR_VR_Pose_State_v8";
 constexpr std::uint32_t VrOriginSharedMagic = 0x4f565846; // FXVO
-constexpr std::uint32_t VrOriginSharedVersion = 5;
-inline constexpr char VrOriginSharedMappingName[] = "Local\\FNVXR_VR_Origin_State_v5";
+constexpr std::uint32_t VrOriginSharedVersion = 6;
+inline constexpr char VrOriginSharedMappingName[] = "Local\\FNVXR_VR_Origin_State_v6";
 constexpr std::uint32_t VrOriginStateInvalid = 0;
 constexpr std::uint32_t VrOriginStateRenderLease = 1;
 constexpr std::uint32_t VrOriginStateCommitted = 2;
@@ -31,16 +31,45 @@ constexpr std::uint32_t RuntimeSharedVersion = 1;
 constexpr std::uint32_t PlayerSharedMagic = 0x50564e46; // FNVP
 constexpr std::uint32_t PlayerSharedVersion = 1;
 constexpr std::uint32_t CommandSharedMagic = 0x43564e46; // FNVC
-constexpr std::uint32_t CommandSharedVersion = 1;
+constexpr std::uint32_t CommandSharedVersion = 2;
+inline constexpr char CommandSharedMappingName[] = "Local\\FNVXR_Command_State_v2";
+inline constexpr char CommandWriterMutexName[] = "Local\\FNVXR_Command_Writer_v2";
 constexpr std::uint32_t InputEventSharedMagic = 0x49564e46; // FNVI
 constexpr std::uint32_t InputEventSharedVersion = 1;
 constexpr std::uint32_t InputEventQueueLength = 64;
+inline constexpr char InputEventWriterMutexName[] = "Local\\FNVXR_Input_Event_Writer_v1";
 constexpr std::uint32_t D3D9FrameSharedMagic = 0x46585646; // FNVF
 constexpr std::uint32_t D3D9StereoFrameSharedMagic = 0x53585646; // FNXS
-constexpr std::uint32_t D3D9StereoFrameSharedVersion = 3;
-inline constexpr char D3D9StereoFrameSharedMappingName[] = "Local\\FNVXR_D3D9_StereoFrame_v3";
+constexpr std::uint32_t D3D9StereoFrameSharedVersion = 7;
+inline constexpr char D3D9StereoFrameSharedMappingName[] = "Local\\FNVXR_D3D9_StereoFrame_v7";
 constexpr std::uint32_t D3D9SharedFrameMaxWidth = 4096;
 constexpr std::uint32_t D3D9SharedFrameMaxHeight = 2560;
+// Two independent consumers (the OpenXR host and the evidence capturer) each
+// own one claim lane.  Four payload slots guarantee that even if both readers
+// terminate while holding different slots, one slot remains writable after
+// excluding the current publication.  Stale claims therefore reduce capacity
+// but can never stop the producer.
+constexpr std::uint32_t D3D9StereoFrameReaderLaneCount = 2;
+constexpr std::uint32_t D3D9StereoHostReaderLane = 0;
+constexpr std::uint32_t D3D9StereoCaptureReaderLane = 1;
+constexpr std::uint32_t D3D9StereoFrameSlotCount = 4;
+
+inline LONG selectWritableStereoFrameSlot(
+    LONG publishedSlot,
+    LONG hostReaderSlot,
+    LONG captureReaderSlot)
+{
+    for (LONG candidate = 0;
+         candidate < static_cast<LONG>(D3D9StereoFrameSlotCount);
+         ++candidate)
+    {
+        if (candidate != publishedSlot
+            && candidate != hostReaderSlot
+            && candidate != captureReaderSlot)
+            return candidate;
+    }
+    return -1;
+}
 
 // Describes how the two eye images in SharedD3D9StereoFrameHeader were made.
 // NativeSameFrame is the legacy two-engine-traversal producer. SingleTraversal
@@ -222,7 +251,11 @@ inline bool beginSequencedSharedWrite(volatile LONG& sequence)
             YieldProcessor();
             continue;
         }
-        if (InterlockedCompareExchange(&sequence, before + 1, before) == before)
+        const std::uint32_t beforeBits = static_cast<std::uint32_t>(before);
+        const std::uint32_t desiredBits = beforeBits + 1u;
+        LONG desired = 0;
+        std::memcpy(&desired, &desiredBits, sizeof(desired));
+        if (InterlockedCompareExchange(&sequence, desired, before) == before)
         {
             MemoryBarrier();
             return true;
@@ -232,10 +265,75 @@ inline bool beginSequencedSharedWrite(volatile LONG& sequence)
     return false;
 }
 
+// LONG is the Win32 interlocked storage type, not an ordered identity.  A
+// valid even sequence becomes negative after bit 31 is set; consumers must
+// therefore test the modulo-2^32 bit pattern rather than signed positivity.
+inline std::uint32_t sequencedValueBits(LONG sequence)
+{
+    std::uint32_t bits = 0;
+    std::memcpy(&bits, &sequence, sizeof(bits));
+    return bits;
+}
+
+inline bool sequencedValueIsPublished(LONG sequence)
+{
+    const std::uint32_t bits = sequencedValueBits(sequence);
+    return bits != 0u && (bits & 1u) == 0u;
+}
+
 inline void endSequencedSharedWrite(volatile LONG& sequence)
 {
     MemoryBarrier();
-    InterlockedIncrement(&sequence);
+    const std::uint32_t beforeBits = sequencedValueBits(sequence);
+    std::uint32_t publishedBits = beforeBits + 1u;
+    // Zero is the cold/uninitialized sentinel in every consumer.  The writer
+    // owns the odd value, so it can skip the single modulo-2^32 zero value
+    // without exposing an intermediate even record.
+    if (publishedBits == 0u)
+        publishedBits = 2u;
+    LONG published = 0;
+    std::memcpy(&published, &publishedBits, sizeof(published));
+    InterlockedExchange(&sequence, published);
+}
+
+// Advance a single-writer publication counter while preserving zero as the
+// uninitialized sentinel. This is used by non-seqlock records whose separate
+// `writing` flag already owns the transaction.
+inline LONG incrementNonzeroSharedCounter(volatile LONG& sequence)
+{
+    for (;;)
+    {
+        const LONG before = sequence;
+        std::uint32_t nextBits = sequencedValueBits(before) + 1u;
+        if (nextBits == 0u)
+            nextBits = 1u;
+        LONG next = 0;
+        std::memcpy(&next, &nextBits, sizeof(next));
+        if (InterlockedCompareExchange(&sequence, next, before) == before)
+            return next;
+        YieldProcessor();
+    }
+}
+
+inline bool nonzeroSharedCounterAdvanced(LONG current, LONG previous)
+{
+    const std::uint32_t currentBits = sequencedValueBits(current);
+    const std::uint32_t previousBits = sequencedValueBits(previous);
+    const std::uint32_t delta = currentBits - previousBits;
+    return currentBits != 0u && delta != 0u && delta < 0x80000000u;
+}
+
+// Forward distance in the publication domain 1..UINT32_MAX. Zero is skipped,
+// so ordinary modulo-2^32 subtraction is one too large across the wrap.
+inline std::uint64_t nonzeroSharedCounterDistance(
+    std::uint32_t currentBits,
+    std::uint32_t previousBits)
+{
+    if (currentBits == 0u || previousBits == 0u || currentBits == previousBits)
+        return 0;
+    if (currentBits > previousBits)
+        return static_cast<std::uint64_t>(currentBits - previousBits);
+    return static_cast<std::uint64_t>(0xffffffffu - previousBits) + currentBits;
 }
 
 inline std::int32_t addWrappedInt32(std::int32_t value, std::int32_t delta)
@@ -319,9 +417,15 @@ struct SharedVrPoseState
     // Incremented by the OpenXR host when LOCAL space changes. Consumers must
     // invalidate every recenter/body anchor derived from an older generation.
     std::uint32_t referenceSpaceGeneration;
-    // Nonzero identity of the current host process. Generation numbers can
-    // repeat after a restart; consumers reset all origins when this changes.
-    std::uint32_t producerEpoch;
+    // Nonzero host-lifetime identity. The producer owns a named lifetime mutex
+    // and atomically increments the retained mapping value on every restart;
+    // consumers reset all origins when this changes. Uniqueness assumes fewer
+    // than 2^64 producer lifetimes while the mapping lineage remains live.
+    std::uint64_t producerEpoch;
+    // Monotonic edge mailbox. The host increments this only on a recenter
+    // chord rising edge, so a short press cannot disappear between polls.
+    std::uint32_t recenterRequestId;
+    std::uint32_t reserved;
 };
 
 // The D3D9 native camera transaction is the authority that chooses the
@@ -343,7 +447,7 @@ struct SharedVrOriginState
     std::uint64_t poseFrame;
     float originRot[4];
     float originPos[3];
-    std::uint32_t producerEpoch;
+    std::uint64_t producerEpoch;
     std::uint32_t renderPoseSequence;
     std::uint32_t reserved;
     std::uint64_t renderPoseFrame;
@@ -355,6 +459,15 @@ struct SharedVrOriginState
     std::uint32_t renderCameraWorldValid;
     float renderCameraWorldRot[9];
     float renderCameraWorldPos[3];
+    // Body-root transform captured in the same render transaction as the
+    // camera above. The animation plugin must never combine that historical
+    // camera with a body transform sampled in a later callback.
+    std::uint32_t bodyRootAddress;
+    std::uint32_t bodyRootWorldValid;
+    float bodyRootWorldRot[9];
+    float bodyRootWorldPos[3];
+    float bodyRootWorldScale;
+    std::uint32_t reserved2;
 };
 
 struct SharedCameraState
@@ -426,8 +539,19 @@ struct SharedD3D9StereoFrameHeader
     std::uint32_t rightPayloadOffset;
     std::uint32_t totalMappingBytes;
     std::uint32_t referenceSpaceGeneration;
-    std::uint32_t producerEpoch;
-    std::uint32_t reserved;
+    // Identity of the OpenXR pose publisher whose eye transforms are stored.
+    std::uint64_t producerEpoch;
+    // Independent identity of the D3D9 process that rendered/copied pixels.
+    // Both epochs are required: a renderer restart may retain the same live
+    // pose publisher and a PID can be reused.
+    std::uint64_t rendererProducerEpoch;
+    std::uint32_t producerProcessId;
+    volatile LONG publishedSlot;
+    volatile LONG readerSlots[D3D9StereoFrameReaderLaneCount];
+    // 64-bit ABA guard for the metadata snapshot/claim handshake. Combined
+    // with rendererProducerEpoch, a reader cannot confuse a wrapped 32-bit
+    // sequence with the publication it originally inspected.
+    volatile LONG64 publicationGeneration;
 };
 
 struct SharedPlayerState
@@ -467,7 +591,7 @@ struct SharedCommandState
 
 struct SharedInputEvent
 {
-    std::uint32_t sequence;
+    volatile LONG sequence;
     std::uint32_t type;
     std::uint32_t code;
     std::int32_t value0;
@@ -489,12 +613,12 @@ struct SharedInputEventQueue
 
 static_assert(sizeof(SharedXInputState) == 32, "SharedXInputState layout changed");
 static_assert(sizeof(SharedDInputState) == 100, "SharedDInputState layout changed unexpectedly");
-static_assert(sizeof(SharedVrPoseState) == 272, "SharedVrPoseState layout changed unexpectedly");
-static_assert(sizeof(SharedVrOriginState) == 144, "SharedVrOriginState layout changed unexpectedly");
+static_assert(sizeof(SharedVrPoseState) == 288, "SharedVrPoseState layout changed unexpectedly");
+static_assert(sizeof(SharedVrOriginState) == 216, "SharedVrOriginState layout changed unexpectedly");
 static_assert(sizeof(SharedCameraState) == 80, "SharedCameraState layout changed");
 static_assert(sizeof(SharedRuntimeState) == 88, "SharedRuntimeState layout changed");
 static_assert(sizeof(SharedD3D9FrameHeader) == 28, "SharedD3D9FrameHeader layout changed");
-static_assert(sizeof(SharedD3D9StereoFrameHeader) == 184, "SharedD3D9StereoFrameHeader layout changed");
+static_assert(sizeof(SharedD3D9StereoFrameHeader) == 216, "SharedD3D9StereoFrameHeader layout changed");
 static_assert(sizeof(SharedPlayerState) == 160, "SharedPlayerState layout changed");
 static_assert(sizeof(SharedCommandState) == 216, "SharedCommandState layout changed");
 static_assert(sizeof(SharedInputEvent) == 32, "SharedInputEvent layout changed");
@@ -531,13 +655,20 @@ static_assert(offsetof(SharedVrPoseState, leftAimRot) == 204, "SharedVrPoseState
 static_assert(offsetof(SharedVrPoseState, rightAimRot) == 232, "SharedVrPoseState rightAimRot offset changed");
 static_assert(offsetof(SharedVrPoseState, trackingFlags) == 260, "SharedVrPoseState trackingFlags offset changed");
 static_assert(offsetof(SharedVrPoseState, referenceSpaceGeneration) == 264, "SharedVrPoseState reference generation offset changed");
+static_assert(offsetof(SharedVrPoseState, producerEpoch) == 272, "SharedVrPoseState producer epoch offset changed");
+static_assert(offsetof(SharedVrPoseState, recenterRequestId) == 280, "SharedVrPoseState recenter request offset changed");
 static_assert(offsetof(SharedVrOriginState, poseFrame) == 24, "SharedVrOriginState pose frame offset changed");
 static_assert(offsetof(SharedVrOriginState, originRot) == 32, "SharedVrOriginState rotation offset changed");
-static_assert(offsetof(SharedVrOriginState, renderPoseSequence) == 64, "SharedVrOriginState render pose sequence offset changed");
-static_assert(offsetof(SharedVrOriginState, renderPoseFrame) == 72, "SharedVrOriginState render pose frame offset changed");
-static_assert(offsetof(SharedVrOriginState, renderCameraAddress) == 88, "SharedVrOriginState render camera offset changed");
-static_assert(offsetof(SharedVrOriginState, renderCameraWorldRot) == 96, "SharedVrOriginState render camera rotation offset changed");
-static_assert(offsetof(SharedVrOriginState, renderCameraWorldPos) == 132, "SharedVrOriginState render camera position offset changed");
+static_assert(offsetof(SharedVrOriginState, producerEpoch) == 64, "SharedVrOriginState producer epoch offset changed");
+static_assert(offsetof(SharedVrOriginState, renderPoseSequence) == 72, "SharedVrOriginState render pose sequence offset changed");
+static_assert(offsetof(SharedVrOriginState, renderPoseFrame) == 80, "SharedVrOriginState render pose frame offset changed");
+static_assert(offsetof(SharedVrOriginState, renderCameraAddress) == 96, "SharedVrOriginState render camera offset changed");
+static_assert(offsetof(SharedVrOriginState, renderCameraWorldRot) == 104, "SharedVrOriginState render camera rotation offset changed");
+static_assert(offsetof(SharedVrOriginState, renderCameraWorldPos) == 140, "SharedVrOriginState render camera position offset changed");
+static_assert(offsetof(SharedVrOriginState, bodyRootAddress) == 152, "SharedVrOriginState body root offset changed");
+static_assert(offsetof(SharedVrOriginState, bodyRootWorldRot) == 160, "SharedVrOriginState body rotation offset changed");
+static_assert(offsetof(SharedVrOriginState, bodyRootWorldPos) == 196, "SharedVrOriginState body position offset changed");
+static_assert(offsetof(SharedVrOriginState, bodyRootWorldScale) == 208, "SharedVrOriginState body scale offset changed");
 static_assert(offsetof(SharedD3D9StereoFrameHeader, writing) == 12, "SharedD3D9StereoFrameHeader writing offset changed");
 static_assert(offsetof(SharedD3D9StereoFrameHeader, sequence) == 16, "SharedD3D9StereoFrameHeader sequence offset changed");
 static_assert(offsetof(SharedD3D9StereoFrameHeader, renderedDisplayTime) == 56, "SharedD3D9StereoFrameHeader renderedDisplayTime offset changed");
@@ -545,4 +676,11 @@ static_assert(offsetof(SharedD3D9StereoFrameHeader, leftEyeRot) == 64, "SharedD3
 static_assert(offsetof(SharedD3D9StereoFrameHeader, producerMode) == 152, "SharedD3D9StereoFrameHeader producerMode offset changed");
 static_assert(offsetof(SharedD3D9StereoFrameHeader, renderPairSequence) == 156, "SharedD3D9StereoFrameHeader renderPairSequence offset changed");
 static_assert(offsetof(SharedD3D9StereoFrameHeader, leftPayloadOffset) == 160, "SharedD3D9StereoFrameHeader payload offset changed");
+static_assert(offsetof(SharedD3D9StereoFrameHeader, producerEpoch) == 176, "SharedD3D9StereoFrameHeader producer epoch offset changed");
+static_assert(offsetof(SharedD3D9StereoFrameHeader, rendererProducerEpoch) == 184, "SharedD3D9StereoFrameHeader renderer epoch offset changed");
+static_assert(offsetof(SharedD3D9StereoFrameHeader, producerProcessId) == 192, "SharedD3D9StereoFrameHeader producer PID offset changed");
+static_assert(offsetof(SharedD3D9StereoFrameHeader, publishedSlot) == 196, "SharedD3D9StereoFrameHeader published slot offset changed");
+static_assert(offsetof(SharedD3D9StereoFrameHeader, readerSlots) == 200, "SharedD3D9StereoFrameHeader reader slots offset changed");
+static_assert(offsetof(SharedD3D9StereoFrameHeader, publicationGeneration) == 208, "SharedD3D9StereoFrameHeader publication generation offset changed");
+static_assert(sizeof(SharedD3D9StereoFrameHeader) == 216, "SharedD3D9StereoFrameHeader size changed");
 }

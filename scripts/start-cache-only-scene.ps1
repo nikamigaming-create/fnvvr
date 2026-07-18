@@ -7,6 +7,8 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+throw "Cache-only OpenXR launch is intentionally blocked: this legacy entrypoint has no heartbeat watchdog, safe retail shutdown, or visible fallback. Use the guarded sidecar launcher after its requested mode passes the safety gate."
+
 $Root = Split-Path -Parent $PSScriptRoot
 if ($Frames -gt 0 -and -not $AllowFiniteHostRun) {
     throw "Unsafe cache-only host run refused: finite runs (-Frames $Frames) require -AllowFiniteHostRun."

@@ -33,24 +33,14 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+if (-not [string]::IsNullOrWhiteSpace($D3D9ShaderWvpContracts)) {
+    throw "Raw -D3D9ShaderWvpContracts text is not accepted. Supply -VerifiedShaderDiscoveryRunDir so contracts are regenerated from captured bytecode."
+}
+
 & (Join-Path $PSScriptRoot "audit-launch-safety.ps1") | Out-Host
 
 $verifiedShaderDiscoveryRunDirs = @($VerifiedShaderDiscoveryRunDir |
     Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-if ([string]::IsNullOrWhiteSpace($D3D9ShaderWvpContracts) -and
-    $verifiedShaderDiscoveryRunDirs.Count -gt 0) {
-    $D3D9ShaderWvpContracts = & (Join-Path $PSScriptRoot "get-verified-shader-wvp-contracts.ps1") `
-        -RunDir $verifiedShaderDiscoveryRunDirs `
-        -ContractsOnly
-    if ([string]::IsNullOrWhiteSpace($D3D9ShaderWvpContracts)) {
-        throw "Verified shader discovery produced an empty contract string."
-    }
-    Write-Host ("Verified {0} shader-contract characters from {1} discovery run(s): {2}." -f `
-        $D3D9ShaderWvpContracts.Length,
-        $verifiedShaderDiscoveryRunDirs.Count,
-        ($verifiedShaderDiscoveryRunDirs -join ", "))
-}
-
 $launchArgs = @{
     Configuration = $Configuration
     GameRoot = $GameRoot
@@ -100,13 +90,13 @@ if ($DiscoverShaderContracts) {
     # Full headset runs keep proof telemetry but disable the high-frequency
     # per-draw hammer; it added more than 100 ms to some Fallout traversals.
     $launchArgs.NoTelemetryHammer = $true
-    if ([string]::IsNullOrWhiteSpace($D3D9ShaderWvpContracts) -and -not ($StageOnly -or $ValidateOnly)) {
-        throw "Full VR is fail-closed until -D3D9ShaderWvpContracts supplies reviewed fnv8/sha256/byteCount@register@column-or-row contracts. Run the producer-only shader discovery profile first."
+    if ($verifiedShaderDiscoveryRunDirs.Count -eq 0 -and -not ($StageOnly -or $ValidateOnly)) {
+        throw "Full VR is fail-closed until -VerifiedShaderDiscoveryRunDir supplies captured shader bytecode for regeneration and verification."
     }
     $launchArgs.EnableStereoWorld = $true
-    if (-not [string]::IsNullOrWhiteSpace($D3D9ShaderWvpContracts)) {
+    if ($verifiedShaderDiscoveryRunDirs.Count -gt 0) {
         $launchArgs.EnableD3D9ShaderStereo = $true
-        $launchArgs.D3D9ShaderWvpContracts = $D3D9ShaderWvpContracts
+        $launchArgs.VerifiedShaderDiscoveryRunDir = $verifiedShaderDiscoveryRunDirs
         if (-not [string]::IsNullOrWhiteSpace($D3D9ShaderAllowVertexHashes)) {
             $launchArgs.D3D9ShaderAllowVertexHashes = $D3D9ShaderAllowVertexHashes
         }

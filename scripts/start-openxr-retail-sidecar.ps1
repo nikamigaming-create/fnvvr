@@ -45,12 +45,20 @@ param(
     [double]$D3D9ShaderSanityOffset = 0,
     [string]$D3D9ShaderSanitySlot = "c1w",
     [string]$D3D9ShaderAllowVertexHashes = "",
-    [string]$D3D9ShaderWvpContracts = ""
+    [string]$D3D9ShaderWvpContracts = "",
+    [string[]]$VerifiedShaderDiscoveryRunDir = @()
 )
 
 $ErrorActionPreference = "Stop"
 
 . (Join-Path $PSScriptRoot "fnvxr-sidecar-common.ps1")
+
+if ($StageOnly -and $ValidateOnly) {
+    throw "-StageOnly and -ValidateOnly are mutually exclusive."
+}
+if (-not ($StageOnly -or $ValidateOnly)) {
+    throw "All live OpenXR presentation is intentionally blocked. The remaining finite blockers are an authenticated supervisor/completion record, source-correlated asynchronous output proof, isolated color/depth render transactions, conservative stereo visibility, per-eye depth, complete auxiliary-resource twinning, exact VS+PS camera provenance, and a proved retail rig schedule. This launcher can only -StageOnly or -ValidateOnly; it will not launch the game or touch an OpenXR runtime."
+}
 
 $Root = Split-Path -Parent $PSScriptRoot
 $BuildDir = Join-Path $Root "build"
@@ -75,7 +83,12 @@ New-Item -ItemType Directory -Force -Path $RunDir | Out-Null
 
 trap {
     $caught = $_
-    Write-FnvxrCheckpoint -Path $DebugLog -Message ("ERROR " + $caught.Exception.Message)
+    # The source-level live fuse executes before a run directory exists. Its
+    # diagnostic must remain the user-visible error and must not be replaced by
+    # an empty-path logging failure from this later script-scope trap.
+    if (-not [string]::IsNullOrWhiteSpace([string]$DebugLog)) {
+        Write-FnvxrCheckpoint -Path $DebugLog -Message ("ERROR " + $caught.Exception.Message)
+    }
     $hostWasRunning = [bool]($hostProcess -and -not $hostProcess.HasExited)
     $retailWasRunning = [bool]($falloutPid -and (Get-Process -Id $falloutPid -ErrorAction SilentlyContinue))
     $launcherWasRunning = [bool]($fallout -and -not $fallout.HasExited)
@@ -136,17 +149,44 @@ $NvseLoader = Join-Path $GameRoot "nvse_loader.exe"
 
 Write-FnvxrCheckpoint -Path $DebugLog -Message "start openxr-retail-sidecar"
 
-if ($StageOnly -and $ValidateOnly) {
-    throw "-StageOnly and -ValidateOnly are mutually exclusive."
+if (-not ($StageOnly -or $ValidateOnly) -and ($NoRetail -or $NoSidecarExitWatcher)) {
+    throw "Live OpenXR host-only and watcher-free modes are intentionally blocked. Every launched host must be paired with retail and the heartbeat/exit watchdog."
 }
 if ($DisableRetailRig -and ($EnableRetailRig -or $ApplyRetailRig)) {
     throw "-DisableRetailRig cannot be combined with -EnableRetailRig or -ApplyRetailRig."
 }
-if ($EnableD3D9ShaderStereo -and [string]::IsNullOrWhiteSpace($D3D9ShaderWvpContracts)) {
-    throw "-EnableD3D9ShaderStereo requires verified -D3D9ShaderWvpContracts entries in fnv8/sha256/byteCount@register@column-or-row form."
+if (-not [string]::IsNullOrWhiteSpace($D3D9ShaderWvpContracts)) {
+    throw "Raw -D3D9ShaderWvpContracts text is not accepted; use -VerifiedShaderDiscoveryRunDir."
+}
+$verifiedShaderDiscoveryRunDirs = @($VerifiedShaderDiscoveryRunDir |
+    Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+if ($EnableD3D9ShaderStereo) {
+    if ($verifiedShaderDiscoveryRunDirs.Count -eq 0) {
+        throw "-EnableD3D9ShaderStereo requires -VerifiedShaderDiscoveryRunDir so contracts are regenerated from captured bytecode."
+    }
+    $D3D9ShaderWvpContracts = & (Join-Path $PSScriptRoot "get-verified-shader-wvp-contracts.ps1") `
+        -RunDir $verifiedShaderDiscoveryRunDirs `
+        -ContractsOnly
+    if ([string]::IsNullOrWhiteSpace($D3D9ShaderWvpContracts)) {
+        throw "Verified shader discovery produced no complete safe contracts."
+    }
+}
+if (-not ($StageOnly -or $ValidateOnly)) {
+    if ($EnableStereoWorld -or $EnableD3D9ShaderStereo -or $StereoProducerProofOnly) {
+        throw "OpenXR stereo launch is intentionally blocked: isolated color/depth transactions, per-eye OpenXR depth submission, conservative stereo visibility/LOD/portal/particle traversal, complete auxiliary resource twinning, and exact VS+PS camera-semantic contracts are not implemented. A rejected center traversal can already have changed retail pixels and camera-dependent engine state, while D3D replay cannot recover geometry omitted before submission. Only flat 2D capture remains launchable; stereo producer execution is blocked off-headset as well."
+    }
+    if ($ApplyRetailRig) {
+        throw "Retail rig application is intentionally blocked: the exact animation/render commit schedule is not yet proved. Read-only rig telemetry remains available."
+    }
+}
+if (-not ($StageOnly -or $ValidateOnly) -and $Frames -le 0) {
+    throw "Infinite OpenXR host runs are intentionally blocked until an authenticated external supervisor lease exists. Use an explicitly bounded -Frames value."
 }
 if ($Frames -gt 0 -and -not $AllowFiniteHostRun) {
-    throw "Finite host runs require -AllowFiniteHostRun. Use -Frames 0 for headset testing."
+    throw "Finite host runs require -AllowFiniteHostRun."
+}
+if ($Frames -gt 7200) {
+    throw "Finite host runs are capped at 7200 frames."
 }
 if ($WorldProofStableSamples -lt 1 -or $WorldProofStableSamples -gt 120) {
     throw "-WorldProofStableSamples must be between 1 and 120."
@@ -430,9 +470,9 @@ if ($StereoWorldActive -and -not $DisableRetailRig) {
     # hand renderer. A VR launch that leaves it disabled cannot satisfy the
     # independent controller-to-gun requirement.
     $env:FNVXR_RETAIL_RIG_ENABLE = "1"
-    $env:FNVXR_RETAIL_RIG_APPLY = "1"
-    $env:FNVXR_RETAIL_WEAPON_APPLY = "1"
-    Write-FnvxrCheckpoint -Path $DebugLog -Message "retail rig enabled apply=1 source=stereo-default gravityAlignedOrigin=1 exactRenderPoseLease=1 stableBodyAnchor=1"
+    $env:FNVXR_RETAIL_RIG_APPLY = $(if ($ApplyRetailRig) { "1" } else { "0" })
+    $env:FNVXR_RETAIL_WEAPON_APPLY = $(if ($ApplyRetailRig) { "1" } else { "0" })
+    Write-FnvxrCheckpoint -Path $DebugLog -Message ("retail rig enabled apply={0} source=explicit-only; exact render/animation scheduling is not yet proven" -f $env:FNVXR_RETAIL_RIG_APPLY)
 } elseif ($EnableRetailRig -or $ApplyRetailRig) {
     $env:FNVXR_RETAIL_RIG_ENABLE = "1"
     $env:FNVXR_RETAIL_RIG_APPLY = $(if ($ApplyRetailRig) { "1" } else { "0" })
@@ -612,6 +652,7 @@ if (-not $NoRetail) {
                 "-FalloutPid", $falloutPid,
                 "-HostPid", $hostProcess.Id,
                 "-RunDir", $RunDir,
+                "-ExpectedProfile", $AcceptanceProfile,
                 "-LiveAnalyzer", (Join-Path $PSScriptRoot "analyze-fnvxr-live-run.ps1"),
                 "-StereoCaptureScript", (Join-Path $PSScriptRoot "capture-scene-cache.ps1"),
                 "-CommandExe", $CommandExe,

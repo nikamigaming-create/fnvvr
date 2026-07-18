@@ -12,6 +12,8 @@ param(
 
 $ErrorActionPreference = "SilentlyContinue"
 
+throw "Legacy host restart loops are intentionally blocked: process-existence polling cannot prove OpenXR progress and may relaunch into a live retail process."
+
 function Write-WatchdogLog {
     param([string]$Message)
 

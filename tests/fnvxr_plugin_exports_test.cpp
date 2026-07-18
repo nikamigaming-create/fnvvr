@@ -55,15 +55,24 @@ int main(int argc, char** argv)
 
     using QueryFn = bool (*)(const NVSEInterface*, PluginInfo*);
     using LoadFn = bool (*)(const NVSEInterface*);
+    using RetailMutationProofFn = bool (*)();
 
     auto query = reinterpret_cast<QueryFn>(GetProcAddress(plugin, "NVSEPlugin_Query"));
     auto load = reinterpret_cast<LoadFn>(GetProcAddress(plugin, "NVSEPlugin_Load"));
+    auto retailMutationProof = reinterpret_cast<RetailMutationProofFn>(
+        GetProcAddress(plugin, "FNVXR_RetailMutationProofComplete"));
 
     if (!query)
         return fail("missing NVSEPlugin_Query export");
 
     if (!load)
         return fail("missing NVSEPlugin_Load export");
+
+    if (!retailMutationProof)
+        return fail("missing retail mutation proof export");
+
+    if (retailMutationProof())
+        return fail("retail mutation proof must remain source-blocked");
 
     NVSEInterface nvse {};
     nvse.nvseVersion = 0x060408;
@@ -73,6 +82,21 @@ int main(int argc, char** argv)
     PluginInfo info {};
     if (!query(&nvse, &info))
         return fail("NVSEPlugin_Query rejected test runtime");
+
+    NVSEInterface wrongRuntime = nvse;
+    wrongRuntime.runtimeVersion = 1;
+    if (query(&wrongRuntime, &info))
+        return fail("NVSEPlugin_Query accepted an unsupported runtime");
+
+    NVSEInterface noGoreRuntime = nvse;
+    noGoreRuntime.runtimeVersion = 0x040020d1;
+    if (query(&noGoreRuntime, &info))
+        return fail("NVSEPlugin_Query accepted the unproven no-gore runtime");
+
+    NVSEInterface editorRuntime = nvse;
+    editorRuntime.isEditor = 1;
+    if (query(&editorRuntime, &info))
+        return fail("NVSEPlugin_Query accepted the editor");
 
     if (!info.name || info.version == 0)
         return fail("NVSEPlugin_Query did not fill PluginInfo");
