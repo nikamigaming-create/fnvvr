@@ -133,15 +133,15 @@ int main()
     require(
         privateGeometryCollectorOnVisibleProductionEvidencePresent()
             && privateGeometryCollectorVtableBlockProductionEvidencePresent()
-            && !PrivateGeometryCollectorX86Abi::onVisibleRuntimeVerificationImplemented
-            && !PrivateGeometryCollectorX86Abi::fullClonedVtableProven
+            && PrivateGeometryCollectorX86Abi::onVisibleRuntimeVerificationImplemented
+            && PrivateGeometryCollectorX86Abi::fullClonedVtableProven
             && !PrivateGeometryCollectorX86Abi::runtimeActivationAuthorized
             && !PrivateGeometryCollectorX86Abi::activatesHook
-            && !PrivateGeometryCollectorX86Abi::clonesVtable
+            && PrivateGeometryCollectorX86Abi::clonesVtable
             && !PrivateGeometryCollectorX86Abi::callsEngine
             && !PrivateGeometryCollectorX86Abi::writesProcessMemory
             && !privateGeometryCollectorProductionReady(),
-        "runtime activation flags must remain false after static ABI promotion");
+        "implemented clone proofs must be true while runtime activation remains gated");
 
     constexpr std::uint64_t generation = 0x1122334455667788ull;
     constexpr RetailGeometryPointer32 owner = 0x10002000u;

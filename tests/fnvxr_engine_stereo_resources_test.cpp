@@ -840,7 +840,9 @@ int main()
         RetailWorldStereoResourceConstructionParameters
             .accumulatorMaximumPassCount == 0x2F7u);
 
-    static_assert(!StereoResourceProductionAuthorizationAvailable);
+    static_assert(
+        StereoResourceProductionAuthorizationAvailable
+        == RetailRuntimeProductionAuthorizationAvailable);
     static_assert(std::is_default_constructible_v<StereoResourceAuthorization>);
     static_assert(!std::is_constructible_v<StereoResourceAuthorization, bool>);
     static_assert(!std::is_copy_constructible_v<OwnedResources>);

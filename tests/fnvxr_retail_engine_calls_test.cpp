@@ -99,7 +99,9 @@ int main()
 {
     using namespace fnvxr::engine;
 
-    static_assert(!RetailEngineCallProductionAuthorizationAvailable);
+    static_assert(
+        RetailEngineCallProductionAuthorizationAvailable
+        == RetailRuntimeProductionAuthorizationAvailable);
     static_assert(std::is_default_constructible_v<RetailEngineCallAuthorization>);
     static_assert(
         !std::is_constructible_v<

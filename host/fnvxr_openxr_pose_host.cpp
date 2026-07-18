@@ -6,7 +6,10 @@
 #define XR_USE_GRAPHICS_API_D3D11
 
 #include "fnvxr_protocol.h"
+#include "fnvxr_gpu_color_route.h"
+#include "fnvxr_openxr_live_authority.h"
 #include "fnvxr_shared_state.h"
+#include "fnvxr_stereo_visual_trial.h"
 #include "fnvxr_stereo_math.h"
 
 #include <windows.h>
@@ -34,6 +37,7 @@
 #include <cstdint>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 using Microsoft::WRL::ComPtr;
@@ -242,6 +246,8 @@ struct Renderer
     UINT edgeSmearTexturedVertexCount = 0;
     ComPtr<ID3D11Texture2D> gameTexture;
     ComPtr<ID3D11ShaderResourceView> gameTextureView;
+    ComPtr<ID3D11Texture2D> retainedUiTexture;
+    ComPtr<ID3D11ShaderResourceView> retainedUiTextureView;
     ComPtr<ID3D11Texture2D> worldTexture;
     ComPtr<ID3D11ShaderResourceView> worldTextureView;
     ComPtr<ID3D11ShaderResourceView> pauseSceneTextureView;
@@ -291,6 +297,9 @@ struct Renderer
     std::chrono::steady_clock::time_point gameTextureAcceptedAt {};
     bool gameTextureTransportFresh = false;
     std::uint32_t gameTextureSourceHash = 0;
+    std::uint64_t retainedUiSourceFrame = 0u;
+    std::uint64_t retainedUiRuntimeStateSample = 0u;
+    float retainedUiTextureAspect = 16.0f / 9.0f;
     uint64_t gameTextureUpdates = 0;
     uint64_t gameTextureMisses = 0;
     bool hasWorldTextureFrame = false;
@@ -383,6 +392,137 @@ struct EyeRenderProof
     std::uint32_t samples = 0;
     std::uint32_t nonBlackSamples = 0;
     std::uint32_t variedSamples = 0;
+};
+
+struct SourceViewPublication
+{
+    bool valid = false;
+    std::uint64_t poseSequence = 0u;
+    XrTime predictedDisplayTime = 0;
+    std::uint64_t hostProducerEpoch = 0u;
+    std::uint32_t referenceSpaceGeneration = 0u;
+    std::array<XrView, 2> views {
+        XrView { XR_TYPE_VIEW },
+        XrView { XR_TYPE_VIEW },
+    };
+};
+
+class SourceViewHistory final
+{
+public:
+    void reset() noexcept
+    {
+        mEntries = {};
+        mCursor = 0u;
+    }
+
+    void record(
+        std::uint64_t poseSequence,
+        XrTime predictedDisplayTime,
+        std::uint64_t hostProducerEpoch,
+        std::uint32_t referenceSpaceGeneration,
+        const XrView* views) noexcept
+    {
+        if (poseSequence == 0u
+            || predictedDisplayTime == 0
+            || hostProducerEpoch == 0u
+            || referenceSpaceGeneration == 0u
+            || !views
+            || !viewUsable(views[0])
+            || !viewUsable(views[1])
+            || !eyesDistinct(views[0], views[1]))
+        {
+            return;
+        }
+        SourceViewPublication& entry = mEntries[mCursor];
+        entry.valid = true;
+        entry.poseSequence = poseSequence;
+        entry.predictedDisplayTime = predictedDisplayTime;
+        entry.hostProducerEpoch = hostProducerEpoch;
+        entry.referenceSpaceGeneration = referenceSpaceGeneration;
+        entry.views[0] = views[0];
+        entry.views[1] = views[1];
+        mCursor = (mCursor + 1u) % mEntries.size();
+    }
+
+    bool find(
+        const fnvxr::host::gpu_color::ConsumerFrame& frame,
+        std::uint64_t currentHostProducerEpoch,
+        std::uint32_t currentReferenceSpaceGeneration,
+        SourceViewPublication& found) const noexcept
+    {
+        found = {};
+        for (const SourceViewPublication& entry : mEntries)
+        {
+            const fnvxr::host::gpu_color::SourcePoseLineage lineage {
+                entry.poseSequence,
+                entry.predictedDisplayTime,
+                entry.hostProducerEpoch,
+                entry.referenceSpaceGeneration,
+                entry.valid,
+                entry.valid,
+            };
+            if (entry.valid
+                && fnvxr::host::gpu_color::exactSourcePoseLineage(
+                    frame,
+                    lineage,
+                    currentHostProducerEpoch,
+                    currentReferenceSpaceGeneration))
+            {
+                found = entry;
+                return true;
+            }
+        }
+        return false;
+    }
+
+private:
+    static bool viewUsable(const XrView& view) noexcept
+    {
+        const float quaternionLengthSquared =
+            view.pose.orientation.x * view.pose.orientation.x
+            + view.pose.orientation.y * view.pose.orientation.y
+            + view.pose.orientation.z * view.pose.orientation.z
+            + view.pose.orientation.w * view.pose.orientation.w;
+        const float fov[4] {
+            view.fov.angleLeft,
+            view.fov.angleRight,
+            view.fov.angleUp,
+            view.fov.angleDown,
+        };
+        return std::isfinite(quaternionLengthSquared)
+            && quaternionLengthSquared >= 0.25f
+            && quaternionLengthSquared <= 4.0f
+            && std::isfinite(view.pose.position.x)
+            && std::isfinite(view.pose.position.y)
+            && std::isfinite(view.pose.position.z)
+            && fnvxr::stereo::openXrFovAnglesUsable(fov);
+    }
+
+    static bool eyesDistinct(
+        const XrView& left,
+        const XrView& right) noexcept
+    {
+        const float x = right.pose.position.x - left.pose.position.x;
+        const float y = right.pose.position.y - left.pose.position.y;
+        const float z = right.pose.position.z - left.pose.position.z;
+        const float distanceSquared = x * x + y * y + z * z;
+        return std::isfinite(distanceSquared)
+            && distanceSquared >= 0.03f * 0.03f
+            && distanceSquared <= 0.12f * 0.12f;
+    }
+
+    std::array<SourceViewPublication, 128> mEntries {};
+    std::size_t mCursor = 0u;
+};
+
+struct UiTextureCandidate
+{
+    ComPtr<ID3D11Texture2D> texture;
+    ComPtr<ID3D11ShaderResourceView> view;
+    std::uint64_t sourceFrame = 0u;
+    std::uint64_t runtimeStateSample = 0u;
+    float aspect = 16.0f / 9.0f;
 };
 
 constexpr LONG SharedPointerWidth = 1280;
@@ -2622,12 +2762,18 @@ bool readSharedRuntimeUiActive(
     bool& uiActive,
     bool& gameplayActive,
     bool& cameraActive,
-    std::uint32_t& menuBits)
+    std::uint32_t& menuBits,
+    std::uint32_t& runtimePhase,
+    std::uint32_t& showroomActive,
+    std::uint64_t& runtimeStateSample)
 {
     uiActive = true;
     gameplayActive = false;
     cameraActive = false;
     menuBits = 0;
+    runtimePhase = fnvxr::shared::RuntimePhaseUnknown;
+    showroomActive = 0u;
+    runtimeStateSample = 0u;
     if (!renderer.sharedRuntimeState)
     {
         renderer.sharedRuntimeMapping = OpenFileMappingA(FILE_MAP_READ, FALSE, "Local\\FNVXR_Runtime_State");
@@ -2706,6 +2852,9 @@ bool readSharedRuntimeUiActive(
 
     cameraActive = snapshot.cameraActive != 0u;
     menuBits = snapshot.menuBits;
+    runtimePhase = snapshot.phase;
+    showroomActive = snapshot.showroomActive;
+    runtimeStateSample = snapshot.frame;
     gameplayActive = fnvxr::shared::runtimeGameplayPhase(snapshot.phase, snapshot.menuBits, snapshot.showroomActive);
     // Runtime opens the world probe; a presentable stereo header decides when the quad can disappear.
     uiActive = !gameplayActive;
@@ -3226,7 +3375,7 @@ void closeHostSharedBridge(HostSharedBridge& bridge)
     }
 }
 
-void publishHostSharedBridge(
+std::uint64_t publishHostSharedBridge(
     HostSharedBridge& bridge,
     const fnvxr::PoseFrame& frame,
     XrTime predictedDisplayTime,
@@ -3247,7 +3396,7 @@ void publishHostSharedBridge(
     std::uint32_t viewCount)
 {
     if (!bridge.xinputState || !bridge.dinputState || !bridge.vrPoseState)
-        return;
+        return 0u;
 
     const bool suppressMenuAnalog =
         menuInputActive && envEnabled("FNVXR_XINPUT_MENU_SUPPRESS_ANALOG", true);
@@ -3396,7 +3545,7 @@ void publishHostSharedBridge(
     }
 
     if (!fnvxr::shared::beginSequencedSharedWrite(bridge.vrPoseState->sequence))
-        return;
+        return 0u;
     bridge.vrPoseState->magic = fnvxr::shared::VrPoseSharedMagic;
     bridge.vrPoseState->version = fnvxr::shared::VrPoseSharedVersion;
     bridge.vrPoseState->trackingFlags = poseTrackingFlags;
@@ -3465,6 +3614,9 @@ void publishHostSharedBridge(
         std::memcpy(bridge.vrPoseState->rightFov, bridge.vrPoseState->leftFov, sizeof(bridge.vrPoseState->rightFov));
     }
     fnvxr::shared::endSequencedSharedWrite(bridge.vrPoseState->sequence);
+    return static_cast<std::uint64_t>(
+        fnvxr::shared::sequencedValueBits(
+            bridge.vrPoseState->sequence));
 }
 
 void closeSharedD3D9VideoFrame(Renderer& renderer)
@@ -3534,18 +3686,50 @@ void closeSharedD3D9VideoFrame(Renderer& renderer)
     }
 }
 
-bool updateGameTexture(ID3D11Device* device, Renderer& renderer)
+bool updateGameTexture(
+    ID3D11Device* device,
+    Renderer& renderer,
+    bool diagnosticFallbacksAllowed)
 {
     const auto updateStart = std::chrono::steady_clock::now();
     const int textureWidth = renderer.gameTextureWidth;
     const int textureHeight = renderer.gameTextureHeight;
     static std::vector<std::uint32_t> pixels;
-    bool captured = true;
+    bool captured = false;
     bool fromSharedTransport = false;
     float sourceAspect = static_cast<float>(textureWidth) / static_cast<float>(textureHeight);
-    if (envEquals("FNVXR_GAME_PLANE_SOURCE", "test"))
+    if (!diagnosticFallbacksAllowed)
+    {
+        captured = readSharedD3D9VideoFrame(
+            renderer,
+            pixels,
+            sourceAspect);
+        fromSharedTransport = captured;
+        if (captured && isMostlyBlackFrame(pixels))
+            captured = false;
+        if (!captured)
+        {
+            ++renderer.gameTextureMisses;
+            const auto uiNow = std::chrono::steady_clock::now();
+            const auto maximumStaleAge = std::chrono::milliseconds(std::clamp(
+                envInt("FNVXR_GAME_PLANE_MAX_STALE_MS", 250), 16, 5000));
+            const bool previousRetailFrameFresh =
+                renderer.hasGameTextureFrame
+                && renderer.gameTextureTransportFresh
+                && renderer.gameTextureAcceptedAt.time_since_epoch().count() != 0
+                && uiNow - renderer.gameTextureAcceptedAt <= maximumStaleAge;
+            if (previousRetailFrameFresh)
+                return true;
+            renderer.hasGameTextureFrame = false;
+            renderer.gameTextureTransportFresh = false;
+            renderer.gameTextureSourceHash = 0u;
+            return false;
+        }
+    }
+    else if (envEquals("FNVXR_GAME_PLANE_SOURCE", "test"))
     {
         fillGamePlaneTestPattern(textureWidth, textureHeight, pixels);
+        captured = true;
     }
     else
     {
@@ -4838,7 +5022,7 @@ void drawMenuShowroom(
         gameTextureView);
 }
 
-void drawGameFullscreen(
+void drawFullSurfaceTexture(
     ID3D11DeviceContext* context,
     Renderer& renderer,
     ID3D11ShaderResourceView* gameTextureView)
@@ -4865,6 +5049,113 @@ void drawGameFullscreen(
 
     ID3D11ShaderResourceView* emptyView = nullptr;
     context->PSSetShaderResources(0, 1, &emptyView);
+}
+
+void drawGameFullscreen(
+    ID3D11DeviceContext* context,
+    Renderer& renderer,
+    ID3D11ShaderResourceView* gameTextureView)
+{
+    drawFullSurfaceTexture(context, renderer, gameTextureView);
+}
+
+void drawProductionBinocularEyeColor(
+    ID3D11DeviceContext* context,
+    Renderer& renderer,
+    ID3D11ShaderResourceView* eyeTextureView)
+{
+    // This entry point is intentionally distinct from the retained legacy
+    // mono/fullscreen diagnostic. Its only caller supplies one private GPU
+    // destination view accepted from the ABI-v5 consumer for this exact eye.
+    drawFullSurfaceTexture(context, renderer, eyeTextureView);
+}
+
+bool retainedUiMatches(
+    const Renderer& renderer,
+    const fnvxr::host::gpu_color::ConsumerFrame& frame) noexcept
+{
+    return renderer.retainedUiTexture
+        && renderer.retainedUiTextureView
+        && renderer.retainedUiSourceFrame == frame.sourceFrame
+        && renderer.retainedUiRuntimeStateSample == frame.runtimeStateSample;
+}
+
+bool prepareUiTextureCandidate(
+    ID3D11Device* device,
+    ID3D11Texture2D* source,
+    const fnvxr::host::gpu_color::ConsumerFrame& frame,
+    UiTextureCandidate& candidate) noexcept
+{
+    candidate = {};
+    if (!device
+        || !source
+        || frame.sourceFrame == 0u
+        || frame.runtimeStateSample == 0u)
+    {
+        return false;
+    }
+    D3D11_TEXTURE2D_DESC description {};
+    source->GetDesc(&description);
+    if (description.Width == 0u
+        || description.Height == 0u
+        || description.MipLevels != 1u
+        || description.ArraySize != 1u
+        || description.SampleDesc.Count != 1u)
+    {
+        return false;
+    }
+    description.Usage = D3D11_USAGE_DEFAULT;
+    description.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    description.CPUAccessFlags = 0u;
+    description.MiscFlags = 0u;
+    if (FAILED(device->CreateTexture2D(
+            &description,
+            nullptr,
+            &candidate.texture))
+        || !candidate.texture
+        || FAILED(device->CreateShaderResourceView(
+            candidate.texture.Get(),
+            nullptr,
+            &candidate.view))
+        || !candidate.view)
+    {
+        candidate = {};
+        return false;
+    }
+    ComPtr<ID3D11DeviceContext> context;
+    device->GetImmediateContext(&context);
+    if (!context)
+    {
+        candidate = {};
+        return false;
+    }
+    context->CopyResource(candidate.texture.Get(), source);
+    candidate.sourceFrame = frame.sourceFrame;
+    candidate.runtimeStateSample = frame.runtimeStateSample;
+    candidate.aspect = static_cast<float>(description.Width)
+        / static_cast<float>(description.Height);
+    return true;
+}
+
+void commitUiTextureCandidate(
+    Renderer& renderer,
+    UiTextureCandidate& candidate) noexcept
+{
+    renderer.retainedUiTexture = std::move(candidate.texture);
+    renderer.retainedUiTextureView = std::move(candidate.view);
+    renderer.retainedUiSourceFrame = candidate.sourceFrame;
+    renderer.retainedUiRuntimeStateSample = candidate.runtimeStateSample;
+    renderer.retainedUiTextureAspect = candidate.aspect;
+    candidate = {};
+}
+
+void clearRetainedUiTexture(Renderer& renderer) noexcept
+{
+    renderer.retainedUiTexture.Reset();
+    renderer.retainedUiTextureView.Reset();
+    renderer.retainedUiSourceFrame = 0u;
+    renderer.retainedUiRuntimeStateSample = 0u;
+    renderer.retainedUiTextureAspect = 16.0f / 9.0f;
 }
 
 MenuPointer menuPointerFromAimPose(const XrPosef& aimPose, const GamePlane& gamePlane)
@@ -5390,6 +5681,8 @@ bool renderEye(
     bool showGamePlane,
     bool drawFullscreen,
     bool useCertifiedStereoTextures,
+    ID3D11ShaderResourceView* productionWorldTextureView,
+    ID3D11ShaderResourceView* productionUiTextureView,
     const float clearColor[4],
     EyeRenderProof& renderProof)
 {
@@ -5437,9 +5730,12 @@ bool renderEye(
     }
 
     const XMMATRIX viewProjection = viewFromPose(view.pose) * projectionFromFov(view.fov, 0.05f, 50.0f);
-    ID3D11ShaderResourceView* uiTextureView = renderer.gameTextureView.Get();
+    ID3D11ShaderResourceView* uiTextureView = productionUiTextureView
+        ? productionUiTextureView
+        : renderer.gameTextureView.Get();
     ID3D11ShaderResourceView* worldTextureView = uiTextureView;
-    if (fnvxr::stereo::certifiedStereoTextureMayBeSampled(
+    if (!productionWorldTextureView
+        && fnvxr::stereo::certifiedStereoTextureMayBeSampled(
             drawFullscreen,
             useCertifiedStereoTextures,
             renderer.hasStereoGameFrame,
@@ -5449,7 +5745,16 @@ bool renderEye(
         worldTextureView = renderer.stereoGameTextureViews[eyeIndex].Get();
     }
 
-    if (drawFullscreen)
+    if (productionWorldTextureView)
+    {
+        context->OMSetDepthStencilState(renderer.gamePlaneDepthState.Get(), 0);
+        drawProductionBinocularEyeColor(
+            context.Get(),
+            renderer,
+            productionWorldTextureView);
+        context->OMSetDepthStencilState(renderer.depthState.Get(), 0);
+    }
+    else if (drawFullscreen)
     {
         context->OMSetDepthStencilState(renderer.gamePlaneDepthState.Get(), 0);
         drawGameFullscreen(context.Get(), renderer, worldTextureView);
@@ -5484,7 +5789,9 @@ bool renderEye(
         drawMenuPointer(context.Get(), renderer, viewProjection, menuPointer, gamePlane);
         context->OMSetDepthStencilState(renderer.depthState.Get(), 0);
     }
-    const bool drawWorldProps = envEnabled("FNVXR_SHOW_WORLD_PROPS", false)
+    const bool drawWorldProps = !productionWorldTextureView
+        && !productionUiTextureView
+        && envEnabled("FNVXR_SHOW_WORLD_PROPS", false)
         && (!drawFullscreen || envEnabled("FNVXR_OVERLAY_PROPS_ON_FULLSCREEN", false));
     if (drawWorldProps && envEnabled("FNVXR_SHOW_BODY_RIG", true))
     {
@@ -5932,7 +6239,6 @@ std::vector<TexturedVertex> makeSurroundGamePlaneVertices()
             const float sideV1 = modeSettings.sideV1;
             const float safeBottomV0 = modeSettings.safeBottomV0;
             const float safeBottomV1 = modeSettings.safeBottomV1;
-            const float bottomV0 = modeSettings.bottomV0;
             const float bottomV1 = modeSettings.bottomV1;
             const float transitionPower = std::clamp(modeSettings.transitionPower, 0.20f, 2.0f);
             auto edgeT = [&](float distance, float span) -> float
@@ -7208,16 +7514,6 @@ struct ComApartment
     }
 };
 
-// This is a source-level fuse, independent of scripts and environment text.
-// The host must not touch an OpenXR runtime until the supervisor, correlated
-// asynchronous output proof, and complete render-transaction prerequisites
-// listed at the fail-closed return in main are implemented and reviewed.
-constexpr bool OpenXrLiveRuntimeProofComplete = false;
-// A separate integration fuse prevents a future one-line OpenXR fuse change
-// from reviving the legacy environment-driven mono gameplay/HUD path. This may
-// become true only when the tested PresentationController and GPU transaction
-// are the sole production composition path.
-constexpr bool ProductPresentationControllerIntegrated = false;
 }
 
 int main(int argc, char** argv)
@@ -7231,7 +7527,8 @@ int main(int argc, char** argv)
         std::cerr << "CoInitializeEx failed hr=0x" << std::hex << comApartment.result << std::dec << "\n";
     }
 
-    constexpr std::uint64_t MaximumUnsupervisedFrames = 7200;
+    constexpr std::uint64_t MaximumUnsupervisedFrames =
+        fnvxr::host::MaximumProductHostFrames;
     if (argc != 2 || !argv[1] || argv[1][0] == '\0' || argv[1][0] == '-')
     {
         std::cerr << "A positive finite frame count is required; unsupervised live/infinite host execution is blocked.\n";
@@ -7253,24 +7550,16 @@ int main(int argc, char** argv)
     }
     const uint64_t targetFrames = static_cast<uint64_t>(parsed);
 
-    if (!OpenXrLiveRuntimeProofComplete)
+    constexpr auto openXrInitializationAuthorization =
+        fnvxr::host::CompiledProductOpenXrInitializationAuthorization;
+    if (!openXrInitializationAuthorization.authorized())
     {
         std::cerr
-            << "Live OpenXR presentation is intentionally disabled: missing authenticated "
-               "supervisor/completion proof, source-correlated asynchronous output proof, "
-               "isolated color/depth render transactions, conservative stereo visibility, "
-               "per-eye depth, complete auxiliary-resource twinning, and exact VS+PS camera "
-               "provenance. No OpenXR loader or headset session was touched.\n";
+            << "Product OpenXR initialization is disabled by the compiled source/build "
+               "authorization. No OpenXR loader or headset session was touched. failure="
+            << static_cast<unsigned int>(openXrInitializationAuthorization.failure)
+            << "\n";
         return 26;
-    }
-
-    if (!ProductPresentationControllerIntegrated)
-    {
-        std::cerr
-            << "Live OpenXR presentation is intentionally disabled: the tested HUD-free "
-               "WorldStereo/UiQuad product controller is not integrated into the host. "
-               "No OpenXR loader or headset session was touched.\n";
-        return 27;
     }
 
     OpenXr xr {};
@@ -7338,8 +7627,31 @@ int main(int argc, char** argv)
         std::cerr << "failed to create stereo prop renderer\n";
         return 8;
     }
-    initPauseSceneTexture(device.Get(), renderer);
-    loadSceneCacheIntoStereoTextures(device.Get(), renderer);
+
+    fnvxr::host::gpu_color::Win32Consumer gpuColorConsumer;
+    if (!gpuColorConsumer.initialize(device.Get()))
+    {
+        std::cerr << "ABI-v5 GPU color consumer initialization failed backend="
+                  << static_cast<unsigned>(gpuColorConsumer.backendFailure())
+                  << "; production presentation remains closed\n";
+        return 28;
+    }
+
+    // These assets belong to the historical image-replay harness. They may be
+    // loaded for explicit diagnostics, but are absent from the default v5
+    // product route and can never become a gameplay fallback there.
+    const bool legacyImageDiagnostics =
+        envEnabled("FNVXR_ENABLE_LEGACY_IMAGE_DIAGNOSTICS", false);
+    const bool productionGpuColorV5 = !legacyImageDiagnostics;
+    if (legacyImageDiagnostics)
+    {
+        initPauseSceneTexture(device.Get(), renderer);
+        loadSceneCacheIntoStereoTextures(device.Get(), renderer);
+    }
+    std::cout << "gpuColorTransport version=5 productionDefault=1 productionActive="
+              << static_cast<int>(productionGpuColorV5)
+              << " legacyImageDiagnostics="
+              << static_cast<int>(legacyImageDiagnostics) << "\n";
 
     XrGraphicsBindingD3D11KHR graphicsBinding { XR_TYPE_GRAPHICS_BINDING_D3D11_KHR };
     graphicsBinding.device = device.Get();
@@ -7679,6 +7991,20 @@ int main(int argc, char** argv)
     bool referenceSpaceChangePending = false;
     XrTime referenceSpaceChangeTime = 0;
     ULONGLONG nextProgressHeartbeatMilliseconds = 0;
+    fnvxr::host::gpu_color::ConsumeDisposition previousGpuColorDisposition =
+        fnvxr::host::gpu_color::ConsumeDisposition::Rejected;
+    fnvxr::host::gpu_color::ConsumerFailure previousGpuColorFailure =
+        fnvxr::host::gpu_color::ConsumerFailure::NotInitialized;
+    fnvxr::host::gpu_color::RoutedContent previousGpuColorContent =
+        fnvxr::host::gpu_color::RoutedContent::SafetyBlank;
+    std::uint64_t previousGpuColorTransaction = 0u;
+    std::uint64_t activeGpuColorProducerEpoch = 0u;
+    std::uint32_t activeGpuColorProducerProcessId = 0u;
+    fnvxr::product::PresentationController presentationController;
+    fnvxr::product::PresentationDecision productDecision {};
+    SourceViewHistory sourceViewHistory;
+    fnvxr::host::gpu_color::RuntimeEvidenceHistory<>
+        runtimeEvidenceHistory;
 
     for (uint64_t frameIndex = 1; frameIndex <= targetFrames; ++frameIndex)
     {
@@ -7707,7 +8033,13 @@ int main(int argc, char** argv)
         const bool sessionSyncLost = previousShouldSyncFrames && !shouldSyncFrames;
         const bool sessionSyncRegained = !previousShouldSyncFrames && shouldSyncFrames;
         if (sessionSyncLost)
+        {
             invalidateHostSharedBridgeTracking(sharedBridge, "session-not-running");
+            presentationController.reset();
+            sourceViewHistory.reset();
+            runtimeEvidenceHistory.reset();
+            clearRetainedUiTexture(renderer);
+        }
         if (sessionSyncRegained)
         {
             ++referenceSpaceGeneration;
@@ -7715,6 +8047,10 @@ int main(int argc, char** argv)
                 referenceSpaceGeneration = 1;
             referenceSpaceChangePending = false;
             referenceSpaceChangeTime = 0;
+            presentationController.reset();
+            sourceViewHistory.reset();
+            runtimeEvidenceHistory.reset();
+            clearRetainedUiTexture(renderer);
             std::cout << "sessionTrackingGenerationChanged generation="
                       << referenceSpaceGeneration << " reason=session-rebegun\n";
         }
@@ -7784,6 +8120,10 @@ int main(int argc, char** argv)
                       << " displayTime=" << frameState.predictedDisplayTime << "\n";
             referenceSpaceChangePending = false;
             referenceSpaceChangeTime = 0;
+            presentationController.reset();
+            sourceViewHistory.reset();
+            runtimeEvidenceHistory.reset();
+            clearRetainedUiTexture(renderer);
         }
 
         XrFrameBeginInfo beginInfo { XR_TYPE_FRAME_BEGIN_INFO };
@@ -7821,6 +8161,61 @@ int main(int argc, char** argv)
             }
         }
         const bool shouldRender = runtimeShouldRender || renderWhenNotRequested;
+
+        // Exactly one ABI-v5 consume is issued for each begun OpenXR frame.
+        // The route below is derived only from this result: Rejected cannot
+        // expose an earlier private texture, while NoNewFrame can retain only
+        // the exact ConsumerFrame returned by Consumer::consume this call.
+        const fnvxr::host::gpu_color::ConsumeResult gpuColorConsume =
+            gpuColorConsumer.consume();
+        const fnvxr::host::gpu_color::RoutedFrame gpuColorFrame =
+            fnvxr::host::gpu_color::routeConsumedFrame(
+                gpuColorConsume,
+                gpuColorConsumer.eyeView(0u) != nullptr,
+                gpuColorConsumer.eyeView(1u) != nullptr);
+        if (gpuColorFrame.frame.producerEpoch != 0u
+            && (gpuColorFrame.frame.producerEpoch
+                    != activeGpuColorProducerEpoch
+                || gpuColorFrame.frame.producerProcessId
+                    != activeGpuColorProducerProcessId))
+        {
+            activeGpuColorProducerEpoch =
+                gpuColorFrame.frame.producerEpoch;
+            activeGpuColorProducerProcessId =
+                gpuColorFrame.frame.producerProcessId;
+            presentationController.reset();
+            clearRetainedUiTexture(renderer);
+        }
+        const bool gpuColorStateChanged =
+            gpuColorConsume.disposition != previousGpuColorDisposition
+            || gpuColorConsume.failure != previousGpuColorFailure
+            || gpuColorFrame.content != previousGpuColorContent
+            || gpuColorFrame.frame.transactionId
+                != previousGpuColorTransaction;
+        if (gpuColorStateChanged || frameIndex <= 5u || frameIndex % 300u == 0u)
+        {
+            std::cout << "gpuColorConsume frame=" << frameIndex
+                      << " disposition="
+                      << static_cast<unsigned>(gpuColorConsume.disposition)
+                      << " failure="
+                      << static_cast<unsigned>(gpuColorConsume.failure)
+                      << " backend="
+                      << static_cast<unsigned>(gpuColorConsumer.backendFailure())
+                      << " routed="
+                      << static_cast<unsigned>(gpuColorFrame.content)
+                      << " retained="
+                      << static_cast<int>(gpuColorFrame.retainedConsumerFrame)
+                      << " transaction=" << gpuColorFrame.frame.transactionId
+                      << " sourceFrame=" << gpuColorFrame.frame.sourceFrame
+                      << " poseSequence=" << gpuColorFrame.frame.poseSequence
+                      << " runtimeSample="
+                      << gpuColorFrame.frame.runtimeStateSample
+                      << "\n";
+        }
+        previousGpuColorDisposition = gpuColorConsume.disposition;
+        previousGpuColorFailure = gpuColorConsume.failure;
+        previousGpuColorContent = gpuColorFrame.content;
+        previousGpuColorTransaction = gpuColorFrame.frame.transactionId;
 
         if (shouldReadInput)
         {
@@ -8102,6 +8497,10 @@ int main(int argc, char** argv)
         bool runtimeGameplayActive = false;
         bool runtimeCameraActive = false;
         std::uint32_t runtimeMenuBits = 0;
+        std::uint32_t runtimePhase =
+            fnvxr::shared::RuntimePhaseUnknown;
+        std::uint32_t runtimeShowroomActive = 0u;
+        std::uint64_t runtimeStateSample = 0u;
         const bool stereoWorldIntent = stereoWorldRuntimeEnabled();
         bool haveSharedStereoUiState = false;
         bool sharedStereoStateAdvanced = false;
@@ -8148,7 +8547,15 @@ int main(int argc, char** argv)
         const bool effectiveSharedStereoUiActive =
             heldSharedStereoWorldReady ? false : sharedStereoUiActive;
         const bool haveRuntimeUiState =
-            readSharedRuntimeUiActive(renderer, runtimeUiActive, runtimeGameplayActive, runtimeCameraActive, runtimeMenuBits);
+            readSharedRuntimeUiActive(
+                renderer,
+                runtimeUiActive,
+                runtimeGameplayActive,
+                runtimeCameraActive,
+                runtimeMenuBits,
+                runtimePhase,
+                runtimeShowroomActive,
+                runtimeStateSample);
         fnvxr::shared::SharedPlayerState playerSnapshot {};
         const bool havePlayerSnapshot = readSharedPlayerState(sharedBridge, playerSnapshot);
         if (havePlayerSnapshot)
@@ -8378,54 +8785,236 @@ int main(int argc, char** argv)
             missingStereoFrames = 0;
         }
         previousGameUiMode = gameUiMode;
+        int64_t sourcePoseAgeNanoseconds = 0;
+        bool sourcePoseAgeValid = false;
+        const int64_t maximumSourcePoseAgeNanoseconds =
+            static_cast<int64_t>(std::min(
+                25,
+                std::max(1, envInt(
+                    "FNVXR_STEREO_MAX_SOURCE_POSE_AGE_MS",
+                    25))))
+            * 1000000LL;
+        const int64_t sourcePoseFutureToleranceNanoseconds =
+            static_cast<int64_t>(std::max(
+                0,
+                envInt(
+                    "FNVXR_STEREO_SOURCE_POSE_FUTURE_TOLERANCE_MS",
+                    5)))
+            * 1000000LL;
         const bool controlMode = mode == HostMode::Control;
         const bool flatMode = mode == HostMode::Flat;
         const bool vrMode = mode == HostMode::Vr;
         const bool cacheOnlyMode =
-            renderer.hasCachedSceneFrame
+            legacyImageDiagnostics
+            && renderer.hasCachedSceneFrame
             && envEnabled("FNVXR_CACHE_ONLY", false);
         const bool worldBehindMenu =
-            gameUiMode
+            legacyImageDiagnostics
+            && gameUiMode
             && envEnabled("FNVXR_GAME_WORLD_BEHIND_MENU", true);
         const bool allowCacheFullscreen =
             cacheOnlyMode
             && envEnabled("FNVXR_ALLOW_CACHE_FULLSCREEN", false);
         const bool allowStereoFullscreen =
-            allowCacheFullscreen
-            || (envEnabled("FNVXR_GAME_FULLSCREEN_IN_XR", true)
-                && stereoWorldIntent
-                && stereoCellStable
-                && (!gameUiMode || worldBehindMenu)
-                && (vrMode || worldBehindMenu));
+            legacyImageDiagnostics
+            && (allowCacheFullscreen
+                || (envEnabled("FNVXR_GAME_FULLSCREEN_IN_XR", true)
+                    && stereoWorldIntent
+                    && stereoCellStable
+                    && (!gameUiMode || worldBehindMenu)
+                    && (vrMode || worldBehindMenu)));
         const bool showGameplayPlane =
-            !gameUiMode
+            legacyImageDiagnostics
+            && !gameUiMode
             && !cacheOnlyMode
             && !allowStereoFullscreen
             && (flatMode
                 || controlMode
                 || (vrMode && envEnabled("FNVXR_SHOW_GAME_PLANE_IN_GAME", false)))
             && envEnabled("FNVXR_SHOW_GAME_PLANE_IN_GAME", true);
-        const bool showGamePlane =
-            !cacheOnlyMode
-            &&
-            (gameUiMode || showGameplayPlane)
-            && envEnabled("FNVXR_SHOW_GAME_PLANE", true);
+        SourceViewPublication productSourceView {};
+        const bool productSourceViewFound = sourceViewHistory.find(
+            gpuColorFrame.frame,
+            sharedBridge.producerEpoch,
+            referenceSpaceGeneration,
+            productSourceView);
+        if (gpuColorFrame.frame.renderedDisplayTime != 0)
+        {
+            sourcePoseAgeValid =
+                fnvxr::stereo::sourcePoseAgeWithinBudget(
+                    frameState.predictedDisplayTime,
+                    static_cast<XrTime>(
+                        gpuColorFrame.frame.renderedDisplayTime),
+                    maximumSourcePoseAgeNanoseconds,
+                    sourcePoseFutureToleranceNanoseconds,
+                    &sourcePoseAgeNanoseconds);
+        }
+
+        UiTextureCandidate uiCandidate {};
+        bool incomingUiResourceReady = false;
+        if (gpuColorFrame.content
+            == fnvxr::host::gpu_color::RoutedContent::MonoUiQuad)
+        {
+            incomingUiResourceReady = retainedUiMatches(
+                renderer,
+                gpuColorFrame.frame);
+            if (!incomingUiResourceReady)
+            {
+                incomingUiResourceReady = prepareUiTextureCandidate(
+                    device.Get(),
+                    gpuColorConsumer.eyeTexture(0u),
+                    gpuColorFrame.frame,
+                    uiCandidate);
+            }
+        }
+        fnvxr::host::gpu_color::RoutedFrame controllerRouted =
+            gpuColorFrame;
+        if (controllerRouted.content
+                == fnvxr::host::gpu_color::RoutedContent::MonoUiQuad
+            && !incomingUiResourceReady)
+        {
+            controllerRouted = {};
+        }
+        const fnvxr::host::gpu_color::RuntimeEvidence runtimeEvidence {
+            runtimeStateSample,
+            runtimePhase,
+            runtimeMenuBits,
+            runtimeShowroomActive,
+            runtimeCameraActive,
+            haveRuntimeUiState,
+        };
+        runtimeEvidenceHistory.record(runtimeEvidence);
+        fnvxr::host::gpu_color::RuntimeEvidence sourceRuntimeEvidence {};
+        const bool sourceRuntimeLineageFound =
+            runtimeEvidenceHistory.findStableSource(
+                controllerRouted.frame.runtimeStateSample,
+                runtimeEvidence,
+                sourceRuntimeEvidence);
+        const fnvxr::host::gpu_color::RuntimeEvidence&
+            controllerRuntimeEvidence = sourceRuntimeLineageFound
+                ? sourceRuntimeEvidence
+                : runtimeEvidence;
+        const fnvxr::product::PresentationInput presentationInput =
+            fnvxr::host::gpu_color::makePresentationInput(
+                controllerRuntimeEvidence,
+                controllerRouted,
+                productSourceViewFound,
+                sourcePoseAgeValid);
+        productDecision = productionGpuColorV5
+            ? presentationController.advance(presentationInput)
+            : fnvxr::product::PresentationDecision {};
+        if (productDecision.mode
+                == fnvxr::product::PresentationMode::UiQuad
+            && uiCandidate.view
+            && uiCandidate.sourceFrame
+                == productDecision.presentedUiSourceFrame)
+        {
+            commitUiTextureCandidate(renderer, uiCandidate);
+        }
+        const bool selectedUiResourceReady =
+            renderer.retainedUiTexture
+            && renderer.retainedUiTextureView
+            && renderer.retainedUiSourceFrame
+                == productDecision.presentedUiSourceFrame;
+        const bool worldResourcesReady = productSourceViewFound
+            && gpuColorFrame.content
+                == fnvxr::host::gpu_color::RoutedContent::BinocularWorld
+            && gpuColorFrame.bindLeftEyeView
+            && gpuColorFrame.bindRightEyeView
+            && gpuColorConsumer.eyeView(0u)
+            && gpuColorConsumer.eyeView(1u);
+        const fnvxr::host::gpu_color::ProductCompositionBindings
+            productComposition = productionGpuColorV5
+                ? fnvxr::host::gpu_color::selectProductComposition(
+                    productDecision,
+                    worldResourcesReady,
+                    selectedUiResourceReady)
+                : fnvxr::host::gpu_color::ProductCompositionBindings {};
+        const bool productionUiQuadActive =
+            productComposition.content
+                == fnvxr::host::gpu_color::RoutedContent::MonoUiQuad
+            && productComposition.bindMonoUiView;
+        const bool productionBinocularWorld =
+            productComposition.content
+                == fnvxr::host::gpu_color::RoutedContent::BinocularWorld
+            && productComposition.bindLeftEyeView
+            && productComposition.bindRightEyeView;
+        using StereoVisualTrial =
+            fnvxr::host::stereo_visual_trial::Input;
+        const StereoVisualTrial stereoVisualTrialInput {
+            gpuColorConsume,
+            {
+                productSourceView.poseSequence,
+                productSourceView.predictedDisplayTime,
+                productSourceView.hostProducerEpoch,
+                sharedBridge.producerEpoch,
+                productSourceView.referenceSpaceGeneration,
+                referenceSpaceGeneration,
+                productSourceViewFound,
+                productSourceViewFound,
+            },
+            sourcePoseAgeValid,
+            {
+                sourceRuntimeEvidence.sample,
+                sourceRuntimeEvidence.phase,
+                sourceRuntimeEvidence.menuBits,
+                sourceRuntimeEvidence.showroomActive,
+                sourceRuntimeEvidence.cameraActive,
+                sourceRuntimeEvidence.fresh,
+            },
+            {
+                runtimeEvidence.sample,
+                runtimeEvidence.phase,
+                runtimeEvidence.menuBits,
+                runtimeEvidence.showroomActive,
+                runtimeEvidence.cameraActive,
+                runtimeEvidence.fresh,
+            },
+            gpuColorConsumer.eyeView(0u),
+            gpuColorConsumer.eyeView(1u),
+        };
+        const fnvxr::host::stereo_visual_trial::Decision
+            stereoVisualTrialDecision = productionGpuColorV5
+                ? fnvxr::host::stereo_visual_trial::decide(
+                    stereoVisualTrialInput)
+                : fnvxr::host::stereo_visual_trial::Decision {};
+        // This is deliberately not a ProductPresentationController decision.
+        // It provides an honest, bounded visual proof while controller and
+        // tracked-weapon authority remain closed.
+        const bool stereoVisualTrialActive = !productionBinocularWorld
+            && stereoVisualTrialDecision.bindsStereoVisuals();
+        const bool presentedBinocularWorld = productionBinocularWorld
+            || stereoVisualTrialActive;
+        if (productionUiQuadActive)
+        {
+            gamePlane.height = gamePlane.width
+                / renderer.retainedUiTextureAspect;
+        }
+        const bool showGamePlane = productionUiQuadActive
+            || (!cacheOnlyMode
+                && legacyImageDiagnostics
+                && (gameUiMode || showGameplayPlane)
+                && envEnabled("FNVXR_SHOW_GAME_PLANE", true));
         const uint64_t stereoStaleFrameLimit = static_cast<uint64_t>(std::max(1, envInt("FNVXR_STEREO_STALE_FRAME_LIMIT", 2)));
         const uint64_t stereoStableHandoffFrames =
             static_cast<uint64_t>(std::max(1, envInt("FNVXR_STEREO_STABLE_HANDOFF_FRAMES", 6)));
         const bool allowStereoWorld2dFallback =
             !stereoWorldIntent || envEnabled("FNVXR_ALLOW_STEREO_WORLD_2D_FALLBACK", false);
         const bool stereoLossGamePlaneAllowed =
-            envEnabled("FNVXR_SHOW_GAME_PLANE_ON_STEREO_LOSS", false)
+            legacyImageDiagnostics
+            && envEnabled("FNVXR_SHOW_GAME_PLANE_ON_STEREO_LOSS", false)
             && allowStereoWorld2dFallback;
         const bool monoFullscreenFallbackAllowed =
-            envEnabled("FNVXR_STEREO_FALLBACK_MONO_FULLSCREEN", false)
+            legacyImageDiagnostics
+            && envEnabled("FNVXR_STEREO_FALLBACK_MONO_FULLSCREEN", false)
             && allowStereoWorld2dFallback;
         const bool menuPointerInputActive =
             shouldReadInput
             && showGamePlane
-            && (haveRuntimeUiState ? runtimeUiActive : gameUiMode)
-            && !runtimeGameplayActive;
+            && (legacyImageDiagnostics
+                ? (haveRuntimeUiState ? runtimeUiActive : gameUiMode)
+                : (productionUiQuadActive
+                    && productComposition.pointerEnabled));
         const bool gameplayControlsActive =
             shouldReadInput
             && (haveRuntimeUiState ? (!runtimeUiActive || runtimeGameplayActive) : !gameUiMode);
@@ -8632,18 +9221,6 @@ int main(int argc, char** argv)
         bool presentedGameTexture = false;
         EyeRenderProof leftRenderProof {};
         EyeRenderProof rightRenderProof {};
-        int64_t sourcePoseAgeNanoseconds = 0;
-        bool sourcePoseAgeValid = false;
-        const int64_t maximumSourcePoseAgeNanoseconds =
-            static_cast<int64_t>(std::min(
-                25,
-                std::max(1, envInt("FNVXR_STEREO_MAX_SOURCE_POSE_AGE_MS", 25))))
-            * 1000000LL;
-        const int64_t sourcePoseFutureToleranceNanoseconds =
-            static_cast<int64_t>(std::max(
-                0,
-                envInt("FNVXR_STEREO_SOURCE_POSE_FUTURE_TOLERANCE_MS", 5)))
-            * 1000000LL;
 
         XrViewLocateInfo viewLocateInfo { XR_TYPE_VIEW_LOCATE_INFO };
         viewLocateInfo.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
@@ -8662,7 +9239,7 @@ int main(int argc, char** argv)
         const XrViewStateFlags requiredViewState =
             XR_VIEW_STATE_ORIENTATION_VALID_BIT | XR_VIEW_STATE_POSITION_VALID_BIT;
         const bool viewsValid = (viewState.viewStateFlags & requiredViewState) == requiredViewState;
-        publishHostSharedBridge(
+        const std::uint64_t publishedPoseSequence = publishHostSharedBridge(
             sharedBridge,
             frame,
             frameState.predictedDisplayTime,
@@ -8681,6 +9258,19 @@ int main(int argc, char** argv)
             rawRightAimPose,
             (result == XR_SUCCESS && viewCountOutput >= 2 && viewsValid) ? views.data() : nullptr,
             (result == XR_SUCCESS && viewCountOutput >= 2 && viewsValid) ? viewCountOutput : 0);
+        if (publishedPoseSequence != 0u
+            && (poseTrackingFlags & fnvxr::shared::VrPoseTrackingHmd) != 0u
+            && result == XR_SUCCESS
+            && viewCountOutput >= 2
+            && viewsValid)
+        {
+            sourceViewHistory.record(
+                publishedPoseSequence,
+                frameState.predictedDisplayTime,
+                sharedBridge.producerEpoch,
+                referenceSpaceGeneration,
+                views.data());
+        }
         if (frameIndex <= 5
             || frameIndex % 300 == 0
             || std::fabs(frame.leftThumbstickX) > 0.10f
@@ -8742,15 +9332,16 @@ int main(int argc, char** argv)
 
             const float captureHz = envFloat("FNVXR_GAME_PLANE_CAPTURE_HZ", 45.0f);
             const auto now = std::chrono::steady_clock::now();
-            if (captureHz <= 0.0f || now >= nextGamePlaneCapture)
+            if (legacyImageDiagnostics
+                && (captureHz <= 0.0f || now >= nextGamePlaneCapture))
             {
                 if (!cacheOnlyMode
                     && (showGamePlane
                     || (allowStereoFullscreen && stereoLossGamePlaneAllowed)
                     || (allowStereoFullscreen && monoFullscreenFallbackAllowed)))
                 {
-                        updateGameTexture(device.Get(), renderer);
-                        updateWorldTexture(device.Get(), renderer);
+                    updateGameTexture(device.Get(), renderer, true);
+                    updateWorldTexture(device.Get(), renderer);
                 }
                 if (captureHz > 0.0f)
                 {
@@ -8787,24 +9378,39 @@ int main(int argc, char** argv)
                 renderer.stereoGameRenderedDisplayTime = 0;
                 renderer.stereoStableFrameCount = 0;
             }
-            sourcePoseAgeValid = fnvxr::stereo::sourcePoseAgeWithinBudget(
+            int64_t legacySourcePoseAgeNanoseconds = 0;
+            const bool legacySourcePoseAgeValid =
+                fnvxr::stereo::sourcePoseAgeWithinBudget(
                 frameState.predictedDisplayTime,
                 renderer.stereoGameRenderedDisplayTime,
                 maximumSourcePoseAgeNanoseconds,
                 sourcePoseFutureToleranceNanoseconds,
-                &sourcePoseAgeNanoseconds);
-            const bool stereoFullscreenActive =
+                &legacySourcePoseAgeNanoseconds);
+            const bool legacyStereoFullscreenActive =
                 allowStereoFullscreen
                 && renderer.hasStereoGameFrame
                 && renderer.stereoGameFrameSeparated
                 && renderer.stereoStableFrameCount >= stereoStableHandoffFrames
                 && renderer.stereoReferenceSpaceGeneration == referenceSpaceGeneration
                 && renderer.stereoProducerEpoch == sharedBridge.producerEpoch
-                && sourcePoseAgeValid;
+                && legacySourcePoseAgeValid;
+            const bool stereoFullscreenActive =
+                presentedBinocularWorld
+                || legacyStereoFullscreenActive;
             submittedStereoFullscreen = stereoFullscreenActive;
             std::vector<XrView> submitViews = views;
             bool usingSourceStereoViews = false;
-            if (stereoFullscreenActive && renderer.stereoGameRenderedDisplayTime > 0)
+            if (presentedBinocularWorld)
+            {
+                // Present the exact poses/FOV that the retail v5 transaction
+                // named. Relabeling those pixels with this frame's locateViews
+                // result would break the shared-pose lineage proof.
+                submitViews[0] = productSourceView.views[0];
+                submitViews[1] = productSourceView.views[1];
+                usingSourceStereoViews = true;
+            }
+            else if (legacyStereoFullscreenActive
+                && renderer.stereoGameRenderedDisplayTime > 0)
             {
                 // These are the exact per-eye poses/FOV copied atomically with
                 // the D3D9 pixels. Never label historical pixels with current
@@ -8817,7 +9423,7 @@ int main(int argc, char** argv)
             const bool monoFullscreenFallback =
                 allowStereoFullscreen
                 && !worldBehindMenu
-                && !stereoFullscreenActive
+                && !legacyStereoFullscreenActive
                 && renderer.hasGameTextureFrame
                 && monoFullscreenFallbackAllowed;
             const bool rawStereoReady =
@@ -8826,13 +9432,13 @@ int main(int argc, char** argv)
                 && renderer.stereoStableFrameCount > 0;
             const bool stereoLossGamePlane =
                 allowStereoFullscreen
-                && !stereoFullscreenActive
+                && !legacyStereoFullscreenActive
                 && !monoFullscreenFallback
                 && renderer.hasGameTextureFrame
                 && stereoLossGamePlaneAllowed;
             const bool sceneBeforeQuad = false;
             const bool displayGamePlane = showGamePlane || stereoLossGamePlane;
-            if (stereoFullscreenActive)
+            if (legacyStereoFullscreenActive)
             {
                 missingStereoFrames = 0;
                 stereoFullscreenEverActive = true;
@@ -8840,20 +9446,22 @@ int main(int argc, char** argv)
             }
             else if (allowStereoFullscreen)
                 ++missingStereoFrames;
-            const bool proofLineageFresh = haveSharedStereoUiState
+            const bool proofLineageFresh = legacyImageDiagnostics
                 && haveRuntimeUiState
-                && havePlayerSnapshot;
-            if (stereoFullscreenEverActive
+                && havePlayerSnapshot
+                && haveSharedStereoUiState;
+            if (legacyImageDiagnostics
+                && stereoFullscreenEverActive
                 && stereoCellStable
                 && runtimeGameplayActive
-                && !stereoFullscreenActive)
+                && !legacyStereoFullscreenActive)
             {
-                const auto now = std::chrono::steady_clock::now();
+                const auto watchdogNow = std::chrono::steady_clock::now();
                 if (stereoProgressLostAt.time_since_epoch().count() == 0)
-                    stereoProgressLostAt = now;
+                    stereoProgressLostAt = watchdogNow;
                 const auto maximumLoss = std::chrono::milliseconds(std::clamp(
                     envInt("FNVXR_STEREO_PROGRESS_WATCHDOG_MS", 1000), 100, 5000));
-                if (now - stereoProgressLostAt > maximumLoss)
+                if (watchdogNow - stereoProgressLostAt > maximumLoss)
                 {
                     stereoProgressWatchdogExpired = true;
                     std::cerr
@@ -8870,16 +9478,17 @@ int main(int argc, char** argv)
             {
                 stereoProgressLostAt = {};
             }
-            if (stereoFullscreenEverActive
+            if (legacyImageDiagnostics
+                && stereoFullscreenEverActive
                 && !proofLineageFresh
                 && !stereoProgressWatchdogExpired)
             {
-                const auto now = std::chrono::steady_clock::now();
+                const auto watchdogNow = std::chrono::steady_clock::now();
                 if (stereoProofLineageLostAt.time_since_epoch().count() == 0)
-                    stereoProofLineageLostAt = now;
+                    stereoProofLineageLostAt = watchdogNow;
                 const auto maximumLoss = std::chrono::milliseconds(std::clamp(
                     envInt("FNVXR_STEREO_PROGRESS_WATCHDOG_MS", 1000), 100, 5000));
-                if (now - stereoProofLineageLostAt > maximumLoss)
+                if (watchdogNow - stereoProofLineageLostAt > maximumLoss)
                 {
                     stereoProgressWatchdogExpired = true;
                     std::cerr
@@ -8918,6 +9527,28 @@ int main(int argc, char** argv)
                 previousStereoGameFrameSequence = renderer.stereoGameFrameSequence;
                 std::cout << "renderMode mode=" << hostModeName(mode)
                           << " stereoFullscreen=" << static_cast<int>(stereoFullscreenActive)
+                          << " gpuV5World=" << static_cast<int>(productionBinocularWorld)
+                          << " gpuV5StereoVisualTrial="
+                          << static_cast<int>(stereoVisualTrialActive)
+                          << " gpuV5StereoVisualTrialFailure="
+                          << fnvxr::host::stereo_visual_trial::failureName(
+                                 stereoVisualTrialDecision.failure)
+                          << " gpuV5Ui=" << static_cast<int>(productionUiQuadActive)
+                          << " productMode=" << static_cast<std::uint32_t>(productDecision.mode)
+                          << " productReason=" << static_cast<std::uint32_t>(productDecision.reason)
+                          << " productHud=" << static_cast<int>(productDecision.hudVisible)
+                          << " gpuV5RuntimeLineage="
+                          << static_cast<int>(sourceRuntimeLineageFound)
+                          << " controllerRuntimeSample="
+                          << controllerRuntimeEvidence.sample
+                          << " gpuV5SourceLineage="
+                          << static_cast<int>(productSourceViewFound)
+                          << " gpuV5Transaction=" << gpuColorFrame.frame.transactionId
+                          << " gpuV5SourceFrame=" << gpuColorFrame.frame.sourceFrame
+                          << " gpuV5PoseSequence=" << gpuColorFrame.frame.poseSequence
+                          << " gpuV5RuntimeSample=" << gpuColorFrame.frame.runtimeStateSample
+                          << " currentRuntimeSample=" << runtimeStateSample
+                          << " legacyStereoFullscreen=" << static_cast<int>(legacyStereoFullscreenActive)
                           << " allowStereo=" << static_cast<int>(allowStereoFullscreen)
                           << " showGamePlane=" << static_cast<int>(displayGamePlane)
                           << " sceneBeforeQuad=" << static_cast<int>(sceneBeforeQuad)
@@ -8960,8 +9591,14 @@ int main(int argc, char** argv)
                           << " stereoSeq=" << renderer.stereoGameFrameSequence
                           << " stereoPoseSeq=" << renderer.stereoGamePoseSequence
                           << " stereoRenderedTime=" << renderer.stereoGameRenderedDisplayTime
-                          << " sourcePoseAgeNs=" << sourcePoseAgeNanoseconds
-                          << " sourcePoseAgeValid=" << static_cast<int>(sourcePoseAgeValid)
+                          << " sourcePoseAgeNs="
+                          << (productionGpuColorV5
+                                 ? sourcePoseAgeNanoseconds
+                                 : legacySourcePoseAgeNanoseconds)
+                          << " sourcePoseAgeValid="
+                          << static_cast<int>(productionGpuColorV5
+                                 ? sourcePoseAgeValid
+                                 : legacySourcePoseAgeValid)
                           << " sourcePoseAgeLimitNs=" << maximumSourcePoseAgeNanoseconds
                           << " exactSourceStereoViews=" << static_cast<int>(usingSourceStereoViews)
                           << " stereoStable=" << renderer.stereoStableFrameCount << "/" << stereoStableHandoffFrames
@@ -8973,14 +9610,41 @@ int main(int argc, char** argv)
             }
             bool leftRendered = false;
             bool rightRendered = false;
+            const bool uiQuadVisible = productionUiQuadActive
+                && displayGamePlane
+                && renderer.retainedUiTextureView;
+            const bool legacyDiagnosticVisible = legacyImageDiagnostics
+                && (displayGamePlane
+                    || legacyStereoFullscreenActive
+                    || monoFullscreenFallback);
+            if (presentedBinocularWorld
+                || uiQuadVisible
+                || legacyDiagnosticVisible)
             {
+                ID3D11ShaderResourceView* leftProductionView =
+                    productionBinocularWorld
+                        ? gpuColorConsumer.eyeView(0u)
+                        : (stereoVisualTrialActive
+                            ? stereoVisualTrialDecision.bindings.leftEyeSrv
+                            : nullptr);
+                ID3D11ShaderResourceView* rightProductionView =
+                    productionBinocularWorld
+                        ? gpuColorConsumer.eyeView(1u)
+                        : (stereoVisualTrialActive
+                            ? stereoVisualTrialDecision.bindings.rightEyeSrv
+                            : nullptr);
+                ID3D11ShaderResourceView* productionUiView = uiQuadVisible
+                    ? renderer.retainedUiTextureView.Get()
+                    : nullptr;
+                const bool renderLegacyUiScene = legacyImageDiagnostics
+                    && gameUiMode;
                 leftRendered = renderEye(
                     xr,
                     device.Get(),
                     renderer,
                     leftEye,
                     0,
-                    views[0],
+                    submitViews[0],
                     leftPose,
                     rightPose,
                     leftAimPose,
@@ -8989,10 +9653,12 @@ int main(int argc, char** argv)
                     menuPointer,
                     gamePlane,
                     pauseSceneAnchor,
-                    gameUiMode,
+                    renderLegacyUiScene,
                     displayGamePlane,
-                    stereoFullscreenActive || monoFullscreenFallback,
-                    stereoFullscreenActive,
+                    legacyStereoFullscreenActive || monoFullscreenFallback,
+                    legacyStereoFullscreenActive,
+                    leftProductionView,
+                    productionUiView,
                     leftEyeColor,
                     leftRenderProof);
                 rightRendered = renderEye(
@@ -9001,7 +9667,7 @@ int main(int argc, char** argv)
                     renderer,
                     rightEye,
                     1,
-                    views[1],
+                    submitViews[1],
                     leftPose,
                     rightPose,
                     leftAimPose,
@@ -9010,21 +9676,25 @@ int main(int argc, char** argv)
                     menuPointer,
                     gamePlane,
                     pauseSceneAnchor,
-                    gameUiMode,
+                    renderLegacyUiScene,
                     displayGamePlane,
-                    stereoFullscreenActive || monoFullscreenFallback,
-                    stereoFullscreenActive,
+                    legacyStereoFullscreenActive || monoFullscreenFallback,
+                    legacyStereoFullscreenActive,
+                    rightProductionView,
+                    productionUiView,
                     rightEyeColor,
                     rightRenderProof);
             }
 
             submitProjectionLayer = leftRendered && rightRendered;
             presentedGameTexture = submitProjectionLayer
-                && renderer.hasGameTextureFrame
-                && renderer.gameTextureSourceHash != 0
-                && (displayGamePlane || monoFullscreenFallback)
                 && leftRenderProof.valid
-                && rightRenderProof.valid;
+                && rightRenderProof.valid
+                && (uiQuadVisible
+                    || (legacyImageDiagnostics
+                        && renderer.hasGameTextureFrame
+                        && renderer.gameTextureSourceHash != 0
+                        && (displayGamePlane || monoFullscreenFallback)));
             if (submitProjectionLayer)
             {
                 projectionViews[0].pose = submitViews[0].pose;
@@ -9041,9 +9711,14 @@ int main(int argc, char** argv)
             }
             else
             {
-                std::cerr << "renderEye failed left=" << static_cast<int>(leftRendered)
-                          << " right=" << static_cast<int>(rightRendered)
-                          << "; submitting zero layers\n";
+                if (presentedBinocularWorld
+                    || uiQuadVisible
+                    || legacyDiagnosticVisible)
+                {
+                    std::cerr << "renderEye failed left=" << static_cast<int>(leftRendered)
+                              << " right=" << static_cast<int>(rightRendered)
+                              << "; submitting zero layers\n";
+                }
             }
         }
         else if (shouldRender)
@@ -9089,6 +9764,46 @@ int main(int argc, char** argv)
                 << std::chrono::duration_cast<std::chrono::milliseconds>(
                        std::chrono::system_clock::now().time_since_epoch()).count()
                 << ",\"predictedDisplayTime\":" << frameState.predictedDisplayTime
+                << ",\"productMode\":"
+                << static_cast<std::uint32_t>(productDecision.mode)
+                << ",\"productReason\":"
+                << static_cast<std::uint32_t>(productDecision.reason)
+                << ",\"productGameplayAccepted\":"
+                << (productDecision.gameplayVrAccepted ? "true" : "false")
+                << ",\"productPointerEnabled\":"
+                << (productDecision.pointerEnabled ? "true" : "false")
+                << ",\"productHudVisible\":"
+                << (productDecision.hudVisible ? "true" : "false")
+                << ",\"stereoVisualTrialActive\":"
+                << (stereoVisualTrialActive ? "true" : "false")
+                << ",\"stereoVisualTrialFailure\":\""
+                << fnvxr::host::stereo_visual_trial::failureName(
+                       stereoVisualTrialDecision.failure)
+                << "\",\"stereoVisualTrialRetained\":"
+                << (stereoVisualTrialDecision.bindings.retainedConsumerFrame
+                        ? "true"
+                        : "false")
+                << ",\"stereoVisualTrialFullProductAccepted\":false"
+                << ",\"controllerMutationAuthorized\":false"
+                << ",\"trackedWeaponAuthorized\":false"
+                << ",\"productUiSourceFrame\":"
+                << productDecision.presentedUiSourceFrame
+                << ",\"gpuV5Transaction\":"
+                << gpuColorFrame.frame.transactionId
+                << ",\"gpuV5SourceFrame\":"
+                << gpuColorFrame.frame.sourceFrame
+                << ",\"gpuV5PoseSequence\":"
+                << gpuColorFrame.frame.poseSequence
+                << ",\"gpuV5RuntimeStateSample\":"
+                << gpuColorFrame.frame.runtimeStateSample
+                << ",\"gpuV5RuntimeLineage\":"
+                << (sourceRuntimeLineageFound ? "true" : "false")
+                << ",\"controllerRuntimeStateSample\":"
+                << controllerRuntimeEvidence.sample
+                << ",\"gpuV5RenderedDisplayTime\":"
+                << gpuColorFrame.frame.renderedDisplayTime
+                << ",\"gpuV5ExactSourceView\":"
+                << (productSourceViewFound ? "true" : "false")
                 << ",\"sourceStereoSequence\":" << renderer.stereoGameFrameSequence
                 << ",\"sourceRenderPairSequence\":" << renderer.stereoGameRenderPairSequence
                 << ",\"sourcePoseSequence\":" << renderer.stereoGamePoseSequence
@@ -9177,8 +9892,13 @@ int main(int argc, char** argv)
         // complete before xrDestroySwapchain. Fail-stop and let process teardown
         // reclaim handles rather than making a provably invalid destroy call.
         std::cerr << "D3D11 GPU idle proof timed out; skipping explicit OpenXR teardown\n";
+        gpuColorConsumer.reset();
         return 22;
     }
+    // Release duplicated producer handles, shared resources, private eye
+    // textures, fence interfaces, mapping, and the retained D3D11 reference
+    // while the OpenXR device is still provably alive and idle.
+    gpuColorConsumer.reset();
     if (sessionBegun && !lossPending)
         xr.endSession(session);
     xr.destroySwapchain(leftEye.handle);

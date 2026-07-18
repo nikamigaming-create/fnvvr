@@ -181,6 +181,7 @@ $cmake = Join-Path $Root "CMakeLists.txt"
 $protocolCode = Join-Path $Root "protocol\fnvxr_protocol.h"
 $sharedStateCode = Join-Path $Root "protocol\fnvxr_shared_state.h"
 $hostCode = Join-Path $Root "host\fnvxr_openxr_pose_host.cpp"
+$hostLiveAuthorityCode = Join-Path $Root "host\fnvxr_openxr_live_authority.h"
 $pluginCode = Join-Path $Root "plugin\fnvxr_nvse_plugin.cpp"
 $inputProxySafety = Join-Path $Root "renderhook\fnvxr_input_proxy_safety.h"
 $dinputCode = Join-Path $Root "renderhook\fnvxr_dinput8_proxy.cpp"
@@ -194,7 +195,7 @@ $oldTransportDir = Join-Path $Root ("trans" + "port")
 $stereoWorldSwitchParam = '[switch]$Enable' + 'StereoWorld'
 $stereoWorldRetailArg = '$retailArgs += "-Enable' + 'StereoWorld"'
 
-foreach ($path in @($openxrScript, $retailScript, $legacyScript, $pcvrScript, $commonScript, $stagePluginScript, $buildWin32Script, $watchExitScript, $directHostScript, $legacyHostWatchScript, $cacheOnlyScript, $buildSceneCacheScript, $liveAnalyzerScript, $verifyScript, $verifiedContractScript, $readme, $cmake, $protocolCode, $sharedStateCode, $hostCode, $pluginCode, $inputProxySafety, $dinputCode, $xinputCode, $d3d9Code, $d3d9ActivationCode)) {
+foreach ($path in @($openxrScript, $retailScript, $legacyScript, $pcvrScript, $commonScript, $stagePluginScript, $buildWin32Script, $watchExitScript, $directHostScript, $legacyHostWatchScript, $cacheOnlyScript, $buildSceneCacheScript, $liveAnalyzerScript, $verifyScript, $verifiedContractScript, $readme, $cmake, $protocolCode, $sharedStateCode, $hostCode, $hostLiveAuthorityCode, $pluginCode, $inputProxySafety, $dinputCode, $xinputCode, $d3d9Code, $d3d9ActivationCode)) {
     if (-not (Test-Path -LiteralPath $path)) {
         throw "Missing required sidecar path: $path"
     }
@@ -243,11 +244,16 @@ Require-Text -Path $openxrScript -Text 'OpenXR host exited before creating its s
 Require-Text -Path $openxrScript -Text 'Pattern "fnvxrHostBridgeReady xrSessionCreated=1 sharedMappingsReady=1"' -Reason "OpenXR session and cross-bitness bridge must be ready before retail launch"
 Require-Text -Path $openxrScript -Text 'retail remains live with neutral VR input' -Reason "An idle headset must not prevent or poison the retail sidecar launch"
 Require-Text -Path $hostCode -Text 'fnvxrHostBridgeReady xrSessionCreated=1 sharedMappingsReady=1' -Reason "Host must publish an explicit pre-retail bridge readiness handshake"
-Require-Text -Path $hostCode -Text 'MaximumUnsupervisedFrames = 7200' -Reason "Direct host invocation must have a hard finite upper bound"
-Require-TextBefore -Path $hostCode -RequiredText 'constexpr bool OpenXrLiveRuntimeProofComplete = false;' -BeforeText 'OpenXr xr {};' -Reason "The compiled host fuse must be declared false before any OpenXR object is initialized"
-Require-TextBefore -Path $hostCode -RequiredText 'if (!OpenXrLiveRuntimeProofComplete)' -BeforeText 'OpenXr xr {};' -Reason "The host must branch on its source fuse before loading OpenXR"
-Require-TextBefore -Path $hostCode -RequiredText 'constexpr bool ProductPresentationControllerIntegrated = false;' -BeforeText 'OpenXr xr {};' -Reason "A separate product-controller integration fuse must block revival of legacy mono gameplay"
-Require-TextBefore -Path $hostCode -RequiredText 'if (!ProductPresentationControllerIntegrated)' -BeforeText 'OpenXr xr {};' -Reason "The host must enforce the product-controller integration fuse before loading OpenXR"
+Require-Text -Path $hostLiveAuthorityCode -Text 'MaximumProductHostFrames = 7200u' -Reason "Product host initialization authority must retain the hard finite frame bound"
+Require-Text -Path $hostLiveAuthorityCode -Text 'struct ProductOpenXrInitializationProof' -Reason "OpenXR loader access must depend on modeled integration evidence rather than one opaque boolean"
+Require-Text -Path $hostLiveAuthorityCode -Text 'static_assert(CompiledProductOpenXrInitializationAuthorization.authorized())' -Reason "The checked-in product initialization proof must be constexpr-tested"
+Forbid-Text -Path $hostCode -Text 'OpenXrLiveRuntimeProofComplete' -Reason "The obsolete all-or-nothing host fuse must not return"
+Forbid-Text -Path $hostCode -Text 'ProductPresentationControllerIntegrated' -Reason "Product route integration belongs inside the modeled initialization proof"
+Require-TextBefore -Path $hostCode -RequiredText 'const uint64_t targetFrames = static_cast<uint64_t>(parsed);' -BeforeText 'if (!openXrInitializationAuthorization.authorized())' -Reason "The finite host bound must be parsed before initialization is authorized"
+Require-TextBefore -Path $hostCode -RequiredText 'if (!openXrInitializationAuthorization.authorized())' -BeforeText 'OpenXr xr {};' -Reason "The compiled product initialization authority must fail closed before OpenXR loader access"
+Require-Text -Path $hostCode -Text 'fnvxr::product::PresentationController presentationController;' -Reason "Production presentation must instantiate the tested product controller"
+Require-Text -Path $hostCode -Text 'presentationController.advance(presentationInput)' -Reason "Production presentation must delegate its mode decision to the product controller"
+Require-Text -Path $hostCode -Text 'selectProductComposition(' -Reason "Final v5 GPU/UI bindings must be a fail-closed projection of the controller decision"
 Require-TextBefore -Path $commonScript -RequiredText 'throw "Legacy D3D replay/full-frame stereo environment is retired.' -BeforeText '$env:FNVXR_DISABLE_STEREO_WORLD = "0"' -Reason "Legacy stereo environment configuration must fail before any activation variable is written"
 Require-TextBefore -Path $commonScript -RequiredText '& (Join-Path $Root "scripts\build-win32.ps1") -Configuration $Configuration' -BeforeText '$stageMap = @(' -Reason "Every retail artifact copy must follow a fresh complete Win32 build/test"
 Require-TextBefore -Path $stagePluginScript -RequiredText '& (Join-Path $PSScriptRoot "build-win32.ps1") -Configuration $Configuration' -BeforeText 'Copy-Item -LiteralPath $PluginDll' -Reason "Plugin staging/install must never trust a pre-existing DLL"

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "fnvxr_retail_compatibility_proof.h"
 #include "fnvxr_retail_engine_abi.h"
 
 #if defined(FNVXR_RETAIL_ABI_REVALIDATOR_TEST_AUTHORITY)
@@ -9,11 +10,6 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
-
-namespace fnvxr::module_census
-{
-class OwnedWindowsModuleCensus;
-}
 
 namespace fnvxr::inventory
 {
@@ -33,6 +29,7 @@ enum class RetailAbiRevalidationFailure : std::uint8_t
     MainModuleIsNotFallout,
     InvalidLoadedPe,
     LoadedImageReadFailed,
+    CompatibilityProofRejected,
     RuntimeEvidenceRejected,
 };
 
@@ -52,16 +49,18 @@ struct RetailAbiRevalidationResult
 {
     RetailEngineAbiEvidence evidence {};
     RetailEngineAbiAssessment assessment {};
+    compatibility::RetailCompatibilityProof compatibilityProof {};
     RetailAbiRevalidationFailure failure =
         RetailAbiRevalidationFailure::UnsupportedHostArchitecture;
     RetailAbiRevalidationDiagnostics diagnostics {};
 };
 
 // This is the only production entry point. It has no evidence switches and no
-// caller-selected success path: every bit is derived from the current process
-// and the sealed, owned Windows module census during this call.
-RetailAbiRevalidationResult revalidateCurrentRetailEngineAbiAtDecisionPoint(
-    const module_census::OwnedWindowsModuleCensus& census) noexcept;
+// caller-selected success path. The executable, live layouts, protected ABI,
+// process identity, and narrow mod/overlay compatibility proof are all read
+// synchronously from the current process during this call.
+RetailAbiRevalidationResult revalidateCurrentRetailEngineAbiAtDecisionPoint()
+    noexcept;
 
 #if defined(FNVXR_RETAIL_ABI_REVALIDATOR_TEST_AUTHORITY)
 namespace testing

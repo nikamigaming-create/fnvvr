@@ -3,6 +3,7 @@
 #include "fnvxr_private_geometry_collector.h"
 #include "fnvxr_retail_engine_abi.h"
 #include "fnvxr_retail_renderer_contract.h"
+#include "fnvxr_retail_runtime_binding.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -265,9 +266,9 @@ struct StereoCameraAcquisition
     StereoCameraCleanupToken cleanupToken {};
 };
 
-// This is a capability, not a configuration boolean. Production code in this
-// change has no issuer and therefore cannot produce an authorized value. The
-// test-only issuer is compiled only into the isolated lifecycle test target.
+// This is a capability, not a configuration boolean. The only production
+// issuer is the single same-process retail runtime authority bundle. The
+// lifecycle test retains its isolated friend issuer.
 class StereoResourceAuthorization;
 
 namespace detail
@@ -295,14 +296,26 @@ private:
     {
     }
 
+    explicit constexpr StereoResourceAuthorization(
+        const detail::RetailRuntimeBinding& binding,
+        detail::RetailRuntimeBindingValidator validator) noexcept
+        : mBinding(binding),
+          mBindingValidator(validator)
+    {
+    }
+
     const void* mEvidence = nullptr;
     Validator mValidator = nullptr;
+    detail::RetailRuntimeBinding mBinding {};
+    detail::RetailRuntimeBindingValidator mBindingValidator = nullptr;
 
     friend struct detail::StereoResourceAuthorizationAccess;
+    friend struct detail::RetailRuntimeAuthorityIssuer;
     friend struct StereoResourceLifecycleTestAuthority;
 };
 
-inline constexpr bool StereoResourceProductionAuthorizationAvailable = false;
+inline constexpr bool StereoResourceProductionAuthorizationAvailable =
+    RetailRuntimeProductionAuthorizationAvailable;
 
 namespace detail
 {
@@ -311,8 +324,12 @@ struct StereoResourceAuthorizationAccess
     static bool authorized(
         const StereoResourceAuthorization& authorization) noexcept
     {
-        return authorization.mEvidence
-            && authorization.mValidator
+        if (authorization.mBindingValidator)
+        {
+            return authorization.mBindingValidator(
+                authorization.mBinding);
+        }
+        return authorization.mEvidence && authorization.mValidator
             && authorization.mValidator(authorization.mEvidence);
     }
 };
@@ -1041,7 +1058,9 @@ StereoResourceTransactionResult<CollectorCapacity> acquireCenterStereoResources(
         parameters);
 }
 
-static_assert(!StereoResourceProductionAuthorizationAvailable);
+static_assert(
+    StereoResourceProductionAuthorizationAvailable
+    == RetailRuntimeProductionAuthorizationAvailable);
 static_assert(std::is_standard_layout_v<StereoResourceLayoutMetadata>);
 static_assert(std::is_trivially_copyable_v<StereoResourceLayoutMetadata>);
 static_assert(std::is_standard_layout_v<StereoResourceConstructionParameters>);

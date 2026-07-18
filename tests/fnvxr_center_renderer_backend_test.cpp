@@ -40,6 +40,8 @@ struct FakeContext
     std::vector<std::string> calls;
     const abi::RetailNiVisibleArrayLayout* visiblePointers[2] {};
     abi::RetailBSShaderAccumulatorLayout* accumulators[2] {};
+    abi::RetailNiCameraLayout* collectedCamera = nullptr;
+    abi::RetailNiCameraLayout* cameras[2] {};
     bool failRightRender = false;
     bool restoreSucceeds = true;
 };
@@ -57,13 +59,15 @@ bool snapshot(void* raw) noexcept
 
 bool collect(
     void* raw,
-    abi::RetailNiCameraLayout*,
+    abi::RetailNiCameraLayout* camera,
     void*,
     abi::RetailBSCullingProcessLayout*,
     std::uint64_t generation,
     CenterRendererVisibleSet& result) noexcept
 {
-    static_cast<FakeContext*>(raw)->calls.emplace_back("collect");
+    auto& context = *static_cast<FakeContext*>(raw);
+    context.calls.emplace_back("collect");
+    context.collectedCamera = camera;
     result.array.geometryPointers = 0x1000u;
     result.array.itemCount = 3u;
     result.array.capacity = 3u;
@@ -86,11 +90,12 @@ bool bind(
 bool setCamera(
     void* raw,
     abi::RetailBSShaderAccumulatorLayout* accumulator,
-    abi::RetailNiCameraLayout*) noexcept
+    abi::RetailNiCameraLayout* camera) noexcept
 {
     auto& context = *static_cast<FakeContext*>(raw);
     const int eye = context.accumulators[0] ? 1 : 0;
     context.accumulators[eye] = accumulator;
+    context.cameras[eye] = camera;
     context.calls.emplace_back(eye == 0 ? "camera-left" : "camera-right");
     return true;
 }
@@ -109,12 +114,14 @@ bool addVisible(
 
 bool render(
     void* raw,
-    abi::RetailNiCameraLayout*,
+    abi::RetailNiCameraLayout* camera,
     abi::RetailBSShaderAccumulatorLayout* accumulator,
     std::uint32_t renderContext) noexcept
 {
     auto& context = *static_cast<FakeContext*>(raw);
     const bool right = accumulator == context.accumulators[1];
+    if (camera != context.cameras[right ? 1 : 0])
+        return false;
     context.calls.emplace_back(right ? "render-right" : "render-left");
     return renderContext == RetailWorldRenderContext
         && !(right && context.failRightRender);
@@ -122,13 +129,16 @@ bool render(
 
 bool finalize(
     void* raw,
-    abi::RetailNiCameraLayout*,
+    abi::RetailNiCameraLayout* camera,
     abi::RetailBSShaderAccumulatorLayout* accumulator,
     std::uint32_t renderContext) noexcept
 {
     auto& context = *static_cast<FakeContext*>(raw);
+    const bool right = accumulator == context.accumulators[1];
+    if (camera != context.cameras[right ? 1 : 0])
+        return false;
     context.calls.emplace_back(
-        accumulator == context.accumulators[1]
+        right
             ? "finalize-right"
             : "finalize-left");
     return renderContext == RetailWorldRenderContext;
@@ -188,12 +198,23 @@ CenterRendererOperations operations(FakeContext& context)
 
 CenterRendererFrameInput input()
 {
-    static abi::RetailNiCameraLayout camera {};
+    static abi::RetailNiCameraLayout centerCamera {};
+    static abi::RetailNiCameraLayout leftCamera {};
+    static abi::RetailNiCameraLayout rightCamera {};
     static abi::RetailBSCullingProcessLayout culler {};
     static abi::RetailBSShaderAccumulatorLayout left {};
     static abi::RetailBSShaderAccumulatorLayout right {};
     static std::uint8_t scene = 0u;
-    return { &scene, &camera, &culler, &left, &right, 77u };
+    return {
+        &scene,
+        &centerCamera,
+        &leftCamera,
+        &rightCamera,
+        &culler,
+        &left,
+        &right,
+        77u,
+    };
 }
 }
 
@@ -205,7 +226,9 @@ int main()
     static_assert(RetailWorldAccumulatorConstructorMode == 0x63u);
     static_assert(RetailWorldAccumulatorBatchRendererCount == 1u);
     static_assert(RetailWorldAccumulatorMaximumPassCount == 0x2F7u);
-    static_assert(!CenterRendererProductionAuthorizationAvailable);
+    static_assert(
+        CenterRendererProductionAuthorizationAvailable
+        == RetailRuntimeProductionAuthorizationAvailable);
 
     FakeContext unauthorizedContext;
     const CenterRendererResult unauthorized = executeCenterRendererFrame(
@@ -225,7 +248,7 @@ int main()
         operations(successContext),
         authorization,
         input());
-    require(success.complete, "center/center frame must complete");
+    require(success.complete, "center-cull/distinct-eye frame must complete");
     require(
         success.visibleSetGeneration == 77u
             && success.visibleGeometryCount == 3u,
@@ -235,6 +258,12 @@ int main()
             && successContext.visiblePointers[0]
                 == successContext.visiblePointers[1],
         "both eyes must consume the exact same visible-array object");
+    const CenterRendererFrameInput successfulInput = input();
+    require(
+        successContext.collectedCamera == successfulInput.centerCamera
+            && successContext.cameras[0] == successfulInput.leftCamera
+            && successContext.cameras[1] == successfulInput.rightCamera,
+        "center cull and eye renders must receive their exact camera objects");
     const std::vector<std::string> expected {
         "snapshot",
         "collect",
@@ -286,6 +315,18 @@ int main()
         aliasResult.failure == CenterRendererFailure::InvalidInput
             && aliasContext.calls.empty(),
         "aliased eye accumulators must reject before snapshot");
+
+    CenterRendererFrameInput aliasedCameras = input();
+    aliasedCameras.rightCamera = aliasedCameras.leftCamera;
+    FakeContext cameraAliasContext;
+    const CenterRendererResult cameraAliasResult = executeCenterRendererFrame(
+        operations(cameraAliasContext),
+        authorization,
+        aliasedCameras);
+    require(
+        cameraAliasResult.failure == CenterRendererFailure::InvalidInput
+            && cameraAliasContext.calls.empty(),
+        "aliased eye cameras must reject before snapshot");
 
     std::cout << "fnvxr center renderer backend tests passed\n";
     return EXIT_SUCCESS;

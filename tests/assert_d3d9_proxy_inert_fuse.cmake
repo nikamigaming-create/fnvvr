@@ -6,10 +6,16 @@ if(NOT DEFINED ACTIVATION_HEADER OR NOT EXISTS "${ACTIVATION_HEADER}")
     message(FATAL_ERROR "Missing D3D9 activation contract: ${ACTIVATION_HEADER}")
 endif()
 
+if(NOT DEFINED BRIDGE_HEADER OR NOT EXISTS "${BRIDGE_HEADER}")
+    message(FATAL_ERROR "Missing retail VR bridge source: ${BRIDGE_HEADER}")
+endif()
+
 file(READ "${PROXY_SOURCE}" proxy_source)
 file(READ "${ACTIVATION_HEADER}" activation_header)
+file(READ "${BRIDGE_HEADER}" bridge_header)
 string(REPLACE "\r\n" "\n" proxy_source "${proxy_source}")
 string(REPLACE "\r\n" "\n" activation_header "${activation_header}")
+string(REPLACE "\r\n" "\n" bridge_header "${bridge_header}")
 
 function(require_text haystack needle reason)
     string(FIND "${haystack}" "${needle}" found_at)
@@ -45,8 +51,24 @@ require_text(
     "The proxy must consume the pure activation contract")
 require_text(
     "${proxy_source}"
-    "if constexpr (!fnvxr::d3d9::ProductionRendererAuthorized)\n        return real"
-    "Direct3DCreate9 must return the untouched system interface in the fused build")
+    "if (!currentExecutableIsFalloutNv())\n        return gRealDirect3DCreate9(sdkVersion)"
+    "Non-retail processes must receive the untouched system interface")
+require_text(
+    "${bridge_header}"
+    "engine::authorizeCurrentRetailRuntimeAtDecisionPoint()"
+    "The retail bridge must require current-process authority")
+require_text(
+    "${bridge_header}"
+    "if (!mAuthority.complete())\n            return fail(RetailVrBridgeFailure::RuntimeAuthorityRejected)"
+    "The retail bridge must reject before resolving or mutating engine state")
+require_text(
+    "${proxy_source}"
+    "currentLoadedExecutableMatchesSupportedRetail()"
+    "The early D3D bootstrap must verify the exact loaded retail PE")
+require_text(
+    "${proxy_source}"
+    "#include \"fnvxr_retail_vr_bridge_win32.h\""
+    "The exact retail path must enter through the isolated bridge")
 require_text(
     "${proxy_source}"
     "if constexpr (!fnvxr::d3d9::ProductionRendererAuthorized)\n        return gRealDirect3DCreate9Ex(sdkVersion, out)"
@@ -69,16 +91,21 @@ extract_region(
     "${proxy_source}"
     "extern \"C\" IDirect3D9* WINAPI FNVXR_Direct3DCreate9(UINT sdkVersion)\n{"
     "extern \"C\" HRESULT WINAPI FNVXR_Direct3DCreate9Ex")
-string(FIND "${create9_body}" "if constexpr (!fnvxr::d3d9::ProductionRendererAuthorized)" create9_fuse_at)
-string(FIND "${create9_body}" "ensureD3D9ProxyInitialized()" create9_initialize_at)
+string(FIND "${create9_body}" "if (!currentExecutableIsFalloutNv())" create9_nonretail_at)
+string(FIND "${create9_body}" "assessGameD3D9Bootstrap(" create9_authority_at)
+string(FIND "${create9_body}" "if (!bootstrap.authorized())" create9_complete_at)
+string(FIND "${create9_body}" "authorizeCurrentRetailRuntimeAtDecisionPoint()" create9_mutation_authority_at)
 string(FIND "${create9_body}" "new (std::nothrow) Direct3D9Proxy" create9_wrap_at)
-if(create9_fuse_at EQUAL -1
-    OR create9_initialize_at EQUAL -1
+if(create9_nonretail_at EQUAL -1
+    OR create9_authority_at EQUAL -1
+    OR create9_complete_at EQUAL -1
+    OR NOT create9_mutation_authority_at EQUAL -1
     OR create9_wrap_at EQUAL -1
-    OR create9_fuse_at GREATER create9_initialize_at
-    OR create9_fuse_at GREATER create9_wrap_at)
+    OR create9_nonretail_at GREATER create9_authority_at
+    OR create9_authority_at GREATER create9_complete_at
+    OR create9_complete_at GREATER create9_wrap_at)
     message(FATAL_ERROR
-        "Direct3DCreate9 must return the system interface before initialization or wrapping")
+        "Direct3DCreate9 must use exact bootstrap authority, never premature mutation authority, before wrapping retail")
 endif()
 
 extract_region(

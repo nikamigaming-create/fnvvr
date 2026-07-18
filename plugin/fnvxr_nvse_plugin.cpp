@@ -3,6 +3,7 @@
 #include "fnvxr_protocol.h"
 #include "fnvxr_shared_state.h"
 #include "fnvxr_fabrik.h"
+#include "fnvxr_retail_runtime_authority.h"
 #include "fnvxr_retail_safety.h"
 
 #include <windows.h>
@@ -444,6 +445,9 @@ const NVSEInterface* g_nvse = nullptr;
 // verifies the loaded PE/function ranges and supplies every acceptance gate.
 // No environment variable or loader argument populates this record.
 fnvxr::safety::RetailMutationEvidenceToken g_retailMutationEvidence {};
+fnvxr::engine::RetailRuntimeAuthorityDecision g_retailRuntimeAuthority {};
+bool g_authorizedSharedBridgeStarted = false;
+UInt32 g_retailRuntimeAuthorityAttempts = 0;
 NVSEConsoleInterface* g_console = nullptr;
 NVSEMessagingInterface* g_messaging = nullptr;
 NVSEPlayerControlsInterface* g_playerControls = nullptr;
@@ -9914,6 +9918,92 @@ void consumeExternalXInputBridge()
     g_lastExternalXInputButtons = state.buttons;
 }
 
+bool startBridge();
+
+bool ensureAuthorizedSharedBridgeStarted()
+{
+    if (g_authorizedSharedBridgeStarted)
+    {
+        return g_retailRuntimeAuthority.complete()
+            && gamePluginProducerLeaseHeldByCurrentThread()
+            && g_xinputState
+            && g_dinputState
+            && g_vrPoseState
+            && g_cameraState
+            && g_runtimeState
+            && g_playerState
+            && g_commandState
+            && g_inputEvents;
+    }
+
+    if (!g_retailRuntimeAuthority.complete())
+    {
+        ++g_retailRuntimeAuthorityAttempts;
+        const fnvxr::engine::RetailRuntimeAuthorityDecision decision =
+            fnvxr::engine::authorizeCurrentRetailRuntimeAtDecisionPoint();
+        if (!decision.complete())
+        {
+            if (g_retailRuntimeAuthorityAttempts <= 12
+                || (g_retailRuntimeAuthorityAttempts % 300) == 0)
+            {
+                logTelemetry(
+                    "shared bridge authority deferred attempt=%lu failure=%u; no game state read or mutation performed\n",
+                    static_cast<unsigned long>(g_retailRuntimeAuthorityAttempts),
+                    static_cast<unsigned>(decision.failure));
+            }
+            return false;
+        }
+        g_retailRuntimeAuthority = decision;
+        logTelemetry(
+            "shared bridge exact retail authority acquired attempt=%lu generation=%llu\n",
+            static_cast<unsigned long>(g_retailRuntimeAuthorityAttempts),
+            static_cast<unsigned long long>(
+                g_retailRuntimeAuthority.authority.metadata().generation));
+    }
+
+    if (!acquireGamePluginProducerLease())
+        return false;
+
+    // The OpenXR host owns these three mappings. The plugin maps them only as
+    // controller/pose inputs and never initializes or publishes their bytes.
+    initSharedXInput();
+    initSharedDInput();
+    initSharedVrPose();
+
+    // These mappings are the plugin's authenticated observations of the
+    // exact retail process. They are required by the renderer before any
+    // world or UI transaction can be published.
+    initSharedCamera();
+    initSharedRuntime();
+    initSharedPlayer();
+    initSharedCommand();
+    initSharedInputEvents();
+
+    const bool mappingsReady = g_xinputState
+        && g_dinputState
+        && g_vrPoseState
+        && g_cameraState
+        && g_runtimeState
+        && g_playerState
+        && g_commandState
+        && g_inputEvents;
+    if (!mappingsReady)
+    {
+        logTelemetry("shared bridge initialization deferred: one or more mappings are unavailable\n");
+        return false;
+    }
+
+    // Camera/rig mutation retain their independent, stricter source fuses.
+    // A shared-state publisher becoming ready cannot authorize either hook.
+    if (!installCameraHook() || !installRetailRigHook())
+        return false;
+
+    g_authorizedSharedBridgeStarted = startBridge();
+    if (g_authorizedSharedBridgeStarted)
+        logTelemetry("shared bridge ready under exact current-process authority\n");
+    return g_authorizedSharedBridgeStarted;
+}
+
 void processMainGameLoop()
 {
     processShowroomCarousel();
@@ -9968,13 +10058,13 @@ void handleNvseMessage(NVSEMessagingInterface::Message* message)
 
     if (message->type == MessageMainGameLoop)
     {
-        if (!retailMutationAllowedForCurrentProcess(true))
+        if (!ensureAuthorizedSharedBridgeStarted())
         {
             static bool logged = false;
             if (!logged)
             {
                 logged = true;
-                logTelemetry("mainloop bridge hard-blocked: retail mutation source/evidence proof incomplete\n");
+                logTelemetry("mainloop bridge deferred until exact retail authority and shared mappings are ready\n");
             }
             return;
         }
@@ -10427,14 +10517,6 @@ extern "C" __declspec(dllexport) bool NVSEPlugin_Load(const NVSEInterface* nvse)
     g_nvse = nvse;
     if (nvse->GetPluginHandle)
         g_pluginHandle = nvse->GetPluginHandle();
-    if (!retailMutationAllowedForCurrentProcess(true))
-    {
-        logTelemetry(
-            "plugin loaded inert: retail mutation source/evidence proof incomplete nvse=%u runtime=%u\n",
-            nvse->nvseVersion,
-            nvse->runtimeVersion);
-        return g_pluginHandle != InvalidPluginHandle;
-    }
     if (nvse->QueryInterface)
     {
         g_console = static_cast<NVSEConsoleInterface*>(nvse->QueryInterface(InterfaceConsole));
@@ -10462,20 +10544,12 @@ extern "C" __declspec(dllexport) bool NVSEPlugin_Load(const NVSEInterface* nvse)
         g_console,
         g_playerControls);
     logInputConfig();
-    if (!acquireGamePluginProducerLease())
-        return false;
-    initSharedXInput();
-    initSharedDInput();
-    initSharedVrPose();
-    initSharedCamera();
-    initSharedRuntime();
-    initSharedPlayer();
-    initSharedCommand();
-    initSharedInputEvents();
-    installCameraHook();
-    installRetailRigHook();
-
-    return g_pluginHandle != InvalidPluginHandle && startBridge();
+    // Plugin enumeration can occur before every required compatibility module
+    // has finished loading. Attempt synchronously now, then let the registered
+    // main-loop callback retry. No mapping or game-state access occurs until
+    // the exact current-process authority succeeds.
+    static_cast<void>(ensureAuthorizedSharedBridgeStarted());
+    return g_pluginHandle != InvalidPluginHandle;
 }
 
 BOOL APIENTRY DllMain(HMODULE, DWORD reason, LPVOID)

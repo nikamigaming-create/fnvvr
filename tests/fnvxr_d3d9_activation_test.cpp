@@ -17,6 +17,7 @@ int main()
 {
     using fnvxr::d3d9::CompiledInterpositionPolicy;
     using fnvxr::d3d9::CompiledProductionRendererProof;
+    using fnvxr::d3d9::CompiledRetailVrBridgePolicy;
     using fnvxr::d3d9::ProductionRendererAuthorized;
     using fnvxr::d3d9::ProductionRendererProof;
     using fnvxr::d3d9::interpositionPolicy;
@@ -42,6 +43,17 @@ int main()
         || CompiledInterpositionPolicy.perFrameLogging)
     {
         return fail("the fused D3D9 policy must only forward system exports");
+    }
+
+    if (!CompiledRetailVrBridgePolicy.compiled
+        || !CompiledRetailVrBridgePolicy.exactCurrentProcessAuthorityRequired
+        || !CompiledRetailVrBridgePolicy.exBackedGameDevice
+        || !CompiledRetailVrBridgePolicy.retailWorldHookOnly
+        || CompiledRetailVrBridgePolicy.patchD3D9DeviceVtable
+        || CompiledRetailVrBridgePolicy.cpuImageTransfer
+        || CompiledRetailVrBridgePolicy.legacyDrawReplay)
+    {
+        return fail("the isolated retail bridge policy widened into legacy hooks");
     }
 
     ProductionRendererProof complete {

@@ -1,7 +1,6 @@
 #include "fnvxr_retail_abi_revalidator.h"
 
 #include "fnvxr_module_inventory_acceptance.h"
-#include "fnvxr_windows_module_census.h"
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -1174,11 +1173,12 @@ RetailAbiRevalidationResult revalidateSnapshot(
             imageBase);
     const bool censusAccepted = census
         && inventory::assessModuleInventory(*census).overallAccepted;
-    result.evidence.compatibilityModulesVerified = bound && censusAccepted;
-    // This bit is never accepted from a caller. It records that the reader,
-    // loaded image, process-creation identity, generation, and owned census
-    // were bound inside this one decision-point call.
-    result.evidence.synchronousRuntimeRevalidation = bound && censusAccepted;
+    const bool compatibilityAccepted = bound && censusAccepted;
+    result.evidence.compatibilityModulesVerified = compatibilityAccepted;
+    // Synthetic authority requires its owned census to be bound here. The
+    // production entry promotes these two fields only after its separate
+    // current-process compatibility proof passes below.
+    result.evidence.synchronousRuntimeRevalidation = compatibilityAccepted;
 
     result.assessment = assessRetailEngineAbi(result.evidence);
     result.failure = result.assessment.engineCallsAuthorized
@@ -1216,6 +1216,17 @@ inline constexpr std::array<ExecutableSectionLayoutInternal, 2>
             2u,
         },
     }};
+static_assert(RetailLoadedExecutableSections.size() == 2u);
+static_assert(RetailLoadedExecutableSections[0].rva == 0x00001000u);
+static_assert(
+    RetailLoadedExecutableSections[0].protectionBytes == 0x00BDE000u);
+static_assert(RetailLoadedExecutableSections[1].rva == 0x01009000u);
+static_assert(
+    RetailLoadedExecutableSections[1].protectionBytes == 0x00072000u);
+static_assert(
+    RetailLoadedExecutableSections[1].rva
+            + RetailLoadedExecutableSections[1].protectionBytes
+        == SupportedSizeOfImage);
 
 const RevalidationContract& productionContract() noexcept
 {
@@ -1283,24 +1294,15 @@ bool currentMainModuleIsFallout(HMODULE module) noexcept
 }
 }
 
-RetailAbiRevalidationResult revalidateCurrentRetailEngineAbiAtDecisionPoint(
-    const module_census::OwnedWindowsModuleCensus& census) noexcept
+RetailAbiRevalidationResult revalidateCurrentRetailEngineAbiAtDecisionPoint()
+    noexcept
 {
     RetailAbiRevalidationResult rejected {};
 #if !defined(_M_IX86)
-    (void)census;
     rejected.failure = RetailAbiRevalidationFailure::UnsupportedHostArchitecture;
     rejected.assessment = assessRetailEngineAbi(rejected.evidence);
     return rejected;
 #else
-    const inventory::ModuleInventoryEvidence* censusView = census.sealedView();
-    if (!censusView)
-    {
-        rejected.failure = RetailAbiRevalidationFailure::CensusNotSealed;
-        rejected.assessment = assessRetailEngineAbi(rejected.evidence);
-        return rejected;
-    }
-
     inventory::ProcessCreationIdentity before {};
     if (!currentProcessIdentity(before))
     {
@@ -1308,15 +1310,6 @@ RetailAbiRevalidationResult revalidateCurrentRetailEngineAbiAtDecisionPoint(
         rejected.assessment = assessRetailEngineAbi(rejected.evidence);
         return rejected;
     }
-    if (!inventory::sameProcessCreation(
-            before,
-            censusView->transactionProcessIdentity))
-    {
-        rejected.failure = RetailAbiRevalidationFailure::CensusProcessMismatch;
-        rejected.assessment = assessRetailEngineAbi(rejected.evidence);
-        return rejected;
-    }
-
     HMODULE module = GetModuleHandleW(nullptr);
     if (!module)
     {
@@ -1336,15 +1329,46 @@ RetailAbiRevalidationResult revalidateCurrentRetailEngineAbiAtDecisionPoint(
         reader,
         reinterpret_cast<std::uintptr_t>(module),
         productionContract(),
-        censusView,
+        nullptr,
         before,
-        censusView->transactionGeneration);
+        0u);
+
+    // Run the module/overlay proof last. Its two current-process module
+    // snapshots surround a second verification of every protected function
+    // and vtable range, closing the compatibility window immediately before
+    // capability issuance instead of trusting a pre-existing census.
+    const compatibility::RetailCompatibilityProof compatibilityProof =
+        compatibility::proveCurrentRetailCompatibilityAtDecisionPoint();
+    result.compatibilityProof = compatibilityProof;
+    if (!compatibilityProof.compatible
+        || compatibilityProof.failure
+            != compatibility::RetailCompatibilityFailure::None
+        || compatibilityProof.diagnostics.runtimeImageBase
+            != reinterpret_cast<std::uintptr_t>(module)
+        || compatibilityProof.diagnostics.processId != before.processId
+        || compatibilityProof.diagnostics.processCreationTime100ns
+            != before.creationTime100ns)
+    {
+        result.evidence.compatibilityModulesVerified = false;
+        result.evidence.synchronousRuntimeRevalidation = false;
+        result.assessment = assessRetailEngineAbi(result.evidence);
+        result.failure =
+            RetailAbiRevalidationFailure::CompatibilityProofRejected;
+        return result;
+    }
+    result.evidence.compatibilityModulesVerified = true;
+    result.evidence.synchronousRuntimeRevalidation = true;
+    result.assessment = assessRetailEngineAbi(result.evidence);
+    result.failure = result.assessment.engineCallsAuthorized
+        ? RetailAbiRevalidationFailure::None
+        : RetailAbiRevalidationFailure::RuntimeEvidenceRejected;
 
     inventory::ProcessCreationIdentity after {};
     if (!currentProcessIdentity(after)
         || !inventory::sameProcessCreation(before, after))
     {
         result.evidence.synchronousRuntimeRevalidation = false;
+        result.evidence.compatibilityModulesVerified = false;
         result.assessment = assessRetailEngineAbi(result.evidence);
         result.failure = RetailAbiRevalidationFailure::ProcessIdentityUnavailable;
     }

@@ -269,6 +269,8 @@ int main()
         "the test private culler clone did not install");
 
     abi::RetailNiCameraLayout camera {};
+    abi::RetailNiCameraLayout leftCamera {};
+    abi::RetailNiCameraLayout rightCamera {};
     abi::RetailBSShaderAccumulatorLayout left {};
     abi::RetailBSShaderAccumulatorLayout right {};
     state.left = &left;
@@ -299,6 +301,8 @@ int main()
         {
             &scene,
             &camera,
+            &leftCamera,
+            &rightCamera,
             binding.cullingProcess(),
             &left,
             &right,

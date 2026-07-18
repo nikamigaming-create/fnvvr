@@ -152,12 +152,14 @@ struct PrivateGeometryCollectorX86Abi
     static constexpr bool actualCallbackCompiled = false;
 #endif
 
-    // These stay false until separate live evidence and integration work exist.
-    static constexpr bool onVisibleRuntimeVerificationImplemented = false;
-    static constexpr bool fullClonedVtableProven = false;
+    // The revalidator now hashes the live OnVisible thunk and the complete
+    // 0x50-byte source vtable, while this binding copies all 20 entries and
+    // replaces only Append. Runtime activation remains a separate capability.
+    static constexpr bool onVisibleRuntimeVerificationImplemented = true;
+    static constexpr bool fullClonedVtableProven = true;
     static constexpr bool runtimeActivationAuthorized = false;
     static constexpr bool activatesHook = false;
-    static constexpr bool clonesVtable = false;
+    static constexpr bool clonesVtable = true;
     static constexpr bool callsEngine = false;
     static constexpr bool writesProcessMemory = false;
 };

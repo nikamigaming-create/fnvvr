@@ -1,6 +1,7 @@
 #pragma once
 
 #include "fnvxr_retail_engine_abi.h"
+#include "fnvxr_retail_runtime_binding.h"
 
 #include <array>
 #include <cstddef>
@@ -259,7 +260,7 @@ struct RetailEngineAddressRelocation
 inline constexpr std::uintptr_t RetailPeAllocationAlignment = 0x10000u;
 inline constexpr std::uintptr_t RetailX86MaximumAddress =
     static_cast<std::uintptr_t>(
-        std::numeric_limits<std::uint32_t>::max());
+        (std::numeric_limits<std::uint32_t>::max)());
 
 constexpr RetailEngineAddressRelocation relocateRetailEngineAddress(
     std::uintptr_t loadedImageBase,
@@ -311,9 +312,9 @@ namespace detail
 struct RetailEngineCallAuthorizationAccess;
 }
 
-// There is deliberately no production issuer in this header.  A future
-// same-process probe must own issuance after producing the complete assessment.
-// The named friend exists only in the isolated unit-test translation unit.
+// This header consumes authority but cannot issue it. Production issuance is
+// centralized in the same-process retail runtime authority bundle. The named
+// test friend remains confined to the isolated resolver unit test.
 struct RetailEngineCallResolverTestAuthority;
 
 class RetailEngineCallAuthorization final
@@ -328,13 +329,27 @@ private:
     {
     }
 
+    explicit constexpr RetailEngineCallAuthorization(
+        const abi::RetailEngineAbiAssessment& assessment,
+        const detail::RetailRuntimeBinding& binding,
+        detail::RetailRuntimeBindingValidator validator) noexcept
+        : mAssessment(assessment),
+          mBinding(binding),
+          mBindingValidator(validator)
+    {
+    }
+
     abi::RetailEngineAbiAssessment mAssessment {};
+    detail::RetailRuntimeBinding mBinding {};
+    detail::RetailRuntimeBindingValidator mBindingValidator = nullptr;
 
     friend struct detail::RetailEngineCallAuthorizationAccess;
+    friend struct detail::RetailRuntimeAuthorityIssuer;
     friend struct RetailEngineCallResolverTestAuthority;
 };
 
-inline constexpr bool RetailEngineCallProductionAuthorizationAvailable = false;
+inline constexpr bool RetailEngineCallProductionAuthorizationAvailable =
+    RetailRuntimeProductionAuthorizationAvailable;
 #if defined(_WIN32) && (defined(_M_IX86) || defined(__i386__))
 inline constexpr bool RetailEngineCallArchitectureSupported = true;
 #else
@@ -346,11 +361,17 @@ namespace detail
 struct RetailEngineCallAuthorizationAccess
 {
     static constexpr bool authorized(
-        const RetailEngineCallAuthorization& authorization) noexcept
+        const RetailEngineCallAuthorization& authorization,
+        std::uintptr_t requestedImageBase) noexcept
     {
         return authorization.mAssessment.engineCallsAuthorized
             && authorization.mAssessment.failure
-                == abi::RetailEngineAbiFailure::None;
+                == abi::RetailEngineAbiFailure::None
+            && (!authorization.mBindingValidator
+                || authorization.mBinding.runtimeImageBase
+                    == requestedImageBase)
+            && (!authorization.mBindingValidator
+                || authorization.mBindingValidator(authorization.mBinding));
     }
 };
 
@@ -460,7 +481,9 @@ inline RetailEngineCallResolution resolveRetailEngineCalls(
     const RetailEngineCallAuthorization& authorization,
     std::uintptr_t loadedImageBase) noexcept
 {
-    if (!detail::RetailEngineCallAuthorizationAccess::authorized(authorization))
+    if (!detail::RetailEngineCallAuthorizationAccess::authorized(
+            authorization,
+            loadedImageBase))
         return { {}, RetailEngineCallResolutionFailure::Unauthorized };
     if constexpr (!RetailEngineCallArchitectureSupported)
     {
@@ -536,5 +559,7 @@ inline RetailEngineCallResolution resolveRetailEngineCalls(
     }
 }
 
-static_assert(!RetailEngineCallProductionAuthorizationAvailable);
+static_assert(
+    RetailEngineCallProductionAuthorizationAvailable
+    == RetailEngineCallArchitectureSupported);
 }

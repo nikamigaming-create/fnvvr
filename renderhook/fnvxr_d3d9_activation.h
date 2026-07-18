@@ -58,6 +58,31 @@ constexpr InterpositionPolicy interpositionPolicy(bool productionAuthorized)
 inline constexpr InterpositionPolicy CompiledInterpositionPolicy =
     interpositionPolicy(ProductionRendererAuthorized);
 
+// This is separate from the retired replay interposer above. It describes
+// the narrow exact-retail route: an Ex-backed enumerator, one authorized
+// RenderWorldSceneGraph detour, engine-owned eye rendering, and GPU-only color
+// transport. It never authorizes the retained D3D9 device-vtable hook set.
+struct RetailVrBridgePolicy
+{
+    bool compiled = false;
+    bool exactCurrentProcessAuthorityRequired = true;
+    bool exBackedGameDevice = true;
+    bool retailWorldHookOnly = true;
+    bool patchD3D9DeviceVtable = false;
+    bool cpuImageTransfer = false;
+    bool legacyDrawReplay = false;
+};
+
+inline constexpr RetailVrBridgePolicy CompiledRetailVrBridgePolicy {
+    true,
+    true,
+    true,
+    true,
+    false,
+    false,
+    false,
+};
+
 static_assert(CompiledInterpositionPolicy.forwardSystemExports);
 static_assert(!CompiledInterpositionPolicy.wrapDirect3D9);
 static_assert(!CompiledInterpositionPolicy.patchDirect3D9Vtable);
@@ -65,4 +90,12 @@ static_assert(!CompiledInterpositionPolicy.patchDeviceVtable);
 static_assert(!CompiledInterpositionPolicy.accessSharedMappings);
 static_assert(!CompiledInterpositionPolicy.captureOrCpuReadback);
 static_assert(!CompiledInterpositionPolicy.perFrameLogging);
+static_assert(CompiledRetailVrBridgePolicy.compiled);
+static_assert(
+    CompiledRetailVrBridgePolicy.exactCurrentProcessAuthorityRequired);
+static_assert(CompiledRetailVrBridgePolicy.exBackedGameDevice);
+static_assert(CompiledRetailVrBridgePolicy.retailWorldHookOnly);
+static_assert(!CompiledRetailVrBridgePolicy.patchD3D9DeviceVtable);
+static_assert(!CompiledRetailVrBridgePolicy.cpuImageTransfer);
+static_assert(!CompiledRetailVrBridgePolicy.legacyDrawReplay);
 }

@@ -30,6 +30,18 @@ add_library(fnvxr_protocol INTERFACE)
 target_include_directories(fnvxr_protocol INTERFACE
     ${CMAKE_CURRENT_SOURCE_DIR}/protocol
 )
+
+add_executable(fnvxr_openxr_live_authority_test
+    tests/fnvxr_openxr_live_authority_test.cpp)
+target_include_directories(fnvxr_openxr_live_authority_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/host)
+if(MSVC)
+    target_compile_options(fnvxr_openxr_live_authority_test PRIVATE /W4 /WX)
+endif()
+add_test(
+    NAME fnvxr_openxr_live_authority_test
+    COMMAND fnvxr_openxr_live_authority_test)
+
 if(WIN32)
     add_test(
         NAME fnvxr_build_attestation_test
@@ -45,6 +57,14 @@ if(WIN32)
             -NoProfile
             -ExecutionPolicy Bypass
             -File ${CMAKE_CURRENT_SOURCE_DIR}/tests/fnvxr_retired_launchers_fuse_test.ps1
+            -SourceRoot ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    add_test(
+        NAME fnvxr_product_launcher_test
+        COMMAND powershell.exe
+            -NoProfile
+            -ExecutionPolicy Bypass
+            -File ${CMAKE_CURRENT_SOURCE_DIR}/tests/fnvxr_product_launcher_test.ps1
             -SourceRoot ${CMAKE_CURRENT_SOURCE_DIR}
     )
 endif()
@@ -75,6 +95,7 @@ if(FNVXR_OPENXR_INCLUDE_DIR AND CMAKE_SIZEOF_VOID_P EQUAL 8)
         ${CMAKE_CURRENT_SOURCE_DIR}/renderhook
     )
     target_link_libraries(fnvxr_openxr_pose_host PRIVATE
+        fnvxr_gpu_color_consumer
         d3d11
         d3dcompiler
         dxgi
@@ -83,12 +104,16 @@ if(FNVXR_OPENXR_INCLUDE_DIR AND CMAKE_SIZEOF_VOID_P EQUAL 8)
         bcrypt
     )
     if(MSVC)
-        target_compile_options(fnvxr_openxr_pose_host PRIVATE /fp:strict)
+        target_compile_options(fnvxr_openxr_pose_host PRIVATE /W4 /WX /fp:strict)
+        target_compile_definitions(fnvxr_openxr_pose_host PRIVATE
+            _CRT_SECURE_NO_WARNINGS)
     endif()
     add_test(
         NAME fnvxr_openxr_host_live_fuse
         COMMAND ${CMAKE_COMMAND}
             -DHOST_EXE=$<TARGET_FILE:fnvxr_openxr_pose_host>
+            -DHOST_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/host/fnvxr_openxr_pose_host.cpp
+            -DHOST_AUTHORITY=${CMAKE_CURRENT_SOURCE_DIR}/host/fnvxr_openxr_live_authority.h
             -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_openxr_host_fuse.cmake
     )
 
@@ -112,16 +137,47 @@ if(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 4)
     target_include_directories(nvse_fnvxr PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/runtime
     )
-    target_link_libraries(nvse_fnvxr PRIVATE fnvxr_protocol dbghelp)
+    target_link_libraries(nvse_fnvxr PRIVATE
+        fnvxr_protocol
+        fnvxr_retail_runtime_authority
+        dbghelp)
     set_target_properties(nvse_fnvxr PROPERTIES
         PREFIX ""
         OUTPUT_NAME "nvse_fnvxr"
     )
 
+    add_library(fnvxr_d3d9ex_color_transport_win32 STATIC
+        renderhook/fnvxr_d3d9ex_color_transport_win32.cpp)
+    target_include_directories(fnvxr_d3d9ex_color_transport_win32 PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/renderhook
+        ${CMAKE_CURRENT_SOURCE_DIR}/protocol)
+    if(MSVC)
+        target_compile_options(fnvxr_d3d9ex_color_transport_win32 PRIVATE /W4 /WX)
+    endif()
+
+    add_library(fnvxr_retail_ui_quad_capture_win32 STATIC
+        renderhook/fnvxr_retail_ui_quad_capture_win32.cpp)
+    target_include_directories(fnvxr_retail_ui_quad_capture_win32 PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/renderhook
+        ${CMAKE_CURRENT_SOURCE_DIR}/runtime
+        ${CMAKE_CURRENT_SOURCE_DIR}/protocol)
+    if(MSVC)
+        target_compile_options(
+            fnvxr_retail_ui_quad_capture_win32 PRIVATE /W4 /WX)
+    endif()
+
     add_library(fnvxr_d3d9_proxy MODULE renderhook/fnvxr_d3d9_proxy.cpp)
     target_include_directories(fnvxr_d3d9_proxy PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/renderhook)
     target_sources(fnvxr_d3d9_proxy PRIVATE renderhook/fnvxr_d3d9_proxy.def)
-    target_link_libraries(fnvxr_d3d9_proxy PRIVATE dxguid bcrypt)
+    target_link_libraries(fnvxr_d3d9_proxy PRIVATE
+        dxguid
+        bcrypt
+        fnvxr_d3d9ex_color_transport_win32
+        fnvxr_gpu_color_publisher_win32
+        fnvxr_retail_ui_quad_capture_win32
+        fnvxr_retail_runtime_authority
+        fnvxr_retail_tracked_frame_win32
+        fnvxr_retail_world_hook_win32)
     if(MSVC)
         target_compile_options(fnvxr_d3d9_proxy PRIVATE /fp:strict /arch:SSE2)
     endif()
@@ -138,6 +194,18 @@ if(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 4)
         NAME fnvxr_d3d9_forwarding_test
         COMMAND fnvxr_d3d9_forwarding_test $<TARGET_FILE:fnvxr_d3d9_proxy>
     )
+
+    add_executable(fnvxr_retail_ui_quad_capture_win32_test
+        tests/fnvxr_retail_ui_quad_capture_win32_test.cpp)
+    target_link_libraries(fnvxr_retail_ui_quad_capture_win32_test PRIVATE
+        fnvxr_retail_ui_quad_capture_win32)
+    if(MSVC)
+        target_compile_options(
+            fnvxr_retail_ui_quad_capture_win32_test PRIVATE /W4 /WX)
+    endif()
+    add_test(
+        NAME fnvxr_retail_ui_quad_capture_win32_test
+        COMMAND fnvxr_retail_ui_quad_capture_win32_test)
 
     add_library(fnvxr_xinput_proxy MODULE renderhook/fnvxr_xinput_proxy.cpp)
     target_sources(fnvxr_xinput_proxy PRIVATE renderhook/fnvxr_xinput_proxy.def)
@@ -200,12 +268,113 @@ target_include_directories(fnvxr_d3d9_activation_test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/renderhook
 )
 add_test(NAME fnvxr_d3d9_activation_test COMMAND fnvxr_d3d9_activation_test)
+
+add_executable(fnvxr_d3d9_eye_targets_test
+    tests/fnvxr_d3d9_eye_targets_test.cpp)
+target_include_directories(fnvxr_d3d9_eye_targets_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/renderhook
+    ${CMAKE_CURRENT_SOURCE_DIR}/runtime
+)
+if(MSVC)
+    target_compile_options(fnvxr_d3d9_eye_targets_test PRIVATE /W4 /WX)
+endif()
+add_test(
+    NAME fnvxr_d3d9_eye_targets_test
+    COMMAND fnvxr_d3d9_eye_targets_test)
+
+add_executable(fnvxr_gpu_color_producer_test
+    tests/fnvxr_gpu_color_producer_test.cpp)
+target_include_directories(fnvxr_gpu_color_producer_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/renderhook
+    ${CMAKE_CURRENT_SOURCE_DIR}/protocol
+)
+if(MSVC)
+    target_compile_options(fnvxr_gpu_color_producer_test PRIVATE /W4 /WX)
+endif()
+add_test(
+    NAME fnvxr_gpu_color_producer_test
+    COMMAND fnvxr_gpu_color_producer_test)
+
+add_library(fnvxr_gpu_color_publisher_win32 STATIC
+    renderhook/fnvxr_gpu_color_publisher_win32.cpp)
+target_include_directories(fnvxr_gpu_color_publisher_win32 PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/renderhook
+    ${CMAKE_CURRENT_SOURCE_DIR}/protocol)
+if(MSVC)
+    target_compile_options(fnvxr_gpu_color_publisher_win32 PRIVATE /W4 /WX)
+endif()
+
+add_executable(fnvxr_gpu_color_publisher_win32_test
+    tests/fnvxr_gpu_color_publisher_win32_test.cpp)
+target_link_libraries(fnvxr_gpu_color_publisher_win32_test PRIVATE
+    fnvxr_gpu_color_publisher_win32)
+if(MSVC)
+    target_compile_options(
+        fnvxr_gpu_color_publisher_win32_test PRIVATE /W4 /WX)
+endif()
+add_test(
+    NAME fnvxr_gpu_color_publisher_win32_test
+    COMMAND fnvxr_gpu_color_publisher_win32_test)
+
+add_executable(fnvxr_retail_vr_bridge_win32_test
+    tests/fnvxr_retail_vr_bridge_win32_test.cpp)
+target_include_directories(fnvxr_retail_vr_bridge_win32_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/renderhook
+    ${CMAKE_CURRENT_SOURCE_DIR}/runtime
+    ${CMAKE_CURRENT_SOURCE_DIR}/protocol)
+target_link_libraries(fnvxr_retail_vr_bridge_win32_test PRIVATE
+    fnvxr_gpu_color_publisher_win32
+    fnvxr_retail_runtime_authority
+    fnvxr_retail_tracked_frame_win32
+    fnvxr_retail_world_hook_win32)
+if(MSVC)
+    target_compile_options(
+        fnvxr_retail_vr_bridge_win32_test PRIVATE /W4 /WX)
+endif()
+add_test(
+    NAME fnvxr_retail_vr_bridge_win32_test
+    COMMAND fnvxr_retail_vr_bridge_win32_test)
+
+add_executable(fnvxr_d3d9ex_game_creation_test
+    tests/fnvxr_d3d9ex_game_creation_test.cpp)
+target_include_directories(fnvxr_d3d9ex_game_creation_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/renderhook)
+if(MSVC)
+    target_compile_options(fnvxr_d3d9ex_game_creation_test PRIVATE /W4 /WX)
+endif()
+add_test(
+    NAME fnvxr_d3d9ex_game_creation_test
+    COMMAND fnvxr_d3d9ex_game_creation_test)
+
+if(WIN32)
+    add_executable(fnvxr_d3d11_fence_only_nt_handle_test
+        tests/fnvxr_d3d11_fence_only_nt_handle_test.cpp)
+    target_link_libraries(fnvxr_d3d11_fence_only_nt_handle_test PRIVATE
+        d3d11
+        dxgi)
+    if(MSVC)
+        target_compile_options(fnvxr_d3d11_fence_only_nt_handle_test PRIVATE
+            /W4 /WX)
+    endif()
+    add_test(
+        NAME fnvxr_d3d11_fence_only_nt_handle_test
+        COMMAND fnvxr_d3d11_fence_only_nt_handle_test)
+endif()
+
 add_test(
     NAME fnvxr_d3d9_proxy_inert_fuse
     COMMAND ${CMAKE_COMMAND}
         -DPROXY_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/renderhook/fnvxr_d3d9_proxy.cpp
         -DACTIVATION_HEADER=${CMAKE_CURRENT_SOURCE_DIR}/renderhook/fnvxr_d3d9_activation.h
+        -DBRIDGE_HEADER=${CMAKE_CURRENT_SOURCE_DIR}/renderhook/fnvxr_retail_vr_bridge_win32.h
         -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_d3d9_proxy_inert_fuse.cmake
+)
+
+add_test(
+    NAME fnvxr_retail_ui_quad_capture_source_fuse
+    COMMAND ${CMAKE_COMMAND}
+        -DROOT=${CMAKE_CURRENT_SOURCE_DIR}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_retail_ui_quad_capture_source_fuse.cmake
 )
 
 add_executable(fnvxr_protocol_layout_test tests/fnvxr_protocol_layout_test.cpp)
@@ -332,6 +501,7 @@ endif()
 add_executable(fnvxr_retail_abi_revalidator_test
     tests/fnvxr_retail_abi_revalidator_test.cpp
     runtime/fnvxr_retail_abi_revalidator.cpp
+    runtime/fnvxr_retail_compatibility_proof.cpp
 )
 target_include_directories(fnvxr_retail_abi_revalidator_test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/runtime
@@ -348,6 +518,69 @@ endif()
 add_test(
     NAME fnvxr_retail_abi_revalidator_test
     COMMAND fnvxr_retail_abi_revalidator_test)
+
+add_library(fnvxr_retail_compatibility_proof STATIC
+    runtime/fnvxr_retail_compatibility_proof.cpp)
+target_include_directories(fnvxr_retail_compatibility_proof PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/runtime
+)
+if(WIN32)
+    target_link_libraries(fnvxr_retail_compatibility_proof PRIVATE bcrypt)
+endif()
+if(MSVC)
+    target_compile_options(fnvxr_retail_compatibility_proof PRIVATE /W4 /WX)
+endif()
+
+add_executable(fnvxr_retail_compatibility_proof_test
+    tests/fnvxr_retail_compatibility_proof_test.cpp
+    runtime/fnvxr_retail_compatibility_proof.cpp)
+target_include_directories(fnvxr_retail_compatibility_proof_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/runtime
+)
+target_compile_definitions(fnvxr_retail_compatibility_proof_test PRIVATE
+    FNVXR_RETAIL_COMPATIBILITY_PROOF_TEST_AUTHORITY=1)
+if(WIN32)
+    target_link_libraries(fnvxr_retail_compatibility_proof_test PRIVATE bcrypt)
+endif()
+if(MSVC)
+    target_compile_options(
+        fnvxr_retail_compatibility_proof_test PRIVATE /W4 /WX)
+endif()
+add_test(
+    NAME fnvxr_retail_compatibility_proof_test
+    COMMAND fnvxr_retail_compatibility_proof_test)
+
+target_link_libraries(fnvxr_retail_abi_revalidator PRIVATE
+    fnvxr_retail_compatibility_proof)
+
+add_library(fnvxr_retail_runtime_authority STATIC
+    runtime/fnvxr_retail_runtime_authority.cpp)
+target_include_directories(fnvxr_retail_runtime_authority PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/runtime)
+target_link_libraries(fnvxr_retail_runtime_authority PRIVATE
+    fnvxr_retail_abi_revalidator
+    fnvxr_retail_compatibility_proof)
+if(MSVC)
+    target_compile_options(fnvxr_retail_runtime_authority PRIVATE /W4 /WX)
+endif()
+
+add_executable(fnvxr_retail_runtime_authority_test
+    tests/fnvxr_retail_runtime_authority_test.cpp
+    runtime/fnvxr_retail_runtime_authority.cpp)
+target_include_directories(fnvxr_retail_runtime_authority_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/runtime)
+target_compile_definitions(fnvxr_retail_runtime_authority_test PRIVATE
+    FNVXR_RETAIL_RUNTIME_AUTHORITY_TEST_AUTHORITY=1)
+target_link_libraries(fnvxr_retail_runtime_authority_test PRIVATE
+    fnvxr_retail_abi_revalidator
+    fnvxr_retail_compatibility_proof)
+if(MSVC)
+    target_compile_options(
+        fnvxr_retail_runtime_authority_test PRIVATE /W4 /WX)
+endif()
+add_test(
+    NAME fnvxr_retail_runtime_authority_test
+    COMMAND fnvxr_retail_runtime_authority_test)
 
 add_executable(fnvxr_retail_abi_map_test tests/fnvxr_retail_abi_map_test.cpp)
 target_include_directories(fnvxr_retail_abi_map_test PRIVATE
@@ -399,6 +632,129 @@ endif()
 add_test(
     NAME fnvxr_retail_center_renderer_operations_test
     COMMAND fnvxr_retail_center_renderer_operations_test)
+
+add_executable(fnvxr_retail_center_runtime_test
+    tests/fnvxr_retail_center_runtime_test.cpp)
+target_include_directories(fnvxr_retail_center_runtime_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/runtime
+)
+if(MSVC)
+    target_compile_options(
+        fnvxr_retail_center_runtime_test PRIVATE /W4 /WX)
+endif()
+add_test(
+    NAME fnvxr_retail_center_runtime_test
+    COMMAND fnvxr_retail_center_runtime_test)
+
+add_executable(fnvxr_retail_eye_camera_transaction_test
+    tests/fnvxr_retail_eye_camera_transaction_test.cpp)
+target_include_directories(fnvxr_retail_eye_camera_transaction_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/runtime
+    ${CMAKE_CURRENT_SOURCE_DIR}/protocol
+    ${CMAKE_CURRENT_SOURCE_DIR}/renderhook)
+if(MSVC)
+    target_compile_options(
+        fnvxr_retail_eye_camera_transaction_test PRIVATE /W4 /WX /fp:strict)
+    if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+        target_compile_options(
+            fnvxr_retail_eye_camera_transaction_test PRIVATE /arch:SSE2)
+    endif()
+endif()
+add_test(
+    NAME fnvxr_retail_eye_camera_transaction_test
+    COMMAND fnvxr_retail_eye_camera_transaction_test)
+
+add_executable(fnvxr_retail_tracked_frame_test
+    tests/fnvxr_retail_tracked_frame_test.cpp)
+target_include_directories(fnvxr_retail_tracked_frame_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/runtime
+    ${CMAKE_CURRENT_SOURCE_DIR}/protocol)
+if(MSVC)
+    target_compile_options(fnvxr_retail_tracked_frame_test PRIVATE /W4 /WX)
+endif()
+add_test(
+    NAME fnvxr_retail_tracked_frame_test
+    COMMAND fnvxr_retail_tracked_frame_test)
+
+add_library(fnvxr_retail_tracked_frame_win32 STATIC
+    runtime/fnvxr_retail_tracked_frame_win32.cpp)
+target_include_directories(fnvxr_retail_tracked_frame_win32 PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/runtime
+    ${CMAKE_CURRENT_SOURCE_DIR}/protocol)
+if(MSVC)
+    target_compile_options(fnvxr_retail_tracked_frame_win32 PRIVATE /W4 /WX)
+endif()
+
+add_executable(fnvxr_retail_tracked_frame_win32_test
+    tests/fnvxr_retail_tracked_frame_win32_test.cpp)
+target_link_libraries(fnvxr_retail_tracked_frame_win32_test PRIVATE
+    fnvxr_retail_tracked_frame_win32)
+if(MSVC)
+    target_compile_options(
+        fnvxr_retail_tracked_frame_win32_test PRIVATE /W4 /WX)
+endif()
+add_test(
+    NAME fnvxr_retail_tracked_frame_win32_test
+    COMMAND fnvxr_retail_tracked_frame_win32_test)
+
+add_executable(fnvxr_retail_world_hook_contract_test
+    tests/fnvxr_retail_world_hook_contract_test.cpp)
+target_include_directories(fnvxr_retail_world_hook_contract_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/runtime
+)
+if(MSVC)
+    target_compile_options(
+        fnvxr_retail_world_hook_contract_test PRIVATE /W4 /WX)
+endif()
+add_test(
+    NAME fnvxr_retail_world_hook_contract_test
+    COMMAND fnvxr_retail_world_hook_contract_test)
+
+add_executable(fnvxr_retail_world_controller_test
+    tests/fnvxr_retail_world_controller_test.cpp)
+target_include_directories(fnvxr_retail_world_controller_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/runtime
+    ${CMAKE_CURRENT_SOURCE_DIR}/protocol)
+if(MSVC)
+    target_compile_options(fnvxr_retail_world_controller_test PRIVATE /W4 /WX)
+endif()
+add_test(
+    NAME fnvxr_retail_world_controller_test
+    COMMAND fnvxr_retail_world_controller_test)
+
+add_executable(fnvxr_retail_world_hook_lease_test
+    tests/fnvxr_retail_world_hook_lease_test.cpp)
+target_include_directories(fnvxr_retail_world_hook_lease_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/runtime
+)
+if(MSVC)
+    target_compile_options(
+        fnvxr_retail_world_hook_lease_test PRIVATE /W4 /WX)
+endif()
+add_test(
+    NAME fnvxr_retail_world_hook_lease_test
+    COMMAND fnvxr_retail_world_hook_lease_test)
+
+add_library(fnvxr_retail_world_hook_win32 STATIC
+    runtime/fnvxr_retail_world_hook_win32.cpp)
+target_include_directories(fnvxr_retail_world_hook_win32 PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/runtime
+)
+if(MSVC)
+    target_compile_options(fnvxr_retail_world_hook_win32 PRIVATE /W4 /WX)
+endif()
+
+add_executable(fnvxr_retail_world_hook_win32_test
+    tests/fnvxr_retail_world_hook_win32_test.cpp)
+target_link_libraries(fnvxr_retail_world_hook_win32_test PRIVATE
+    fnvxr_retail_world_hook_win32)
+if(MSVC)
+    target_compile_options(
+        fnvxr_retail_world_hook_win32_test PRIVATE /W4 /WX)
+endif()
+add_test(
+    NAME fnvxr_retail_world_hook_win32_test
+    COMMAND fnvxr_retail_world_hook_win32_test)
 
 add_executable(fnvxr_private_geometry_collector_test
     tests/fnvxr_private_geometry_collector_test.cpp
@@ -469,11 +825,69 @@ add_executable(fnvxr_gpu_transport_test tests/fnvxr_gpu_transport_test.cpp)
 target_link_libraries(fnvxr_gpu_transport_test PRIVATE fnvxr_protocol)
 add_test(NAME fnvxr_gpu_transport_test COMMAND fnvxr_gpu_transport_test)
 
+add_executable(fnvxr_gpu_color_transport_test
+    tests/fnvxr_gpu_color_transport_test.cpp)
+target_link_libraries(fnvxr_gpu_color_transport_test PRIVATE fnvxr_protocol)
+if(MSVC)
+    target_compile_options(fnvxr_gpu_color_transport_test PRIVATE /W4 /WX)
+endif()
+add_test(
+    NAME fnvxr_gpu_color_transport_test
+    COMMAND fnvxr_gpu_color_transport_test)
+
+add_library(fnvxr_gpu_color_consumer STATIC
+    host/fnvxr_gpu_color_consumer.cpp)
+target_include_directories(fnvxr_gpu_color_consumer PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/host
+    ${CMAKE_CURRENT_SOURCE_DIR}/protocol)
+if(WIN32)
+    target_link_libraries(fnvxr_gpu_color_consumer PUBLIC d3d11 dxgi)
+endif()
+if(MSVC)
+    target_compile_options(fnvxr_gpu_color_consumer PRIVATE /W4 /WX)
+endif()
+
+add_executable(fnvxr_gpu_color_consumer_test
+    tests/fnvxr_gpu_color_consumer_test.cpp)
+target_link_libraries(fnvxr_gpu_color_consumer_test PRIVATE
+    fnvxr_gpu_color_consumer)
+if(MSVC)
+    target_compile_options(fnvxr_gpu_color_consumer_test PRIVATE /W4 /WX)
+endif()
+add_test(
+    NAME fnvxr_gpu_color_consumer_test
+    COMMAND fnvxr_gpu_color_consumer_test)
+
+add_executable(fnvxr_gpu_color_route_test
+    tests/fnvxr_gpu_color_route_test.cpp)
+target_link_libraries(fnvxr_gpu_color_route_test PRIVATE
+    fnvxr_gpu_color_consumer)
+if(MSVC)
+    target_compile_options(fnvxr_gpu_color_route_test PRIVATE /W4 /WX)
+endif()
+add_test(
+    NAME fnvxr_gpu_color_route_test
+    COMMAND fnvxr_gpu_color_route_test)
+
+add_executable(fnvxr_stereo_visual_trial_test
+    tests/fnvxr_stereo_visual_trial_test.cpp)
+target_link_libraries(fnvxr_stereo_visual_trial_test PRIVATE
+    fnvxr_gpu_color_consumer)
+if(MSVC)
+    target_compile_options(fnvxr_stereo_visual_trial_test PRIVATE /W4 /WX)
+endif()
+add_test(
+    NAME fnvxr_stereo_visual_trial_test
+    COMMAND fnvxr_stereo_visual_trial_test)
+
 add_executable(fnvxr_input_proxy_safety_test
     tests/fnvxr_input_proxy_safety_test.cpp)
 target_include_directories(fnvxr_input_proxy_safety_test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/renderhook
 )
+if(MSVC)
+    target_compile_options(fnvxr_input_proxy_safety_test PRIVATE /W4 /WX)
+endif()
 add_test(
     NAME fnvxr_input_proxy_safety_test
     COMMAND fnvxr_input_proxy_safety_test
@@ -484,6 +898,12 @@ add_test(
         -DDINPUT_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/renderhook/fnvxr_dinput8_proxy.cpp
         -DXINPUT_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/renderhook/fnvxr_xinput_proxy.cpp
         -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_input_proxy_inert_fuse.cmake
+)
+add_test(
+    NAME fnvxr_retail_input_weapon_inert_fuse
+    COMMAND ${CMAKE_COMMAND}
+        -DSOURCE_ROOT=${CMAKE_CURRENT_SOURCE_DIR}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_retail_input_weapon_inert_fuse.cmake
 )
 
 add_executable(fnvxr_shared_state_probe tools/fnvxr_shared_state_probe.cpp)

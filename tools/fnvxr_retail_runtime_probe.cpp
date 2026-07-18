@@ -183,7 +183,7 @@ const char* retailEngineAbiFailureName(
     {
         case Failure::None: return "NONE";
         case Failure::UnsupportedExecutable: return "UNSUPPORTED_EXECUTABLE";
-        case Failure::LoadedExecutableSectionsUnverified: return "LOADED_EXECUTABLE_SECTIONS_UNVERIFIED";
+        case Failure::LoadedExecutableSectionLayoutUnverified: return "LOADED_EXECUTABLE_SECTION_LAYOUT_UNVERIFIED";
         case Failure::CoreManifestUnverified: return "CORE_MANIFEST_UNVERIFIED";
         case Failure::StaticFunctionInventoryIncomplete: return "STATIC_FUNCTION_INVENTORY_INCOMPLETE";
         case Failure::StaticVtableBlockInventoryIncomplete: return "STATIC_VTABLE_BLOCK_INVENTORY_INCOMPLETE";
@@ -1529,7 +1529,7 @@ int main(int argc, char** argv)
 
     fnvxr::engine::abi::RetailEngineAbiEvidence engineAbiEvidence {};
     engineAbiEvidence.loadedExecutableIdentityMatched = identityMatches;
-    engineAbiEvidence.loadedExecutableSectionsMatched = false;
+    engineAbiEvidence.loadedExecutableSectionLayoutAndProtectionsVerified = false;
     engineAbiEvidence.coreManifestMatched = protectedManifestMatches;
     engineAbiEvidence.fullFunctionInventoryMatched = abiEvidenceMatches;
     engineAbiEvidence.vtableSlotsMatched = vtableSlotsMatch;
@@ -1551,7 +1551,7 @@ int main(int argc, char** argv)
               << (fnvxr::engine::abi::retailFunctionInventoryProductionProven()
                       ? 1
                       : 0)
-              << " loaded_executable_sections=0"
+              << " loaded_executable_section_layout=0"
               << " static_vtable_blocks="
               << (fnvxr::engine::abi::retailVtableBlockInventoryProductionProven()
                       ? 1

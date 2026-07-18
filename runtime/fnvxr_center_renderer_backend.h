@@ -2,6 +2,7 @@
 
 #include "fnvxr_retail_engine_abi.h"
 #include "fnvxr_retail_renderer_contract.h"
+#include "fnvxr_retail_runtime_binding.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -66,6 +67,8 @@ struct CenterRendererFrameInput
 {
     void* sceneObject = nullptr;
     abi::RetailNiCameraLayout* centerCamera = nullptr;
+    abi::RetailNiCameraLayout* leftCamera = nullptr;
+    abi::RetailNiCameraLayout* rightCamera = nullptr;
     abi::RetailBSCullingProcessLayout* privateCuller = nullptr;
     abi::RetailBSShaderAccumulatorLayout* leftAccumulator = nullptr;
     abi::RetailBSShaderAccumulatorLayout* rightAccumulator = nullptr;
@@ -159,14 +162,26 @@ private:
     {
     }
 
+    explicit constexpr CenterRendererAuthorization(
+        const detail::RetailRuntimeBinding& binding,
+        detail::RetailRuntimeBindingValidator validator) noexcept
+        : mBinding(binding),
+          mBindingValidator(validator)
+    {
+    }
+
     const void* mEvidence = nullptr;
     Validator mValidator = nullptr;
+    detail::RetailRuntimeBinding mBinding {};
+    detail::RetailRuntimeBindingValidator mBindingValidator = nullptr;
 
     friend struct detail::CenterRendererAuthorizationAccess;
+    friend struct detail::RetailRuntimeAuthorityIssuer;
     friend struct CenterRendererLifecycleTestAuthority;
 };
 
-inline constexpr bool CenterRendererProductionAuthorizationAvailable = false;
+inline constexpr bool CenterRendererProductionAuthorizationAvailable =
+    RetailRuntimeProductionAuthorizationAvailable;
 
 namespace detail
 {
@@ -175,8 +190,12 @@ struct CenterRendererAuthorizationAccess
     static bool authorized(
         const CenterRendererAuthorization& authorization) noexcept
     {
-        return authorization.mEvidence
-            && authorization.mValidator
+        if (authorization.mBindingValidator)
+        {
+            return authorization.mBindingValidator(
+                authorization.mBinding);
+        }
+        return authorization.mEvidence && authorization.mValidator
             && authorization.mValidator(authorization.mEvidence);
     }
 };
@@ -197,9 +216,14 @@ inline bool centerRendererInputValid(
 {
     return input.sceneObject
         && input.centerCamera
+        && input.leftCamera
+        && input.rightCamera
         && input.privateCuller
         && input.leftAccumulator
         && input.rightAccumulator
+        && input.centerCamera != input.leftCamera
+        && input.centerCamera != input.rightCamera
+        && input.leftCamera != input.rightCamera
         && input.leftAccumulator != input.rightAccumulator
         && input.generation != 0u;
 }
@@ -346,7 +370,7 @@ inline CenterRendererResult executeCenterRendererFrame(
     CenterRendererFailure failure = detail::renderCenterEye(
         operations,
         CenterRendererEye::Left,
-        input.centerCamera,
+        input.leftCamera,
         input.leftAccumulator,
         visibleSet,
         isolation);
@@ -363,7 +387,7 @@ inline CenterRendererResult executeCenterRendererFrame(
     failure = detail::renderCenterEye(
         operations,
         CenterRendererEye::Right,
-        input.centerCamera,
+        input.rightCamera,
         input.rightAccumulator,
         visibleSet,
         isolation);

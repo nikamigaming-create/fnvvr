@@ -241,7 +241,7 @@ struct SyntheticFixture
     RetailNiVisibleArrayLayout visible {};
     RetailBSCullingProcessLayout culler {};
 
-    std::array<ExecutableSectionSeal, 1> executableSections {};
+    std::array<ExecutableSectionLayout, 1> executableSections {};
     std::array<LoadedFunctionManifestEntry, 13> coreManifest {};
     std::array<RetailFunctionAbiDescriptor, 22> functions {};
     std::array<RetailVtableSlotDescriptor, 16> vtableSlots {};
@@ -399,9 +399,7 @@ struct SyntheticFixture
         executableSections[0].protectionBytes = TextProtectionBytes;
         executableSections[0].rawBytes = TextRawBytes;
         executableSections[0].characteristics = 0x60000020u;
-        executableSections[0].sha256 = sha256ForSyntheticAuthority(
-            image.data() + TextRva, TextProtectionBytes);
-        executableSections[0].independentLoadedSamples = 2u;
+        executableSections[0].independentLayoutSamples = 2u;
 
         for (std::size_t index = 0; index < coreManifest.size(); ++index)
         {
@@ -533,8 +531,8 @@ void testCompleteDecisionPointDerivesEveryEvidenceField()
 
     require(evidence.loadedExecutableIdentityMatched,
         "the exact loaded PE identity was not derived");
-    require(evidence.loadedExecutableSectionsMatched,
-        "the complete executable-section seal was not derived");
+    require(evidence.loadedExecutableSectionLayoutAndProtectionsVerified,
+        "the exact executable-section layout and protections were not derived");
     require(evidence.coreManifestMatched,
         "the 13-entry core manifest was not derived");
     require(evidence.fullFunctionInventoryMatched,
@@ -559,9 +557,9 @@ void testCompleteDecisionPointDerivesEveryEvidenceField()
         "complete derived evidence did not authorize");
     require(result.diagnostics.loadedExecutableSectionCount == 1u,
         "the executable section census was not exact");
-    require(result.diagnostics.executableSectionBytesHashed
+    require(result.diagnostics.executableSectionBytesInspected
             == TextProtectionBytes,
-        "the executable section padding was not hashed");
+        "the complete executable protection range was not inspected");
     require(result.diagnostics.functionBodiesHashed
             == fixture.coreManifest.size() + fixture.functions.size(),
         "not every function body was hashed");
@@ -625,16 +623,29 @@ void testIndependentSealsAndProtectionFailClosed()
     static_assert(TextPagePadding < TextRva + TextProtectionBytes);
     fixture.image[TextPagePadding] ^= 0x20u;
     rejected = fixture.evaluate();
-    require(!rejected.evidence.loadedExecutableSectionsMatched,
-        "executable page padding was omitted from the section seal");
-    requireRejected(rejected, "mutated executable padding authorized calls");
+    require(
+        rejected.evidence.loadedExecutableSectionLayoutAndProtectionsVerified
+            && rejected.assessment.engineCallsAuthorized,
+        "unrelated mod-patched .text bytes were mistaken for protected engine-call content");
     fixture.image[TextPagePadding] ^= 0x20u;
+
+    constexpr std::size_t TextSectionRawBytesOffset = 0x178u + 16u;
+    writeU32(
+        fixture.image,
+        TextSectionRawBytesOffset,
+        TextRawBytes + 0x200u);
+    rejected = fixture.evaluate();
+    require(
+        !rejected.evidence.loadedExecutableSectionLayoutAndProtectionsVerified,
+        "changed executable-section geometry was accepted");
+    requireRejected(rejected, "changed executable-section geometry authorized calls");
+    writeU32(fixture.image, TextSectionRawBytesOffset, TextRawBytes);
 
     fixture.protections[1].access = SyntheticMemoryAccess::ExecuteReadWrite;
     fixture.snapshot.protectionRanges = fixture.protections.data();
     rejected = revalidateSyntheticRetailAbiAtDecisionPoint(
         fixture.snapshot, fixture.contract);
-    require(!rejected.evidence.loadedExecutableSectionsMatched,
+    require(!rejected.evidence.loadedExecutableSectionLayoutAndProtectionsVerified,
         "a writable executable retail section was accepted");
     requireRejected(rejected, "writable executable memory authorized calls");
 }
@@ -719,10 +730,8 @@ void testLoadedIdentityAndExactInventoryShapesFailClosed()
 
 void testProductionEntryCannotAuthorizeThisTestProcess()
 {
-    fnvxr::module_census::OwnedWindowsModuleCensus census(
-        SyntheticProcessIdentity, SyntheticGeneration);
     const RetailAbiRevalidationResult result =
-        revalidateCurrentRetailEngineAbiAtDecisionPoint(census);
+        revalidateCurrentRetailEngineAbiAtDecisionPoint();
     requireRejected(result,
         "the production revalidator authorized a non-Fallout test process");
     require(!result.evidence.loadedExecutableIdentityMatched
