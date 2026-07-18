@@ -412,14 +412,6 @@ std::wstring lower(std::wstring value)
     return value;
 }
 
-bool isProhibitedModule(std::wstring_view name) noexcept
-{
-    return name == L"gameoverlayrenderer.dll"
-        || name == L"gameoverlayrenderer64.dll"
-        || name == L"nvspcap.dll"
-        || name == L"nvspcap64.dll";
-}
-
 bool moduleRecordValid(const ModuleRecord& module) noexcept
 {
     if (module.baseName.empty()
@@ -825,18 +817,6 @@ PassResult evaluatePass(
         return result;
     }
 
-    result.evidence.prohibitedModulesAbsent = true;
-    for (const ModuleRecord& module : modules)
-    {
-        if (isProhibitedModule(module.baseName))
-        {
-            result.evidence.prohibitedModulesAbsent = false;
-            result.failure =
-                RetailCompatibilityFailure::ProhibitedOverlayOrCaptureLoaded;
-            return result;
-        }
-    }
-
     std::size_t jipCount = 0u;
     const ModuleRecord* jipModule = uniqueModule(
         modules,
@@ -1105,8 +1085,6 @@ RetailCompatibilityEvidence combineEvidence(
         before.evidence.retailExecutableIdentityMatched
             && after.evidence.retailExecutableIdentityMatched,
         moduleStable,
-        before.evidence.prohibitedModulesAbsent
-            && after.evidence.prohibitedModulesAbsent,
         before.evidence.jip5730ExactOrAbsent
             && after.evidence.jip5730ExactOrAbsent,
         before.evidence.showOff184ExactOrAbsent
@@ -1131,7 +1109,6 @@ bool allEvidence(const RetailCompatibilityEvidence& evidence) noexcept
 {
     return evidence.retailExecutableIdentityMatched
         && evidence.moduleSnapshotStable
-        && evidence.prohibitedModulesAbsent
         && evidence.jip5730ExactOrAbsent
         && evidence.showOff184ExactOrAbsent
         && evidence.renderFirstPersonStockOrJipNormalized

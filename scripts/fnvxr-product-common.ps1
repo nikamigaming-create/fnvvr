@@ -1,6 +1,157 @@
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version 3.0
 
+# System.Diagnostics.Process.Modules is not a complete module census when an
+# x64 PowerShell supervisor observes a Win32 process. In that configuration it
+# can expose only the executable and the WOW64 support modules, omitting the
+# target's Win32 loader list. Use the native Toolhelp contract with the
+# explicit TH32CS_SNAPMODULE32 flag so exact staged-module evidence is not
+# architecture-dependent.
+if (-not ("Fnvxr.Product.NativeModuleCensus" -as [type])) {
+    Add-Type -Language CSharp -TypeDefinition @"
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Threading;
+
+namespace Fnvxr.Product
+{
+    public sealed class NativeModuleRecord
+    {
+        public string Path;
+        public string Name;
+        public ulong BaseAddress;
+        public uint ImageSize;
+    }
+
+    public static class NativeModuleCensus
+    {
+        private const uint TH32CS_SNAPMODULE = 0x00000008;
+        private const uint TH32CS_SNAPMODULE32 = 0x00000010;
+        private const int ERROR_BAD_LENGTH = 24;
+        private const int ERROR_NO_MORE_FILES = 18;
+        private const int ERROR_PARTIAL_COPY = 299;
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        private struct MODULEENTRY32W
+        {
+            public uint dwSize;
+            public uint th32ModuleID;
+            public uint th32ProcessID;
+            public uint GlblcntUsage;
+            public uint ProccntUsage;
+            public IntPtr modBaseAddr;
+            public uint modBaseSize;
+            public IntPtr hModule;
+
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)]
+            public string szModule;
+
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)]
+            public string szExePath;
+        }
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr CreateToolhelp32Snapshot(uint flags, uint processId);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool Module32FirstW(IntPtr snapshot, ref MODULEENTRY32W entry);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool Module32NextW(IntPtr snapshot, ref MODULEENTRY32W entry);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool CloseHandle(IntPtr handle);
+
+        private static IntPtr OpenSnapshot(uint processId)
+        {
+            int lastError = 0;
+            for (int attempt = 0; attempt != 32; ++attempt)
+            {
+                IntPtr snapshot = CreateToolhelp32Snapshot(
+                    TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32,
+                    processId);
+                if (snapshot != new IntPtr(-1))
+                    return snapshot;
+
+                lastError = Marshal.GetLastWin32Error();
+                if (lastError != ERROR_BAD_LENGTH && lastError != ERROR_PARTIAL_COPY)
+                    throw new Win32Exception(lastError);
+                Thread.Sleep(1);
+            }
+            throw new Win32Exception(lastError);
+        }
+
+        public static NativeModuleRecord[] Enumerate(uint processId)
+        {
+            IntPtr snapshot = OpenSnapshot(processId);
+            try
+            {
+                List<NativeModuleRecord> records = new List<NativeModuleRecord>();
+                MODULEENTRY32W entry = new MODULEENTRY32W();
+                entry.dwSize = (uint)Marshal.SizeOf(typeof(MODULEENTRY32W));
+                if (!Module32FirstW(snapshot, ref entry))
+                {
+                    int firstError = Marshal.GetLastWin32Error();
+                    if (firstError == ERROR_NO_MORE_FILES)
+                        return records.ToArray();
+                    throw new Win32Exception(firstError, "Module32FirstW failed");
+                }
+
+                while (true)
+                {
+                    NativeModuleRecord record = new NativeModuleRecord();
+                    record.Path = entry.szExePath;
+                    record.Name = entry.szModule;
+                    record.BaseAddress = unchecked((ulong)entry.modBaseAddr.ToInt64());
+                    record.ImageSize = entry.modBaseSize;
+                    records.Add(record);
+
+                    entry.dwSize = (uint)Marshal.SizeOf(typeof(MODULEENTRY32W));
+                    if (!Module32NextW(snapshot, ref entry))
+                    {
+                        int nextError = Marshal.GetLastWin32Error();
+                        if (nextError != ERROR_NO_MORE_FILES)
+                            throw new Win32Exception(nextError, "Module32NextW failed");
+                        break;
+                    }
+                }
+                return records.ToArray();
+            }
+            finally
+            {
+                CloseHandle(snapshot);
+            }
+        }
+    }
+}
+"@
+}
+
+function Get-FnvxrProductLoadedModuleCensus {
+    param([Parameter(Mandatory = $true)][uint32]$ProcessId)
+
+    if ($ProcessId -eq 0) { throw "Native module census requires a nonzero process id." }
+    try {
+        foreach ($module in [Fnvxr.Product.NativeModuleCensus]::Enumerate($ProcessId)) {
+            if ([string]::IsNullOrWhiteSpace($module.Path)) { continue }
+            [pscustomobject][ordered]@{
+                path = [System.IO.Path]::GetFullPath([string]$module.Path)
+                name = [string]$module.Name
+                baseAddress = [uint64]$module.BaseAddress
+                imageSize = [uint32]$module.ImageSize
+                census = "CreateToolhelp32Snapshot(SNAPMODULE|SNAPMODULE32)"
+            }
+        }
+    } catch {
+        throw "Native module census failed for process $ProcessId`: $($_.Exception.Message)"
+    }
+}
+
 function Get-FnvxrProductRoot {
     return (Resolve-Path -LiteralPath (Split-Path -Parent $PSScriptRoot)).Path
 }
@@ -535,7 +686,10 @@ function Get-FnvxrProductMinimalEnvironment {
     param(
         [Parameter(Mandatory = $true)][string]$RunId,
         [Parameter(Mandatory = $true)][string]$RunDirectory,
-        [Parameter(Mandatory = $true)][string]$OpenXrLoaderPath
+        [Parameter(Mandatory = $true)][string]$OpenXrLoaderPath,
+        [Parameter(Mandatory = $true)]
+        [ValidateRange(5, 900)]
+        [int]$SessionReadyTimeoutSeconds
     )
 
     return [ordered]@{
@@ -544,6 +698,7 @@ function Get-FnvxrProductMinimalEnvironment {
         FNVXR_RUN_ID = $RunId
         FNVXR_RUN_LOG_DIR = $RunDirectory
         FNVXR_OPENXR_LOADER_HINT = $OpenXrLoaderPath
+        FNVXR_SESSION_READY_TIMEOUT_SECONDS = [string]$SessionReadyTimeoutSeconds
         FNVXR_ENABLE_LEGACY_IMAGE_DIAGNOSTICS = "0"
         FNVXR_ALLOW_STEREO_WORLD_2D_FALLBACK = "0"
         FNVXR_SHOW_GAME_PLANE_ON_STEREO_LOSS = "0"

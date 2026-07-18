@@ -11,7 +11,6 @@
 #include "fnvxr_d3d9_eye_targets.h"
 #include "fnvxr_d3d9ex_color_transport_win32.h"
 #include "fnvxr_d3d9ex_game_creation.h"
-#include "fnvxr_retail_ui_quad_capture_win32.h"
 #include "fnvxr_retail_vr_bridge_win32.h"
 #include "fnvxr_stereo_math.h"
 
@@ -4345,7 +4344,7 @@ bool setWideWorldShaderConstants(
     {
         char order[32] {};
         readShaderMatrixOrder(order, sizeof(order));
-        char message[384] {};
+        char message[768] {};
         sprintf_s(
             message,
             "wide world shader constants count=%ld order=%s patched=%u alignment=%u firstStart=%u maxPatchDelta=%.6f fovX=%.3f cropScale=(%.5f %.5f)",
@@ -7425,15 +7424,21 @@ bool ensureRetailEngineEyeTargets(IDirect3DDevice9* device) noexcept
         return false;
 
     IDirect3DDevice9Ex* deviceEx = nullptr;
-    const bool exDeviceAvailable = SUCCEEDED(device->QueryInterface(
-            __uuidof(IDirect3DDevice9Ex),
-            reinterpret_cast<void**>(&deviceEx)))
-        && deviceEx;
+    const HRESULT deviceExResult = device->QueryInterface(
+        __uuidof(IDirect3DDevice9Ex),
+        reinterpret_cast<void**>(&deviceEx));
+    const bool exDeviceAvailable = SUCCEEDED(deviceExResult) && deviceEx;
     if (deviceEx)
         deviceEx->Release();
     if (!exDeviceAvailable)
     {
-        logLine("retail eye targets rejected: IDirect3DDevice9Ex is required");
+        char message[160] {};
+        sprintf_s(
+            message,
+            "retail eye targets rejected: IDirect3DDevice9Ex query failed result=0x%08lx returned=%d",
+            static_cast<unsigned long>(deviceExResult),
+            deviceEx ? 1 : 0);
+        logRetailVrLine(message);
         return false;
     }
 
@@ -7448,12 +7453,20 @@ bool ensureRetailEngineEyeTargets(IDirect3DDevice9* device) noexcept
         &backBuffer);
     const HRESULT depthResult = device->GetDepthStencilSurface(
         &authoritativeDepth);
+    const HRESULT colorDescriptionResult = SUCCEEDED(backBufferResult) && backBuffer
+        ? backBuffer->GetDesc(&colorDescription)
+        : D3DERR_INVALIDCALL;
+    const HRESULT depthDescriptionResult = SUCCEEDED(depthResult) && authoritativeDepth
+        ? authoritativeDepth->GetDesc(&depthDescription)
+        : D3DERR_INVALIDCALL;
     const bool descriptionsAvailable = SUCCEEDED(backBufferResult)
         && backBuffer
         && SUCCEEDED(depthResult)
         && authoritativeDepth
-        && SUCCEEDED(backBuffer->GetDesc(&colorDescription))
-        && SUCCEEDED(authoritativeDepth->GetDesc(&depthDescription));
+        && SUCCEEDED(colorDescriptionResult)
+        && SUCCEEDED(depthDescriptionResult);
+    const bool backBufferAvailable = backBuffer != nullptr;
+    const bool authoritativeDepthAvailable = authoritativeDepth != nullptr;
     releaseSurface(backBuffer);
     releaseSurface(authoritativeDepth);
     if (!descriptionsAvailable
@@ -7463,7 +7476,29 @@ bool ensureRetailEngineEyeTargets(IDirect3DDevice9* device) noexcept
         || depthDescription.Height != colorDescription.Height
         || (depthDescription.Usage & D3DUSAGE_DEPTHSTENCIL) == 0u)
     {
-        logLine("retail eye targets rejected: authoritative color/depth descriptions are invalid");
+        char message[384] {};
+        sprintf_s(
+            message,
+            "retail eye targets rejected: authoritative surfaces invalid backBuffer=0x%08lx/%d colorDesc=0x%08lx size=%ux%u format=%u usage=0x%lx ms=%u/%lu depth=0x%08lx/%d depthDesc=0x%08lx size=%ux%u format=%u usage=0x%lx ms=%u/%lu",
+            static_cast<unsigned long>(backBufferResult),
+            backBufferAvailable ? 1 : 0,
+            static_cast<unsigned long>(colorDescriptionResult),
+            colorDescription.Width,
+            colorDescription.Height,
+            static_cast<unsigned>(colorDescription.Format),
+            static_cast<unsigned long>(colorDescription.Usage),
+            static_cast<unsigned>(colorDescription.MultiSampleType),
+            static_cast<unsigned long>(colorDescription.MultiSampleQuality),
+            static_cast<unsigned long>(depthResult),
+            authoritativeDepthAvailable ? 1 : 0,
+            static_cast<unsigned long>(depthDescriptionResult),
+            depthDescription.Width,
+            depthDescription.Height,
+            static_cast<unsigned>(depthDescription.Format),
+            static_cast<unsigned long>(depthDescription.Usage),
+            static_cast<unsigned>(depthDescription.MultiSampleType),
+            static_cast<unsigned long>(depthDescription.MultiSampleQuality));
+        logRetailVrLine(message);
         return false;
     }
 
@@ -7588,6 +7623,79 @@ bool ensureRetailEngineEyeTargets(IDirect3DDevice9* device) noexcept
             retailEyeTargetDeviceApi(),
             resources))
     {
+        fnvxr::d3d9::EyeTargetSurfaceDescription leftColor {};
+        fnvxr::d3d9::EyeTargetSurfaceDescription leftDepth {};
+        fnvxr::d3d9::EyeTargetSurfaceDescription rightColor {};
+        fnvxr::d3d9::EyeTargetSurfaceDescription rightDepth {};
+        const bool descriptionsAvailable =
+            describeRetailEyeTargetSurface(nullptr, gLeftEyeSurface, leftColor)
+            && describeRetailEyeTargetSurface(nullptr, gLeftEyeDepth, leftDepth)
+            && describeRetailEyeTargetSurface(nullptr, gRightEyeSurface, rightColor)
+            && describeRetailEyeTargetSurface(nullptr, gRightEyeDepth, rightDepth);
+        const auto leftPair = compareRetailEyeTargetSurfaceIdentity(
+            nullptr,
+            gLeftEyeSurface,
+            gLeftEyeDepth);
+        const auto colors = compareRetailEyeTargetSurfaceIdentity(
+            nullptr,
+            gLeftEyeSurface,
+            gRightEyeSurface);
+        const auto leftColorRightDepth = compareRetailEyeTargetSurfaceIdentity(
+            nullptr,
+            gLeftEyeSurface,
+            gRightEyeDepth);
+        const auto leftDepthRightColor = compareRetailEyeTargetSurfaceIdentity(
+            nullptr,
+            gLeftEyeDepth,
+            gRightEyeSurface);
+        const auto depths = compareRetailEyeTargetSurfaceIdentity(
+            nullptr,
+            gLeftEyeDepth,
+            gRightEyeDepth);
+        const auto rightPair = compareRetailEyeTargetSurfaceIdentity(
+            nullptr,
+            gRightEyeSurface,
+            gRightEyeDepth);
+        char message[1024] {};
+        sprintf_s(
+            message,
+            "retail eye target context rejected: desc=%d leftColor=%ux%u/%u/%u/%lu/%d/%d leftDepth=%ux%u/%u/%u/%lu/%d/%d rightColor=%ux%u/%u/%u/%lu/%d/%d rightDepth=%ux%u/%u/%u/%lu/%d/%d identities=%u/%u/%u/%u/%u/%u",
+            descriptionsAvailable ? 1 : 0,
+            leftColor.width,
+            leftColor.height,
+            leftColor.format,
+            leftColor.multisampleType,
+            static_cast<unsigned long>(leftColor.multisampleQuality),
+            leftColor.renderTarget ? 1 : 0,
+            leftColor.depthStencil ? 1 : 0,
+            leftDepth.width,
+            leftDepth.height,
+            leftDepth.format,
+            leftDepth.multisampleType,
+            static_cast<unsigned long>(leftDepth.multisampleQuality),
+            leftDepth.renderTarget ? 1 : 0,
+            leftDepth.depthStencil ? 1 : 0,
+            rightColor.width,
+            rightColor.height,
+            rightColor.format,
+            rightColor.multisampleType,
+            static_cast<unsigned long>(rightColor.multisampleQuality),
+            rightColor.renderTarget ? 1 : 0,
+            rightColor.depthStencil ? 1 : 0,
+            rightDepth.width,
+            rightDepth.height,
+            rightDepth.format,
+            rightDepth.multisampleType,
+            static_cast<unsigned long>(rightDepth.multisampleQuality),
+            rightDepth.renderTarget ? 1 : 0,
+            rightDepth.depthStencil ? 1 : 0,
+            static_cast<unsigned>(leftPair),
+            static_cast<unsigned>(colors),
+            static_cast<unsigned>(leftColorRightDepth),
+            static_cast<unsigned>(leftDepthRightColor),
+            static_cast<unsigned>(depths),
+            static_cast<unsigned>(rightPair));
+        logRetailVrLine(message);
         releaseStereoTargets();
         return false;
     }
@@ -7642,11 +7750,6 @@ struct RetailVrProxyContext
 
 RetailVrProxyContext gRetailVrProxyContext {};
 RetailVrBridge* gRetailVrBridge = nullptr;
-fnvxr::engine::RetailTrackedFrameWin32Reader gRetailUiTrackedFrames {};
-fnvxr::d3d9::RetailUiQuadPresentHookWin32 gRetailUiPresentHook {};
-volatile LONG gRetailUiWithheldPresentCount = 0;
-fnvxr::d3d9::RetailUiQuadCaptureFailure gRetailUiLastWithhold =
-    fnvxr::d3d9::RetailUiQuadCaptureFailure::NotInitialized;
 volatile LONG gRetailVrBridgeInitializationAttempts = 0;
 
 bool initializeRetailVrBridge(IDirect3DDevice9* device) noexcept;
@@ -7695,120 +7798,6 @@ fnvxr::d3d9::color_transport::ProducerPublication produceRetailVrColorPair(
     return produceRetailEngineColorPair(identity);
 }
 
-bool readRetailUiPublishedFrame(
-    void* opaque,
-    fnvxr::engine::RetailTrackedFrame& frame) noexcept
-{
-    auto* context = static_cast<RetailVrProxyContext*>(opaque);
-    return context
-        && context->device
-        && initializeRetailVrBridge(context->device)
-        && gRetailUiTrackedFrames.readPublishedFrame(frame);
-}
-
-bool copyRetailUiBackBufferToMonoTargets(
-    void* opaque,
-    void* deviceOpaque) noexcept
-{
-    auto* context = static_cast<RetailVrProxyContext*>(opaque);
-    auto* device = static_cast<IDirect3DDevice9*>(deviceOpaque);
-    if (!context
-        || !device
-        || device != context->device
-        || !gLeftEyeSurface
-        || !gRightEyeSurface)
-    {
-        return false;
-    }
-
-    IDirect3DSurface9* backBuffer = nullptr;
-    if (FAILED(device->GetBackBuffer(
-            0u,
-            0u,
-            D3DBACKBUFFER_TYPE_MONO,
-            &backBuffer))
-        || !backBuffer)
-    {
-        return false;
-    }
-    D3DSURFACE_DESC source {};
-    D3DSURFACE_DESC left {};
-    D3DSURFACE_DESC right {};
-    const bool descriptionsMatch = SUCCEEDED(backBuffer->GetDesc(&source))
-        && SUCCEEDED(gLeftEyeSurface->GetDesc(&left))
-        && SUCCEEDED(gRightEyeSurface->GetDesc(&right))
-        && source.Width != 0u
-        && source.Height != 0u
-        && source.Width == left.Width
-        && source.Height == left.Height
-        && left.Width == right.Width
-        && left.Height == right.Height
-        && left.Format == gStereoTargetFormat
-        && right.Format == gStereoTargetFormat
-        && fnvxr::d3d9::retailSharedEyeTargetColorFormatAccepted(
-            static_cast<std::uint32_t>(gStereoTargetFormat));
-    const bool copied = descriptionsMatch
-        && SUCCEEDED(device->StretchRect(
-            backBuffer,
-            nullptr,
-            gLeftEyeSurface,
-            nullptr,
-            D3DTEXF_NONE))
-        && SUCCEEDED(device->StretchRect(
-            backBuffer,
-            nullptr,
-            gRightEyeSurface,
-            nullptr,
-            D3DTEXF_NONE));
-    backBuffer->Release();
-    return copied;
-}
-
-bool publishRetailMonoUiQuad(
-    void*,
-    const fnvxr::engine::RetailTrackedFrame& frame) noexcept
-{
-    RetailVrBridge* bridge = gRetailVrBridge;
-    return bridge && bridge->publishMonoUiQuadFromPresent(frame);
-}
-
-void withholdRetailMonoUiQuad(
-    void*,
-    fnvxr::d3d9::RetailUiQuadCaptureFailure failure) noexcept
-{
-    gRetailUiLastWithhold = failure;
-    InterlockedIncrement(&gRetailUiWithheldPresentCount);
-}
-
-bool initializeRetailVrPresentBootstrap(IDirect3DDevice9* device) noexcept
-{
-    if (!device)
-        return false;
-    if (gRetailUiPresentHook.ready())
-        return device == gRetailUiPresentHook.device();
-    if (gRetailVrProxyContext.device
-        && gRetailVrProxyContext.device != device)
-    {
-        return false;
-    }
-    gRetailVrProxyContext.device = device;
-    fnvxr::d3d9::RetailUiQuadCaptureOperations uiOperations {};
-    uiOperations.context = &gRetailVrProxyContext;
-    uiOperations.readPublishedFrame = &readRetailUiPublishedFrame;
-    uiOperations.copyBackBufferToMonoTargets =
-        &copyRetailUiBackBufferToMonoTargets;
-    uiOperations.publishMonoUiQuad = &publishRetailMonoUiQuad;
-    uiOperations.withholdMonoUiQuad = &withholdRetailMonoUiQuad;
-    if (!gRetailUiPresentHook.initializeAuthorizedDevice(
-            device,
-            uiOperations))
-    {
-        gRetailVrProxyContext = {};
-        return false;
-    }
-    return true;
-}
-
 void __fastcall retailVrWorldRenderAdapter(
     void* retailThis,
     void*,
@@ -7838,8 +7827,7 @@ bool initializeRetailVrBridge(IDirect3DDevice9* device) noexcept
             && gRetailVrBridge
             && gRetailVrBridge->ready();
     }
-    if (gRetailVrProxyContext.device != device
-        || !gRetailUiPresentHook.ready())
+    if (gRetailVrProxyContext.device != device)
     {
         return false;
     }
@@ -7888,12 +7876,9 @@ bool initializeRetailVrBridge(IDirect3DDevice9* device) noexcept
         delete bridge;
         return false;
     }
-    // As with the bridge-owned gameplay reader, mapping names are configured
-    // now and the first Present after NVSE publishes them opens them lazily.
-    static_cast<void>(gRetailUiTrackedFrames.initialize());
     gRetailVrBridge = bridge;
     logRetailVrLine(
-        "retail VR bridge initialized: exact world hook, v5 GPU transport, and UI-only Present capture ready");
+        "retail VR bridge initialized: exact world hook and v5 GPU transport ready");
     return true;
 }
 
@@ -15466,8 +15451,8 @@ bool loadRealD3D9()
 class Direct3D9Proxy final : public IDirect3D9
 {
 public:
-    Direct3D9Proxy(IDirect3D9* real, IDirect3D9Ex* realEx)
-        : mReal(real), mRealEx(realEx)
+    explicit Direct3D9Proxy(IDirect3D9* real)
+        : mReal(real)
     {
     }
 
@@ -15646,76 +15631,16 @@ public:
         }
         logLine(message);
 
-        HRESULT result = D3DERR_INVALIDCALL;
-        if (mRealEx && returnedDevice)
-        {
-            D3DDISPLAYMODEEX fullscreenMode {};
-            D3DDISPLAYMODEEX* fullscreenModePointer = nullptr;
-            if (presentationParameters)
-            {
-                const auto modeFields =
-                    fnvxr::d3d9::makeGameD3D9ExDisplayModeFields(
-                        presentationParameters->Windowed != FALSE,
-                        static_cast<std::uint32_t>(
-                            sizeof(D3DDISPLAYMODEEX)),
-                        presentationParameters->BackBufferWidth,
-                        presentationParameters->BackBufferHeight,
-                        presentationParameters->FullScreen_RefreshRateInHz,
-                        static_cast<std::uint32_t>(
-                            presentationParameters->BackBufferFormat),
-                        static_cast<std::uint32_t>(
-                            D3DSCANLINEORDERING_UNKNOWN));
-                if (modeFields.required)
-                {
-                    fullscreenMode.Size = modeFields.structureBytes;
-                    fullscreenMode.Width = modeFields.width;
-                    fullscreenMode.Height = modeFields.height;
-                    fullscreenMode.RefreshRate = modeFields.refreshRate;
-                    fullscreenMode.Format = static_cast<D3DFORMAT>(
-                        modeFields.format);
-                    fullscreenMode.ScanLineOrdering =
-                        static_cast<D3DSCANLINEORDERING>(
-                            modeFields.scanLineOrdering);
-                    fullscreenModePointer = &fullscreenMode;
-                }
-            }
-
-            IDirect3DDevice9Ex* returnedExDevice = nullptr;
-            result = mRealEx->CreateDeviceEx(
-                adapter,
-                deviceType,
-                focusWindow,
-                behaviorFlags,
-                presentationParameters,
-                fullscreenModePointer,
-                &returnedExDevice);
-            if (SUCCEEDED(result) && returnedExDevice)
-            {
-                *returnedDevice = static_cast<IDirect3DDevice9*>(
-                    returnedExDevice);
-            }
-            else if (returnedExDevice)
-            {
-                returnedExDevice->Release();
-            }
-        }
-        else if (!mRealEx)
-        {
-            result = mReal->CreateDevice(
-                adapter,
-                deviceType,
-                focusWindow,
-                behaviorFlags,
-                presentationParameters,
-                returnedDevice);
-        }
+        const HRESULT result = mReal->CreateDevice(
+            adapter,
+            deviceType,
+            focusWindow,
+            behaviorFlags,
+            presentationParameters,
+            returnedDevice);
         logLine(SUCCEEDED(result)
-                ? (mRealEx
-                    ? "CreateDeviceEx-backed CreateDevice succeeded"
-                    : "CreateDevice succeeded")
-                : (mRealEx
-                    ? "CreateDeviceEx-backed CreateDevice failed"
-                    : "CreateDevice failed"));
+                ? "CreateDevice succeeded"
+                : "CreateDevice failed");
         if (SUCCEEDED(result) && returnedDevice && *returnedDevice)
         {
             if constexpr (fnvxr::d3d9::ProductionRendererAuthorized)
@@ -15729,25 +15654,15 @@ public:
                     return D3DERR_NOTAVAILABLE_RESULT;
                 }
             }
-            // The exact image authority was already proven before the retail
-            // D3D9 wrapper existed. Shared pose/runtime publications can
-            // legitimately appear only after NVSE's first main-loop callback,
-            // so install the one-method Present bootstrap now and retry the
-            // world bridge from Present without denying the retail device.
-            if (!initializeRetailVrPresentBootstrap(*returnedDevice))
-            {
-                (*returnedDevice)->Release();
-                *returnedDevice = nullptr;
-                return D3DERR_NOTAVAILABLE_RESULT;
-            }
-            static_cast<void>(initializeRetailVrBridge(*returnedDevice));
+            // Preserve Fallout's concrete device exactly as returned by the
+            // system runtime. Retail VR may attach only at a boundary that
+            // does not replace the device or mutate its native vtable.
         }
         return result;
     }
 
 private:
     IDirect3D9* mReal = nullptr;
-    IDirect3D9Ex* mRealEx = nullptr;
     volatile LONG mRefs = 1;
 };
 
@@ -15811,15 +15726,14 @@ extern "C" IDirect3D9* WINAPI FNVXR_Direct3DCreate9(UINT sdkVersion)
         return gRealDirect3DCreate9(sdkVersion);
 
     // NVSE is still loading plugins when Fallout requests D3D9. Authorize only
-    // the exact Ex-backed bootstrap here; the bridge retries full synchronous
-    // compatibility/ABI authority from Present before any engine mutation or
-    // UI publication.
+    // the exact ordinary-D3D9 bootstrap here. Later VR attachment must preserve
+    // the concrete device and wait for full synchronous runtime authority.
     const fnvxr::d3d9::GameD3D9BootstrapDecision bootstrap =
         fnvxr::d3d9::assessGameD3D9Bootstrap({
             true,
             currentLoadedExecutableMatchesSupportedRetail(),
             sizeof(void*) == 4u,
-            gRealDirect3DCreate9Ex != nullptr,
+            gRealDirect3DCreate9 != nullptr,
             true,
             true,
         });
@@ -15835,32 +15749,21 @@ extern "C" IDirect3D9* WINAPI FNVXR_Direct3DCreate9(UINT sdkVersion)
     }
 
     const auto backend = fnvxr::d3d9::selectGameD3D9CreationBackend(
-        true,
-        gRealDirect3DCreate9 != nullptr,
-        gRealDirect3DCreate9Ex != nullptr);
-    if (backend != fnvxr::d3d9::GameD3D9CreationBackend::ExBackedD3D9)
+        gRealDirect3DCreate9 != nullptr);
+    if (backend != fnvxr::d3d9::GameD3D9CreationBackend::LegacyD3D9)
     {
-        logRetailVrLine("retail VR D3D9 creation rejected: Ex-backed backend unavailable");
+        logRetailVrLine("retail VR D3D9 creation rejected: ordinary D3D9 backend unavailable");
         return nullptr;
     }
 
-    IDirect3D9Ex* realEx = nullptr;
-    const HRESULT createResult = gRealDirect3DCreate9Ex(
-        sdkVersion,
-        &realEx);
-    if (FAILED(createResult) || !realEx)
-    {
-        if (realEx)
-            realEx->Release();
+    IDirect3D9* real = gRealDirect3DCreate9(sdkVersion);
+    if (!real)
         return nullptr;
-    }
 
-    Direct3D9Proxy* proxy = new (std::nothrow) Direct3D9Proxy(
-        static_cast<IDirect3D9*>(realEx),
-        realEx);
+    Direct3D9Proxy* proxy = new (std::nothrow) Direct3D9Proxy(real);
     if (!proxy)
     {
-        realEx->Release();
+        real->Release();
         return nullptr;
     }
     return proxy;

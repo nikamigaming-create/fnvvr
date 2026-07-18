@@ -174,7 +174,6 @@ if(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 4)
         bcrypt
         fnvxr_d3d9ex_color_transport_win32
         fnvxr_gpu_color_publisher_win32
-        fnvxr_retail_ui_quad_capture_win32
         fnvxr_retail_runtime_authority
         fnvxr_retail_tracked_frame_win32
         fnvxr_retail_world_hook_win32)
@@ -868,6 +867,28 @@ endif()
 add_test(
     NAME fnvxr_gpu_color_route_test
     COMMAND fnvxr_gpu_color_route_test)
+
+add_executable(fnvxr_host_ui_capture_gate_test
+    tests/fnvxr_host_ui_capture_gate_test.cpp)
+target_link_libraries(fnvxr_host_ui_capture_gate_test PRIVATE fnvxr_protocol)
+if(MSVC)
+    target_compile_options(fnvxr_host_ui_capture_gate_test PRIVATE /W4 /WX)
+endif()
+add_test(
+    NAME fnvxr_host_ui_capture_gate_test
+    COMMAND fnvxr_host_ui_capture_gate_test)
+
+add_executable(fnvxr_retail_observation_authority_test
+    tests/fnvxr_retail_observation_authority_test.cpp)
+target_include_directories(fnvxr_retail_observation_authority_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/runtime)
+if(MSVC)
+    target_compile_options(
+        fnvxr_retail_observation_authority_test PRIVATE /W4 /WX)
+endif()
+add_test(
+    NAME fnvxr_retail_observation_authority_test
+    COMMAND fnvxr_retail_observation_authority_test)
 
 add_executable(fnvxr_stereo_visual_trial_test
     tests/fnvxr_stereo_visual_trial_test.cpp)

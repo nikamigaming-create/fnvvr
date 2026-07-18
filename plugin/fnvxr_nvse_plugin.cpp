@@ -3,6 +3,7 @@
 #include "fnvxr_protocol.h"
 #include "fnvxr_shared_state.h"
 #include "fnvxr_fabrik.h"
+#include "fnvxr_retail_observation_authority.h"
 #include "fnvxr_retail_runtime_authority.h"
 #include "fnvxr_retail_safety.h"
 
@@ -448,6 +449,9 @@ fnvxr::safety::RetailMutationEvidenceToken g_retailMutationEvidence {};
 fnvxr::engine::RetailRuntimeAuthorityDecision g_retailRuntimeAuthority {};
 bool g_authorizedSharedBridgeStarted = false;
 UInt32 g_retailRuntimeAuthorityAttempts = 0;
+bool g_authorizedRuntimeObservationStarted = false;
+UInt32 g_retailObservationAuthorityAttempts = 0;
+UInt64 g_runtimeObservationFrame = 0;
 NVSEConsoleInterface* g_console = nullptr;
 NVSEMessagingInterface* g_messaging = nullptr;
 NVSEPlayerControlsInterface* g_playerControls = nullptr;
@@ -9920,6 +9924,92 @@ void consumeExternalXInputBridge()
 
 bool startBridge();
 
+struct RuntimeObservation
+{
+    UInt64 frame = 0u;
+    UInt32 menuBits = 0u;
+    RuntimePhase phase = RuntimePhase::Unknown;
+    bool uiInputAllowed = false;
+};
+
+bool ensureAuthorizedRuntimeObservationStarted()
+{
+    if (g_authorizedRuntimeObservationStarted)
+    {
+        return gamePluginProducerLeaseHeldByCurrentThread()
+            && g_runtimeState;
+    }
+
+    ++g_retailObservationAuthorityAttempts;
+    const auto proof = fnvxr::engine::compatibility::
+        proveCurrentRetailCompatibilityAtDecisionPoint();
+    if (!fnvxr::engine::retailObservationAuthorized(proof))
+    {
+        if (g_retailObservationAuthorityAttempts <= 12u
+            || (g_retailObservationAuthorityAttempts % 300u) == 0u)
+        {
+            logTelemetry(
+                "runtime observation authority deferred attempt=%lu failure=%u compatible=%d evidence=%d%d%d%d%d%d%d%d%d%d; no game state read performed\n",
+                static_cast<unsigned long>(
+                    g_retailObservationAuthorityAttempts),
+                static_cast<unsigned>(proof.failure),
+                static_cast<int>(proof.compatible),
+                static_cast<int>(proof.evidence.retailExecutableIdentityMatched),
+                static_cast<int>(proof.evidence.moduleSnapshotStable),
+                static_cast<int>(proof.evidence.jip5730ExactOrAbsent),
+                static_cast<int>(proof.evidence.showOff184ExactOrAbsent),
+                static_cast<int>(proof.evidence.renderFirstPersonStockOrJipNormalized),
+                static_cast<int>(proof.evidence.protectedCoreBodiesMatched),
+                static_cast<int>(proof.evidence.protectedFunctionInventoryMatched),
+                static_cast<int>(proof.evidence.protectedVtableSlotsMatched),
+                static_cast<int>(proof.evidence.protectedVtableBlocksMatched),
+                static_cast<int>(proof.evidence.synchronousSameProcess));
+        }
+        return false;
+    }
+    if (!acquireGamePluginProducerLease())
+        return false;
+    initSharedRuntime();
+    g_authorizedRuntimeObservationStarted = g_runtimeState != nullptr;
+    if (g_authorizedRuntimeObservationStarted)
+    {
+        logTelemetry(
+            "runtime observation ready under exact same-process compatibility authority attempt=%lu\n",
+            static_cast<unsigned long>(g_retailObservationAuthorityAttempts));
+    }
+    return g_authorizedRuntimeObservationStarted;
+}
+
+RuntimeObservation observeAndPublishRuntime()
+{
+    RuntimeObservation observation {};
+    observation.frame = ++g_runtimeObservationFrame;
+    observation.menuBits = currentMenuBits();
+    observation.phase = runtimePhaseFromMenuBits(observation.menuBits);
+    observation.uiInputAllowed =
+        uiInputAllowedFromMenuBits(observation.menuBits);
+    publishRuntimeState(
+        observation.frame,
+        observation.menuBits,
+        observation.phase,
+        observation.uiInputAllowed);
+
+    static UInt32 previousMenuBits = 0xffffffffu;
+    if (observation.menuBits != previousMenuBits
+        || observation.frame <= 10u
+        || (observation.frame % 300u) == 0u)
+    {
+        previousMenuBits = observation.menuBits;
+        logTelemetry(
+            "runtime observation frame=%llu bits=0x%02X phase=%lu ui=%d source=compatibility-authorized-mainloop\n",
+            static_cast<unsigned long long>(observation.frame),
+            observation.menuBits,
+            static_cast<unsigned long>(observation.phase),
+            static_cast<int>(observation.uiInputAllowed));
+    }
+    return observation;
+}
+
 bool ensureAuthorizedSharedBridgeStarted()
 {
     if (g_authorizedSharedBridgeStarted)
@@ -9947,9 +10037,29 @@ bool ensureAuthorizedSharedBridgeStarted()
                 || (g_retailRuntimeAuthorityAttempts % 300) == 0)
             {
                 logTelemetry(
-                    "shared bridge authority deferred attempt=%lu failure=%u; no game state read or mutation performed\n",
+                    "shared bridge authority deferred attempt=%lu failure=%u revalidation=%u abi=%u compatibility=%u compatible=%d evidence=%d%d%d%d%d%d%d%d%d%d diagnostics=%zu,%zu,%zu,%zu; no game state read or mutation performed\n",
                     static_cast<unsigned long>(g_retailRuntimeAuthorityAttempts),
-                    static_cast<unsigned>(decision.failure));
+                    static_cast<unsigned>(decision.failure),
+                    static_cast<unsigned>(decision.revalidation.failure),
+                    static_cast<unsigned>(decision.revalidation.assessment.failure),
+                    static_cast<unsigned>(
+                        decision.revalidation.compatibilityProof.failure),
+                    static_cast<int>(
+                        decision.revalidation.compatibilityProof.compatible),
+                    static_cast<int>(decision.revalidation.evidence.loadedExecutableIdentityMatched),
+                    static_cast<int>(decision.revalidation.evidence.loadedExecutableSectionLayoutAndProtectionsVerified),
+                    static_cast<int>(decision.revalidation.evidence.coreManifestMatched),
+                    static_cast<int>(decision.revalidation.evidence.fullFunctionInventoryMatched),
+                    static_cast<int>(decision.revalidation.evidence.vtableSlotsMatched),
+                    static_cast<int>(decision.revalidation.evidence.vtableBlocksMatched),
+                    static_cast<int>(decision.revalidation.evidence.liveObjectLayoutsVerified),
+                    static_cast<int>(decision.revalidation.evidence.constructorOwnershipVerified),
+                    static_cast<int>(decision.revalidation.evidence.bothWorldBranchesVerified),
+                    static_cast<int>(decision.revalidation.evidence.compatibilityModulesVerified),
+                    decision.revalidation.diagnostics.functionBodiesHashed,
+                    decision.revalidation.diagnostics.vtableSlotsRead,
+                    decision.revalidation.diagnostics.vtableBlockBytesHashed,
+                    decision.revalidation.diagnostics.executableSectionBytesInspected);
             }
             return false;
         }
@@ -10004,19 +10114,17 @@ bool ensureAuthorizedSharedBridgeStarted()
     return g_authorizedSharedBridgeStarted;
 }
 
-void processMainGameLoop()
+void processMainGameLoop(const RuntimeObservation& observation)
 {
     processShowroomCarousel();
     syncExternalDInputPointer();
     consumeExternalDInputBridge();
     consumeExternalXInputBridge();
 
-    static UInt64 runtimeFrame = 0;
-    static UInt32 previousMenuBits = 0xffffffff;
-    const UInt64 frame = ++runtimeFrame;
-    const UInt32 menuBits = currentMenuBits();
-    const RuntimePhase phase = runtimePhaseFromMenuBits(menuBits);
-    const bool uiInputAllowed = uiInputAllowedFromMenuBits(menuBits);
+    const UInt64 frame = observation.frame;
+    const UInt32 menuBits = observation.menuBits;
+    const RuntimePhase phase = observation.phase;
+    const bool uiInputAllowed = observation.uiInputAllowed;
     recoverFocusLossPause(frame, menuBits, phase);
     if (phase == RuntimePhase::Gameplay)
     {
@@ -10027,22 +10135,9 @@ void processMainGameLoop()
         cancelThirdPersonL3Control("mainloop:ui", frame);
     updateSharedCamera(frame, menuBits);
     updateSharedPlayer(frame, phase);
-    publishRuntimeState(frame, menuBits, phase, uiInputAllowed);
     logCameraTelemetry(frame, menuBits);
     tickUiFavoriteAssignment(frame, menuBits);
     consumeSharedCommand(frame);
-    if (menuBits != previousMenuBits || frame <= 10 || (frame % 300) == 0)
-    {
-        previousMenuBits = menuBits;
-        logTelemetry(
-            "runtime state frame=%llu bits=0x%02X phase=%lu ui=%d camera=%u source=mainloop\n",
-            static_cast<unsigned long long>(frame),
-            menuBits,
-            static_cast<unsigned long>(phase),
-            static_cast<int>(uiInputAllowed),
-            g_cameraState ? g_cameraState->active : 0u);
-    }
-
     UInt32 pending = g_pendingAcceptClicks.exchange(0);
     if (pending > 5)
         pending = 5;
@@ -10058,6 +10153,9 @@ void handleNvseMessage(NVSEMessagingInterface::Message* message)
 
     if (message->type == MessageMainGameLoop)
     {
+        if (!ensureAuthorizedRuntimeObservationStarted())
+            return;
+        const RuntimeObservation observation = observeAndPublishRuntime();
         if (!ensureAuthorizedSharedBridgeStarted())
         {
             static bool logged = false;
@@ -10068,7 +10166,7 @@ void handleNvseMessage(NVSEMessagingInterface::Message* message)
             }
             return;
         }
-        processMainGameLoop();
+        processMainGameLoop(observation);
     }
 }
 

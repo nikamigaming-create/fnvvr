@@ -18,6 +18,15 @@ inline constexpr std::uint32_t SupportedSizeOfImage = 0x0107B000u;
 inline constexpr std::uint64_t SupportedFileBytes = 16549704u;
 inline constexpr char SupportedFileSha256[] =
     "518C87F58A6C4D9826E9EF8FBB7F4213882FA70822675610D45AEA2464502A57";
+// Exact executable-section tuple from that same supported file. Keeping this
+// beside the PE identity prevents a second, stale identity from drifting in
+// the live ABI revalidator.
+inline constexpr std::uint32_t SupportedTextRva = 0x00001000u;
+inline constexpr std::uint32_t SupportedTextVirtualBytes = 0x00BDD58Bu;
+inline constexpr std::uint32_t SupportedTextMappedBytes = 0x00BDD600u;
+inline constexpr std::uint32_t SupportedTextProtectionBytes = 0x00BDE000u;
+inline constexpr std::uint32_t SupportedTextRawBytes = 0x00BDD600u;
+inline constexpr std::uint32_t SupportedTextCharacteristics = 0x60000020u;
 
 struct LoadedExecutableIdentity
 {

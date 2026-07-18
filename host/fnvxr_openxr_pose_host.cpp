@@ -7,6 +7,7 @@
 
 #include "fnvxr_protocol.h"
 #include "fnvxr_gpu_color_route.h"
+#include "fnvxr_host_ui_capture_gate.h"
 #include "fnvxr_openxr_live_authority.h"
 #include "fnvxr_shared_state.h"
 #include "fnvxr_stereo_visual_trial.h"
@@ -35,6 +36,7 @@
 #include <iostream>
 #include <cstdlib>
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <thread>
 #include <utility>
@@ -300,6 +302,7 @@ struct Renderer
     std::uint64_t retainedUiSourceFrame = 0u;
     std::uint64_t retainedUiRuntimeStateSample = 0u;
     float retainedUiTextureAspect = 16.0f / 9.0f;
+    bool retainedUiHostWindowCaptured = false;
     uint64_t gameTextureUpdates = 0;
     uint64_t gameTextureMisses = 0;
     bool hasWorldTextureFrame = false;
@@ -5146,6 +5149,7 @@ void commitUiTextureCandidate(
     renderer.retainedUiSourceFrame = candidate.sourceFrame;
     renderer.retainedUiRuntimeStateSample = candidate.runtimeStateSample;
     renderer.retainedUiTextureAspect = candidate.aspect;
+    renderer.retainedUiHostWindowCaptured = false;
     candidate = {};
 }
 
@@ -5156,6 +5160,336 @@ void clearRetainedUiTexture(Renderer& renderer) noexcept
     renderer.retainedUiSourceFrame = 0u;
     renderer.retainedUiRuntimeStateSample = 0u;
     renderer.retainedUiTextureAspect = 16.0f / 9.0f;
+    renderer.retainedUiHostWindowCaptured = false;
+}
+
+bool uploadProductUiWindowTexture(
+    ID3D11Device* device,
+    Renderer& renderer,
+    const std::vector<std::uint32_t>& pixels,
+    std::uint32_t width,
+    std::uint32_t height,
+    float aspect,
+    const fnvxr::product::UiFrameProof& proof) noexcept
+{
+    if (!device
+        || width == 0u
+        || height == 0u
+        || width > (std::numeric_limits<UINT>::max)() / 4u
+        || pixels.size() != static_cast<std::size_t>(width) * height
+        || !std::isfinite(aspect)
+        || aspect <= 0.0f
+        || !proof.completeForUiQuad())
+    {
+        return false;
+    }
+
+    bool reusable = renderer.retainedUiHostWindowCaptured
+        && renderer.retainedUiTexture
+        && renderer.retainedUiTextureView;
+    if (reusable)
+    {
+        D3D11_TEXTURE2D_DESC existing {};
+        renderer.retainedUiTexture->GetDesc(&existing);
+        reusable = existing.Width == width
+            && existing.Height == height
+            && existing.MipLevels == 1u
+            && existing.ArraySize == 1u
+            && existing.Format == DXGI_FORMAT_B8G8R8A8_TYPELESS
+            && existing.SampleDesc.Count == 1u
+            && existing.Usage == D3D11_USAGE_DEFAULT
+            && (existing.BindFlags & D3D11_BIND_SHADER_RESOURCE) != 0u;
+    }
+
+    if (reusable)
+    {
+        ComPtr<ID3D11DeviceContext> context;
+        device->GetImmediateContext(&context);
+        if (!context)
+            return false;
+        context->UpdateSubresource(
+            renderer.retainedUiTexture.Get(),
+            0u,
+            nullptr,
+            pixels.data(),
+            width * 4u,
+            0u);
+    }
+    else
+    {
+        D3D11_TEXTURE2D_DESC description {};
+        description.Width = width;
+        description.Height = height;
+        description.MipLevels = 1u;
+        description.ArraySize = 1u;
+        description.Format = DXGI_FORMAT_B8G8R8A8_TYPELESS;
+        description.SampleDesc.Count = 1u;
+        description.Usage = D3D11_USAGE_DEFAULT;
+        description.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        D3D11_SUBRESOURCE_DATA initial {};
+        initial.pSysMem = pixels.data();
+        initial.SysMemPitch = width * 4u;
+
+        ComPtr<ID3D11Texture2D> texture;
+        if (FAILED(device->CreateTexture2D(
+                &description,
+                &initial,
+                &texture))
+            || !texture)
+        {
+            return false;
+        }
+        D3D11_SHADER_RESOURCE_VIEW_DESC viewDescription {};
+        viewDescription.Format = DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+        viewDescription.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        viewDescription.Texture2D.MipLevels = 1u;
+        ComPtr<ID3D11ShaderResourceView> view;
+        if (FAILED(device->CreateShaderResourceView(
+                texture.Get(),
+                &viewDescription,
+                &view))
+            || !view)
+        {
+            return false;
+        }
+        renderer.retainedUiTexture = std::move(texture);
+        renderer.retainedUiTextureView = std::move(view);
+    }
+
+    renderer.retainedUiSourceFrame = proof.sourceFrame;
+    renderer.retainedUiRuntimeStateSample = proof.runtimeStateSample;
+    renderer.retainedUiTextureAspect = aspect;
+    renderer.retainedUiHostWindowCaptured = true;
+    return true;
+}
+
+const char* uiCaptureRetailStateName(fnvxr::product::RetailState state) noexcept
+{
+    using State = fnvxr::product::RetailState;
+    switch (state)
+    {
+        case State::Unknown: return "unknown";
+        case State::InteractiveUi: return "interactive_ui";
+        case State::Loading: return "loading";
+        case State::Gameplay: return "gameplay";
+    }
+    return "invalid";
+}
+
+void logProductUiWindowCapture(
+    std::uint64_t sourceFrame,
+    const fnvxr::host::ui_capture::RuntimeSample& before,
+    const fnvxr::host::ui_capture::RuntimeSample& after,
+    const fnvxr::host::ui_capture::WindowCapture& capture,
+    const char* failure,
+    bool uploadAttempted,
+    bool uploadSucceeded,
+    long long copyMicroseconds) noexcept
+{
+    static std::uint64_t attempts = 0u;
+    static const char* previousOutcome = nullptr;
+    ++attempts;
+    const char* outcome = failure ? failure : "unknown";
+    const bool accepted = std::strcmp(outcome, "none") == 0 && uploadSucceeded;
+    const bool sameOutcome = previousOutcome
+        && std::strcmp(outcome, previousOutcome) == 0;
+    if (attempts > 10u
+        && attempts % 120u != 0u
+        && sameOutcome)
+    {
+        return;
+    }
+    previousOutcome = outcome;
+    std::cout << "productUiCapture attempt=" << attempts
+              << " accepted=" << static_cast<int>(accepted)
+              << " failure=" << outcome
+              << " sourceFrame=" << sourceFrame
+              << " beforeSample=" << before.sample
+              << " afterSample=" << after.sample
+              << " beforeFresh=" << static_cast<int>(before.fresh)
+              << " afterFresh=" << static_cast<int>(after.fresh)
+              << " beforeClass="
+              << uiCaptureRetailStateName(fnvxr::host::ui_capture::classify(before))
+              << " afterClass="
+              << uiCaptureRetailStateName(fnvxr::host::ui_capture::classify(after))
+              << " beforePhase=" << before.phase
+              << " afterPhase=" << after.phase
+              << " beforeBits=0x" << std::hex << before.menuBits
+              << " afterBits=0x" << after.menuBits << std::dec
+              << " beforeShowroom=" << before.showroomActive
+              << " afterShowroom=" << after.showroomActive
+              << " beforeCamera=" << static_cast<int>(before.cameraActive)
+              << " afterCamera=" << static_cast<int>(after.cameraActive)
+              << " copied=" << static_cast<int>(capture.complete)
+              << " visible=" << static_cast<int>(capture.visibleContent)
+              << " owned=" << static_cast<int>(capture.retailWindowOwned)
+              << " uploadAttempted=" << static_cast<int>(uploadAttempted)
+              << " uploadSucceeded=" << static_cast<int>(uploadSucceeded)
+              << " dimensions=" << capture.width << "x" << capture.height
+              << " pixels=" << capture.pixelCount
+              << " copyUs=" << copyMicroseconds
+              << "\n";
+    std::cout.flush();
+}
+
+bool prepareProductUiWindowFallback(
+    ID3D11Device* device,
+    Renderer& renderer,
+    std::uint64_t sourceFrame,
+    const fnvxr::host::ui_capture::RuntimeSample& before,
+    fnvxr::product::UiFrameProof& proof,
+    fnvxr::host::ui_capture::RuntimeSample& validatedRuntime) noexcept
+{
+    namespace ui_capture = fnvxr::host::ui_capture;
+    proof = {};
+    validatedRuntime = {};
+    if (!device)
+    {
+        logProductUiWindowCapture(
+            sourceFrame,
+            before,
+            {},
+            {},
+            "device_unavailable",
+            false,
+            false,
+            -1);
+        return false;
+    }
+    if (!ui_capture::confirmedUi(before))
+    {
+        const ui_capture::Decision rejected = ui_capture::assess(before, {}, {});
+        logProductUiWindowCapture(
+            sourceFrame,
+            before,
+            {},
+            {},
+            ui_capture::failureName(rejected.failure),
+            false,
+            false,
+            -1);
+        return false;
+    }
+
+    // A previously sandwiched capture remains valid while its exact post-copy
+    // sample is current. A newer sample is recaptured once in this OpenXR
+    // frame and admitted only if the bracketing observations prove identical
+    // confirmed UI state; it is never relabeled across gameplay or unknown.
+    if (renderer.retainedUiHostWindowCaptured
+        && renderer.retainedUiTexture
+        && renderer.retainedUiTextureView
+        && renderer.retainedUiSourceFrame != 0u
+        && renderer.retainedUiRuntimeStateSample == before.sample)
+    {
+        proof = {
+            renderer.retainedUiSourceFrame,
+            before.sample,
+            true,
+            true,
+            true,
+        };
+        validatedRuntime = before;
+        return proof.completeForUiQuad();
+    }
+
+    if (renderer.gameTextureWidth <= 0 || renderer.gameTextureHeight <= 0)
+    {
+        logProductUiWindowCapture(
+            sourceFrame,
+            before,
+            {},
+            {},
+            "capture_dimensions_invalid",
+            false,
+            false,
+            -1);
+        return false;
+    }
+    static std::vector<std::uint32_t> pixels;
+    float aspect = static_cast<float>(renderer.gameTextureWidth)
+        / static_cast<float>(renderer.gameTextureHeight);
+    const auto copyStarted = std::chrono::steady_clock::now();
+    const bool copied = captureFalloutWindowBgra(
+        renderer.gameTextureWidth,
+        renderer.gameTextureHeight,
+        pixels,
+        aspect);
+    const long long copyMicroseconds =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - copyStarted).count();
+
+    bool afterUiActive = true;
+    bool afterGameplayActive = false;
+    bool afterCameraActive = false;
+    std::uint32_t afterMenuBits = 0u;
+    std::uint32_t afterPhase = fnvxr::shared::RuntimePhaseUnknown;
+    std::uint32_t afterShowroomActive = 0u;
+    std::uint64_t afterRuntimeSample = 0u;
+    const bool afterFresh = readSharedRuntimeUiActive(
+        renderer,
+        afterUiActive,
+        afterGameplayActive,
+        afterCameraActive,
+        afterMenuBits,
+        afterPhase,
+        afterShowroomActive,
+        afterRuntimeSample);
+    const ui_capture::RuntimeSample after {
+        afterRuntimeSample,
+        afterPhase,
+        afterMenuBits,
+        afterShowroomActive,
+        afterCameraActive,
+        afterFresh,
+    };
+    const ui_capture::WindowCapture capture {
+        sourceFrame,
+        static_cast<std::uint32_t>(renderer.gameTextureWidth),
+        static_cast<std::uint32_t>(renderer.gameTextureHeight),
+        pixels.size(),
+        copied,
+        copied && !isMostlyBlackFrame(pixels),
+        copied,
+    };
+    const ui_capture::Decision decision =
+        ui_capture::assess(before, capture, after);
+    if (!decision.accepted())
+    {
+        logProductUiWindowCapture(
+            sourceFrame,
+            before,
+            after,
+            capture,
+            ui_capture::failureName(decision.failure),
+            false,
+            false,
+            copyMicroseconds);
+        return false;
+    }
+    const bool uploaded = uploadProductUiWindowTexture(
+            device,
+            renderer,
+            pixels,
+            capture.width,
+            capture.height,
+            aspect,
+            decision.proof);
+    logProductUiWindowCapture(
+        sourceFrame,
+        before,
+        after,
+        capture,
+        uploaded ? ui_capture::failureName(decision.failure) : "upload_failed",
+        true,
+        uploaded,
+        copyMicroseconds);
+    if (!uploaded)
+    {
+        return false;
+    }
+    proof = decision.proof;
+    validatedRuntime = after;
+    return true;
 }
 
 MenuPointer menuPointerFromAimPose(const XrPosef& aimPose, const GamePlane& gamePlane)
@@ -7254,7 +7588,7 @@ bool locatePose(OpenXr& xr, XrSpace space, XrSpace baseSpace, XrTime time, XrPos
 bool pollUntilSessionReady(OpenXr& xr, XrInstance instance, XrSession session)
 {
     const int timeoutSeconds = std::clamp(
-        envInt("FNVXR_SESSION_READY_TIMEOUT_SECONDS", 45), 1, 300);
+        envInt("FNVXR_SESSION_READY_TIMEOUT_SECONDS", 45), 1, 900);
     const auto started = std::chrono::steady_clock::now();
     auto nextHeartbeat = std::chrono::steady_clock::now() + std::chrono::seconds(5);
 
@@ -8864,8 +9198,29 @@ int main(int argc, char** argv)
                     device.Get(),
                     gpuColorConsumer.eyeTexture(0u),
                     gpuColorFrame.frame,
-                    uiCandidate);
+                uiCandidate);
             }
+        }
+        const fnvxr::host::ui_capture::RuntimeSample hostUiRuntimeBefore {
+            runtimeStateSample,
+            runtimePhase,
+            runtimeMenuBits,
+            runtimeShowroomActive,
+            runtimeCameraActive,
+            haveRuntimeUiState,
+        };
+        fnvxr::host::ui_capture::RuntimeSample hostUiValidatedRuntime {};
+        fnvxr::product::UiFrameProof hostUiProof {};
+        bool hostUiResourceReady = false;
+        if (!incomingUiResourceReady)
+        {
+            hostUiResourceReady = prepareProductUiWindowFallback(
+                device.Get(),
+                renderer,
+                frame.frame,
+                hostUiRuntimeBefore,
+                hostUiProof,
+                hostUiValidatedRuntime);
         }
         fnvxr::host::gpu_color::RoutedFrame controllerRouted =
             gpuColorFrame;
@@ -8875,13 +9230,15 @@ int main(int argc, char** argv)
         {
             controllerRouted = {};
         }
+        const fnvxr::host::ui_capture::RuntimeSample& controllerRuntimeSample =
+            hostUiResourceReady ? hostUiValidatedRuntime : hostUiRuntimeBefore;
         const fnvxr::host::gpu_color::RuntimeEvidence runtimeEvidence {
-            runtimeStateSample,
-            runtimePhase,
-            runtimeMenuBits,
-            runtimeShowroomActive,
-            runtimeCameraActive,
-            haveRuntimeUiState,
+            controllerRuntimeSample.sample,
+            controllerRuntimeSample.phase,
+            controllerRuntimeSample.menuBits,
+            controllerRuntimeSample.showroomActive,
+            controllerRuntimeSample.cameraActive,
+            controllerRuntimeSample.fresh,
         };
         runtimeEvidenceHistory.record(runtimeEvidence);
         fnvxr::host::gpu_color::RuntimeEvidence sourceRuntimeEvidence {};
@@ -8894,12 +9251,14 @@ int main(int argc, char** argv)
             controllerRuntimeEvidence = sourceRuntimeLineageFound
                 ? sourceRuntimeEvidence
                 : runtimeEvidence;
-        const fnvxr::product::PresentationInput presentationInput =
+        fnvxr::product::PresentationInput presentationInput =
             fnvxr::host::gpu_color::makePresentationInput(
                 controllerRuntimeEvidence,
                 controllerRouted,
                 productSourceViewFound,
                 sourcePoseAgeValid);
+        if (hostUiResourceReady)
+            presentationInput.ui = hostUiProof;
         productDecision = productionGpuColorV5
             ? presentationController.advance(presentationInput)
             : fnvxr::product::PresentationDecision {};

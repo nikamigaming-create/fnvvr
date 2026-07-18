@@ -3,9 +3,9 @@ param(
     [string]$GameRoot = "D:\SteamLibrary\steamapps\common\Fallout New Vegas",
     [string]$OpenXrLoaderPath = "",
     [ValidateRange(1, 7200)][int]$HostFrames = 7200,
-    [ValidateRange(5, 45)][int]$MaximumRunSeconds = 40,
+    [ValidateRange(5, 900)][int]$MaximumRunSeconds = 40,
     [ValidateRange(5, 120)][int]$HostReadyTimeoutSeconds = 45,
-    [ValidateRange(5, 120)][int]$RetailReadyTimeoutSeconds = 60,
+    [ValidateRange(5, 900)][int]$RetailReadyTimeoutSeconds = 60,
     [switch]$UseAttestedBuild,
     [switch]$ValidateOnly
 )
@@ -68,7 +68,8 @@ if ($ValidateOnly) {
         minimalEnvironmentKeys = @(Get-FnvxrProductMinimalEnvironment `
             -RunId "validate-only" `
             -RunDirectory "validate-only" `
-            -OpenXrLoaderPath $stagedLoaderPath).Keys
+            -OpenXrLoaderPath $stagedLoaderPath `
+            -SessionReadyTimeoutSeconds $RetailReadyTimeoutSeconds).Keys
     } | ConvertTo-Json -Depth 8
     return
 }
@@ -118,6 +119,7 @@ $manifest = [ordered]@{
     staged = @()
     processes = [ordered]@{}
     readiness = [ordered]@{
+        hostBridge = $false
         hostPose = $false
         retailRuntimeAndPose = $false
         exactModules = $false
@@ -126,6 +128,8 @@ $manifest = [ordered]@{
         falloutStopped = $false
         nvseLoaderStopped = $false
         hostStopped = $false
+        stageRestorationRequired = $false
+        stagedArtifactsRestored = $false
         failedStageRolledBack = $false
     }
     logs = [ordered]@{
@@ -145,7 +149,6 @@ $hostProcess = $null
 $nvse = $null
 $fallout = $null
 $staged = @()
-$runtimeReady = $false
 $normalCompletion = $false
 
 function Write-SupervisorLog {
@@ -174,33 +177,66 @@ function Wait-ExactLoadedModule {
         [Parameter(Mandatory = $true)][int]$TimeoutSeconds
     )
 
+    $expectedFullPath = [System.IO.Path]::GetFullPath($ExpectedPath)
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     do {
         $Process.Refresh()
         if ($Process.HasExited) { throw "Fallout exited before loading $ExpectedPath." }
-        try {
-            foreach ($module in $Process.Modules) {
-                if ([string]::Equals($module.FileName, $ExpectedPath, [System.StringComparison]::OrdinalIgnoreCase)) {
-                    $identity = Get-FnvxrProductFileIdentity -Path $module.FileName -RequirePe
-                    if ($identity.sha256 -cne $ExpectedSha256) {
-                        throw "Loaded module hash differs from staged module: $ExpectedPath"
-                    }
-                    return $identity
+        foreach ($module in @(Get-FnvxrProductLoadedModuleCensus -ProcessId ([uint32]$Process.Id))) {
+            if ([string]::Equals($module.path, $expectedFullPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+                $identity = Get-FnvxrProductFileIdentity -Path $module.path -RequirePe
+                if ($identity.sha256 -cne $ExpectedSha256) {
+                    throw "Loaded module hash differs from staged module: $ExpectedPath"
                 }
+                $identity | Add-Member -NotePropertyName loadedModuleBaseAddress `
+                    -NotePropertyValue ("0x{0:x}" -f [uint64]$module.baseAddress)
+                $identity | Add-Member -NotePropertyName loadedModuleImageSize `
+                    -NotePropertyValue ([uint32]$module.imageSize)
+                $identity | Add-Member -NotePropertyName loadedModuleCensus `
+                    -NotePropertyValue ([string]$module.census)
+                return $identity
             }
-        } catch {
-            if ($_.Exception.Message -like "Loaded module hash differs*") { throw }
         }
         Start-Sleep -Milliseconds 200
     } while ([DateTime]::UtcNow -lt $deadline)
     throw "Timed out waiting for exact loaded module: $ExpectedPath"
 }
 
+function Wait-FnvxrProductHostBridgeReady {
+    param(
+        [Parameter(Mandatory = $true)][System.Diagnostics.Process]$Process,
+        [Parameter(Mandatory = $true)][string]$LogPath,
+        [Parameter(Mandatory = $true)][int]$TimeoutSeconds
+    )
+
+    $pattern = "fnvxrHostBridgeReady xrSessionCreated=1 sharedMappingsReady=1"
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    do {
+        $Process.Refresh()
+        if ($Process.HasExited) { return $false }
+        if (Test-Path -LiteralPath $LogPath -PathType Leaf) {
+            $ready = Select-String `
+                -LiteralPath $LogPath `
+                -Pattern $pattern `
+                -SimpleMatch `
+                -Quiet `
+                -ErrorAction SilentlyContinue
+            if ($ready) {
+                $Process.Refresh()
+                return -not $Process.HasExited
+            }
+        }
+        Start-Sleep -Milliseconds 200
+    } while ([DateTime]::UtcNow -lt $deadline)
+    return $false
+}
+
 try {
     $environment = Get-FnvxrProductMinimalEnvironment `
         -RunId $runId `
         -RunDirectory $runDirectory `
-        -OpenXrLoaderPath $stagedLoaderPath
+        -OpenXrLoaderPath $stagedLoaderPath `
+        -SessionReadyTimeoutSeconds $RetailReadyTimeoutSeconds
     Set-FnvxrProductMinimalEnvironment -Environment $environment
     $manifest.environment = $environment
     $manifest.state = "starting-host"
@@ -223,23 +259,31 @@ try {
     }
     Write-FnvxrProductJsonAtomic -Value $manifest -Path $manifestPath
 
-    Wait-FnvxrProductProbeReady `
-        -ProbePath $probePath `
-        -Arguments @("--require-pose", "--require-advancing", "--sample-delay-ms", "100") `
-        -RequiredProcess $hostProcess `
-        -TimeoutSeconds $HostReadyTimeoutSeconds `
-        -LogPath $probeLog `
-        -Description "advancing OpenXR v8 pose publication"
-    $manifest.readiness.hostPose = $true
+    $hostBridgeReady = Wait-FnvxrProductHostBridgeReady `
+        -Process $hostProcess `
+        -LogPath $hostOut `
+        -TimeoutSeconds $HostReadyTimeoutSeconds
+    if (-not $hostBridgeReady) {
+        $hostProcess.Refresh()
+        if ($hostProcess.HasExited) {
+            throw "OpenXR host exited before publishing its authoritative session/shared-mapping bridge handshake (exit code $($hostProcess.ExitCode))."
+        }
+        throw "Timed out after $HostReadyTimeoutSeconds seconds waiting for the authoritative OpenXR session/shared-mapping bridge handshake."
+    }
+    $manifest.readiness.hostBridge = $true
     $manifest.state = "staging-attested-retail-artifacts"
     Write-FnvxrProductJsonAtomic -Value $manifest -Path $manifestPath
-    Write-SupervisorLog "host pose publication is advancing; staging exact Win32 product set"
+    Write-SupervisorLog "host OpenXR session/shared mappings are authoritative and host is alive; staging exact Win32 product set"
 
     $staged = @(Install-FnvxrProductArtifactSet `
         -Plan $stagePlan `
         -BackupRoot $backupRoot `
         -RunId $runId)
     $manifest.staged = $staged
+    $hostProcess.Refresh()
+    if ($hostProcess.HasExited) {
+        throw "OpenXR host exited after bridge readiness but before retail launch."
+    }
     $manifest.state = "starting-retail"
     Write-FnvxrProductJsonAtomic -Value $manifest -Path $manifestPath
 
@@ -280,7 +324,7 @@ try {
         -TimeoutSeconds $remainingReadySeconds `
         -LogPath $probeLog `
         -Description "advancing retail runtime plus OpenXR pose publication"
-    $runtimeReady = $true
+    $manifest.readiness.hostPose = $true
     $manifest.readiness.retailRuntimeAndPose = $true
 
     $d3d9Record = @($staged | Where-Object { $_.key -eq "x86/d3d9.dll" })[0]
@@ -358,12 +402,21 @@ try {
         } catch {}
     } else { $manifest.cleanup.hostStopped = $true }
 
-    if ($manifest.error -and $staged.Count -gt 0 -and -not $runtimeReady) {
+    if ($staged.Count -gt 0) {
+        $manifest.cleanup.stageRestorationRequired = $true
         try {
             Restore-FnvxrProductArtifactSet -Records $staged
-            $manifest.cleanup.failedStageRolledBack = $true
+            $manifest.cleanup.stagedArtifactsRestored = $true
+            if ($manifest.error) {
+                $manifest.cleanup.failedStageRolledBack = $true
+            }
         } catch {
             $manifest.cleanup.rollbackError = $_.Exception.Message
+            if (-not $manifest.error) {
+                $manifest.error = "Staged artifact restoration failed: $($_.Exception.Message)"
+                $manifest.state = "failed"
+                Write-SupervisorLog ("ERROR " + $manifest.error)
+            }
         }
     }
 

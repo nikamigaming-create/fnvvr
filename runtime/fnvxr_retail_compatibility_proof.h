@@ -17,8 +17,7 @@ enum class RetailCompatibilityFailure : std::uint8_t
     MainModuleUnavailable,
     MainModuleIsNotFallout,
     RetailExecutableIdentityMismatch,
-    ProhibitedOverlayOrCaptureLoaded,
-    DuplicateJipModule,
+    DuplicateJipModule = 9,
     Jip5730IdentityMismatch,
     JipRenderFirstPersonRewriteMismatch,
     DuplicateShowOffModule,
@@ -34,7 +33,6 @@ struct RetailCompatibilityEvidence
 {
     bool retailExecutableIdentityMatched = false;
     bool moduleSnapshotStable = false;
-    bool prohibitedModulesAbsent = false;
     bool jip5730ExactOrAbsent = false;
     bool showOff184ExactOrAbsent = false;
     bool renderFirstPersonStockOrJipNormalized = false;
@@ -70,8 +68,11 @@ struct RetailCompatibilityProof
 };
 
 // Enumerates and re-enumerates only the current process. Unknown modules are
-// tolerated unless prohibited by name or they alter a protected engine range.
-// There is no full-image or exact-module-count claim in this proof.
+// tolerated unless they alter a protected engine range. Canonical path,
+// signature, and mapped-code validation for the complete module census is a
+// separate mandatory module-inventory proof; this proof independently demands
+// stable modules and exact protected retail/JIP/ShowOff bytes. There is no
+// full-image or exact-module-count claim in this proof.
 RetailCompatibilityProof proveCurrentRetailCompatibilityAtDecisionPoint()
     noexcept;
 

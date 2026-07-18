@@ -47,13 +47,14 @@ int main()
 
     if (!CompiledRetailVrBridgePolicy.compiled
         || !CompiledRetailVrBridgePolicy.exactCurrentProcessAuthorityRequired
-        || !CompiledRetailVrBridgePolicy.exBackedGameDevice
+        || CompiledRetailVrBridgePolicy.exBackedGameDevice
         || !CompiledRetailVrBridgePolicy.retailWorldHookOnly
-        || CompiledRetailVrBridgePolicy.patchD3D9DeviceVtable
+        || CompiledRetailVrBridgePolicy.replaceD3D9DeviceVtablePointer
+        || CompiledRetailVrBridgePolicy.leaseNativePresentSlot
         || CompiledRetailVrBridgePolicy.cpuImageTransfer
         || CompiledRetailVrBridgePolicy.legacyDrawReplay)
     {
-        return fail("the isolated retail bridge policy widened into legacy hooks");
+        return fail("retail startup must preserve the ordinary game device and forbid vtable mutation");
     }
 
     ProductionRendererProof complete {

@@ -78,13 +78,24 @@ require_text(
     "RetailD3D9PresentVtableSlot = 17u"
     "The isolated hook must patch only the IDirect3DDevice9 Present slot")
 require_text(
-    "${hook_header_text}"
-    "RetailD3D9ExDeviceMethodCount = 134u"
-    "The private vtable clone must preserve the complete Ex interface")
+    "${hook_source_text}"
+    "mPresentEntry = &originalVtable[RetailD3D9PresentVtableSlot];"
+    "The hook must lease only the native Present entry")
 require_text(
     "${hook_source_text}"
-    "VirtualAlloc("
-    "The hook must use a private per-device vtable clone")
+    "PAGE_EXECUTE_READWRITE"
+    "The native Present entry must be made writable only for the bounded lease update")
+foreach(forbidden IN ITEMS
+        "RetailD3D9ExDeviceMethodCount"
+        "VirtualAlloc("
+        "mPrivateVtable"
+        "std::memcpy(privateVtable"
+        "reinterpret_cast<void* volatile*>(deviceVtableAddress)")
+    forbid_text(
+        "${hook_header_text}\n${hook_source_text}"
+        "${forbidden}"
+        "The Present hook must never replace or truncate the concrete D3D9 device vtable")
+endforeach()
 require_text(
     "${hook_source_text}"
     "return original("
@@ -93,39 +104,6 @@ require_text(
     "${hook_source_text}"
     "if (mInstalled)\n        return device == mDevice && ready();"
     "Present installation must be idempotent for the exact authorized device")
-
-string(FIND "${proxy_text}" "bool copyRetailUiBackBufferToMonoTargets(" proxy_copy_begin)
-string(FIND "${proxy_text}" "void __fastcall retailVrWorldRenderAdapter(" proxy_copy_end)
-if(proxy_copy_begin EQUAL -1
-    OR proxy_copy_end EQUAL -1
-    OR proxy_copy_end LESS_EQUAL proxy_copy_begin)
-    message(FATAL_ERROR "Could not isolate production UI copy callbacks")
-endif()
-math(EXPR proxy_copy_length "${proxy_copy_end} - ${proxy_copy_begin}")
-string(SUBSTRING
-    "${proxy_text}"
-    ${proxy_copy_begin}
-    ${proxy_copy_length}
-    proxy_copy_text)
-require_text(
-    "${proxy_copy_text}"
-    "device->StretchRect("
-    "Retail UI pixels must move from the actual backbuffer on the GPU")
-require_text(
-    "${proxy_copy_text}"
-    "publishMonoUiQuadFromPresent(frame)"
-    "Retail UI pixels must publish through the production v5 bridge")
-foreach(forbidden IN ITEMS
-        "GetRenderTargetData"
-        "LockRect"
-        "D3D9_Frame_v1"
-        "captureSharedVideoFrame"
-        "readEnv")
-    forbid_text(
-        "${proxy_copy_text}"
-        "${forbidden}"
-        "Production UI callbacks must remain GPU-only and configuration-free")
-endforeach()
 
 require_text(
     "${bridge_text}"
@@ -143,21 +121,21 @@ forbid_text(
     "${bridge_text}"
     "mNextUiTransactionId"
     "UI transaction IDs must not use a disjoint range that regresses on return to world")
-require_text(
-    "${proxy_text}"
-    "gRetailUiPresentHook.initializeAuthorizedDevice("
-    "The exact-retail bridge lifecycle must install the isolated Present hook")
-require_text(
-    "${proxy_text}"
-    "&& initializeRetailVrBridge(context->device)"
-    "Present must retry deferred bridge initialization after NVSE mappings appear")
-require_text(
-    "${proxy_text}"
-    "static_cast<void>(initializeRetailVrBridge(*returnedDevice));"
-    "CreateDevice may attempt bridge initialization but must not reject a late mapping")
 forbid_text(
     "${proxy_text}"
-    "if (!initializeRetailVrBridge(*returnedDevice))"
-    "CreateDevice must not fail solely because runtime mappings are late")
+    "gRetailUiPresentHook.initializeAuthorizedDevice("
+    "The retail product must not mutate the concrete D3D9 device's Present slot")
+forbid_text(
+    "${proxy_text}"
+    "fnvxr_retail_ui_quad_capture_win32.h"
+    "The product proxy must not import the native Present-slot hook")
+forbid_text(
+    "${proxy_text}"
+    "initializeRetailVrPresentBootstrap(*returnedDevice)"
+    "CreateDevice must return Fallout's ordinary device without installing a vtable hook")
+forbid_text(
+    "${proxy_text}"
+    "initializeRetailVrBridge(*returnedDevice)"
+    "CreateDevice must not eagerly initialize the VR bridge before Fallout binds depth")
 
 message(STATUS "Retail UI-only Present capture source fuse PASS")

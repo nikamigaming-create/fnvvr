@@ -67,6 +67,10 @@ require_text(
     "The early D3D bootstrap must verify the exact loaded retail PE")
 require_text(
     "${proxy_source}"
+    "IDirect3D9* real = gRealDirect3DCreate9(sdkVersion);"
+    "Retail startup must preserve Fallout's ordinary D3D9 enumerator")
+require_text(
+    "${proxy_source}"
     "#include \"fnvxr_retail_vr_bridge_win32.h\""
     "The exact retail path must enter through the isolated bridge")
 require_text(
@@ -107,6 +111,23 @@ if(create9_nonretail_at EQUAL -1
     message(FATAL_ERROR
         "Direct3DCreate9 must use exact bootstrap authority, never premature mutation authority, before wrapping retail")
 endif()
+
+extract_region(
+    game_proxy_body
+    "${proxy_source}"
+    "class Direct3D9Proxy final : public IDirect3D9"
+    "bool currentExecutableIsFalloutNv() noexcept")
+foreach(forbidden IN ITEMS
+        "mRealEx"
+        "CreateDeviceEx("
+        "initializeRetailVrPresentBootstrap("
+        "initializeRetailVrBridge(*returnedDevice)")
+    string(FIND "${game_proxy_body}" "${forbidden}" forbidden_at)
+    if(NOT forbidden_at EQUAL -1)
+        message(FATAL_ERROR
+            "Fallout's ordinary game device must remain untouched; found '${forbidden}'")
+    endif()
+endforeach()
 
 extract_region(
     create9ex_body

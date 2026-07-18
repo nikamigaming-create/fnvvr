@@ -13,6 +13,9 @@
 
 namespace
 {
+static_assert(fnvxr::engine::SupportedTextVirtualBytes == 0x00BDD58Bu);
+static_assert(fnvxr::engine::SupportedTextMappedBytes == 0x00BDD600u);
+static_assert(fnvxr::engine::SupportedTextRawBytes == 0x00BDD600u);
 using namespace fnvxr::engine;
 using namespace fnvxr::engine::abi;
 using namespace fnvxr::engine::abi::revalidation;
@@ -645,9 +648,10 @@ void testIndependentSealsAndProtectionFailClosed()
     fixture.snapshot.protectionRanges = fixture.protections.data();
     rejected = revalidateSyntheticRetailAbiAtDecisionPoint(
         fixture.snapshot, fixture.contract);
-    require(!rejected.evidence.loadedExecutableSectionLayoutAndProtectionsVerified,
-        "a writable executable retail section was accepted");
-    requireRejected(rejected, "writable executable memory authorized calls");
+    require(rejected.evidence.loadedExecutableSectionLayoutAndProtectionsVerified,
+        "an unrelated runtime-patched executable page invalidated exact PE geometry");
+    requireRejected(rejected,
+        "writable protected engine ranges authorized calls");
 }
 
 void testEveryLiveLayoutAndCensusRemainSynchronous()
@@ -747,7 +751,7 @@ int main()
     static_assert(RetailVtableSlots.size() == 16u);
     static_assert(RetailVtableBlocks.size() == 1u);
     static_assert(sizeof(RetailBSCullingProcessLayout) == 0xC8u);
-    static_assert(AllowedModuleCount == 124u);
+    static_assert(AllowedModuleCount == 126u);
 
     testCompleteDecisionPointDerivesEveryEvidenceField();
     testEveryFunctionAndVtableSlotIsLiveEvidence();

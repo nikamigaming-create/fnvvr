@@ -491,7 +491,6 @@ void testExactOptionalModulesAndJipNormalizationAuthorize()
         "the exact narrow compatibility proof did not authorize");
     require(proof.evidence.retailExecutableIdentityMatched
             && proof.evidence.moduleSnapshotStable
-            && proof.evidence.prohibitedModulesAbsent
             && proof.evidence.jip5730ExactOrAbsent
             && proof.evidence.showOff184ExactOrAbsent
             && proof.evidence.renderFirstPersonStockOrJipNormalized
@@ -530,7 +529,7 @@ void testOptionalAbsenceAndUnrelatedModificationsAreAllowed()
         "optional module absence or unrelated modded text was rejected");
 }
 
-void testExactModuleIdentitiesAndOverlaysFailClosed()
+void testExactModuleIdentitiesAndStableGraphicsHooksCoexist()
 {
     Fixture fixture;
     fixture.jipFile[0] ^= 1u;
@@ -574,11 +573,18 @@ void testExactModuleIdentitiesAndOverlaysFailClosed()
     };
     fixture.modulesBefore.push_back(overlay);
     fixture.modulesAfter.push_back(overlay);
+    const RetailCompatibilityProof coexistence = fixture.evaluate();
+    require(coexistence.compatible
+            && coexistence.evidence.moduleSnapshotStable,
+        "a stable graphics hook invalidated exact protected-byte proof");
+
+    fixture.mainImage[CoreFirstRva] ^= 0x10u;
     rejected = fixture.evaluate();
     require(rejected.failure
-            == RetailCompatibilityFailure::ProhibitedOverlayOrCaptureLoaded,
-        "the known Steam overlay was not rejected by basename");
-    requireRejected(rejected, "a known overlay authorized");
+            == RetailCompatibilityFailure::ProtectedCoreBodyMismatch,
+        "a graphics hook bypassed protected engine-byte verification");
+    requireRejected(rejected,
+        "changed protected engine bytes authorized with a graphics hook loaded");
 }
 
 void testOnlyTheProvenJipRewriteCanNormalize()
@@ -694,7 +700,7 @@ int main()
 {
     testExactOptionalModulesAndJipNormalizationAuthorize();
     testOptionalAbsenceAndUnrelatedModificationsAreAllowed();
-    testExactModuleIdentitiesAndOverlaysFailClosed();
+    testExactModuleIdentitiesAndStableGraphicsHooksCoexist();
     testOnlyTheProvenJipRewriteCanNormalize();
     testEveryProtectedFunctionSlotAndBlockFailsClosed();
     testSnapshotsAndProtectionMustRemainSynchronous();

@@ -561,7 +561,11 @@ bool verifyExecutableSectionLayoutAndProtections(
 
         ++diagnostics.loadedExecutableSectionCount;
         std::uintptr_t address = 0u;
-        Sha256Digest inspectionDigest {};
+        // Section headers establish executable intent and exact geometry.
+        // Runtime patchers may transiently split unrelated pages into RW or
+        // RWX regions, so whole-section coverage requires only committed,
+        // readable, unguarded memory. Exact protected engine ranges below
+        // retain their independent RX/nonwritable and digest requirements.
         const bool observed = checkedAdd(imageBase, section.rva, address)
             && rangeWithinImage(
                 imageBase,
@@ -572,13 +576,8 @@ bool verifyExecutableSectionLayoutAndProtections(
                 reader,
                 address,
                 section.protectionBytes,
-                true,
-                true)
-            && hashMemory(
-                reader,
-                address,
-                section.protectionBytes,
-                inspectionDigest);
+                false,
+                false);
         if (observed)
         {
             diagnostics.executableSectionBytesInspected +=
@@ -595,7 +594,6 @@ bool verifyExecutableSectionLayoutAndProtections(
                 contract.executableSections[executableIndex];
             allMatched = allMatched
                 && observed
-                && inspectionDigest.valid
                 && expected.independentLayoutSamples
                     >= MinimumIndependentLoadedSamples
                 && sameExecutableSectionLayout(section, expected);
@@ -1197,12 +1195,12 @@ inline constexpr std::array<ExecutableSectionLayoutInternal, 2>
     RetailLoadedExecutableSections {{
         {
             { '.', 't', 'e', 'x', 't', 0u, 0u, 0u },
-            0x00001000u,
-            0x00BDD38Bu,
-            0x00BDD400u,
-            0x00BDE000u,
-            0x00BDD400u,
-            0x60000020u,
+            SupportedTextRva,
+            SupportedTextVirtualBytes,
+            SupportedTextMappedBytes,
+            SupportedTextProtectionBytes,
+            SupportedTextRawBytes,
+            SupportedTextCharacteristics,
             2u,
         },
         {
@@ -1217,9 +1215,19 @@ inline constexpr std::array<ExecutableSectionLayoutInternal, 2>
         },
     }};
 static_assert(RetailLoadedExecutableSections.size() == 2u);
-static_assert(RetailLoadedExecutableSections[0].rva == 0x00001000u);
+static_assert(RetailLoadedExecutableSections[0].rva == SupportedTextRva);
 static_assert(
-    RetailLoadedExecutableSections[0].protectionBytes == 0x00BDE000u);
+    RetailLoadedExecutableSections[0].virtualBytes
+        == SupportedTextVirtualBytes);
+static_assert(
+    RetailLoadedExecutableSections[0].mappedBytes
+        == SupportedTextMappedBytes);
+static_assert(
+    RetailLoadedExecutableSections[0].protectionBytes
+        == SupportedTextProtectionBytes);
+static_assert(
+    RetailLoadedExecutableSections[0].rawBytes
+        == SupportedTextRawBytes);
 static_assert(RetailLoadedExecutableSections[1].rva == 0x01009000u);
 static_assert(
     RetailLoadedExecutableSections[1].protectionBytes == 0x00072000u);
@@ -1356,6 +1364,25 @@ RetailAbiRevalidationResult revalidateCurrentRetailEngineAbiAtDecisionPoint()
             RetailAbiRevalidationFailure::CompatibilityProofRejected;
         return result;
     }
+    // The dual-pass compatibility proof is the authoritative current-process
+    // source for protected bytes after exact JIP normalization. Promote only
+    // the ranges it reverified; live object layouts remain independently
+    // observed above and can stay unavailable at the main menu.
+    result.evidence.coreManifestMatched =
+        compatibilityProof.evidence.protectedCoreBodiesMatched;
+    result.evidence.fullFunctionInventoryMatched =
+        compatibilityProof.evidence.protectedFunctionInventoryMatched;
+    result.evidence.vtableSlotsMatched =
+        compatibilityProof.evidence.protectedVtableSlotsMatched;
+    result.evidence.vtableBlocksMatched =
+        compatibilityProof.evidence.protectedVtableBlocksMatched;
+    result.evidence.constructorOwnershipVerified =
+        result.evidence.fullFunctionInventoryMatched
+        && sealedConstructorOwnership(productionContract());
+    result.evidence.bothWorldBranchesVerified =
+        result.evidence.coreManifestMatched
+        && result.evidence.fullFunctionInventoryMatched
+        && sealedBothWorldBranches(productionContract());
     result.evidence.compatibilityModulesVerified = true;
     result.evidence.synchronousRuntimeRevalidation = true;
     result.assessment = assessRetailEngineAbi(result.evidence);

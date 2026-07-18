@@ -27,6 +27,38 @@ foreach(required_trial_text IN ITEMS
     endif()
 endforeach()
 
+foreach(required_ui_capture_text IN ITEMS
+        "#include \"fnvxr_host_ui_capture_gate.h\""
+        "prepareProductUiWindowFallback("
+        "ui_capture::confirmedUi(before)"
+        "const bool copied = captureFalloutWindowBgra("
+        "ui_capture::assess(before, capture, after)"
+        "hostUiValidatedRuntime"
+        "hostUiResourceReady ? hostUiValidatedRuntime : hostUiRuntimeBefore"
+        "productUiCapture attempt="
+        "presentationInput.ui = hostUiProof")
+    string(FIND "${host_source}" "${required_ui_capture_text}" ui_capture_at)
+    if(ui_capture_at EQUAL -1)
+        message(FATAL_ERROR
+            "Host lost its strict UI-only window-capture path: ${required_ui_capture_text}")
+    endif()
+endforeach()
+
+string(FIND "${host_source}"
+    "ui_capture::confirmedUi(before)" ui_precheck_at)
+string(FIND "${host_source}"
+    "const bool copied = captureFalloutWindowBgra(" ui_window_copy_at)
+string(FIND "${host_source}"
+    "ui_capture::assess(before, capture, after)" ui_sandwich_at)
+if(ui_precheck_at EQUAL -1
+    OR ui_window_copy_at EQUAL -1
+    OR ui_sandwich_at EQUAL -1
+    OR NOT ui_precheck_at LESS ui_window_copy_at
+    OR NOT ui_window_copy_at LESS ui_sandwich_at)
+    message(FATAL_ERROR
+        "Product UI capture must precheck UI, copy the retail window, then validate the second runtime sample")
+endif()
+
 foreach(retired_fuse IN ITEMS
         "OpenXrLiveRuntimeProofComplete"
         "ProductPresentationControllerIntegrated")

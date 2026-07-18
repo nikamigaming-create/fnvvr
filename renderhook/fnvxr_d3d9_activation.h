@@ -59,16 +59,17 @@ inline constexpr InterpositionPolicy CompiledInterpositionPolicy =
     interpositionPolicy(ProductionRendererAuthorized);
 
 // This is separate from the retired replay interposer above. It describes
-// the narrow exact-retail route: an Ex-backed enumerator, one authorized
+// the narrow exact-retail route: Fallout's ordinary D3D9 device, one authorized
 // RenderWorldSceneGraph detour, engine-owned eye rendering, and GPU-only color
-// transport. It never authorizes the retained D3D9 device-vtable hook set.
+// transport. It never authorizes any D3D9 device-vtable mutation.
 struct RetailVrBridgePolicy
 {
     bool compiled = false;
     bool exactCurrentProcessAuthorityRequired = true;
-    bool exBackedGameDevice = true;
+    bool exBackedGameDevice = false;
     bool retailWorldHookOnly = true;
-    bool patchD3D9DeviceVtable = false;
+    bool replaceD3D9DeviceVtablePointer = false;
+    bool leaseNativePresentSlot = false;
     bool cpuImageTransfer = false;
     bool legacyDrawReplay = false;
 };
@@ -76,8 +77,9 @@ struct RetailVrBridgePolicy
 inline constexpr RetailVrBridgePolicy CompiledRetailVrBridgePolicy {
     true,
     true,
+    false,
     true,
-    true,
+    false,
     false,
     false,
     false,
@@ -93,9 +95,10 @@ static_assert(!CompiledInterpositionPolicy.perFrameLogging);
 static_assert(CompiledRetailVrBridgePolicy.compiled);
 static_assert(
     CompiledRetailVrBridgePolicy.exactCurrentProcessAuthorityRequired);
-static_assert(CompiledRetailVrBridgePolicy.exBackedGameDevice);
+static_assert(!CompiledRetailVrBridgePolicy.exBackedGameDevice);
 static_assert(CompiledRetailVrBridgePolicy.retailWorldHookOnly);
-static_assert(!CompiledRetailVrBridgePolicy.patchD3D9DeviceVtable);
+static_assert(!CompiledRetailVrBridgePolicy.replaceD3D9DeviceVtablePointer);
+static_assert(!CompiledRetailVrBridgePolicy.leaseNativePresentSlot);
 static_assert(!CompiledRetailVrBridgePolicy.cpuImageTransfer);
 static_assert(!CompiledRetailVrBridgePolicy.legacyDrawReplay);
 }
