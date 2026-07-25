@@ -50,11 +50,11 @@ int main()
         || CompiledRetailVrBridgePolicy.exBackedGameDevice
         || !CompiledRetailVrBridgePolicy.retailWorldHookOnly
         || CompiledRetailVrBridgePolicy.replaceD3D9DeviceVtablePointer
-        || CompiledRetailVrBridgePolicy.leaseNativePresentSlot
-        || CompiledRetailVrBridgePolicy.cpuImageTransfer
+        || !CompiledRetailVrBridgePolicy.leaseNativePresentSlot
+        || !CompiledRetailVrBridgePolicy.cpuImageTransfer
         || CompiledRetailVrBridgePolicy.legacyDrawReplay)
     {
-        return fail("retail startup must preserve the ordinary game device and forbid vtable mutation");
+        return fail("retail bridge must preserve ordinary D3D9 and isolate its CPU transport and Present lease");
     }
 
     ProductionRendererProof complete {

@@ -70,6 +70,7 @@ foreach ($forbidden in @(
 foreach ($required in @(
     'FNVXR_RUN_PROFILE = "stereo-visual-trial-v5"',
     'FNVXR_ENABLE_LEGACY_IMAGE_DIAGNOSTICS = "0"',
+    'FNVXR_ENABLE_ENGINE_CENTER_STEREO = "1"',
     'FNVXR_ALLOW_STEREO_WORLD_2D_FALLBACK = "0"',
     'FNVXR_SESSION_READY_TIMEOUT_SECONDS',
     'Get-ChildItem Env:',
@@ -92,13 +93,24 @@ foreach ($trialBoundary in @(
     'fullProductAccepted = $false',
     'controllerMutationAuthorized = $false',
     'trackedWeaponAuthorized = $false',
-    '$manifest.trialReady = $true')) {
+    '$manifest.trialReady = $true',
+    '$manifest.readiness.retailVrBridge = $true',
+    '$manifest.readiness.stereoOutput = $true',
+    'Get-FnvxrProductStereoOutputProof')) {
     if (-not $launcher.Contains($trialBoundary)) {
         throw "Product launcher lost its honest visual-trial boundary: $trialBoundary"
     }
 }
 if ($launcher.Contains('$manifest.accepted = $true')) {
     throw "Visual trial must not represent itself as full product acceptance."
+}
+if (-not $launcher.Contains(
+    'retail VR bridge initialized: exact world hook, ordinary-D3D9 CPU-v7 stereo transport, and deferred Present bootstrap ready')) {
+    throw "Visual trial must prove bridge initialization instead of accepting a merely loaded proxy."
+}
+if (-not $launcher.Contains(
+    'No proven binocular engine-stereo frame reached OpenXR')) {
+    throw "Visual trial must fail when no binocular engine-stereo output was observed."
 }
 
 $hostStart = $launcher.IndexOf('$hostProcess = Start-Process')

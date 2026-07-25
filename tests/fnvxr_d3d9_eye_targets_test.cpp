@@ -262,6 +262,18 @@ int main()
     }
     require(!retailSharedEyeTargetColorFormatAccepted(21u),
         "A8R8G8B8 must not enter a transport that cannot map its DXGI format");
+    require(RetailCpuEyeTargetColorFormats.size() == 2u,
+        "CPU eye target format count changed");
+    require(RetailCpuEyeTargetColorFormats[0] == 21u
+            && RetailCpuEyeTargetColorFormats[1] == 22u,
+        "CPU eye target formats must remain canonical BGRA8");
+    for (const std::uint32_t format : RetailCpuEyeTargetColorFormats)
+    {
+        require(retailCpuEyeTargetColorFormatAccepted(format),
+            "listed CPU eye target format was rejected");
+    }
+    require(!retailCpuEyeTargetColorFormatAccepted(32u),
+        "non-BGRA CPU eye target format was accepted");
 
     {
         FakeState state;

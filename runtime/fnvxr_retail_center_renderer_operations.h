@@ -64,9 +64,10 @@ public:
     bool initialize(
         const RetailEngineCalls& calls,
         Binding& binding,
+        abi::RetailBSShaderAccumulatorLayout& collectionAccumulator,
         const RetailEyeTargetOperations& targets) noexcept
     {
-        if (!calls.complete()
+        if (!calls.privateStereoComplete()
             || !binding.ownedVtableCloneInstalled()
             || !binding.ownedVtableIntegrityValid()
             || !retailEyeTargetOperationsComplete(targets))
@@ -75,6 +76,7 @@ public:
         }
         mCalls = calls;
         mBinding = &binding;
+        mCollectionAccumulator = &collectionAccumulator;
         mTargets = targets;
         mInitialized = true;
         return true;
@@ -83,18 +85,30 @@ public:
     bool ready() const noexcept
     {
         return mInitialized
-            && mCalls.complete()
+            && mCalls.privateStereoComplete()
             && mBinding
+            && mCollectionAccumulator
             && mBinding->ownedVtableCloneInstalled()
             && mBinding->ownedVtableIntegrityValid()
             && retailEyeTargetOperationsComplete(mTargets);
     }
 
 private:
+    struct EngineAccumulatorSnapshot
+    {
+        abi::RetailRendererAccumulatorOwnerLayout* renderer = nullptr;
+        abi::RetailPointer32 rendererAccumulator = 0u;
+        abi::RetailPointer32 accumulatingAccumulator = 0u;
+        abi::RetailPointer32 renderingAccumulator = 0u;
+        bool active = false;
+    };
+
     bool mInitialized = false;
     RetailEngineCalls mCalls {};
     Binding* mBinding = nullptr;
+    abi::RetailBSShaderAccumulatorLayout* mCollectionAccumulator = nullptr;
     RetailEyeTargetOperations mTargets {};
+    EngineAccumulatorSnapshot mEngineSnapshot {};
 
     friend struct detail::RetailCenterRendererOperationsAdapter<
         CollectorCapacity>;
@@ -113,11 +127,124 @@ struct RetailCenterRendererOperationsAdapter
         return context && context->ready() ? context : nullptr;
     }
 
+    static abi::RetailBSShaderAccumulatorLayout* accumulatorFromAddress(
+        abi::RetailPointer32 address) noexcept
+    {
+        return reinterpret_cast<abi::RetailBSShaderAccumulatorLayout*>(
+            static_cast<std::uintptr_t>(address));
+    }
+
+    static bool snapshotEngineAccumulatorState(Context& context) noexcept
+    {
+        if (context.mEngineSnapshot.active
+            || !context.mCalls.privateStereoRegistrationComplete())
+        {
+            return false;
+        }
+        const abi::RetailPointer32 rendererAddress =
+            *context.mCalls.rendererSingleton;
+        if (rendererAddress == 0u)
+            return false;
+        auto* renderer =
+            reinterpret_cast<abi::RetailRendererAccumulatorOwnerLayout*>(
+                static_cast<std::uintptr_t>(rendererAddress));
+        const abi::RetailPointer32 rendererAccumulator =
+            renderer->accumulator;
+        auto* ownedAccumulator = accumulatorFromAddress(rendererAccumulator);
+        const abi::RetailPointer32 accumulatingAccumulator =
+            *context.mCalls.accumulatingAccumulator;
+        const abi::RetailPointer32 renderingAccumulator =
+            *context.mCalls.renderingAccumulator;
+        // At the stock world boundary these are three owners of the same
+        // coordinator-owned accumulator. Requiring that exact state keeps the
+        // saved pointer alive while the private eyes are temporarily installed.
+        if (!ownedAccumulator
+            || ownedAccumulator->referenceCount < 4u
+            || accumulatingAccumulator != rendererAccumulator
+            || renderingAccumulator != rendererAccumulator)
+        {
+            return false;
+        }
+
+        context.mEngineSnapshot = {
+            renderer,
+            rendererAccumulator,
+            accumulatingAccumulator,
+            renderingAccumulator,
+            true,
+        };
+        return true;
+    }
+
+    static bool restoreEngineAccumulatorState(Context& context) noexcept
+    {
+        if (!context.mEngineSnapshot.active)
+            return true;
+        const typename Context::EngineAccumulatorSnapshot snapshot =
+            context.mEngineSnapshot;
+        auto* rendererAccumulator = accumulatorFromAddress(
+            snapshot.rendererAccumulator);
+        auto* accumulatingAccumulator = accumulatorFromAddress(
+            snapshot.accumulatingAccumulator);
+        auto* renderingAccumulator = accumulatorFromAddress(
+            snapshot.renderingAccumulator);
+        context.mCalls.setRenderingAccumulator(renderingAccumulator);
+        context.mCalls.setAccumulatingAccumulator(accumulatingAccumulator);
+        context.mCalls.rendererSetAccumulator(
+            snapshot.renderer,
+            rendererAccumulator);
+        const bool restored = snapshot.renderer->accumulator
+                == snapshot.rendererAccumulator
+            && *context.mCalls.accumulatingAccumulator
+                == snapshot.accumulatingAccumulator
+            && *context.mCalls.renderingAccumulator
+                == snapshot.renderingAccumulator;
+        if (restored)
+            context.mEngineSnapshot = {};
+        return restored;
+    }
+
+    static bool registerEyeAccumulator(
+        Context& context,
+        abi::RetailBSShaderAccumulatorLayout* accumulator) noexcept
+    {
+        if (!context.mEngineSnapshot.active || !accumulator)
+            return false;
+        const std::uintptr_t accumulatorAddress =
+            reinterpret_cast<std::uintptr_t>(accumulator);
+        if (accumulatorAddress
+            > (std::numeric_limits<abi::RetailPointer32>::max)())
+        {
+            return false;
+        }
+        const abi::RetailPointer32 address =
+            static_cast<abi::RetailPointer32>(accumulatorAddress);
+        context.mCalls.rendererSetAccumulator(
+            context.mEngineSnapshot.renderer,
+            accumulator);
+        context.mCalls.setAccumulatingAccumulator(accumulator);
+        // AddVisibleArray is permitted to draw immediately, before the
+        // explicit render call. Its rendering-global must therefore already
+        // name this eye's private accumulator; leaving the stock accumulator
+        // installed sends those draws through the wrong camera/state lane and
+        // produced the all-black private-eye payload seen in the live runs.
+        context.mCalls.setRenderingAccumulator(accumulator);
+        return context.mEngineSnapshot.renderer->accumulator == address
+            && *context.mCalls.accumulatingAccumulator == address
+            && *context.mCalls.renderingAccumulator == address;
+    }
+
     static bool snapshot(void* opaque) noexcept
     {
         Context* context = checked(opaque);
-        return context
-            && context->mTargets.snapshot(context->mTargets.context);
+        if (!context || !snapshotEngineAccumulatorState(*context))
+            return false;
+        if (!context->mTargets.snapshot(context->mTargets.context))
+        {
+            context->mEngineSnapshot = {};
+            return false;
+        }
+        return true;
     }
 
     static bool collect(
@@ -134,6 +261,8 @@ struct RetailCenterRendererOperationsAdapter
             || !camera
             || !sceneObject
             || !culler
+            || !context->mCollectionAccumulator
+            || context->mCollectionAccumulator->referenceCount != 1u
             || generation == 0u
             || culler != context->mBinding->cullingProcess())
         {
@@ -141,13 +270,46 @@ struct RetailCenterRendererOperationsAdapter
         }
 
 #if defined(_MSC_VER) && defined(_M_IX86)
+        const std::uintptr_t collectionAccumulatorAddress =
+            reinterpret_cast<std::uintptr_t>(
+                context->mCollectionAccumulator);
+        if (collectionAccumulatorAddress
+                > (std::numeric_limits<abi::RetailPointer32>::max)()
+            || culler->shaderAccumulator != 0u)
+        {
+            return false;
+        }
         if (!context->mBinding->beginCollection(generation))
             return false;
+        context->mCalls.accumulatorSetCamera(
+            reinterpret_cast<abi::RetailNiAccumulatorLayout*>(
+                context->mCollectionAccumulator),
+            camera);
+        context->mCalls.cullingProcessSetAccumulator(
+            culler,
+            context->mCollectionAccumulator);
+        if (culler->shaderAccumulator
+                != static_cast<abi::RetailPointer32>(
+                    collectionAccumulatorAddress)
+            || context->mCollectionAccumulator->referenceCount != 2u)
+        {
+            if (culler->shaderAccumulator
+                == static_cast<abi::RetailPointer32>(
+                    collectionAccumulatorAddress))
+            {
+                context->mCalls.cullingProcessSetAccumulator(culler, nullptr);
+            }
+            return false;
+        }
         context->mCalls.cullingProcessAlt(
             culler,
             camera,
             sceneObject,
             nullptr);
+        context->mCalls.cullingProcessSetAccumulator(culler, nullptr);
+        if (culler->shaderAccumulator != 0u
+            || context->mCollectionAccumulator->referenceCount != 1u)
+            return false;
         if (context->mBinding->sealCollection()
             != geometry::GeometrySealResult::Sealed)
         {
@@ -206,6 +368,8 @@ struct RetailCenterRendererOperationsAdapter
         Context* context = checked(opaque);
         if (!context || !accumulator || !camera)
             return false;
+        if (!registerEyeAccumulator(*context, accumulator))
+            return false;
         context->mCalls.accumulatorSetCamera(
             reinterpret_cast<abi::RetailNiAccumulatorLayout*>(accumulator),
             camera);
@@ -244,7 +408,12 @@ struct RetailCenterRendererOperationsAdapter
             camera,
             accumulator,
             renderContext);
-        return true;
+        const std::uintptr_t accumulatorAddress =
+            reinterpret_cast<std::uintptr_t>(accumulator);
+        return accumulatorAddress
+                <= (std::numeric_limits<abi::RetailPointer32>::max)()
+            && *context->mCalls.renderingAccumulator
+                == static_cast<abi::RetailPointer32>(accumulatorAddress);
     }
 
     static bool finalize(
@@ -293,14 +462,19 @@ struct RetailCenterRendererOperationsAdapter
                 context->mTargets.context,
                 eye,
                 isolation);
+            restoreEngineAccumulatorState(*context);
         }
     }
 
     static bool restore(void* opaque) noexcept
     {
         Context* context = checked(opaque);
-        return context
-            && context->mTargets.restore(context->mTargets.context);
+        if (!context)
+            return false;
+        const bool targetsRestored =
+            context->mTargets.restore(context->mTargets.context);
+        const bool engineRestored = restoreEngineAccumulatorState(*context);
+        return targetsRestored && engineRestored;
     }
 
     static void discard(

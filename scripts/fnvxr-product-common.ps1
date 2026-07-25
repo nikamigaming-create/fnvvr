@@ -700,6 +700,7 @@ function Get-FnvxrProductMinimalEnvironment {
         FNVXR_OPENXR_LOADER_HINT = $OpenXrLoaderPath
         FNVXR_SESSION_READY_TIMEOUT_SECONDS = [string]$SessionReadyTimeoutSeconds
         FNVXR_ENABLE_LEGACY_IMAGE_DIAGNOSTICS = "0"
+        FNVXR_ENABLE_ENGINE_CENTER_STEREO = "1"
         FNVXR_ALLOW_STEREO_WORLD_2D_FALLBACK = "0"
         FNVXR_SHOW_GAME_PLANE_ON_STEREO_LOSS = "0"
         FNVXR_STEREO_FALLBACK_MONO_FULLSCREEN = "0"
@@ -742,11 +743,21 @@ function Wait-FnvxrProductProbeReady {
         [Parameter(Mandatory = $true)][string]$Description
     )
 
+    $requiredProcessId = $RequiredProcess.Id
+    $requiredProcessName = try {
+        [string]$RequiredProcess.ProcessName
+    } catch {
+        "process"
+    }
+    if ([string]::IsNullOrWhiteSpace($requiredProcessName)) {
+        $requiredProcessName = "process"
+    }
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     do {
         $RequiredProcess.Refresh()
         if ($RequiredProcess.HasExited) {
-            throw "$Description failed because $($RequiredProcess.ProcessName) exited with code $($RequiredProcess.ExitCode)."
+            $exitCode = try { [string]$RequiredProcess.ExitCode } catch { "unknown" }
+            throw "$Description failed because $requiredProcessName`:$requiredProcessId exited with code $exitCode."
         }
         if (Test-FnvxrProductProbeReady -ProbePath $ProbePath -Arguments $Arguments -LogPath $LogPath) {
             return

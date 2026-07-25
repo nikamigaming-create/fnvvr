@@ -99,17 +99,21 @@ string(FIND "${create9_body}" "if (!currentExecutableIsFalloutNv())" create9_non
 string(FIND "${create9_body}" "assessGameD3D9Bootstrap(" create9_authority_at)
 string(FIND "${create9_body}" "if (!bootstrap.authorized())" create9_complete_at)
 string(FIND "${create9_body}" "authorizeCurrentRetailRuntimeAtDecisionPoint()" create9_mutation_authority_at)
+string(FIND "${create9_body}" "IDirect3D9* real = gRealDirect3DCreate9(sdkVersion);" create9_ordinary_at)
 string(FIND "${create9_body}" "new (std::nothrow) Direct3D9Proxy" create9_wrap_at)
 if(create9_nonretail_at EQUAL -1
     OR create9_authority_at EQUAL -1
     OR create9_complete_at EQUAL -1
     OR NOT create9_mutation_authority_at EQUAL -1
+    OR create9_ordinary_at EQUAL -1
     OR create9_wrap_at EQUAL -1
     OR create9_nonretail_at GREATER create9_authority_at
     OR create9_authority_at GREATER create9_complete_at
+    OR create9_complete_at GREATER create9_ordinary_at
+    OR create9_ordinary_at GREATER create9_wrap_at
     OR create9_complete_at GREATER create9_wrap_at)
     message(FATAL_ERROR
-        "Direct3DCreate9 must use exact bootstrap authority, never premature mutation authority, before wrapping retail")
+        "Direct3DCreate9 must use exact bootstrap authority, never premature mutation authority, before creating and wrapping the ordinary retail enumerator")
 endif()
 
 extract_region(
@@ -117,17 +121,44 @@ extract_region(
     "${proxy_source}"
     "class Direct3D9Proxy final : public IDirect3D9"
     "bool currentExecutableIsFalloutNv() noexcept")
-foreach(forbidden IN ITEMS
-        "mRealEx"
-        "CreateDeviceEx("
-        "initializeRetailVrPresentBootstrap("
-        "initializeRetailVrBridge(*returnedDevice)")
+foreach(required IN ITEMS
+        "explicit Direct3D9Proxy(IDirect3D9* real)"
+        "const HRESULT result = mReal->CreateDevice("
+        "initializeRetailVrPresentBootstrap(*returnedDevice)"
+        "static_cast<void>(initializeRetailVrBridge(*returnedDevice))")
+    string(FIND "${game_proxy_body}" "${required}" required_at)
+    if(required_at EQUAL -1)
+        message(FATAL_ERROR
+            "The exact-retail ordinary-D3D9 bridge is incomplete: missing '${required}'")
+    endif()
+endforeach()
+foreach(forbidden IN ITEMS "mRealEx" "CreateDeviceEx(")
     string(FIND "${game_proxy_body}" "${forbidden}" forbidden_at)
     if(NOT forbidden_at EQUAL -1)
         message(FATAL_ERROR
-            "Fallout's ordinary game device must remain untouched; found '${forbidden}'")
+            "Fallout's ordinary game device was replaced by an Ex path: '${forbidden}'")
     endif()
 endforeach()
+string(FIND "${game_proxy_body}" "const HRESULT result = mReal->CreateDevice(" create_device_at)
+string(FIND "${game_proxy_body}" "initializeRetailVrPresentBootstrap(*returnedDevice)" present_bootstrap_at)
+string(FIND "${game_proxy_body}" "static_cast<void>(initializeRetailVrBridge(*returnedDevice))" bridge_attempt_at)
+if(create_device_at GREATER present_bootstrap_at
+    OR present_bootstrap_at GREATER bridge_attempt_at)
+    message(FATAL_ERROR
+        "The retail device must exist before its one-slot Present bootstrap, and the bootstrap must exist before bridge initialization")
+endif()
+require_text(
+    "${proxy_source}"
+    "header->producerMode =\n        fnvxr::shared::StereoProducerEngineCenter;"
+    "The isolated CPU publisher must identify the exact engine-center producer")
+require_text(
+    "${proxy_source}"
+    "device->GetRenderTargetData(\n        gLeftEyeSurface"
+    "The ordinary-D3D9 bridge must read back the private left eye")
+require_text(
+    "${proxy_source}"
+    "operations.publishCpuPair = &publishRetailVrCpuPair;"
+    "The retail bridge must select the isolated CPU pair publisher")
 
 extract_region(
     create9ex_body

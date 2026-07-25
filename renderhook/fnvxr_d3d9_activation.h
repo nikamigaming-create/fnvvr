@@ -59,9 +59,10 @@ inline constexpr InterpositionPolicy CompiledInterpositionPolicy =
     interpositionPolicy(ProductionRendererAuthorized);
 
 // This is separate from the retired replay interposer above. It describes
-// the narrow exact-retail route: Fallout's ordinary D3D9 device, one authorized
-// RenderWorldSceneGraph detour, engine-owned eye rendering, and GPU-only color
-// transport. It never authorizes any D3D9 device-vtable mutation.
+// the narrow exact-retail route: Fallout's ordinary D3D9 device, one
+// authorized RenderWorldSceneGraph detour, engine-owned eye rendering, a
+// bounded CPU readback transport, and a single leased Present slot used to
+// finish deferred startup. It never authorizes the retained draw-hook set.
 struct RetailVrBridgePolicy
 {
     bool compiled = false;
@@ -80,8 +81,8 @@ inline constexpr RetailVrBridgePolicy CompiledRetailVrBridgePolicy {
     false,
     true,
     false,
-    false,
-    false,
+    true,
+    true,
     false,
 };
 
@@ -98,7 +99,7 @@ static_assert(
 static_assert(!CompiledRetailVrBridgePolicy.exBackedGameDevice);
 static_assert(CompiledRetailVrBridgePolicy.retailWorldHookOnly);
 static_assert(!CompiledRetailVrBridgePolicy.replaceD3D9DeviceVtablePointer);
-static_assert(!CompiledRetailVrBridgePolicy.leaseNativePresentSlot);
-static_assert(!CompiledRetailVrBridgePolicy.cpuImageTransfer);
+static_assert(CompiledRetailVrBridgePolicy.leaseNativePresentSlot);
+static_assert(CompiledRetailVrBridgePolicy.cpuImageTransfer);
 static_assert(!CompiledRetailVrBridgePolicy.legacyDrawReplay);
 }

@@ -227,9 +227,23 @@ int main()
 
     if (fnvxr::shared::StereoProducerDrawReplay != 1
         || fnvxr::shared::StereoProducerNativeSameFrame != 2
-        || fnvxr::shared::StereoProducerSingleTraversal != 3)
+        || fnvxr::shared::StereoProducerSingleTraversal != 3
+        || fnvxr::shared::StereoProducerEngineCenter != 4)
     {
         return fail("shared stereo producer provenance values mismatch");
+    }
+    if (!fnvxr::shared::stereoProducerCarriesSameTransactionEyes(
+            fnvxr::shared::StereoProducerNativeSameFrame)
+        || !fnvxr::shared::stereoProducerCarriesSameTransactionEyes(
+            fnvxr::shared::StereoProducerSingleTraversal)
+        || !fnvxr::shared::stereoProducerCarriesSameTransactionEyes(
+            fnvxr::shared::StereoProducerEngineCenter)
+        || fnvxr::shared::stereoProducerCarriesSameTransactionEyes(
+            fnvxr::shared::StereoProducerDrawReplay)
+        || fnvxr::shared::stereoProducerCarriesSameTransactionEyes(
+            fnvxr::shared::StereoProducerUnknown))
+    {
+        return fail("same-transaction stereo producer classification mismatch");
     }
 
     const std::uint32_t aimTrackingBits =

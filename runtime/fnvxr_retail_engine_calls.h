@@ -20,14 +20,21 @@ struct RetailEngineCalls
     abi::NiCameraCreateFunction niCameraCreate = nullptr;
     abi::BSCullingProcessConstructorFunction cullingProcessConstruct = nullptr;
     abi::BSCullingProcessDestructorBodyFunction cullingProcessDestroy = nullptr;
+    abi::CullingProcessSetAccumulatorFunction cullingProcessSetAccumulator = nullptr;
     abi::BSShaderAccumulatorConstructorFunction shaderAccumulatorConstruct = nullptr;
     abi::BSShaderAccumulatorScalarDestructorFunction shaderAccumulatorDestroy = nullptr;
     abi::NiRefObjectFreeFunction niRefObjectFree = nullptr;
     abi::AccumulatorSetCameraFunction accumulatorSetCamera = nullptr;
     abi::CullingProcessAltFunction cullingProcessAlt = nullptr;
     abi::AccumulatorAddVisibleArrayFunction accumulatorAddVisibleArray = nullptr;
+    abi::RendererSetAccumulatorFunction rendererSetAccumulator = nullptr;
+    abi::SetCurrentAccumulatorFunction setAccumulatingAccumulator = nullptr;
+    abi::SetCurrentAccumulatorFunction setRenderingAccumulator = nullptr;
     abi::AccumulatorRenderFunction renderAccumulatorWithoutFinalize = nullptr;
     abi::AccumulatorRenderFunction finalizeAccumulator = nullptr;
+    volatile abi::RetailPointer32* rendererSingleton = nullptr;
+    volatile abi::RetailPointer32* accumulatingAccumulator = nullptr;
+    volatile abi::RetailPointer32* renderingAccumulator = nullptr;
 
     bool empty() const noexcept
     {
@@ -36,14 +43,21 @@ struct RetailEngineCalls
             && !niCameraCreate
             && !cullingProcessConstruct
             && !cullingProcessDestroy
+            && !cullingProcessSetAccumulator
             && !shaderAccumulatorConstruct
             && !shaderAccumulatorDestroy
             && !niRefObjectFree
             && !accumulatorSetCamera
             && !cullingProcessAlt
             && !accumulatorAddVisibleArray
+            && !rendererSetAccumulator
+            && !setAccumulatingAccumulator
+            && !setRenderingAccumulator
             && !renderAccumulatorWithoutFinalize
-            && !finalizeAccumulator;
+            && !finalizeAccumulator
+            && !rendererSingleton
+            && !accumulatingAccumulator
+            && !renderingAccumulator;
     }
 
     bool complete() const noexcept
@@ -53,6 +67,7 @@ struct RetailEngineCalls
             && niCameraCreate
             && cullingProcessConstruct
             && cullingProcessDestroy
+            && cullingProcessSetAccumulator
             && shaderAccumulatorConstruct
             && shaderAccumulatorDestroy
             && niRefObjectFree
@@ -61,6 +76,21 @@ struct RetailEngineCalls
             && accumulatorAddVisibleArray
             && renderAccumulatorWithoutFinalize
             && finalizeAccumulator;
+    }
+
+    bool privateStereoRegistrationComplete() const noexcept
+    {
+        return rendererSetAccumulator
+            && setAccumulatingAccumulator
+            && setRenderingAccumulator
+            && rendererSingleton
+            && accumulatingAccumulator
+            && renderingAccumulator;
+    }
+
+    bool privateStereoComplete() const noexcept
+    {
+        return complete() && privateStereoRegistrationComplete();
     }
 };
 
@@ -71,14 +101,21 @@ struct RetailEngineCallAddressTable
     std::uintptr_t niCameraCreate = 0u;
     std::uintptr_t cullingProcessConstruct = 0u;
     std::uintptr_t cullingProcessDestroy = 0u;
+    std::uintptr_t cullingProcessSetAccumulator = 0u;
     std::uintptr_t shaderAccumulatorConstruct = 0u;
     std::uintptr_t shaderAccumulatorDestroy = 0u;
     std::uintptr_t niRefObjectFree = 0u;
     std::uintptr_t accumulatorSetCamera = 0u;
     std::uintptr_t cullingProcessAlt = 0u;
     std::uintptr_t accumulatorAddVisibleArray = 0u;
+    std::uintptr_t rendererSetAccumulator = 0u;
+    std::uintptr_t setAccumulatingAccumulator = 0u;
+    std::uintptr_t setRenderingAccumulator = 0u;
     std::uintptr_t renderAccumulatorWithoutFinalize = 0u;
     std::uintptr_t finalizeAccumulator = 0u;
+    std::uintptr_t rendererSingleton = 0u;
+    std::uintptr_t accumulatingAccumulator = 0u;
+    std::uintptr_t renderingAccumulator = 0u;
 };
 
 namespace detail
@@ -148,6 +185,8 @@ inline constexpr RetailEngineCallAddressTable RetailEngineCallPreferredAddresses
     detail::uniqueRetailFunctionPreferredAddress(
         "BSCullingProcess::~BSCullingProcess body"),
     detail::uniqueRetailFunctionPreferredAddress(
+        "BSCullingProcess::SetAccumulator"),
+    detail::uniqueRetailFunctionPreferredAddress(
         "BSShaderAccumulator::BSShaderAccumulator"),
     detail::uniqueRetailFunctionPreferredAddress(
         "BSShaderAccumulator scalar deleting destructor"),
@@ -157,8 +196,17 @@ inline constexpr RetailEngineCallAddressTable RetailEngineCallPreferredAddresses
     detail::uniqueRetailFunctionPreferredAddress(
         "NiAccumulator::AddVisibleArray"),
     detail::uniqueRetailFunctionPreferredAddress(
+        "NiDX9Renderer::SetAccumulator"),
+    detail::uniqueRetailFunctionPreferredAddress(
+        "SetAccumulatingAccumulator"),
+    detail::uniqueRetailFunctionPreferredAddress(
+        "SetRenderingAccumulator"),
+    detail::uniqueRetailFunctionPreferredAddress(
         "RenderAccumulatorWithoutFinalize"),
     detail::uniqueRetailFunctionPreferredAddress("FinalizeAccumulator"),
+    abi::RendererSingletonPointerAddress,
+    abi::AccumulatingAccumulatorPointerAddress,
+    abi::RenderingAccumulatorPointerAddress,
 };
 
 constexpr bool retailEngineCallInventoryComplete() noexcept
@@ -179,6 +227,10 @@ constexpr bool retailEngineCallInventoryComplete() noexcept
                "BSCullingProcess::~BSCullingProcess body",
                RetailEngineCallPreferredAddresses.cullingProcessDestroy)
         && detail::uniqueProductionFunctionMatches(
+               "BSCullingProcess::SetAccumulator",
+               RetailEngineCallPreferredAddresses
+                   .cullingProcessSetAccumulator)
+        && detail::uniqueProductionFunctionMatches(
                "BSShaderAccumulator::BSShaderAccumulator",
                RetailEngineCallPreferredAddresses.shaderAccumulatorConstruct)
         && detail::uniqueProductionFunctionMatches(
@@ -197,6 +249,16 @@ constexpr bool retailEngineCallInventoryComplete() noexcept
                "NiAccumulator::AddVisibleArray",
                RetailEngineCallPreferredAddresses.accumulatorAddVisibleArray)
         && detail::uniqueProductionFunctionMatches(
+               "NiDX9Renderer::SetAccumulator",
+               RetailEngineCallPreferredAddresses.rendererSetAccumulator)
+        && detail::uniqueProductionFunctionMatches(
+               "SetAccumulatingAccumulator",
+               RetailEngineCallPreferredAddresses
+                   .setAccumulatingAccumulator)
+        && detail::uniqueProductionFunctionMatches(
+               "SetRenderingAccumulator",
+               RetailEngineCallPreferredAddresses.setRenderingAccumulator)
+        && detail::uniqueProductionFunctionMatches(
                "RenderAccumulatorWithoutFinalize",
                RetailEngineCallPreferredAddresses
                    .renderAccumulatorWithoutFinalize)
@@ -213,6 +275,9 @@ static_assert(
 static_assert(
     RetailEngineCallPreferredAddresses.cullingProcessDestroy == 0x004A0F60u);
 static_assert(
+    RetailEngineCallPreferredAddresses.cullingProcessSetAccumulator
+    == 0x004A0FD0u);
+static_assert(
     RetailEngineCallPreferredAddresses.shaderAccumulatorConstruct
     == 0x00B660D0u);
 static_assert(
@@ -227,10 +292,27 @@ static_assert(
     RetailEngineCallPreferredAddresses.accumulatorAddVisibleArray
     == 0x00A9B790u);
 static_assert(
+    RetailEngineCallPreferredAddresses.rendererSetAccumulator
+    == 0x004DC540u);
+static_assert(
+    RetailEngineCallPreferredAddresses.setAccumulatingAccumulator
+    == 0x00B54AC0u);
+static_assert(
+    RetailEngineCallPreferredAddresses.setRenderingAccumulator
+    == 0x00B54B10u);
+static_assert(
     RetailEngineCallPreferredAddresses.renderAccumulatorWithoutFinalize
     == 0x00B6BA20u);
 static_assert(
     RetailEngineCallPreferredAddresses.finalizeAccumulator == 0x00B6B930u);
+static_assert(
+    RetailEngineCallPreferredAddresses.rendererSingleton == 0x011F4748u);
+static_assert(
+    RetailEngineCallPreferredAddresses.accumulatingAccumulator
+    == 0x011F95ECu);
+static_assert(
+    RetailEngineCallPreferredAddresses.renderingAccumulator
+    == 0x011F95F0u);
 static_assert(retailEngineCallInventoryComplete());
 
 enum class RetailEngineAddressRelocationFailure : std::uint8_t
@@ -375,7 +457,7 @@ struct RetailEngineCallAuthorizationAccess
     }
 };
 
-inline constexpr std::array<std::uintptr_t, 13>
+inline constexpr std::array<std::uintptr_t, 20>
 retailEngineCallAddressesAsArray(
     const RetailEngineCallAddressTable& addresses) noexcept
 {
@@ -385,19 +467,26 @@ retailEngineCallAddressesAsArray(
         addresses.niCameraCreate,
         addresses.cullingProcessConstruct,
         addresses.cullingProcessDestroy,
+        addresses.cullingProcessSetAccumulator,
         addresses.shaderAccumulatorConstruct,
         addresses.shaderAccumulatorDestroy,
         addresses.niRefObjectFree,
         addresses.accumulatorSetCamera,
         addresses.cullingProcessAlt,
         addresses.accumulatorAddVisibleArray,
+        addresses.rendererSetAccumulator,
+        addresses.setAccumulatingAccumulator,
+        addresses.setRenderingAccumulator,
         addresses.renderAccumulatorWithoutFinalize,
         addresses.finalizeAccumulator,
+        addresses.rendererSingleton,
+        addresses.accumulatingAccumulator,
+        addresses.renderingAccumulator,
     }};
 }
 
 inline constexpr RetailEngineCallAddressTable retailEngineCallAddressesFromArray(
-    const std::array<std::uintptr_t, 13>& addresses) noexcept
+    const std::array<std::uintptr_t, 20>& addresses) noexcept
 {
     return {
         addresses[0],
@@ -413,6 +502,13 @@ inline constexpr RetailEngineCallAddressTable retailEngineCallAddressesFromArray
         addresses[10],
         addresses[11],
         addresses[12],
+        addresses[13],
+        addresses[14],
+        addresses[15],
+        addresses[16],
+        addresses[17],
+        addresses[18],
+        addresses[19],
     };
 }
 
@@ -420,9 +516,9 @@ inline RetailEngineAddressRelocationFailure relocateRetailEngineCallTable(
     std::uintptr_t loadedImageBase,
     RetailEngineCallAddressTable& relocated) noexcept
 {
-    const std::array<std::uintptr_t, 13> preferred =
+    const std::array<std::uintptr_t, 20> preferred =
         retailEngineCallAddressesAsArray(RetailEngineCallPreferredAddresses);
-    std::array<std::uintptr_t, 13> candidate {};
+    std::array<std::uintptr_t, 20> candidate {};
     for (std::size_t index = 0u; index < preferred.size(); ++index)
     {
         const RetailEngineAddressRelocation result =
@@ -528,6 +624,9 @@ inline RetailEngineCallResolution resolveRetailEngineCalls(
         calls.cullingProcessDestroy =
             reinterpret_cast<abi::BSCullingProcessDestructorBodyFunction>(
                 addresses.cullingProcessDestroy);
+        calls.cullingProcessSetAccumulator =
+            reinterpret_cast<abi::CullingProcessSetAccumulatorFunction>(
+                addresses.cullingProcessSetAccumulator);
         calls.shaderAccumulatorConstruct =
             reinterpret_cast<abi::BSShaderAccumulatorConstructorFunction>(
                 addresses.shaderAccumulatorConstruct);
@@ -546,14 +645,32 @@ inline RetailEngineCallResolution resolveRetailEngineCalls(
         calls.accumulatorAddVisibleArray =
             reinterpret_cast<abi::AccumulatorAddVisibleArrayFunction>(
                 addresses.accumulatorAddVisibleArray);
+        calls.rendererSetAccumulator =
+            reinterpret_cast<abi::RendererSetAccumulatorFunction>(
+                addresses.rendererSetAccumulator);
+        calls.setAccumulatingAccumulator =
+            reinterpret_cast<abi::SetCurrentAccumulatorFunction>(
+                addresses.setAccumulatingAccumulator);
+        calls.setRenderingAccumulator =
+            reinterpret_cast<abi::SetCurrentAccumulatorFunction>(
+                addresses.setRenderingAccumulator);
         calls.renderAccumulatorWithoutFinalize =
             reinterpret_cast<abi::AccumulatorRenderFunction>(
                 addresses.renderAccumulatorWithoutFinalize);
         calls.finalizeAccumulator =
             reinterpret_cast<abi::AccumulatorRenderFunction>(
                 addresses.finalizeAccumulator);
+        calls.rendererSingleton =
+            reinterpret_cast<volatile abi::RetailPointer32*>(
+                addresses.rendererSingleton);
+        calls.accumulatingAccumulator =
+            reinterpret_cast<volatile abi::RetailPointer32*>(
+                addresses.accumulatingAccumulator);
+        calls.renderingAccumulator =
+            reinterpret_cast<volatile abi::RetailPointer32*>(
+                addresses.renderingAccumulator);
 
-        if (!calls.complete())
+        if (!calls.privateStereoComplete())
             return { {}, RetailEngineCallResolutionFailure::AddressOverflow };
         return { calls, RetailEngineCallResolutionFailure::None };
     }

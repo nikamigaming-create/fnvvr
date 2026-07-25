@@ -20,6 +20,26 @@ inline constexpr std::array<std::uint32_t, 3u>
         113u, // D3DFMT_A16B16G16R16F -> DXGI_FORMAT_R16G16B16A16_FLOAT
     };
 
+// CPU publication uses the canonical BGRA8 byte layout consumed by the
+// protocol-v7 OpenXR host. These formats are ordinary-D3D9 render targets and
+// do not require D3D9Ex shared handles.
+inline constexpr std::array<std::uint32_t, 2u>
+    RetailCpuEyeTargetColorFormats {
+        21u, // D3DFMT_A8R8G8B8
+        22u, // D3DFMT_X8R8G8B8
+    };
+
+constexpr bool retailCpuEyeTargetColorFormatAccepted(
+    std::uint32_t format) noexcept
+{
+    for (const std::uint32_t candidate : RetailCpuEyeTargetColorFormats)
+    {
+        if (candidate == format)
+            return true;
+    }
+    return false;
+}
+
 constexpr bool retailSharedEyeTargetColorFormatAccepted(
     std::uint32_t format) noexcept
 {

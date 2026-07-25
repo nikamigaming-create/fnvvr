@@ -246,7 +246,9 @@ struct SyntheticFixture
 
     std::array<ExecutableSectionLayout, 1> executableSections {};
     std::array<LoadedFunctionManifestEntry, 13> coreManifest {};
-    std::array<RetailFunctionAbiDescriptor, 22> functions {};
+    std::array<
+        RetailFunctionAbiDescriptor,
+        RetailFunctionAbiInventory.size()> functions {};
     std::array<RetailVtableSlotDescriptor, 16> vtableSlots {};
     std::array<RetailVtableBlockDescriptor, 1> vtableBlocks {};
     std::vector<ModuleObservation> modules = completeModuleSet();
@@ -539,7 +541,7 @@ void testCompleteDecisionPointDerivesEveryEvidenceField()
     require(evidence.coreManifestMatched,
         "the 13-entry core manifest was not derived");
     require(evidence.fullFunctionInventoryMatched,
-        "the 22-entry function inventory was not derived");
+        "the 23-entry function inventory was not derived");
     require(evidence.vtableSlotsMatched,
         "the 16 exact vtable slots were not derived");
     require(evidence.vtableBlocksMatched,
@@ -747,7 +749,7 @@ void testProductionEntryCannotAuthorizeThisTestProcess()
 int main()
 {
     static_assert(RetailEngineManifest.size() == 13u);
-    static_assert(RetailFunctionAbiInventory.size() == 22u);
+    static_assert(RetailFunctionAbiInventory.size() == 26u);
     static_assert(RetailVtableSlots.size() == 16u);
     static_assert(RetailVtableBlocks.size() == 1u);
     static_assert(sizeof(RetailBSCullingProcessLayout) == 0xC8u);

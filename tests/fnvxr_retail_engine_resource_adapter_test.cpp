@@ -66,6 +66,7 @@ struct FakeEngine
     int accumulatorDestructionCount = 0;
     bool cullerVtableRestoredBeforeDestroy = false;
     bool failAllocation = false;
+    bool misalignBindingAllocation = false;
 };
 
 FakeEngine* gFake = nullptr;
@@ -86,8 +87,21 @@ void* FNVXR_TEST_CDECL fakeAllocate(std::uint32_t byteCount)
 {
     if (gFake->failAllocation)
         return nullptr;
-    void* result = ::operator new(byteCount, std::nothrow);
-    if (byteCount == sizeof(Binding))
+    constexpr std::size_t BindingAllocationBytes =
+        sizeof(Binding) + alignof(Binding) - 1u;
+    void* result = nullptr;
+    if (byteCount == BindingAllocationBytes
+        && gFake->misalignBindingAllocation)
+    {
+        auto* base = static_cast<std::byte*>(
+            ::operator new(byteCount + alignof(Binding), std::nothrow));
+        result = base ? base + 4u : nullptr;
+    }
+    else
+    {
+        result = ::operator new(byteCount, std::nothrow);
+    }
+    if (byteCount == BindingAllocationBytes)
     {
         gFake->calls.push_back(BindingAllocate);
         gFake->bindingBytes = byteCount;
@@ -104,8 +118,18 @@ void* FNVXR_TEST_CDECL fakeAllocate(std::uint32_t byteCount)
 
 void FNVXR_TEST_CDECL fakeFree(void* allocation, std::uint32_t byteCount)
 {
-    if (byteCount == sizeof(Binding))
+    constexpr std::size_t BindingAllocationBytes =
+        sizeof(Binding) + alignof(Binding) - 1u;
+    if (byteCount == BindingAllocationBytes)
+    {
         gFake->calls.push_back(BindingFree);
+        if (gFake->misalignBindingAllocation)
+        {
+            ::operator delete(
+                static_cast<std::byte*>(allocation) - 4u);
+            return;
+        }
+    }
     ::operator delete(allocation);
 }
 
@@ -134,6 +158,9 @@ void FNVXR_TEST_THISCALL_IMPL fakeCullerDestroy(
     gFake->calls.push_back(CullerDestroy);
     gFake->cullerVtableRestoredBeforeDestroy = culler
         && culler->base.vtable == abi::BSCullingProcessVtableAddress;
+    require(
+        !culler || culler->shaderAccumulator == 0u,
+        "the adapter must release a stale culler accumulator reference before culler destruction");
 }
 
 abi::RetailBSShaderAccumulatorLayout* FNVXR_TEST_THISCALL_IMPL
@@ -151,6 +178,7 @@ fakeAccumulatorConstruct(
     gFake->accumulatorPasses[index] = passes;
     storage->vtable = static_cast<abi::RetailPointer32>(
         abi::BSShaderAccumulatorVtableAddress);
+    storage->referenceCount = 0u;
     return storage;
 }
 
@@ -161,6 +189,9 @@ fakeAccumulatorDestroy(
     std::uint32_t flags)
 {
     const int index = gFake->accumulatorDestructionCount++;
+    require(
+        accumulator->referenceCount == 0u,
+        "the adapter did not consume its accumulator ownership reference before destruction");
     gFake->calls.push_back(index == 0 ? RightDestroy : LeftDestroy);
     gFake->scalarDeletingFlags[index] = flags;
     ::operator delete(accumulator);
@@ -180,6 +211,27 @@ void FNVXR_TEST_THISCALL_IMPL fakeSetCamera(
     FNVXR_TEST_EDX_ARGUMENT
     abi::RetailNiCameraLayout*)
 {
+}
+
+void FNVXR_TEST_THISCALL_IMPL fakeSetCullerAccumulator(
+    abi::RetailBSCullingProcessLayout* culler,
+    FNVXR_TEST_EDX_ARGUMENT
+    abi::RetailBSShaderAccumulatorLayout* accumulator)
+{
+    if (culler->shaderAccumulator != 0u)
+    {
+        auto* previous = reinterpret_cast<
+            abi::RetailBSShaderAccumulatorLayout*>(
+                static_cast<std::uintptr_t>(
+                    culler->shaderAccumulator));
+        require(previous->referenceCount > 0u,
+            "the fake culler released an unowned accumulator");
+        --previous->referenceCount;
+    }
+    culler->shaderAccumulator = static_cast<abi::RetailPointer32>(
+        reinterpret_cast<std::uintptr_t>(accumulator));
+    if (accumulator)
+        ++accumulator->referenceCount;
 }
 
 void FNVXR_TEST_THISCALL_IMPL fakeProcessAlt(
@@ -221,6 +273,9 @@ RetailEngineCallResolution fakeResolution()
         abi::BSCullingProcessConstructorFunction>(&fakeCullerConstruct);
     calls.cullingProcessDestroy = engineFunction<
         abi::BSCullingProcessDestructorBodyFunction>(&fakeCullerDestroy);
+    calls.cullingProcessSetAccumulator = engineFunction<
+        abi::CullingProcessSetAccumulatorFunction>(
+            &fakeSetCullerAccumulator);
     calls.shaderAccumulatorConstruct = engineFunction<
         abi::BSShaderAccumulatorConstructorFunction>(
             &fakeAccumulatorConstruct);
@@ -277,7 +332,7 @@ int main()
     using namespace fnvxr::engine;
 
     const RetailEngineCallResolution resolution = fakeResolution();
-    require(resolution.complete(), "the fake call surface must cover all 13 retail calls");
+    require(resolution.complete(), "the fake call surface must cover all 14 retail calls");
 
     auto vtable = stockCullerVtable();
     RetailEngineResourceContext<CollectorCapacity> context;
@@ -315,10 +370,21 @@ int main()
             else
                 require(clone[index] == vtable[index], "every inherited non-Append vslot must stay stock");
         }
+#if defined(_MSC_VER) && defined(_M_IX86)
+        fakeSetCullerAccumulator(
+            result.resources.cullingProcess(),
+            nullptr,
+            result.resources.leftAccumulator());
+        require(
+            result.resources.leftAccumulator()->referenceCount == 2u,
+            "the teardown test must begin with a live culler NiPointer reference");
+#endif
     }
 
     requireExactLifecycle(fake);
-    require(fake.bindingBytes == sizeof(Binding), "Ni_Alloc must receive the complete binding allocation size");
+    require(
+        fake.bindingBytes == sizeof(Binding) + alignof(Binding) - 1u,
+        "Ni_Alloc must include enough padding to align the private binding");
     require(fake.cullerArgument == RetailWorldCullerConstructorArgument,
         "the culler constructor must receive the captured zero argument");
     for (int index = 0; index < 2; ++index)
@@ -334,6 +400,37 @@ int main()
         "the owned vtable must restore the stock culler vtable before the engine destructor");
     require(context.failure() == RetailEngineResourceAdapterFailure::None,
         "a complete lifecycle must leave the concrete adapter healthy");
+
+    RetailEngineResourceContext<CollectorCapacity> misalignedContext;
+    require(
+        misalignedContext.initialize(
+            resolution,
+            SupportedImageBase,
+            vtable.data(),
+            42u),
+        "the misaligned-allocation adapter context must initialize");
+    FakeEngine misalignedFake;
+    misalignedFake.misalignBindingAllocation = true;
+    gFake = &misalignedFake;
+    {
+        auto result = acquireCenterStereoResources<CollectorCapacity>(
+            makeRetailEngineStereoResourceOperations(misalignedContext),
+            StereoResourceLifecycleTestAuthority::issue(admitted),
+            RetailWorldStereoResourceConstructionParameters);
+        require(
+            result.succeeded(),
+            "a four-byte-aligned retail heap result must be promoted to the binding's eight-byte alignment");
+        require(
+            reinterpret_cast<std::uintptr_t>(
+                result.resources.collectorBinding())
+                    % alignof(Binding) == 0u,
+            "the exposed private binding address must satisfy its exact alignment");
+    }
+    requireExactLifecycle(misalignedFake);
+    require(
+        misalignedContext.failure()
+            == RetailEngineResourceAdapterFailure::None,
+        "aligned binding teardown must release the original retail allocation base");
 
     RetailEngineResourceContext<CollectorCapacity> incompleteContext;
     RetailEngineCallResolution incomplete = resolution;

@@ -88,6 +88,7 @@ $completionHashPath = Join-Path $runDirectory "completion.sha256"
 $hostOut = Join-Path $runDirectory "host.stdout.log"
 $hostErr = Join-Path $runDirectory "host.stderr.log"
 $probeLog = Join-Path $runDirectory "readiness-probe.log"
+$retailVrLog = Join-Path $runDirectory "fnvxr_retail_vr.log"
 $launcherLog = Join-Path $runDirectory "supervisor.log"
 New-Item -ItemType Directory -Path $runDirectory -Force | Out-Null
 
@@ -123,6 +124,8 @@ $manifest = [ordered]@{
         hostPose = $false
         retailRuntimeAndPose = $false
         exactModules = $false
+        retailVrBridge = $false
+        stereoOutput = $false
     }
     cleanup = [ordered]@{
         falloutStopped = $false
@@ -137,6 +140,7 @@ $manifest = [ordered]@{
         hostStdout = $hostOut
         hostStderr = $hostErr
         readinessProbe = $probeLog
+        retailVrBridge = $retailVrLog
     }
 }
 Write-FnvxrProductJsonAtomic -Value $manifest -Path $manifestPath
@@ -229,6 +233,118 @@ function Wait-FnvxrProductHostBridgeReady {
         Start-Sleep -Milliseconds 200
     } while ([DateTime]::UtcNow -lt $deadline)
     return $false
+}
+
+function Wait-FnvxrProductLogPattern {
+    param(
+        [Parameter(Mandatory = $true)][System.Diagnostics.Process]$Process,
+        [Parameter(Mandatory = $true)][string]$LogPath,
+        [Parameter(Mandatory = $true)][string]$Pattern,
+        [Parameter(Mandatory = $true)][int]$TimeoutSeconds
+    )
+
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    do {
+        $Process.Refresh()
+        if ($Process.HasExited) { return $false }
+        if ((Test-Path -LiteralPath $LogPath -PathType Leaf) -and
+            (Select-String -LiteralPath $LogPath -Pattern $Pattern `
+                -SimpleMatch -Quiet -ErrorAction SilentlyContinue)) {
+            return $true
+        }
+        Start-Sleep -Milliseconds 100
+    } while ([DateTime]::UtcNow -lt $deadline)
+    return $false
+}
+
+function Get-FnvxrProductStereoOutputProof {
+    param([Parameter(Mandatory = $true)][string]$LogPath)
+
+    if (-not (Test-Path -LiteralPath $LogPath -PathType Leaf)) {
+        return $null
+    }
+    $lines = @(Get-Content -LiteralPath $LogPath -Tail 300)
+    [array]::Reverse($lines)
+    foreach ($line in $lines) {
+        if (-not $line.StartsWith('{"event":"fnvxrOpenXrSubmit"')) {
+            continue
+        }
+        try {
+            $frame = $line | ConvertFrom-Json -ErrorAction Stop
+        } catch {
+            continue
+        }
+        $gpuProof =
+            [bool]$frame.stereoVisualTrialActive -and
+            [uint64]$frame.gpuV5Transaction -gt 0 -and
+            [uint64]$frame.gpuV5SourceFrame -gt 0 -and
+            [uint64]$frame.gpuV5PoseSequence -gt 0 -and
+            [bool]$frame.gpuV5RuntimeLineage -and
+            [bool]$frame.gpuV5ExactSourceView
+        $cpuProof =
+            [bool]$frame.cpuEngineStereoActive -and
+            [int]$frame.cpuEngineProducerMode -eq 4 -and
+            [uint64]$frame.cpuEngineTransaction -gt 0 -and
+            [uint64]$frame.sourceRenderPairSequence -gt 0 -and
+            [uint64]$frame.sourcePoseSequence -gt 0 -and
+            [uint64]$frame.sourceReferenceSpaceGeneration -gt 0 -and
+            [string]$frame.sourcePoseProducerEpoch -ne "0" -and
+            [string]$frame.sourceRendererProducerEpoch -ne "0" -and
+            [uint32]$frame.sourceProducerProcessId -gt 0 -and
+            [bool]$frame.sourcePoseAgeValid -and
+            [int]$frame.nonBlackSamples -gt 0 -and
+            [int]$frame.meaningfulDifferentSamples -gt 0 -and
+            [int]$frame.leftActiveTiles -gt 0 -and
+            [int]$frame.rightActiveTiles -gt 0 -and
+            [int]$frame.differentTiles -gt 0 -and
+            [string]$frame.leftHash -ne "0x0" -and
+            [string]$frame.rightHash -ne "0x0" -and
+            [string]$frame.leftHash -ne [string]$frame.rightHash
+        if (($gpuProof -or $cpuProof) -and
+            [bool]$frame.stereoFullscreen -and
+            [bool]$frame.runtimeGameplay -and
+            [bool]$frame.runtimeShouldRender -and
+            [bool]$frame.projectionLayerSubmitted -and
+            [int]$frame.layerCount -eq 1 -and
+            [string]$frame.xrEndFrame -eq "XR_SUCCESS" -and
+            [bool]$frame.leftOutputProof -and
+            [bool]$frame.rightOutputProof -and
+            [int]$frame.leftOutputNonBlackSamples -gt 0 -and
+            [int]$frame.rightOutputNonBlackSamples -gt 0 -and
+            [int]$frame.leftOutputVariedSamples -gt 0 -and
+            [int]$frame.rightOutputVariedSamples -gt 0 -and
+            [string]$frame.leftOutputHash -ne "0x0" -and
+            [string]$frame.rightOutputHash -ne "0x0" -and
+            [string]$frame.leftOutputHash -ne [string]$frame.rightOutputHash) {
+            $transport = if ($cpuProof) { "cpu-engine-v7" } else { "gpu-v5" }
+            $transaction = if ($cpuProof) {
+                [uint64]$frame.cpuEngineTransaction
+            } else {
+                [uint64]$frame.gpuV5Transaction
+            }
+            $sourceFrame = if ($cpuProof) {
+                [uint64]$frame.sourcePoseSequence
+            } else {
+                [uint64]$frame.gpuV5SourceFrame
+            }
+            $poseSequence = if ($cpuProof) {
+                [uint64]$frame.sourcePoseSequence
+            } else {
+                [uint64]$frame.gpuV5PoseSequence
+            }
+            return [ordered]@{
+                frame = [uint64]$frame.frame
+                transport = $transport
+                transaction = $transaction
+                sourceFrame = $sourceFrame
+                poseSequence = $poseSequence
+                leftOutputHash = [string]$frame.leftOutputHash
+                rightOutputHash = [string]$frame.rightOutputHash
+                observedAtUtc = [DateTime]::UtcNow.ToString("o")
+            }
+        }
+    }
+    return $null
 }
 
 try {
@@ -341,16 +457,23 @@ try {
         -TimeoutSeconds 10
     $manifest.readiness.exactModules = $true
     $manifest.processes.fallout.loadedProductModules = @($loadedD3d9, $loadedPlugin)
+    if (-not (Wait-FnvxrProductLogPattern `
+        -Process $fallout `
+        -LogPath $retailVrLog `
+        -Pattern "retail VR bridge initialized: exact world hook, ordinary-D3D9 CPU-v7 stereo transport, and deferred Present bootstrap ready" `
+        -TimeoutSeconds 15)) {
+        throw "The exact D3D9 module loaded, but its ordinary-D3D9 retail VR bridge never initialized. See $retailVrLog"
+    }
+    $manifest.readiness.retailVrBridge = $true
     $manifest.state = "ready-and-supervised"
-    $manifest.trialReady = $true
-    $manifest.readyAtUtc = [DateTime]::UtcNow.ToString("o")
     Write-FnvxrProductJsonAtomic -Value $manifest -Path $manifestPath
-    Write-SupervisorLog "stereo visual trial ready: retail runtime, pose, d3d9 bridge, and NVSE plugin identities are live; controller/weapon product gates remain closed"
+    Write-SupervisorLog "retail runtime, pose, exact modules, and the CPU-v7 engine bridge are live; waiting for proven binocular headset output"
 
     $deadline = [DateTime]::UtcNow.AddSeconds($MaximumRunSeconds)
     $healthFailures = 0
     $nextHealthCheck = [DateTime]::UtcNow
     $completion = $null
+    $stereoOutputProof = $null
     do {
         $hostProcess.Refresh()
         $fallout.Refresh()
@@ -360,6 +483,25 @@ try {
             break
         }
         if ([DateTime]::UtcNow -ge $nextHealthCheck) {
+            if (-not $stereoOutputProof) {
+                $stereoOutputProof =
+                    Get-FnvxrProductStereoOutputProof -LogPath $hostOut
+                if ($stereoOutputProof) {
+                    $manifest.readiness.stereoOutput = $true
+                    $manifest.stereoOutputProof = $stereoOutputProof
+                    $manifest.trialReady = $true
+                    $manifest.readyAtUtc = [DateTime]::UtcNow.ToString("o")
+                    Write-FnvxrProductJsonAtomic `
+                        -Value $manifest `
+                        -Path $manifestPath
+                    Write-SupervisorLog (
+                        "proven binocular output transaction={0} frame={1} left={2} right={3}; controller/weapon product gates remain closed" -f
+                        $stereoOutputProof.transaction,
+                        $stereoOutputProof.frame,
+                        $stereoOutputProof.leftOutputHash,
+                        $stereoOutputProof.rightOutputHash)
+                }
+            }
             if (Test-FnvxrProductProbeReady `
                 -ProbePath $probePath `
                 -Arguments @("--require-pose", "--require-runtime", "--require-advancing", "--sample-delay-ms", "100") `
@@ -375,6 +517,9 @@ try {
     } while ([DateTime]::UtcNow -lt $deadline)
     if (-not $completion) { $completion = "supervised-time-limit" }
 
+    if (-not $stereoOutputProof) {
+        throw "No proven binocular engine-stereo frame reached OpenXR before '$completion'. Enter a loaded gameplay world before the bounded visual trial expires; evidence is in $runDirectory"
+    }
     $normalCompletion = $completion -in @("retail-exited", "host-frame-limit", "supervised-time-limit")
     if (-not $normalCompletion) { throw "Product supervision failed: $completion" }
     $manifest.completion = $completion

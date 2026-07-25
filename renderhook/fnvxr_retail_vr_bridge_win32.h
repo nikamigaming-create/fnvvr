@@ -30,16 +30,24 @@ struct RetailVrBridgeOperations
     color_transport::ProducerPublication (*produceColorPair)(
         void*,
         const color_transport::ProducerFrameIdentity&) noexcept = nullptr;
+    // Ordinary D3D9 cannot export the eye textures to D3D11. The exact-retail
+    // bridge may instead synchronously read back and publish the two private
+    // engine targets after the same world transaction completes.
+    bool (*publishCpuPair)(
+        void*,
+        const engine::RetailTrackedFrame&,
+        std::uint64_t) noexcept = nullptr;
 };
 
 constexpr bool retailVrBridgeOperationsComplete(
     const RetailVrBridgeOperations& operations) noexcept
 {
+    const bool gpuPublicationComplete = operations.prepareColorProducer
+        && operations.produceColorPair;
     return operations.context
         && engine::retailEyeTargetOperationsComplete(operations.eyeTargets)
         && operations.prepareDistinctCameraFrame
-        && operations.prepareColorProducer
-        && operations.produceColorPair;
+        && (operations.publishCpuPair || gpuPublicationComplete);
 }
 
 class RetailV5PublicationSequence final
@@ -80,6 +88,14 @@ enum class RetailVrBridgeFailure : std::uint8_t
     WorldControllerRejected,
     HookMemoryRejected,
     HookInstallRejected,
+};
+
+struct RetailVrBridgeFrameDiagnostics
+{
+    engine::RetailWorldControllerResult controller {};
+    engine::RetailCenterRuntimeFrameResult renderer {};
+    std::uint64_t dispatchCount = 0u;
+    std::uint64_t stereoCompleteCount = 0u;
 };
 
 template <std::size_t CollectorCapacity>
@@ -164,13 +180,14 @@ public:
         // readGameplayFrame() reopen the two mappings lazily; gameplay remains
         // fail-closed until both stable publications exist.
         static_cast<void>(mTrackedFrames.initialize());
-        if (!mPublisher.initialize())
-            return fail(RetailVrBridgeFailure::ColorPublisherRejected);
-
         mResourceSetId = metadata.generation;
         if (mResourceSetId == 0u)
             mResourceSetId = 1u;
-        if (!mOperations.prepareColorProducer(
+        mCpuPublication = mOperations.publishCpuPair != nullptr;
+        if (!mCpuPublication && !mPublisher.initialize())
+            return fail(RetailVrBridgeFailure::ColorPublisherRejected);
+        if (!mCpuPublication
+            && !mOperations.prepareColorProducer(
                 mOperations.context,
                 mResourceSetId))
         {
@@ -222,7 +239,7 @@ public:
             && mFailure == RetailVrBridgeFailure::None
             && mAuthority.complete()
             && mCenterRuntime.ready()
-            && mPublisher.ready()
+            && (mCpuPublication || mPublisher.ready())
             && mController.ready()
             && mHookLease
             && mHookLease->installed();
@@ -231,6 +248,11 @@ public:
     RetailVrBridgeFailure failure() const noexcept
     {
         return mFailure;
+    }
+
+    RetailVrBridgeFrameDiagnostics frameDiagnostics() const noexcept
+    {
+        return mFrameDiagnostics;
     }
 
     bool dispatchFromFastcallAdapter(
@@ -253,6 +275,7 @@ public:
         const engine::RetailTrackedFrame& tracked) noexcept
     {
         if (!ready()
+            || mCpuPublication
             || !engine::validateRetailTrackedUiFrame(tracked).complete())
         {
             return false;
@@ -294,8 +317,20 @@ private:
         const engine::RetailWorldHookDispatchFrame& frame) noexcept
     {
         RetailVrBridgeWin32* bridge = checked(opaque);
-        if (bridge)
-            static_cast<void>(bridge->mController.dispatch(frame));
+        if (!bridge)
+            return;
+
+        bridge->mFrameDiagnostics.renderer = {};
+        const engine::RetailWorldControllerResult result =
+            bridge->mController.dispatch(frame);
+        bridge->mFrameDiagnostics.controller = result;
+        ++bridge->mFrameDiagnostics.dispatchCount;
+        if (result.complete()
+            && result.disposition
+                == engine::RetailWorldHookDisposition::StereoWorldComplete)
+        {
+            ++bridge->mFrameDiagnostics.stereoCompleteCount;
+        }
     }
 
     static bool callOriginalForUi(
@@ -353,9 +388,12 @@ private:
         RetailVrBridgeWin32* bridge = checked(opaque);
         if (!bridge)
             return {};
-        return bridge->mCenterRuntime.renderWorld(
+        const engine::RetailCenterRuntimeFrameResult result =
+            bridge->mCenterRuntime.renderWorld(
             bridge->mAuthority.authority.centerRenderer(),
             frame);
+        bridge->mFrameDiagnostics.renderer = result;
+        return result;
     }
 
     static bool publishGpuPair(
@@ -366,6 +404,14 @@ private:
         RetailVrBridgeWin32* bridge = checked(opaque);
         if (!bridge)
             return false;
+        if (bridge->mCpuPublication)
+        {
+            return bridge->mOperations.publishCpuPair
+                && bridge->mOperations.publishCpuPair(
+                    bridge->mOperations.context,
+                    tracked,
+                    transactionId);
+        }
         color_transport::ProducerFrameIdentity identity {};
         identity.presentationMode =
             gpu::color_v5::PresentationMode::BinocularWorld;
@@ -390,6 +436,7 @@ private:
         const color_transport::ProducerFrameIdentity& identity) noexcept
     {
         if (!ready()
+            || mCpuPublication
             || !gpu::color_v5::validPresentationMode(
                 identity.presentationMode))
         {
@@ -433,8 +480,10 @@ private:
     std::uint64_t mResourceSetId = 0u;
     RetailV5PublicationSequence mPublicationSequence {};
     ULONGLONG mReleasePendingSince = 0u;
+    RetailVrBridgeFrameDiagnostics mFrameDiagnostics {};
     RetailVrBridgeFailure mFailure =
         RetailVrBridgeFailure::UnsupportedArchitecture;
+    bool mCpuPublication = false;
     bool mInitialized = false;
 };
 }

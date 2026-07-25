@@ -80,8 +80,8 @@ int main()
         retailFunctionInventoryProductionProven(),
         "the independently captured ABI inventory must be production-proven");
     require(
-        RetailFunctionAbiInventory.size() == 22u,
-        "the complete ABI inventory must include the OnVisible dispatch thunk");
+        RetailFunctionAbiInventory.size() == 26u,
+        "the complete ABI inventory must include the culler accumulator binding and OnVisible dispatch thunk");
 
     for (std::size_t left = 0; left < RetailFunctionAbiInventory.size(); ++left)
     {

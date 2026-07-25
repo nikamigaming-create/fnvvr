@@ -11,6 +11,45 @@ void require(bool condition, const char* message)
     if (!condition)
         throw std::runtime_error(message);
 }
+
+bool snapshotEyeTargets(void*) noexcept { return false; }
+bool bindEyeTarget(
+    void*,
+    fnvxr::engine::CenterRendererEye,
+    fnvxr::engine::CenterRendererEyeIsolation&) noexcept
+{
+    return false;
+}
+bool endEyeTarget(
+    void*,
+    fnvxr::engine::CenterRendererEye,
+    fnvxr::engine::CenterRendererEyeIsolation&) noexcept
+{
+    return false;
+}
+void rollbackEyeTarget(
+    void*,
+    fnvxr::engine::CenterRendererEye,
+    fnvxr::engine::CenterRendererEyeIsolation&) noexcept
+{
+}
+bool restoreEyeTargets(void*) noexcept { return false; }
+bool prepareCameraFrame(
+    void*,
+    const fnvxr::engine::RetailWorldHookDispatchFrame&,
+    const fnvxr::engine::RetailTrackedFrame&,
+    std::uint64_t,
+    fnvxr::engine::RetailCenterRuntimeFrame&) noexcept
+{
+    return false;
+}
+bool publishCpuPair(
+    void*,
+    const fnvxr::engine::RetailTrackedFrame&,
+    std::uint64_t) noexcept
+{
+    return false;
+}
 }
 
 int main()
@@ -41,7 +80,32 @@ int main()
             && invalid == 0u,
         "unknown presentation mode consumed a publication identity");
 
+    fnvxr::d3d9::RetailVrBridgeOperations cpuOperations {};
+    cpuOperations.context = &cpuOperations;
+    cpuOperations.eyeTargets = {
+        &cpuOperations,
+        &snapshotEyeTargets,
+        &bindEyeTarget,
+        &endEyeTarget,
+        &rollbackEyeTarget,
+        &restoreEyeTargets,
+    };
+    cpuOperations.prepareDistinctCameraFrame = &prepareCameraFrame;
+    cpuOperations.publishCpuPair = &publishCpuPair;
+    require(
+        fnvxr::d3d9::retailVrBridgeOperationsComplete(cpuOperations),
+        "complete ordinary-D3D9 CPU publication operations were rejected");
+    cpuOperations.publishCpuPair = nullptr;
+    require(
+        !fnvxr::d3d9::retailVrBridgeOperationsComplete(cpuOperations),
+        "bridge accepted neither a CPU publisher nor a complete GPU publisher");
+
     fnvxr::d3d9::RetailVrBridgeWin32<4096u> bridge;
+    const auto initialDiagnostics = bridge.frameDiagnostics();
+    require(
+        initialDiagnostics.dispatchCount == 0u
+            && initialDiagnostics.stereoCompleteCount == 0u,
+        "bridge diagnostics did not start empty");
     require(
         !bridge.initialize({}, 0u),
         "empty bridge operations unexpectedly initialized");

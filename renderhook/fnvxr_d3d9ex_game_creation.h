@@ -80,5 +80,4 @@ constexpr GameD3D9CreationBackend selectGameD3D9CreationBackend(
         ? GameD3D9CreationBackend::LegacyD3D9
         : GameD3D9CreationBackend::Unavailable;
 }
-
 }

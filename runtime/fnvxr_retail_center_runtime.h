@@ -107,6 +107,7 @@ public:
         if (!mRendererContext.initialize(
                 resolution.calls,
                 *mResources.collectorBinding(),
+                *mResources.leftAccumulator(),
                 targets))
         {
             mResources = {};
@@ -129,6 +130,7 @@ public:
         mLastPoseFrame = 0u;
         mLastPoseSequence = 0;
         mOrigin = {};
+        mEyeCameraFailure = RetailEyeCameraFailure::None;
         mFailure = RetailCenterRuntimeFailure::None;
         mInitialized = true;
         return true;
@@ -143,6 +145,7 @@ public:
         if (!mRendererContext.initialize(
                 calls,
                 *mResources.collectorBinding(),
+                *mResources.leftAccumulator(),
                 targets))
         {
             return fail(RetailCenterRuntimeFailure::RendererOperationsRejected);

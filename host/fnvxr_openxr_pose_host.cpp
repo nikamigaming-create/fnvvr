@@ -314,6 +314,7 @@ struct Renderer
     bool stereoGameFrameWorldCandidate = false;
     LONG stereoGameFrameSequence = 0;
     LONG stereoGameRenderPairSequence = 0;
+    LONG stereoProducerMode = 0;
     LONG stereoGamePoseSequence = 0;
     XrTime stereoGameRenderedDisplayTime = 0;
     std::uint32_t stereoReferenceSpaceGeneration = 0;
@@ -912,12 +913,15 @@ float fovCenterCropRatio(float centerDegrees, float wideDegrees)
 
 bool stereoWorldRuntimeEnabled()
 {
-    // Color-only eye images cannot support certified translational 6DoF. Keep
-    // this path diagnostic-only until matching per-pixel depth is captured and
-    // submitted through XR_KHR_composition_layer_depth.
+    const bool exactEngineCenterTransport =
+        envEnabled("FNVXR_ENABLE_ENGINE_CENTER_STEREO", false);
+    const bool retainedDiagnostic =
+        envEnabled("FNVXR_USE_STEREO_GAME_TEXTURES", false)
+        && envEnabled(
+            "FNVXR_ENABLE_UNPROVEN_COLOR_ONLY_STEREO_DIAGNOSTIC",
+            false);
     return !envEnabled("FNVXR_DISABLE_STEREO_WORLD", false)
-        && envEnabled("FNVXR_USE_STEREO_GAME_TEXTURES", false)
-        && envEnabled("FNVXR_ENABLE_UNPROVEN_COLOR_ONLY_STEREO_DIAGNOSTIC", false);
+        && (exactEngineCenterTransport || retainedDiagnostic);
 }
 
 XrDuration swapchainWaitTimeout()
@@ -2396,9 +2400,10 @@ bool readSharedD3D9StereoFrame(
         return false;
     const bool requireNativeStereo = envEnabled("FNVXR_REQUIRE_NATIVE_STEREO", true);
     const LONG sourceRenderPairSequence = header->renderPairSequence;
+    const LONG sourceProducerMode = header->producerMode;
     const bool coherentSameTickProducer =
-        (header->producerMode == static_cast<LONG>(fnvxr::shared::StereoProducerNativeSameFrame)
-            || header->producerMode == static_cast<LONG>(fnvxr::shared::StereoProducerSingleTraversal))
+        fnvxr::shared::stereoProducerCarriesSameTransactionEyes(
+            static_cast<std::uint32_t>(sourceProducerMode))
         && fnvxr::shared::sequencedValueBits(sourceRenderPairSequence) != 0u;
     if (requireNativeStereo && !coherentSameTickProducer)
         return false;
@@ -2541,6 +2546,7 @@ bool readSharedD3D9StereoFrame(
     renderer.lastSharedStereoSequence = sequenceBefore;
     renderer.lastSharedStereoPublicationGeneration = publicationGenerationBefore;
     renderer.stereoGameRenderPairSequence = sourceRenderPairSequence;
+    renderer.stereoProducerMode = sourceProducerMode;
     renderer.stereoReferenceSpaceGeneration = sourceReferenceGeneration;
     renderer.stereoProducerEpoch = sourceProducerEpoch;
     renderer.stereoRendererProducerEpoch = sourceRendererProducerEpoch;
@@ -2664,8 +2670,8 @@ bool readSharedStereoState(
     const bool poseValid = header->poseValid != 0;
     const bool poseTimed = header->renderedDisplayTime > 0;
     const bool coherentSameTickProducer =
-        (header->producerMode == static_cast<LONG>(fnvxr::shared::StereoProducerNativeSameFrame)
-            || header->producerMode == static_cast<LONG>(fnvxr::shared::StereoProducerSingleTraversal))
+        fnvxr::shared::stereoProducerCarriesSameTransactionEyes(
+            static_cast<std::uint32_t>(header->producerMode))
         && fnvxr::shared::sequencedValueBits(header->renderPairSequence) != 0u;
     const bool acceptedProducer =
         !envEnabled("FNVXR_REQUIRE_NATIVE_STEREO", true) || coherentSameTickProducer;
@@ -7977,6 +7983,9 @@ int main(int argc, char** argv)
     const bool legacyImageDiagnostics =
         envEnabled("FNVXR_ENABLE_LEGACY_IMAGE_DIAGNOSTICS", false);
     const bool productionGpuColorV5 = !legacyImageDiagnostics;
+    const bool productionCpuEngineStereo =
+        !legacyImageDiagnostics
+        && envEnabled("FNVXR_ENABLE_ENGINE_CENTER_STEREO", false);
     if (legacyImageDiagnostics)
     {
         initPauseSceneTexture(device.Get(), renderer);
@@ -7984,6 +7993,8 @@ int main(int argc, char** argv)
     }
     std::cout << "gpuColorTransport version=5 productionDefault=1 productionActive="
               << static_cast<int>(productionGpuColorV5)
+              << " cpuEngineStereoProduction="
+              << static_cast<int>(productionCpuEngineStereo)
               << " legacyImageDiagnostics="
               << static_cast<int>(legacyImageDiagnostics) << "\n";
 
@@ -9135,6 +9146,14 @@ int main(int argc, char** argv)
                     "FNVXR_STEREO_SOURCE_POSE_FUTURE_TOLERANCE_MS",
                     5)))
             * 1000000LL;
+        const int64_t maximumCpuSourcePoseAgeNanoseconds =
+            static_cast<int64_t>(std::clamp(
+                envInt(
+                    "FNVXR_CPU_STEREO_MAX_SOURCE_POSE_AGE_MS",
+                    75),
+                1,
+                100))
+            * 1000000LL;
         const bool controlMode = mode == HostMode::Control;
         const bool flatMode = mode == HostMode::Flat;
         const bool vrMode = mode == HostMode::Vr;
@@ -9166,6 +9185,16 @@ int main(int argc, char** argv)
                 || controlMode
                 || (vrMode && envEnabled("FNVXR_SHOW_GAME_PLANE_IN_GAME", false)))
             && envEnabled("FNVXR_SHOW_GAME_PLANE_IN_GAME", true);
+        const bool allowCpuEngineStereo =
+            productionCpuEngineStereo
+            && vrMode
+            && stereoWorldIntent
+            && !gameUiMode
+            && haveRuntimeUiState
+            && runtimeGameplayActive;
+        int64_t cpuSourcePoseAgeNanoseconds = 0;
+        bool cpuSourcePoseAgeValid = false;
+        bool cpuEngineStereoActive = false;
         SourceViewPublication productSourceView {};
         const bool productSourceViewFound = sourceViewHistory.find(
             gpuColorFrame.frame,
@@ -9709,9 +9738,9 @@ int main(int argc, char** argv)
                     nextGamePlaneCapture = now + interval;
                 }
             }
-            if (allowStereoFullscreen)
+            if (allowStereoFullscreen || allowCpuEngineStereo)
             {
-                    updateStereoGameTextures(device.Get(), renderer);
+                updateStereoGameTextures(device.Get(), renderer);
             }
             else
             {
@@ -9725,7 +9754,7 @@ int main(int argc, char** argv)
                 renderer.stereoStableFrameCount = 0;
                 renderer.stereoFrameMisses = 0;
             }
-            if (allowStereoFullscreen
+            if ((allowStereoFullscreen || allowCpuEngineStereo)
                 && renderer.stereoFrameMisses > stereoStaleFrameLimit)
             {
                 renderer.hasStereoGameFrame = false;
@@ -9745,6 +9774,29 @@ int main(int argc, char** argv)
                 maximumSourcePoseAgeNanoseconds,
                 sourcePoseFutureToleranceNanoseconds,
                 &legacySourcePoseAgeNanoseconds);
+            cpuSourcePoseAgeValid =
+                fnvxr::stereo::sourcePoseAgeWithinBudget(
+                    frameState.predictedDisplayTime,
+                    renderer.stereoGameRenderedDisplayTime,
+                    maximumCpuSourcePoseAgeNanoseconds,
+                    sourcePoseFutureToleranceNanoseconds,
+                    &cpuSourcePoseAgeNanoseconds);
+            cpuEngineStereoActive =
+                allowCpuEngineStereo
+                && renderer.hasStereoGameFrame
+                && renderer.stereoGameFrameSeparated
+                && renderer.stereoGameFrameWorldCandidate
+                && renderer.stereoProducerMode
+                    == static_cast<LONG>(
+                        fnvxr::shared::StereoProducerEngineCenter)
+                && renderer.stereoGameRenderPairSequence != 0
+                && renderer.stereoStableFrameCount
+                    >= stereoStableHandoffFrames
+                && renderer.stereoReferenceSpaceGeneration
+                    == referenceSpaceGeneration
+                && renderer.stereoProducerEpoch
+                    == sharedBridge.producerEpoch
+                && cpuSourcePoseAgeValid;
             const bool legacyStereoFullscreenActive =
                 allowStereoFullscreen
                 && renderer.hasStereoGameFrame
@@ -9755,6 +9807,7 @@ int main(int argc, char** argv)
                 && legacySourcePoseAgeValid;
             const bool stereoFullscreenActive =
                 presentedBinocularWorld
+                || cpuEngineStereoActive
                 || legacyStereoFullscreenActive;
             submittedStereoFullscreen = stereoFullscreenActive;
             std::vector<XrView> submitViews = views;
@@ -9768,7 +9821,8 @@ int main(int argc, char** argv)
                 submitViews[1] = productSourceView.views[1];
                 usingSourceStereoViews = true;
             }
-            else if (legacyStereoFullscreenActive
+            else if ((cpuEngineStereoActive
+                    || legacyStereoFullscreenActive)
                 && renderer.stereoGameRenderedDisplayTime > 0)
             {
                 // These are the exact per-eye poses/FOV copied atomically with
@@ -9797,22 +9851,27 @@ int main(int argc, char** argv)
                 && stereoLossGamePlaneAllowed;
             const bool sceneBeforeQuad = false;
             const bool displayGamePlane = showGamePlane || stereoLossGamePlane;
-            if (legacyStereoFullscreenActive)
+            if (cpuEngineStereoActive
+                || legacyStereoFullscreenActive)
             {
                 missingStereoFrames = 0;
                 stereoFullscreenEverActive = true;
                 stereoProgressLostAt = {};
             }
-            else if (allowStereoFullscreen)
+            else if (allowStereoFullscreen || allowCpuEngineStereo)
                 ++missingStereoFrames;
-            const bool proofLineageFresh = legacyImageDiagnostics
-                && haveRuntimeUiState
-                && havePlayerSnapshot
-                && haveSharedStereoUiState;
-            if (legacyImageDiagnostics
+            const bool proofLineageFresh =
+                (legacyImageDiagnostics
+                    && haveRuntimeUiState
+                    && havePlayerSnapshot
+                    && haveSharedStereoUiState)
+                || (productionCpuEngineStereo
+                    && haveRuntimeUiState
+                    && haveSharedStereoUiState);
+            if ((legacyImageDiagnostics || productionCpuEngineStereo)
                 && stereoFullscreenEverActive
-                && stereoCellStable
                 && runtimeGameplayActive
+                && !cpuEngineStereoActive
                 && !legacyStereoFullscreenActive)
             {
                 const auto watchdogNow = std::chrono::steady_clock::now();
@@ -9837,7 +9896,7 @@ int main(int argc, char** argv)
             {
                 stereoProgressLostAt = {};
             }
-            if (legacyImageDiagnostics
+            if ((legacyImageDiagnostics || productionCpuEngineStereo)
                 && stereoFullscreenEverActive
                 && !proofLineageFresh
                 && !stereoProgressWatchdogExpired)
@@ -9893,6 +9952,10 @@ int main(int argc, char** argv)
                           << fnvxr::host::stereo_visual_trial::failureName(
                                  stereoVisualTrialDecision.failure)
                           << " gpuV5Ui=" << static_cast<int>(productionUiQuadActive)
+                          << " cpuEngineStereo="
+                          << static_cast<int>(cpuEngineStereoActive)
+                          << " cpuEngineProducerMode="
+                          << renderer.stereoProducerMode
                           << " productMode=" << static_cast<std::uint32_t>(productDecision.mode)
                           << " productReason=" << static_cast<std::uint32_t>(productDecision.reason)
                           << " productHud=" << static_cast<int>(productDecision.hudVisible)
@@ -9951,13 +10014,17 @@ int main(int argc, char** argv)
                           << " stereoPoseSeq=" << renderer.stereoGamePoseSequence
                           << " stereoRenderedTime=" << renderer.stereoGameRenderedDisplayTime
                           << " sourcePoseAgeNs="
-                          << (productionGpuColorV5
-                                 ? sourcePoseAgeNanoseconds
-                                 : legacySourcePoseAgeNanoseconds)
+                          << (cpuEngineStereoActive
+                                 ? cpuSourcePoseAgeNanoseconds
+                                 : (productionGpuColorV5
+                                     ? sourcePoseAgeNanoseconds
+                                     : legacySourcePoseAgeNanoseconds))
                           << " sourcePoseAgeValid="
-                          << static_cast<int>(productionGpuColorV5
-                                 ? sourcePoseAgeValid
-                                 : legacySourcePoseAgeValid)
+                          << static_cast<int>(cpuEngineStereoActive
+                                 ? cpuSourcePoseAgeValid
+                                 : (productionGpuColorV5
+                                     ? sourcePoseAgeValid
+                                     : legacySourcePoseAgeValid))
                           << " sourcePoseAgeLimitNs=" << maximumSourcePoseAgeNanoseconds
                           << " exactSourceStereoViews=" << static_cast<int>(usingSourceStereoViews)
                           << " stereoStable=" << renderer.stereoStableFrameCount << "/" << stereoStableHandoffFrames
@@ -9977,21 +10044,26 @@ int main(int argc, char** argv)
                     || legacyStereoFullscreenActive
                     || monoFullscreenFallback);
             if (presentedBinocularWorld
+                || cpuEngineStereoActive
                 || uiQuadVisible
                 || legacyDiagnosticVisible)
             {
                 ID3D11ShaderResourceView* leftProductionView =
-                    productionBinocularWorld
+                    cpuEngineStereoActive
+                        ? renderer.stereoGameTextureViews[0].Get()
+                        : (productionBinocularWorld
                         ? gpuColorConsumer.eyeView(0u)
                         : (stereoVisualTrialActive
                             ? stereoVisualTrialDecision.bindings.leftEyeSrv
-                            : nullptr);
+                            : nullptr));
                 ID3D11ShaderResourceView* rightProductionView =
-                    productionBinocularWorld
+                    cpuEngineStereoActive
+                        ? renderer.stereoGameTextureViews[1].Get()
+                        : (productionBinocularWorld
                         ? gpuColorConsumer.eyeView(1u)
                         : (stereoVisualTrialActive
                             ? stereoVisualTrialDecision.bindings.rightEyeSrv
-                            : nullptr);
+                            : nullptr));
                 ID3D11ShaderResourceView* productionUiView = uiQuadVisible
                     ? renderer.retainedUiTextureView.Get()
                     : nullptr;
@@ -10071,6 +10143,7 @@ int main(int argc, char** argv)
             else
             {
                 if (presentedBinocularWorld
+                    || cpuEngineStereoActive
                     || uiQuadVisible
                     || legacyDiagnosticVisible)
                 {
@@ -10143,6 +10216,13 @@ int main(int argc, char** argv)
                         ? "true"
                         : "false")
                 << ",\"stereoVisualTrialFullProductAccepted\":false"
+                << ",\"cpuEngineStereoActive\":"
+                << (cpuEngineStereoActive ? "true" : "false")
+                << ",\"cpuEngineProducerMode\":"
+                << renderer.stereoProducerMode
+                << ",\"cpuEngineTransaction\":"
+                << fnvxr::shared::sequencedValueBits(
+                    renderer.stereoGameRenderPairSequence)
                 << ",\"controllerMutationAuthorized\":false"
                 << ",\"trackedWeaponAuthorized\":false"
                 << ",\"productUiSourceFrame\":"
@@ -10171,9 +10251,20 @@ int main(int argc, char** argv)
                 << ",\"sourceRendererProducerEpoch\":\"" << renderer.stereoRendererProducerEpoch << "\""
                 << ",\"sourceProducerProcessId\":" << renderer.stereoProducerProcessId
                 << ",\"sourceRenderedDisplayTime\":" << renderer.stereoGameRenderedDisplayTime
-                << ",\"sourcePoseAgeNanoseconds\":" << sourcePoseAgeNanoseconds
-                << ",\"sourcePoseAgeValid\":" << (sourcePoseAgeValid ? "true" : "false")
-                << ",\"sourcePoseAgeLimitNanoseconds\":" << maximumSourcePoseAgeNanoseconds
+                << ",\"sourcePoseAgeNanoseconds\":"
+                << (cpuEngineStereoActive
+                    ? cpuSourcePoseAgeNanoseconds
+                    : sourcePoseAgeNanoseconds)
+                << ",\"sourcePoseAgeValid\":"
+                << ((cpuEngineStereoActive
+                        ? cpuSourcePoseAgeValid
+                        : sourcePoseAgeValid)
+                    ? "true"
+                    : "false")
+                << ",\"sourcePoseAgeLimitNanoseconds\":"
+                << (cpuEngineStereoActive
+                    ? maximumCpuSourcePoseAgeNanoseconds
+                    : maximumSourcePoseAgeNanoseconds)
                 << ",\"sourcePoseFutureToleranceNanoseconds\":" << sourcePoseFutureToleranceNanoseconds
                 << ",\"leftHash\":\"0x" << std::hex << renderer.stereoLeftHash
                 << "\",\"rightHash\":\"0x" << renderer.stereoRightHash << std::dec

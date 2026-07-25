@@ -71,6 +71,15 @@ struct RetailSceneGraphLayout
     float cameraFov;
 };
 
+// The stock AccumulateScene wrapper installs the active shader accumulator in
+// NiDX9Renderer before any geometry is admitted. Only the proven leading
+// ownership field is modeled here; the remainder of the renderer is opaque.
+struct RetailRendererAccumulatorOwnerLayout
+{
+    std::uint8_t opaqueBase[0x08];
+    RetailPointer32 accumulator;
+};
+
 struct RetailNiCullingProcessLayout
 {
     RetailPointer32 vtable;
@@ -117,6 +126,7 @@ static_assert(sizeof(RetailNiVisibleArrayLayout) == 0x10u);
 static_assert(sizeof(RetailNiAccumulatorLayout) == 0x0Cu);
 static_assert(sizeof(RetailNiCameraLayout) == 0x114u);
 static_assert(sizeof(RetailSceneGraphLayout) == 0xC0u);
+static_assert(sizeof(RetailRendererAccumulatorOwnerLayout) == 0x0Cu);
 static_assert(sizeof(RetailNiCullingProcessLayout) == 0x90u);
 static_assert(sizeof(RetailBSCullingProcessLayout) == 0xC8u);
 static_assert(sizeof(RetailBSShaderAccumulatorLayout) == 0x280u);
@@ -142,6 +152,8 @@ static_assert(offsetof(RetailSceneGraphLayout, visibleArray) == 0xB0u);
 static_assert(offsetof(RetailSceneGraphLayout, cullingProcess) == 0xB4u);
 static_assert(offsetof(RetailSceneGraphLayout, isMenuSceneGraph) == 0xB8u);
 static_assert(offsetof(RetailSceneGraphLayout, cameraFov) == 0xBCu);
+static_assert(
+    offsetof(RetailRendererAccumulatorOwnerLayout, accumulator) == 0x08u);
 
 static_assert(offsetof(RetailNiCullingProcessLayout, useAppendFunction) == 0x04u);
 static_assert(offsetof(RetailNiCullingProcessLayout, visibleArray) == 0x08u);
@@ -173,6 +185,11 @@ static_assert(std::is_trivially_copyable_v<RetailBSCullingProcessLayout>);
 static_assert(std::is_trivially_copyable_v<RetailBSShaderAccumulatorLayout>);
 
 inline constexpr std::uintptr_t SceneGraphSingletonPointerAddress = 0x011DEB7Cu;
+inline constexpr std::uintptr_t RendererSingletonPointerAddress = 0x011F4748u;
+inline constexpr std::uintptr_t AccumulatingAccumulatorPointerAddress =
+    0x011F95ECu;
+inline constexpr std::uintptr_t RenderingAccumulatorPointerAddress =
+    0x011F95F0u;
 inline constexpr std::uintptr_t BSCullingProcessVtableAddress = 0x0101E2ECu;
 inline constexpr std::uintptr_t BSShaderAccumulatorVtableAddress = 0x010ADFF8u;
 
@@ -240,6 +257,10 @@ using CullingProcessAltFunction = void
         RetailNiCameraLayout* camera,
         void* sceneObject,
         RetailNiVisibleArrayLayout* visibleArray);
+using CullingProcessSetAccumulatorFunction = void
+    (FNVXR_RETAIL_THISCALL*)(
+        RetailBSCullingProcessLayout* cullingProcess,
+        RetailBSShaderAccumulatorLayout* accumulator);
 using CullingProcessFunction = void
     (FNVXR_RETAIL_THISCALL*)(
         RetailBSCullingProcessLayout* cullingProcess,
@@ -264,6 +285,12 @@ using AccumulatorRenderFunction = void (FNVXR_RETAIL_CDECL*)(
     RetailNiCameraLayout* camera,
     RetailBSShaderAccumulatorLayout* accumulator,
     std::uint32_t branchSelectorOrContext);
+using RendererSetAccumulatorFunction = void
+    (FNVXR_RETAIL_THISCALL*)(
+        RetailRendererAccumulatorOwnerLayout* renderer,
+        RetailBSShaderAccumulatorLayout* accumulator);
+using SetCurrentAccumulatorFunction = void (FNVXR_RETAIL_CDECL*)(
+    RetailBSShaderAccumulatorLayout* accumulator);
 
 #undef FNVXR_RETAIL_CDECL
 #undef FNVXR_RETAIL_THISCALL
@@ -288,7 +315,7 @@ struct RetailFunctionAbiDescriptor
 // and both world-branch/wrapper call frames, establishing the argument
 // semantics recorded here.  Runtime use still requires a synchronous match in
 // the exact target process; this static inventory is never sufficient alone.
-inline constexpr std::array<RetailFunctionAbiDescriptor, 22>
+inline constexpr std::array<RetailFunctionAbiDescriptor, 26>
     RetailFunctionAbiInventory {{
         {
             "Ni_Alloc",
@@ -350,6 +377,19 @@ inline constexpr std::array<RetailFunctionAbiDescriptor, 22>
             RetailX86CallingConvention::Thiscall,
             0u,
             0u,
+            true,
+            true,
+            true,
+            2u,
+        },
+        {
+            "BSCullingProcess::SetAccumulator",
+            0x004A0FD0u,
+            32u,
+            sha256FromHex("0E8D694C72A4D0CE8E0C4D7AE13C736A60DD52C30814F123F3D7968CB08867B0"),
+            RetailX86CallingConvention::Thiscall,
+            1u,
+            4u,
             true,
             true,
             true,
@@ -428,6 +468,45 @@ inline constexpr std::array<RetailFunctionAbiDescriptor, 22>
             RetailX86CallingConvention::Thiscall,
             1u,
             4u,
+            true,
+            true,
+            true,
+            2u,
+        },
+        {
+            "NiDX9Renderer::SetAccumulator",
+            0x004DC540u,
+            28u,
+            sha256FromHex("074EEB885B54AD9928D05953D884D7EBE1E972F343218CB3B259847C544059CE"),
+            RetailX86CallingConvention::Thiscall,
+            1u,
+            4u,
+            true,
+            true,
+            true,
+            2u,
+        },
+        {
+            "SetAccumulatingAccumulator",
+            0x00B54AC0u,
+            67u,
+            sha256FromHex("090D769BE42412C91238B145FAF565C7E798B33383C36C013FC63D3F414D22E0"),
+            RetailX86CallingConvention::Cdecl,
+            1u,
+            0u,
+            true,
+            true,
+            true,
+            2u,
+        },
+        {
+            "SetRenderingAccumulator",
+            0x00B54B10u,
+            67u,
+            sha256FromHex("7275C2641733458099883732EAFB7CEFDC6B5C791F1ECB56AC24BF6864F7B7D3"),
+            RetailX86CallingConvention::Cdecl,
+            1u,
+            0u,
             true,
             true,
             true,

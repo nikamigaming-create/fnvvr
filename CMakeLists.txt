@@ -174,6 +174,7 @@ if(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 4)
         bcrypt
         fnvxr_d3d9ex_color_transport_win32
         fnvxr_gpu_color_publisher_win32
+        fnvxr_retail_ui_quad_capture_win32
         fnvxr_retail_runtime_authority
         fnvxr_retail_tracked_frame_win32
         fnvxr_retail_world_hook_win32)

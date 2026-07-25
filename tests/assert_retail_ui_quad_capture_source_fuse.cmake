@@ -7,7 +7,8 @@ set(hook_header "${ROOT}/renderhook/fnvxr_retail_ui_quad_capture_win32.h")
 set(hook_source "${ROOT}/renderhook/fnvxr_retail_ui_quad_capture_win32.cpp")
 set(proxy "${ROOT}/renderhook/fnvxr_d3d9_proxy.cpp")
 set(bridge "${ROOT}/renderhook/fnvxr_retail_vr_bridge_win32.h")
-foreach(path IN LISTS controller hook_header hook_source proxy bridge)
+set(activation "${ROOT}/renderhook/fnvxr_d3d9_activation.h")
+foreach(path IN LISTS controller hook_header hook_source proxy bridge activation)
     if(NOT EXISTS "${path}")
         message(FATAL_ERROR "Missing UI capture source: ${path}")
     endif()
@@ -18,8 +19,9 @@ file(READ "${hook_header}" hook_header_text)
 file(READ "${hook_source}" hook_source_text)
 file(READ "${proxy}" proxy_text)
 file(READ "${bridge}" bridge_text)
+file(READ "${activation}" activation_text)
 foreach(variable IN ITEMS
-        controller_text hook_header_text hook_source_text proxy_text bridge_text)
+        controller_text hook_header_text hook_source_text proxy_text bridge_text activation_text)
     string(REPLACE "\r\n" "\n" ${variable} "${${variable}}")
 endforeach()
 
@@ -121,21 +123,46 @@ forbid_text(
     "${bridge_text}"
     "mNextUiTransactionId"
     "UI transaction IDs must not use a disjoint range that regresses on return to world")
-forbid_text(
+require_text(
+    "${activation_text}"
+    "static_assert(!CompiledRetailVrBridgePolicy.exBackedGameDevice);"
+    "The isolated eye-texture path must preserve Fallout's ordinary D3D9 device")
+require_text(
+    "${activation_text}"
+    "static_assert(CompiledRetailVrBridgePolicy.leaseNativePresentSlot);"
+    "The isolated UI/deferred-startup seam must explicitly authorize its single Present-slot lease")
+require_text(
+    "${activation_text}"
+    "static_assert(!CompiledRetailVrBridgePolicy.replaceD3D9DeviceVtablePointer);"
+    "The narrow Present lease must not authorize whole-vtable replacement")
+require_text(
+    "${activation_text}"
+    "static_assert(CompiledRetailVrBridgePolicy.cpuImageTransfer);"
+    "The isolated engine bridge must explicitly authorize its bounded CPU transfer")
+require_text(
+    "${proxy_text}"
+    "#include \"fnvxr_retail_ui_quad_capture_win32.h\""
+    "The product proxy must import the isolated Present-slot adapter")
+require_text(
     "${proxy_text}"
     "gRetailUiPresentHook.initializeAuthorizedDevice("
-    "The retail product must not mutate the concrete D3D9 device's Present slot")
-forbid_text(
+    "The exact-retail device must install the isolated Present-slot adapter")
+require_text(
     "${proxy_text}"
-    "fnvxr_retail_ui_quad_capture_win32.h"
-    "The product proxy must not import the native Present-slot hook")
-forbid_text(
+    "if (!initializeRetailVrPresentBootstrap(*returnedDevice))"
+    "CreateDevice must fail closed if its authorized one-slot bootstrap cannot be installed")
+require_text(
     "${proxy_text}"
-    "initializeRetailVrPresentBootstrap(*returnedDevice)"
-    "CreateDevice must return Fallout's ordinary device without installing a vtable hook")
-forbid_text(
-    "${proxy_text}"
-    "initializeRetailVrBridge(*returnedDevice)"
-    "CreateDevice must not eagerly initialize the VR bridge before Fallout binds depth")
+    "&& initializeRetailVrBridge(context->device)"
+    "Present must retry the bridge only through the UI adapter's bounded callback")
+
+string(FIND "${proxy_text}" "if (!initializeRetailVrPresentBootstrap(*returnedDevice))" bootstrap_at)
+string(FIND "${proxy_text}" "static_cast<void>(initializeRetailVrBridge(*returnedDevice))" initial_bridge_at)
+if(bootstrap_at EQUAL -1
+    OR initial_bridge_at EQUAL -1
+    OR bootstrap_at GREATER initial_bridge_at)
+    message(FATAL_ERROR
+        "The one-slot Present bootstrap must be installed before any initial bridge attempt")
+endif()
 
 message(STATUS "Retail UI-only Present capture source fuse PASS")

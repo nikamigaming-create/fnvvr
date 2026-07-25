@@ -974,9 +974,9 @@ function Copy-FnvxrStageArtifact {
         [bool]$Copy
     )
 
-    $optional = [bool]$Item.Optional
+    $optional = [bool]($Item.ContainsKey('Optional') -and $Item.Optional)
     $sourceInfo = Get-FnvxrArtifactInfo -Path $Item.Source
-    if ($Item.Machine -and $sourceInfo.exists -and $sourceInfo.peMachine -ne $Item.Machine) {
+    if ($Item.ContainsKey('Machine') -and $Item.Machine -and $sourceInfo.exists -and $sourceInfo.peMachine -ne $Item.Machine) {
         throw "Build output has wrong PE architecture: $($Item.Source) expected=$($Item.Machine) actual=$($sourceInfo.peMachine)"
     }
     if (-not $sourceInfo.exists) {

@@ -21,6 +21,7 @@ enum class RetailEngineResourceAdapterFailure : std::uint8_t
     AllocationFailed,
     CleanupTokenMismatch,
     ConstructorInputMismatch,
+    AccumulatorReferenceOwnershipMismatch,
     CullerVtableInstallFailed,
 };
 
@@ -116,6 +117,8 @@ private:
     struct AllocationRecord
     {
         void* address = nullptr;
+        void* allocationBase = nullptr;
+        std::uint32_t allocationByteCount = 0u;
         std::uint64_t tokenGeneration = 0u;
         bool constructed = false;
 
@@ -127,6 +130,8 @@ private:
         void clear() noexcept
         {
             address = nullptr;
+            allocationBase = nullptr;
+            allocationByteCount = 0u;
             tokenGeneration = 0u;
             constructed = false;
         }
@@ -271,7 +276,14 @@ struct RetailEngineResourceAdapter
         abi::RetailNiCameraLayout* camera = context->mCalls.niCameraCreate();
         if (!camera)
             return { true, nullptr, {} };
-        context->mCamera = { camera, tokenGeneration, true };
+        context->mCamera = {
+            camera,
+            camera,
+            static_cast<std::uint32_t>(
+                StereoCameraLayoutMetadata.allocationByteCount),
+            tokenGeneration,
+            true,
+        };
         return {
             true,
             camera,
@@ -325,16 +337,54 @@ struct RetailEngineResourceAdapter
         const std::uint64_t tokenGeneration = context->issueTokenGeneration();
         if (tokenGeneration == 0u)
             return {};
-        void* raw = context->mCalls.niAllocate(
-            static_cast<std::uint32_t>(metadata.allocationByteCount));
-        if (!raw)
+        if (metadata.allocationAlignment == 0u
+            || (metadata.allocationAlignment
+                    & (metadata.allocationAlignment - 1u)) != 0u)
+        {
+            context->fail(RetailEngineResourceAdapterFailure::InvalidMetadata);
+            return {};
+        }
+        const std::size_t alignmentPadding =
+            metadata.allocationAlignment - 1u;
+        if (metadata.allocationByteCount
+            > (std::numeric_limits<std::uint32_t>::max)()
+                - alignmentPadding)
+        {
+            context->fail(RetailEngineResourceAdapterFailure::InvalidMetadata);
+            return {};
+        }
+        const auto allocationByteCount = static_cast<std::uint32_t>(
+            metadata.allocationByteCount + alignmentPadding);
+        void* allocationBase = context->mCalls.niAllocate(
+            allocationByteCount);
+        if (!allocationBase)
             return { true, nullptr, {} };
-        context->mBinding = { raw, tokenGeneration, false };
+        const std::uintptr_t allocationAddress =
+            reinterpret_cast<std::uintptr_t>(allocationBase);
+        if (allocationAddress
+            > (std::numeric_limits<std::uintptr_t>::max)()
+                - alignmentPadding)
+        {
+            context->mCalls.niFree(allocationBase, allocationByteCount);
+            context->fail(RetailEngineResourceAdapterFailure::AllocationFailed);
+            return {};
+        }
+        const std::uintptr_t alignedAddress =
+            (allocationAddress + alignmentPadding)
+            & ~static_cast<std::uintptr_t>(alignmentPadding);
+        void* alignedStorage = reinterpret_cast<void*>(alignedAddress);
+        context->mBinding = {
+            alignedStorage,
+            allocationBase,
+            allocationByteCount,
+            tokenGeneration,
+            false,
+        };
         return {
             true,
-            static_cast<Binding*>(raw),
+            static_cast<Binding*>(alignedStorage),
             StereoBindingStorageCleanupToken::fromOpaque(
-                reinterpret_cast<std::uintptr_t>(raw),
+                alignedAddress,
                 tokenGeneration),
         };
     }
@@ -364,8 +414,8 @@ struct RetailEngineResourceAdapter
             return;
         }
         context->mCalls.niFree(
-            context->mBinding.address,
-            static_cast<std::uint32_t>(metadata.allocationByteCount));
+            context->mBinding.allocationBase,
+            context->mBinding.allocationByteCount);
         context->mBinding.clear();
     }
 
@@ -481,7 +531,13 @@ struct RetailEngineResourceAdapter
             static_cast<std::uint32_t>(metadata.allocationByteCount));
         if (!raw)
             return { true, nullptr, {} };
-        record = { raw, tokenGeneration, false };
+        record = {
+            raw,
+            raw,
+            static_cast<std::uint32_t>(metadata.allocationByteCount),
+            tokenGeneration,
+            false,
+        };
         return {
             true,
             static_cast<abi::RetailBSShaderAccumulatorLayout*>(raw),
@@ -559,6 +615,18 @@ struct RetailEngineResourceAdapter
                 parameters.accumulatorBatchRendererCount,
                 parameters.accumulatorMaximumPassCount);
         record.constructed = true;
+        if (storage->referenceCount != 0u)
+        {
+            context->fail(
+                RetailEngineResourceAdapterFailure
+                    ::AccumulatorReferenceOwnershipMismatch);
+            return { true, nullptr };
+        }
+        // NiRefObject constructors begin at reference count zero.  This raw
+        // resource owner holds one explicit reference so the culler's scoped
+        // NiPointer binding can increment/decrement without deleting the
+        // accumulator before its eye render.
+        storage->referenceCount = 1u;
         return { true, returned };
     }
 
@@ -593,6 +661,44 @@ struct RetailEngineResourceAdapter
                 RetailEngineResourceAdapterFailure::CleanupTokenMismatch);
             return;
         }
+
+        // A failed frame must not leave the private culler's NiPointer holding
+        // an accumulator past its owner teardown. Release that scoped engine
+        // reference while both objects are still alive, then require the sole
+        // explicit owner reference before invoking the deleting destructor.
+        if (context->mBinding.active()
+            && context->mBinding.constructed)
+        {
+            auto* binding = static_cast<Binding*>(
+                context->mBinding.address);
+            auto* culler = binding ? binding->cullingProcess() : nullptr;
+            const std::uintptr_t accumulatorAddress =
+                reinterpret_cast<std::uintptr_t>(accumulator);
+            if (culler
+                && accumulatorAddress
+                    <= (std::numeric_limits<abi::RetailPointer32>::max)()
+                && culler->shaderAccumulator
+                    == static_cast<abi::RetailPointer32>(
+                        accumulatorAddress))
+            {
+                context->mCalls.cullingProcessSetAccumulator(culler, nullptr);
+                if (culler->shaderAccumulator != 0u)
+                {
+                    context->fail(
+                        RetailEngineResourceAdapterFailure
+                            ::AccumulatorReferenceOwnershipMismatch);
+                    return;
+                }
+            }
+        }
+        if (accumulator->referenceCount != 1u)
+        {
+            context->fail(
+                RetailEngineResourceAdapterFailure
+                    ::AccumulatorReferenceOwnershipMismatch);
+            return;
+        }
+        accumulator->referenceCount = 0u;
         (void)context->mCalls.shaderAccumulatorDestroy(accumulator, 1u);
         record.clear();
     }

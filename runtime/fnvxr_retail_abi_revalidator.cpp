@@ -829,8 +829,15 @@ bool finiteFrustum(const RetailNiFrustumLayout& value) noexcept
 bool verifyLiveLayouts(
     const MemoryReader& reader,
     std::uintptr_t imageBase,
-    const RevalidationContract& contract) noexcept
+    const RevalidationContract& contract,
+    RetailAbiRevalidationDiagnostics& diagnostics) noexcept
 {
+    using Failure = RetailLiveLayoutFailure;
+    diagnostics.liveLayoutFailure = Failure::None;
+    const auto reject = [&diagnostics](Failure failure) noexcept {
+        diagnostics.liveLayoutFailure = failure;
+        return false;
+    };
     std::uintptr_t singletonAddress = 0u;
     std::uintptr_t expectedCullerVtable = 0u;
     RetailPointer32 sceneAddress32 = 0u;
@@ -843,8 +850,11 @@ bool verifyLiveLayouts(
             contract,
             imageBase,
             contract.bSCullingProcessVtableAddress,
-            expectedCullerVtable)
-        || !rangeHasAccess(
+            expectedCullerVtable))
+    {
+        return reject(Failure::AddressRelocation);
+    }
+    if (!rangeHasAccess(
             reader,
             singletonAddress,
             sizeof(sceneAddress32),
@@ -853,13 +863,15 @@ bool verifyLiveLayouts(
         || !reader.read(
             singletonAddress,
             &sceneAddress32,
-            sizeof(sceneAddress32))
-        || sceneAddress32 == 0u)
+            sizeof(sceneAddress32)))
     {
-        return false;
+        return reject(Failure::SceneGraphSingletonUnreadable);
     }
+    if (sceneAddress32 == 0u)
+        return reject(Failure::SceneGraphPointersMissing);
 
     const std::uintptr_t sceneAddress = sceneAddress32;
+    diagnostics.liveSceneGraphAddress = sceneAddress;
     RetailSceneGraphLayout scene {};
     RetailNiCameraLayout camera {};
     RetailBSCullingProcessLayout culler {};
@@ -870,71 +882,109 @@ bool verifyLiveLayouts(
             sizeof(scene),
             false,
             false)
-        || !reader.read(sceneAddress, &scene, sizeof(scene))
-        || scene.camera == 0u
-        || scene.visibleArray == 0u
-        || scene.cullingProcess == 0u
-        || !rangeHasAccess(
+        || !reader.read(sceneAddress, &scene, sizeof(scene)))
+    {
+        return reject(Failure::SceneGraphUnreadable);
+    }
+    diagnostics.liveSceneCameraAddress = scene.camera;
+    diagnostics.liveSceneVisibleArrayAddress = scene.visibleArray;
+    diagnostics.liveSceneCullerAddress = scene.cullingProcess;
+    if (scene.camera == 0u || scene.cullingProcess == 0u)
+    {
+        return reject(Failure::SceneGraphPointersMissing);
+    }
+    if (!rangeHasAccess(
             reader,
             scene.camera,
             sizeof(camera),
             false,
             false)
-        || !rangeHasAccess(
+        || !reader.read(scene.camera, &camera, sizeof(camera)))
+    {
+        return reject(Failure::CameraUnreadable);
+    }
+    if (!rangeHasAccess(
             reader,
             scene.cullingProcess,
             sizeof(culler),
             false,
             false)
-        || !rangeHasAccess(
-            reader,
-            scene.visibleArray,
-            sizeof(visible),
-            false,
-            false)
-        || !reader.read(scene.camera, &camera, sizeof(camera))
-        || !reader.read(scene.cullingProcess, &culler, sizeof(culler))
-        || !reader.read(scene.visibleArray, &visible, sizeof(visible)))
+        || !reader.read(scene.cullingProcess, &culler, sizeof(culler)))
     {
-        return false;
+        return reject(Failure::CullerUnreadable);
+    }
+    diagnostics.liveCullerCameraAddress = culler.base.camera;
+    diagnostics.liveCullerVisibleArrayAddress = culler.base.visibleArray;
+
+    // SceneGraph::visibleArray and the matching culler bindings describe the
+    // stock cull operation in progress; retail clears them between traversals.
+    // Present-time authority therefore cannot require that transient state.
+    // When the stock traversal is bound, validate it fully. The center renderer
+    // owns independent per-eye visible arrays and never consumes this pointer.
+    const bool stockCullStateBound = scene.visibleArray != 0u;
+    if (stockCullStateBound
+        && (!rangeHasAccess(
+                reader,
+                scene.visibleArray,
+                sizeof(visible),
+                false,
+                false)
+            || !reader.read(scene.visibleArray, &visible, sizeof(visible))))
+    {
+        return reject(Failure::VisibleArrayUnreadable);
     }
 
-    if (scene.isMenuSceneGraph > 1u
-        || !finiteFloat(scene.cameraFov)
+    if (scene.isMenuSceneGraph > 1u)
+        return reject(Failure::MenuFlagInvalid);
+    if (!finiteFloat(scene.cameraFov)
         || scene.cameraFov <= 0.0f
-        || scene.cameraFov >= 180.0f
-        || culler.base.vtable != static_cast<RetailPointer32>(
-            expectedCullerVtable)
-        || culler.base.useAppendFunction > 1u
-        || culler.base.camera != scene.camera
-        || culler.base.visibleArray != scene.visibleArray
-        || culler.cullModeStackSize > 10u
-        || !finiteFrustum(camera.frustum)
-        || !finiteFrustum(culler.base.frustum)
-        || !finiteFloat(camera.minimumNearPlane)
-        || camera.minimumNearPlane <= 0.0f
-        || !finiteFloat(camera.maximumFarNearRatio)
-        || camera.maximumFarNearRatio <= 0.0f
-        || !finiteFloat(camera.viewport.left)
+        || scene.cameraFov >= 180.0f)
+        return reject(Failure::CameraFovInvalid);
+    if (culler.base.vtable
+        != static_cast<RetailPointer32>(expectedCullerVtable))
+        return reject(Failure::CullerVtableMismatch);
+    if (culler.base.useAppendFunction > 1u)
+        return reject(Failure::CullerAppendFlagInvalid);
+    if (stockCullStateBound && culler.base.camera != scene.camera)
+        return reject(Failure::CullerCameraMismatch);
+    if (stockCullStateBound
+        && culler.base.visibleArray != scene.visibleArray)
+        return reject(Failure::CullerVisibleArrayMismatch);
+    if (culler.cullModeStackSize > 10u)
+        return reject(Failure::CullerStackInvalid);
+    if (!finiteFrustum(camera.frustum))
+        return reject(Failure::CameraFrustumInvalid);
+    if (stockCullStateBound && !finiteFrustum(culler.base.frustum))
+        return reject(Failure::CullerFrustumInvalid);
+    if (!finiteFloat(camera.minimumNearPlane)
+        || camera.minimumNearPlane <= 0.0f)
+        return reject(Failure::CameraNearPlaneInvalid);
+    if (!finiteFloat(camera.maximumFarNearRatio)
+        || camera.maximumFarNearRatio <= 0.0f)
+        return reject(Failure::CameraFarNearRatioInvalid);
+    if (!finiteFloat(camera.viewport.left)
         || !finiteFloat(camera.viewport.right)
         || !finiteFloat(camera.viewport.top)
         || !finiteFloat(camera.viewport.bottom)
         || camera.viewport.left == camera.viewport.right
-        || camera.viewport.top == camera.viewport.bottom
-        || !finiteFloat(camera.lodAdjust)
-        || camera.lodAdjust <= 0.0f
-        || visible.itemCount > visible.capacity
-        || visible.capacity > 10000000u
-        || (visible.itemCount != 0u && visible.geometryPointers == 0u))
-    {
-        return false;
-    }
+        || camera.viewport.top == camera.viewport.bottom)
+        return reject(Failure::CameraViewportInvalid);
+    if (!finiteFloat(camera.lodAdjust) || camera.lodAdjust <= 0.0f)
+        return reject(Failure::CameraLodInvalid);
+    if (stockCullStateBound
+        && (visible.itemCount > visible.capacity
+            || visible.capacity > 10000000u))
+        return reject(Failure::VisibleArrayCountsInvalid);
+    if (stockCullStateBound
+        && visible.itemCount != 0u
+        && visible.geometryPointers == 0u)
+        return reject(Failure::VisibleArrayStorageMissing);
     for (float value : camera.worldToCamera)
     {
         if (!finiteFloat(value))
-            return false;
+            return reject(Failure::CameraWorldMatrixInvalid);
     }
-    if (visible.itemCount != 0u)
+    if (stockCullStateBound && visible.itemCount != 0u)
     {
         const std::size_t pointerBytes =
             static_cast<std::size_t>(visible.itemCount) * sizeof(RetailPointer32);
@@ -945,7 +995,7 @@ bool verifyLiveLayouts(
                 false,
                 false))
         {
-            return false;
+            return reject(Failure::VisibleArrayStorageMissing);
         }
     }
     return true;
@@ -1154,7 +1204,8 @@ RetailAbiRevalidationResult revalidateSnapshot(
     result.evidence.liveObjectLayoutsVerified = verifyLiveLayouts(
         reader,
         imageBase,
-        contract);
+        contract,
+        result.diagnostics);
     result.evidence.constructorOwnershipVerified =
         result.evidence.fullFunctionInventoryMatched
         && sealedConstructorOwnership(contract);

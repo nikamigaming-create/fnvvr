@@ -155,7 +155,9 @@ struct Fixture
         std::vector<std::uint8_t>(RenderFirstPersonBytes, 0x90u);
 
     std::array<LoadedFunctionManifestEntry, 13> coreManifest {};
-    std::array<RetailFunctionAbiDescriptor, 22> functions {};
+    std::array<
+        RetailFunctionAbiDescriptor,
+        RetailFunctionAbiInventory.size()> functions {};
     std::array<RetailVtableSlotDescriptor, 16> slots {};
     std::array<RetailVtableBlockDescriptor, 1> blocks {};
     std::vector<SyntheticModule> modulesBefore {};
@@ -505,7 +507,7 @@ void testExactOptionalModulesAndJipNormalizationAuthorize()
             && proof.diagnostics.showOffPresent,
         "the exact optional-module path was not diagnosed");
     require(proof.diagnostics.protectedCoreBodiesHashed == 13u
-            && proof.diagnostics.protectedFunctionsHashed == 22u
+            && proof.diagnostics.protectedFunctionsHashed == 26u
             && proof.diagnostics.protectedVtableSlotsRead == 16u
             && proof.diagnostics.protectedVtableBytesHashed == 0x50u,
         "not every protected engine range was inspected");

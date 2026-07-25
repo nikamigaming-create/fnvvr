@@ -75,10 +75,21 @@ inline LONG selectWritableStereoFrameSlot(
 // NativeSameFrame is the legacy two-engine-traversal producer. SingleTraversal
 // applies the HMD pose to the retail camera once, builds one Gamebryo scene,
 // and replays that exact D3D draw stream into both eyes from the same tick.
+// EngineCenter renders one conservative center cull into two private engine
+// accumulators and publishes those exact same-transaction eye targets.
 constexpr std::uint32_t StereoProducerUnknown = 0;
 constexpr std::uint32_t StereoProducerDrawReplay = 1;
 constexpr std::uint32_t StereoProducerNativeSameFrame = 2;
 constexpr std::uint32_t StereoProducerSingleTraversal = 3;
+constexpr std::uint32_t StereoProducerEngineCenter = 4;
+
+constexpr bool stereoProducerCarriesSameTransactionEyes(
+    std::uint32_t producerMode) noexcept
+{
+    return producerMode == StereoProducerNativeSameFrame
+        || producerMode == StereoProducerSingleTraversal
+        || producerMode == StereoProducerEngineCenter;
+}
 
 constexpr std::uint32_t RuntimePhaseUnknown = 0;
 constexpr std::uint32_t RuntimePhaseMenu = 1;

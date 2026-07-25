@@ -75,6 +75,8 @@ void requireAddresses(
                 == 0x004A0EB0u + delta
             && functionAddress(calls.cullingProcessDestroy)
                 == 0x004A0F60u + delta
+            && functionAddress(calls.cullingProcessSetAccumulator)
+                == 0x004A0FD0u + delta
             && functionAddress(calls.shaderAccumulatorConstruct)
                 == 0x00B660D0u + delta
             && functionAddress(calls.shaderAccumulatorDestroy)
@@ -87,10 +89,22 @@ void requireAddresses(
                 == 0x00C4F070u + delta
             && functionAddress(calls.accumulatorAddVisibleArray)
                 == 0x00A9B790u + delta
+            && functionAddress(calls.rendererSetAccumulator)
+                == 0x004DC540u + delta
+            && functionAddress(calls.setAccumulatingAccumulator)
+                == 0x00B54AC0u + delta
+            && functionAddress(calls.setRenderingAccumulator)
+                == 0x00B54B10u + delta
             && functionAddress(calls.renderAccumulatorWithoutFinalize)
                 == 0x00B6BA20u + delta
             && functionAddress(calls.finalizeAccumulator)
-                == 0x00B6B930u + delta,
+                == 0x00B6B930u + delta
+            && reinterpret_cast<std::uintptr_t>(calls.rendererSingleton)
+                == 0x011F4748u + delta
+            && reinterpret_cast<std::uintptr_t>(
+                calls.accumulatingAccumulator) == 0x011F95ECu + delta
+            && reinterpret_cast<std::uintptr_t>(
+                calls.renderingAccumulator) == 0x011F95F0u + delta,
         "every resolved engine call must use its exact ASLR-relocated address");
 }
 }
@@ -122,6 +136,9 @@ int main()
         RetailEngineCallPreferredAddresses.cullingProcessDestroy
         == 0x004A0F60u);
     static_assert(
+        RetailEngineCallPreferredAddresses.cullingProcessSetAccumulator
+        == 0x004A0FD0u);
+    static_assert(
         RetailEngineCallPreferredAddresses.shaderAccumulatorConstruct
         == 0x00B660D0u);
     static_assert(
@@ -140,11 +157,29 @@ int main()
         RetailEngineCallPreferredAddresses.accumulatorAddVisibleArray
         == 0x00A9B790u);
     static_assert(
+        RetailEngineCallPreferredAddresses.rendererSetAccumulator
+        == 0x004DC540u);
+    static_assert(
+        RetailEngineCallPreferredAddresses.setAccumulatingAccumulator
+        == 0x00B54AC0u);
+    static_assert(
+        RetailEngineCallPreferredAddresses.setRenderingAccumulator
+        == 0x00B54B10u);
+    static_assert(
         RetailEngineCallPreferredAddresses.renderAccumulatorWithoutFinalize
         == 0x00B6BA20u);
     static_assert(
         RetailEngineCallPreferredAddresses.finalizeAccumulator
         == 0x00B6B930u);
+    static_assert(
+        RetailEngineCallPreferredAddresses.rendererSingleton
+        == 0x011F4748u);
+    static_assert(
+        RetailEngineCallPreferredAddresses.accumulatingAccumulator
+        == 0x011F95ECu);
+    static_assert(
+        RetailEngineCallPreferredAddresses.renderingAccumulator
+        == 0x011F95F0u);
     static_assert(retailEngineCallInventoryComplete());
 
     const RetailEngineCallResolution defaultAuthorization =
@@ -234,20 +269,27 @@ int main()
                 == RelocatedBase + (0x00B6B930u - SupportedImageBase),
         "ASLR relocation must preserve the preferred-image offset");
 
-    const std::array<std::uintptr_t, 13> everyPreferredAddress {{
+    const std::array<std::uintptr_t, 20> everyPreferredAddress {{
         RetailEngineCallPreferredAddresses.niAllocate,
         RetailEngineCallPreferredAddresses.niFree,
         RetailEngineCallPreferredAddresses.niCameraCreate,
         RetailEngineCallPreferredAddresses.cullingProcessConstruct,
         RetailEngineCallPreferredAddresses.cullingProcessDestroy,
+        RetailEngineCallPreferredAddresses.cullingProcessSetAccumulator,
         RetailEngineCallPreferredAddresses.shaderAccumulatorConstruct,
         RetailEngineCallPreferredAddresses.shaderAccumulatorDestroy,
         RetailEngineCallPreferredAddresses.niRefObjectFree,
         RetailEngineCallPreferredAddresses.accumulatorSetCamera,
         RetailEngineCallPreferredAddresses.cullingProcessAlt,
         RetailEngineCallPreferredAddresses.accumulatorAddVisibleArray,
+        RetailEngineCallPreferredAddresses.rendererSetAccumulator,
+        RetailEngineCallPreferredAddresses.setAccumulatingAccumulator,
+        RetailEngineCallPreferredAddresses.setRenderingAccumulator,
         RetailEngineCallPreferredAddresses.renderAccumulatorWithoutFinalize,
         RetailEngineCallPreferredAddresses.finalizeAccumulator,
+        RetailEngineCallPreferredAddresses.rendererSingleton,
+        RetailEngineCallPreferredAddresses.accumulatingAccumulator,
+        RetailEngineCallPreferredAddresses.renderingAccumulator,
     }};
     for (const std::uintptr_t preferredAddress : everyPreferredAddress)
     {
