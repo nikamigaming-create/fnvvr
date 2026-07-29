@@ -99,6 +99,10 @@ int main()
     static_assert(std::is_pointer_v<BSCullingProcessConstructorFunction>);
     static_assert(std::is_pointer_v<BSShaderAccumulatorConstructorFunction>);
     static_assert(std::is_pointer_v<AccumulatorAddVisibleArrayFunction>);
+    static_assert(
+        std::is_pointer_v<AccumulatorFinishAccumulatingFunction>);
+    static_assert(
+        std::is_pointer_v<FinishAccumulatingShaderAccumulatorFunction>);
     static_assert(std::is_pointer_v<GeometryOnVisibleFunction>);
     static_assert(std::is_pointer_v<CullingProcessAltFunction>);
     static_assert(std::is_pointer_v<AccumulatorRenderFunction>);
@@ -118,8 +122,8 @@ int main()
         retailFunctionInventoryProductionProven(),
         "the independently captured ABI inventory must be production-proven");
     require(
-        RetailFunctionAbiInventory.size() == 26u,
-        "the complete ABI inventory must include the culler accumulator binding and OnVisible dispatch thunk");
+        RetailFunctionAbiInventory.size() == 28u,
+        "the complete ABI inventory must include finish-accumulating, culler binding, and OnVisible dispatch");
 
     for (std::size_t left = 0; left < RetailFunctionAbiInventory.size(); ++left)
     {
@@ -171,8 +175,8 @@ int main()
             "shared ABI and core-manifest identities must not drift apart");
     }
     require(
-        coreFunctionsCrossChecked == 7u,
-        "all seven core accumulator/culling ABI bodies must cross-check the manifest");
+        coreFunctionsCrossChecked == 9u,
+        "all nine core accumulator/culling ABI bodies must cross-check the manifest");
 
     const auto allocate = findFunction("Ni_Alloc");
     const auto free = findFunction("Ni_Free");
@@ -231,6 +235,35 @@ int main()
         "the shader deleting destructor must stay independently hash-gated");
 
     const auto addVisibleArray = findFunction("NiAccumulator::AddVisibleArray");
+    const auto finishVisible =
+        findFunction("NiAccumulator::FinishAccumulating");
+    const auto finishShader =
+        findFunction("FinishAccumulatingShaderAccumulator");
+    require(
+        finishVisible != RetailFunctionAbiInventory.end()
+            && finishVisible->preferredAddress == 0x00A9B570u
+            && finishVisible->byteCount == 437u
+            && finishVisible->callingConvention
+                == RetailX86CallingConvention::Thiscall
+            && finishVisible->stackArgumentCount == 0u
+            && finishVisible->sha256.bytes
+                == sha256FromHex(
+                       "192CA9CE2B5C39AC15A0DBFA4F6D2650471A17775AD3950032419C381A3FB20F")
+                       .bytes,
+        "the +0xA4 visible-list finishing target must be independently hash-sealed");
+    require(
+        finishShader != RetailFunctionAbiInventory.end()
+            && finishShader->preferredAddress == 0x00B65E80u
+            && finishShader->byteCount == 51u
+            && finishShader->callingConvention
+                == RetailX86CallingConvention::Cdecl
+            && finishShader->stackArgumentCount == 1u
+            && finishShader->calleePopBytes == 0u
+            && finishShader->sha256.bytes
+                == sha256FromHex(
+                       "9D03349FA8780CF4B1898D4B0355D03BD58343E6D514ABE5F44734C63F8E0684")
+                       .bytes,
+        "the stock shader-batch preparation wrapper must retain its exact cdecl ABI");
     require(
         addVisibleArray != RetailFunctionAbiInventory.end()
             && addVisibleArray->preferredAddress == 0x00A9B790u

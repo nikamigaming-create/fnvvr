@@ -86,15 +86,41 @@ enum class Event : std::uint8_t
     Snapshot,
     BindLeft,
     AddLeft,
+    FinishLeft,
     RenderLeft,
     FinalizeLeft,
     EndLeft,
     BindRight,
     AddRight,
+    FinishRight,
     RenderRight,
     FinalizeRight,
     EndRight,
     Restore,
+};
+
+struct QueueGeometryFixture
+{
+    std::array<std::uint8_t, 0xA0u> geometry {};
+    std::array<std::uint8_t, 0x1Au> property {};
+
+    void initialize() noexcept
+    {
+#if defined(_MSC_VER) && defined(_M_IX86)
+        const abi::RetailPointer32 propertyAddress =
+            static_cast<abi::RetailPointer32>(
+                reinterpret_cast<std::uintptr_t>(property.data()));
+        const std::uint16_t propertyFlags = 0x0001u;
+        std::memcpy(
+            geometry.data() + 0x9Cu,
+            &propertyAddress,
+            sizeof(propertyAddress));
+        std::memcpy(
+            property.data() + 0x18u,
+            &propertyFlags,
+            sizeof(propertyFlags));
+#endif
+    }
 };
 
 struct FakeState
@@ -104,12 +130,11 @@ struct FakeState
     abi::RetailBSShaderAccumulatorLayout* left = nullptr;
     abi::RetailBSShaderAccumulatorLayout* right = nullptr;
     int accumulatorConstructionCount = 0;
-    int geometry[3] { 1, 2, 3 };
+    QueueGeometryFixture geometry[3] {};
     abi::RetailPointer32 stockGeometryPointers[3] {};
     abi::RetailNiVisibleArrayLayout stockVisibleArray {};
     std::uint32_t addCount = 0u;
     std::uint32_t stockAppendCount = 0u;
-    abi::RetailPointer32 visiblePointers[2] {};
     abi::RetailNiCameraLayout* cullCamera = nullptr;
     abi::RetailNiCameraLayout* eyeCameras[2] {};
     abi::RetailRendererAccumulatorOwnerLayout renderer {};
@@ -117,6 +142,7 @@ struct FakeState
     abi::RetailPointer32 rendererSingleton = 0u;
     abi::RetailPointer32 accumulatingAccumulator = 0u;
     abi::RetailPointer32 renderingAccumulator = 0u;
+    abi::RetailPointer32 populationRenderingAccumulator = 0u;
     abi::RetailPointer32 stockCullerVtable = 0u;
 };
 
@@ -221,6 +247,17 @@ void FNVXR_TEST_THISCALL_IMPL fakeCullerDestroy(
     require(
         culler && culler->base.vtable == gState->stockCullerVtable,
         "runtime did not restore the stock culler vtable before teardown");
+    if (culler->shaderAccumulator != 0u)
+    {
+        auto* accumulator = reinterpret_cast<
+            abi::RetailBSShaderAccumulatorLayout*>(
+                static_cast<std::uintptr_t>(culler->shaderAccumulator));
+        require(
+            accumulator->referenceCount > 0u,
+            "culler teardown released an unowned accumulator");
+        --accumulator->referenceCount;
+        culler->shaderAccumulator = 0u;
+    }
 }
 
 void FNVXR_TEST_THISCALL_IMPL fakeSetCullerAccumulator(
@@ -284,6 +321,7 @@ fakeAccumulatorConstruct(
     storage->vtable = static_cast<abi::RetailPointer32>(
         abi::BSShaderAccumulatorVtableAddress);
     storage->referenceCount = 0u;
+    storage->renderMode = 0u;
     return storage;
 }
 
@@ -345,20 +383,11 @@ void __fastcall fakeOriginalAppend(
 #endif
 
 void FNVXR_TEST_THISCALL_IMPL fakeAddVisible(
-    abi::RetailNiAccumulatorLayout* accumulator,
+    abi::RetailNiAccumulatorLayout*,
     FNVXR_TEST_EDX_ARGUMENT
-    abi::RetailNiVisibleArrayLayout* visible)
+    abi::RetailNiVisibleArrayLayout*)
 {
-    const bool left = reinterpret_cast<abi::RetailBSShaderAccumulatorLayout*>(
-        accumulator) == gState->left;
-    const abi::RetailPointer32 expected = static_cast<abi::RetailPointer32>(
-        reinterpret_cast<std::uintptr_t>(accumulator));
-    require(gState->renderer.accumulator == expected
-            && gState->accumulatingAccumulator == expected,
-        "runtime did not register the eye accumulator before visible admission");
-    gState->events.push_back(left ? Event::AddLeft : Event::AddRight);
-    require(gState->addCount < 2u, "visible set added more than twice");
-    gState->visiblePointers[gState->addCount++] = visible->geometryPointers;
+    require(false, "runtime must not replay AddVisibleArray for private eyes");
 }
 
 void FNVXR_TEST_CDECL fakeRender(
@@ -373,6 +402,23 @@ void FNVXR_TEST_CDECL fakeRender(
         camera == gState->eyeCameras[left ? 0 : 1],
         "render did not receive the accumulator's exact eye camera");
     gState->events.push_back(left ? Event::RenderLeft : Event::RenderRight);
+}
+
+void FNVXR_TEST_THISCALL_IMPL fakeFinishAccumulating(
+    abi::RetailNiAccumulatorLayout* base
+    FNVXR_TEST_TRAILING_EDX)
+{
+    auto* accumulator =
+        reinterpret_cast<abi::RetailBSShaderAccumulatorLayout*>(base);
+    const bool left = accumulator == gState->left;
+    const abi::RetailPointer32 expected = accumulatorAddress(accumulator);
+    require(gState->renderer.accumulator == expected
+            && gState->accumulatingAccumulator == expected
+            && gState->renderingAccumulator
+                == gState->populationRenderingAccumulator,
+        "runtime changed accumulator ownership before finish-accumulating");
+    gState->events.push_back(
+        left ? Event::FinishLeft : Event::FinishRight);
 }
 
 void FNVXR_TEST_CDECL fakeFinalize(
@@ -395,11 +441,35 @@ Target engineFunction(Source source) noexcept
 }
 
 void FNVXR_TEST_CDECL fakeAccumulateScene(
-    abi::RetailNiCameraLayout*,
-    void*,
-    abi::RetailBSCullingProcessLayout*)
+    abi::RetailNiCameraLayout* camera,
+    void* scene,
+    abi::RetailBSCullingProcessLayout* culler)
 {
-    require(false, "runtime used AccumulateScene instead of the private collector cull");
+    require(
+        camera && scene && culler
+            && culler == gState->binding->cullingProcess()
+            && culler->base.vtable == gState->stockCullerVtable,
+        "runtime did not use its constructor-owned culler for eye accumulation");
+    auto* accumulator = reinterpret_cast<
+        abi::RetailBSShaderAccumulatorLayout*>(
+            static_cast<std::uintptr_t>(culler->shaderAccumulator));
+    require(
+        accumulator
+            && camera
+                == gState->eyeCameras[
+                    accumulator == gState->left ? 0 : 1]
+            && accumulator->shadowScene
+                == gState->stockAccumulator.shadowScene,
+        "runtime did not inherit the exact stock frame state");
+    replaceAccumulatorOwner(gState->renderer.accumulator, accumulator);
+    fakeSetAccumulatingAccumulator(accumulator);
+    require(
+        gState->renderingAccumulator
+            == gState->populationRenderingAccumulator,
+        "private accumulation changed the prepared stock rendering lane");
+    gState->events.push_back(
+        accumulator == gState->left ? Event::AddLeft : Event::AddRight);
+    ++gState->addCount;
 }
 
 RetailEngineCallResolution fakeResolution()
@@ -431,6 +501,9 @@ RetailEngineCallResolution fakeResolution()
         &fakeAccumulateScene);
     calls.accumulatorAddVisibleArray = engineFunction<
         abi::AccumulatorAddVisibleArrayFunction>(&fakeAddVisible);
+    calls.accumulatorFinishAccumulating = engineFunction<
+        abi::AccumulatorFinishAccumulatingFunction>(
+            &fakeFinishAccumulating);
     calls.rendererSetAccumulator = engineFunction<
         abi::RendererSetAccumulatorFunction>(&fakeRendererSetAccumulator);
     calls.setAccumulatingAccumulator = &fakeSetAccumulatingAccumulator;
@@ -539,6 +612,7 @@ int main()
     FakeState state;
     gState = &state;
     state.stockAccumulator.referenceCount = 4u;
+    state.stockAccumulator.shadowScene = 0x00ABC000u;
     state.rendererSingleton = static_cast<abi::RetailPointer32>(
         reinterpret_cast<std::uintptr_t>(&state.renderer));
     const abi::RetailPointer32 stockAccumulatorAddress =
@@ -547,6 +621,7 @@ int main()
     state.renderer.accumulator = stockAccumulatorAddress;
     state.accumulatingAccumulator = stockAccumulatorAddress;
     state.renderingAccumulator = stockAccumulatorAddress;
+    state.populationRenderingAccumulator = stockAccumulatorAddress;
     auto vtable = stockVtable();
 #if defined(_MSC_VER) && defined(_M_IX86)
     state.stockCullerVtable = static_cast<abi::RetailPointer32>(
@@ -649,8 +724,10 @@ int main()
     stockCuller.base.useAppendFunction = 0u;
     for (std::size_t index = 0u; index < 3u; ++index)
     {
+        state.geometry[index].initialize();
         state.stockGeometryPointers[index] = static_cast<abi::RetailPointer32>(
-            reinterpret_cast<std::uintptr_t>(&state.geometry[index]));
+            reinterpret_cast<std::uintptr_t>(
+                state.geometry[index].geometry.data()));
     }
     state.stockVisibleArray = {
         static_cast<abi::RetailPointer32>(
@@ -685,8 +762,8 @@ int main()
         geometry::PrivateGeometryCollectorVslotCallbackFunction<Capacity>>(
             static_cast<std::uintptr_t>(
                 captureVtable[Binding::AppendVtableEntryIndex]));
-    for (int& geometry : state.geometry)
-        captureAppend(&stockCuller, nullptr, &geometry);
+    for (QueueGeometryFixture& geometry : state.geometry)
+        captureAppend(&stockCuller, nullptr, geometry.geometry.data());
     const bool captureFinished = runtime.finishStockCullerCapture(&stockCuller);
     require(
         captureFinished
@@ -719,9 +796,8 @@ int main()
     };
     require(state.events == expected, "runtime changed collect/left/right order");
     require(
-        state.visiblePointers[0] != 0u
-            && state.visiblePointers[0] == state.visiblePointers[1],
-        "left and right did not consume the identical visible set");
+        state.addCount == 2u,
+        "left and right did not each execute one stock accumulation");
     require(
         state.eyeCameras[0]
             && state.eyeCameras[1]

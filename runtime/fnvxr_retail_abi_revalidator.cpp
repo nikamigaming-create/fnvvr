@@ -1023,6 +1023,8 @@ bool sealedBothWorldBranches(const RevalidationContract& contract) noexcept
     constexpr const char* Required[] = {
         "AccumulateScene",
         "AccumulateSecondWorldBranch",
+        "NiAccumulator::FinishAccumulating",
+        "FinishAccumulatingShaderAccumulator",
         "RenderAccumulatorWithoutFinalize",
         "FinalizeAccumulator",
         "RenderAndFinalizeAccumulator",

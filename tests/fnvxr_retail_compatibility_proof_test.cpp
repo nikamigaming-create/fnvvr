@@ -66,7 +66,8 @@ constexpr std::size_t UpdateCameraBytes = 0x0200u;
 constexpr std::size_t JohnnyRenderFirstPersonCallOffset = 0x01E2u;
 constexpr std::uintptr_t JohnnyRenderFirstPersonStockTargetPreferred =
     0x00422000u;
-constexpr std::uint32_t JohnnyRenderFirstPersonHookRva = 0x000001A0u;
+constexpr std::uint32_t JohnnyRenderFirstPersonHookRva =
+    JohnnyGuitar528RenderFirstPersonHookRva;
 constexpr std::size_t JohnnyUpdateCameraOverwriteOffset = 0x0040u;
 constexpr std::array<std::uint8_t, 5> JohnnyUpdateCameraOriginalBytes {
     0xDFu, 0xE0u, 0xF6u, 0xC4u, 0x41u,
@@ -77,9 +78,12 @@ constexpr std::uintptr_t JohnnyUpdateCameraFirstStockTargetPreferred =
 constexpr std::size_t JohnnyUpdateCameraSecondCallOffset = 0x00A0u;
 constexpr std::uintptr_t JohnnyUpdateCameraSecondStockTargetPreferred =
     0x00424000u;
-constexpr std::uint32_t JohnnyUpdateCameraOverwriteHookRva = 0x00000210u;
-constexpr std::uint32_t JohnnyUpdateCameraFirstCallHookRva = 0x00000220u;
-constexpr std::uint32_t JohnnyUpdateCameraSecondCallHookRva = 0x00000230u;
+constexpr std::uint32_t JohnnyUpdateCameraOverwriteHookRva =
+    JohnnyGuitar528UpdateCameraOverwriteHookRva;
+constexpr std::uint32_t JohnnyUpdateCameraFirstCallHookRva =
+    JohnnyGuitar528UpdateCameraFirstCallHookRva;
+constexpr std::uint32_t JohnnyUpdateCameraSecondCallHookRva =
+    JohnnyGuitar528UpdateCameraSecondCallHookRva;
 
 void writeU16(
     std::vector<std::uint8_t>& bytes,
@@ -186,7 +190,9 @@ struct Fixture
     std::vector<std::uint8_t> stockUpdateCamera =
         std::vector<std::uint8_t>(UpdateCameraBytes, 0x91u);
 
-    std::array<LoadedFunctionManifestEntry, 13> coreManifest {};
+    std::array<
+        LoadedFunctionManifestEntry,
+        RetailEngineManifest.size()> coreManifest {};
     std::array<
         RetailFunctionAbiDescriptor,
         RetailFunctionAbiInventory.size()> functions {};
@@ -691,8 +697,8 @@ void testExactOptionalModulesAndJipNormalizationAuthorize()
             && !proof.diagnostics.johnnyGuitarNormalizationApplied
             && proof.diagnostics.showOffPresent,
         "the exact optional-module path was not diagnosed");
-    require(proof.diagnostics.protectedCoreBodiesHashed == 13u
-            && proof.diagnostics.protectedFunctionsHashed == 26u
+    require(proof.diagnostics.protectedCoreBodiesHashed == 15u
+            && proof.diagnostics.protectedFunctionsHashed == 28u
             && proof.diagnostics.protectedVtableSlotsRead == 16u
             && proof.diagnostics.protectedVtableBytesHashed == 0x50u,
         "not every protected engine range was inspected");

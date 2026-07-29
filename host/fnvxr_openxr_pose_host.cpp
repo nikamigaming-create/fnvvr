@@ -9899,7 +9899,7 @@ int main(int argc, char** argv)
             && haveRuntimeUiState
             && runtimeGameplayActive;
         namespace cpu_presentation = fnvxr::host::cpu_engine_presentation;
-        const cpu_presentation::RuntimeSample cpuRuntime {
+        const cpu_presentation::RuntimeSample cpuCurrentRuntime {
             runtimeStateSample,
             runtimePhase,
             runtimeMenuBits,
@@ -9940,7 +9940,7 @@ int main(int argc, char** argv)
                 incomingCpuUi.identity.runtimeStateSample;
             if (cpu_presentation::flatUiFrameEligible(
                     incomingCpuUi.identity,
-                    cpuRuntime))
+                    cpuCurrentRuntime))
             {
                 static_cast<void>(uploadCpuEngineUiTexture(
                     device.Get(),
@@ -9969,10 +9969,12 @@ int main(int argc, char** argv)
             && sharedStereoUiActive
             && cpu_presentation::flatUiFrameEligible(
                 retainedCpuUiIdentity,
-                cpuRuntime);
+                cpuCurrentRuntime);
         int64_t cpuSourcePoseAgeNanoseconds = 0;
         bool cpuSourcePoseAgeValid = false;
         bool cpuEngineStereoActive = false;
+        bool cpuEngineRuntimeLineageFound = false;
+        std::uint64_t cpuEngineSourceRuntimeSample = 0u;
         SourceViewPublication productSourceView {};
         const bool productSourceViewFound = sourceViewHistory.find(
             gpuColorFrame.frame,
@@ -10584,6 +10586,23 @@ int main(int argc, char** argv)
                 false,
                 renderer.hasStereoGameFrame,
             };
+            fnvxr::host::gpu_color::RuntimeEvidence
+                cpuWorldRuntimeEvidence {};
+            cpuEngineRuntimeLineageFound =
+                runtimeEvidenceHistory.findStableSource(
+                    renderer.stereoGameRuntimeStateSample,
+                    runtimeEvidence,
+                    cpuWorldRuntimeEvidence);
+            cpuEngineSourceRuntimeSample =
+                cpuWorldRuntimeEvidence.sample;
+            const cpu_presentation::RuntimeSample cpuWorldRuntime {
+                cpuWorldRuntimeEvidence.sample,
+                cpuWorldRuntimeEvidence.phase,
+                cpuWorldRuntimeEvidence.menuBits,
+                cpuWorldRuntimeEvidence.showroomActive,
+                cpuWorldRuntimeEvidence.cameraActive,
+                cpuWorldRuntimeEvidence.fresh,
+            };
             cpuEngineStereoActive =
                 allowCpuEngineStereo
                 && renderer.hasStereoGameFrame
@@ -10599,9 +10618,10 @@ int main(int argc, char** argv)
                     == referenceSpaceGeneration
                 && renderer.stereoProducerEpoch
                     == sharedBridge.producerEpoch
+                && cpuEngineRuntimeLineageFound
                 && cpu_presentation::binocularWorldFrameEligible(
                     cpuWorldIdentity,
-                    cpuRuntime,
+                    cpuWorldRuntime,
                     cpuUiBoundary)
                 && cpuSourcePoseAgeValid;
             const bool legacyStereoFullscreenActive =
@@ -11059,6 +11079,10 @@ int main(int argc, char** argv)
                 << (sourceRuntimeLineageFound ? "true" : "false")
                 << ",\"controllerRuntimeStateSample\":"
                 << controllerRuntimeEvidence.sample
+                << ",\"cpuEngineRuntimeLineage\":"
+                << (cpuEngineRuntimeLineageFound ? "true" : "false")
+                << ",\"cpuEngineSourceRuntimeSample\":"
+                << cpuEngineSourceRuntimeSample
                 << ",\"gpuV5RenderedDisplayTime\":"
                 << gpuColorFrame.frame.renderedDisplayTime
                 << ",\"gpuV5ExactSourceView\":"

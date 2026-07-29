@@ -9,9 +9,10 @@
 
 namespace fnvxr::engine
 {
-// A deliberately narrow writer contract for the three audited E8 calls in
-// RenderWorldSceneGraph.  It has no allocation or arbitrary-memory operation:
-// the Win32 implementation accepts only one of those five-byte instructions.
+// A deliberately narrow writer contract for the six audited accumulation and
+// render-phase E8 calls in RenderWorldSceneGraph. It has no allocation or
+// arbitrary-memory operation: the Win32 implementation accepts only one of
+// those five-byte instructions.
 struct RetailWorldAccumulationHookMemoryOperations
 {
     void* context = nullptr;
@@ -112,6 +113,8 @@ RetailWorldAccumulationHookInstallResult installRetailWorldAccumulationHook(
     const RetailWorldHookAuthorization&,
     const RetailWorldAccumulationHookMemoryOperations&,
     std::uint32_t,
+    std::uintptr_t,
+    std::uintptr_t,
     std::uintptr_t) noexcept;
 
 namespace detail
@@ -513,6 +516,8 @@ private:
         const RetailWorldHookAuthorization&,
         const RetailWorldAccumulationHookMemoryOperations&,
         std::uint32_t,
+        std::uintptr_t,
+        std::uintptr_t,
         std::uintptr_t) noexcept;
 };
 
@@ -555,6 +560,8 @@ private:
         const RetailWorldHookAuthorization&,
         const RetailWorldAccumulationHookMemoryOperations&,
         std::uint32_t,
+        std::uintptr_t,
+        std::uintptr_t,
         std::uintptr_t) noexcept;
 };
 
@@ -602,7 +609,9 @@ installRetailWorldAccumulationHook(
     const RetailWorldHookAuthorization& authorization,
     const RetailWorldAccumulationHookMemoryOperations& memory,
     std::uint32_t runtimeWorldAddress,
-    std::uintptr_t cdeclAdapterAddress) noexcept
+    std::uintptr_t accumulationAdapterAddress,
+    std::uintptr_t renderWithoutFinalizeAdapterAddress,
+    std::uintptr_t renderAndFinalizeAdapterAddress) noexcept
 {
     using Failure = RetailWorldAccumulationHookInstallFailure;
     constexpr std::size_t CallSiteCount =
@@ -621,7 +630,12 @@ installRetailWorldAccumulationHook(
             Failure::MemoryOperationsIncomplete,
             CallSiteCount);
     }
-    if (cdeclAdapterAddress == 0u || cdeclAdapterAddress > 0xFFFFFFFFu)
+    if (accumulationAdapterAddress == 0u
+        || accumulationAdapterAddress > 0xFFFFFFFFu
+        || renderWithoutFinalizeAdapterAddress == 0u
+        || renderWithoutFinalizeAdapterAddress > 0xFFFFFFFFu
+        || renderAndFinalizeAdapterAddress == 0u
+        || renderAndFinalizeAdapterAddress > 0xFFFFFFFFu)
     {
         return detail::retailWorldAccumulationHookInstallFailure(
             Failure::InvalidAdapterAddress,
@@ -669,9 +683,25 @@ installRetailWorldAccumulationHook(
                 Failure::CallSiteContractMismatch,
                 index);
         }
+        std::uintptr_t adapterAddress = accumulationAdapterAddress;
+        switch (contract.relayKind)
+        {
+        case RetailWorldAccumulationCallSiteContract::RelayKind::
+            AccumulateScene:
+            adapterAddress = accumulationAdapterAddress;
+            break;
+        case RetailWorldAccumulationCallSiteContract::RelayKind::
+            RenderWithoutFinalize:
+            adapterAddress = renderWithoutFinalizeAdapterAddress;
+            break;
+        case RetailWorldAccumulationCallSiteContract::RelayKind::
+            RenderAndFinalize:
+            adapterAddress = renderAndFinalizeAdapterAddress;
+            break;
+        }
         const RetailWorldRelativeCall replacement = encodeRetailWorldX86Call(
             patch.address,
-            cdeclAdapterAddress);
+            adapterAddress);
         if (!replacement.valid)
         {
             return detail::retailWorldAccumulationHookInstallFailure(

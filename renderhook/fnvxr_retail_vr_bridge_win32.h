@@ -37,10 +37,17 @@ struct RetailVrBridgeOperations
     // The replacement E8 must enter the verified stock target with the
     // caller's original register/stack context.  The proxy owns that naked
     // relay, while the bridge owns the only authenticated target address and
-    // arms it immediately before the three calls are patched.
+    // arms it immediately before the accumulation calls are patched.
     bool (*armAccumulationCallRelay)(void*, std::uintptr_t) noexcept =
         nullptr;
     void (*disarmAccumulationCallRelay)(void*) noexcept = nullptr;
+    // The branch-local post-accumulation relays split the stock render and
+    // finalize phases without globally hooking either shared helper.
+    bool (*armRenderPhaseCallRelays)(
+        void*,
+        std::uintptr_t,
+        std::uintptr_t) noexcept = nullptr;
+    void (*disarmRenderPhaseCallRelays)(void*) noexcept = nullptr;
     bool (*prepareDistinctCameraFrame)(
         void*,
         const engine::RetailWorldAccumulationCallFrame&,
@@ -90,6 +97,8 @@ constexpr bool retailVrBridgeOperationsComplete(
         && engine::retailEyeTargetOperationsComplete(operations.eyeTargets)
         && operations.armAccumulationCallRelay
         && operations.disarmAccumulationCallRelay
+        && operations.armRenderPhaseCallRelays
+        && operations.disarmRenderPhaseCallRelays
         && operations.prepareDistinctCameraFrame
         && selectedPublicationComplete;
 }
@@ -165,8 +174,38 @@ struct RetailVrBridgeFrameDiagnostics
     EyeCamera eyeCamera {};
     engine::RetailCenterVisibilityDiagnostics visibility {};
     engine::RetailCenterAccumulatorSnapshotDiagnostics accumulatorSnapshot {};
+    engine::RetailCenterRendererTimingDiagnostics rendererTiming {};
     std::uint64_t dispatchCount = 0u;
     std::uint64_t stereoCompleteCount = 0u;
+};
+
+// Private-eye rendering can itself enter the retail AccumulateScene callsites
+// (shadow/auxiliary scene passes).  Those nested stock calls must still run,
+// but they must not recursively capture into or dispatch the one bridge
+// transaction that is currently consuming the sealed visible set.
+class RetailVrPrivateRenderDispatchGate final
+{
+public:
+    bool tryEnter() noexcept
+    {
+        if (mActive)
+            return false;
+        mActive = true;
+        return true;
+    }
+
+    void leave() noexcept
+    {
+        mActive = false;
+    }
+
+    bool active() const noexcept
+    {
+        return mActive;
+    }
+
+private:
+    bool mActive = false;
 };
 
 template <std::size_t CollectorCapacity>
@@ -178,6 +217,12 @@ public:
     {
         delete mAccumulationHookLease;
         mAccumulationHookLease = nullptr;
+        if (mRenderPhaseRelaysArmed
+            && mOperations.disarmRenderPhaseCallRelays)
+        {
+            mOperations.disarmRenderPhaseCallRelays(mOperations.context);
+            mRenderPhaseRelaysArmed = false;
+        }
         if (mAccumulationRelayArmed
             && mOperations.disarmAccumulationCallRelay)
         {
@@ -191,11 +236,15 @@ public:
 
     bool initialize(
         const RetailVrBridgeOperations& operations,
-        std::uintptr_t cdeclAdapterAddress) noexcept
+        std::uintptr_t accumulationAdapterAddress,
+        std::uintptr_t renderWithoutFinalizeAdapterAddress,
+        std::uintptr_t renderAndFinalizeAdapterAddress) noexcept
     {
 #if !defined(_WIN32) || !defined(_M_IX86)
         (void)operations;
-        (void)cdeclAdapterAddress;
+        (void)accumulationAdapterAddress;
+        (void)renderWithoutFinalizeAdapterAddress;
+        (void)renderAndFinalizeAdapterAddress;
         mFailure = RetailVrBridgeFailure::UnsupportedArchitecture;
         return false;
 #else
@@ -204,8 +253,12 @@ public:
         if (mInitialized || mAccumulationHookLease)
             return fail(RetailVrBridgeFailure::AlreadyInitialized);
         if (!retailVrBridgeOperationsComplete(operations)
-            || cdeclAdapterAddress == 0u
-            || cdeclAdapterAddress > 0xFFFFFFFFu)
+            || accumulationAdapterAddress == 0u
+            || accumulationAdapterAddress > 0xFFFFFFFFu
+            || renderWithoutFinalizeAdapterAddress == 0u
+            || renderWithoutFinalizeAdapterAddress > 0xFFFFFFFFu
+            || renderAndFinalizeAdapterAddress == 0u
+            || renderAndFinalizeAdapterAddress > 0xFFFFFFFFu)
         {
             return fail(RetailVrBridgeFailure::OperationsIncomplete);
         }
@@ -299,12 +352,24 @@ public:
             return fail(RetailVrBridgeFailure::AccumulationHookInstallRejected);
         }
         mAccumulationRelayArmed = true;
+        if (!mOperations.armRenderPhaseCallRelays(
+                mOperations.context,
+                reinterpret_cast<std::uintptr_t>(
+                    mCalls.calls.renderAccumulatorWithoutFinalize),
+                reinterpret_cast<std::uintptr_t>(
+                    mCalls.calls.finalizeAccumulator)))
+        {
+            return fail(RetailVrBridgeFailure::AccumulationHookInstallRejected);
+        }
+        mRenderPhaseRelaysArmed = true;
         engine::RetailWorldAccumulationHookInstallResult installed =
             engine::installRetailWorldAccumulationHook(
                 authority.worldHook(),
                 mAccumulationHookMemory.operations(),
                 metadata.runtimeWorldAddress,
-                cdeclAdapterAddress);
+                accumulationAdapterAddress,
+                renderWithoutFinalizeAdapterAddress,
+                renderAndFinalizeAdapterAddress);
         if (!installed.complete())
         {
             return fail(
@@ -353,51 +418,110 @@ public:
         return mFrameDiagnostics;
     }
 
+    bool privateRenderDispatchActive() const noexcept
+    {
+        return mPrivateRenderDispatchGate.active();
+    }
+
     void beginStockCullerCaptureFromAccumulationAdapter(
         engine::abi::RetailBSCullingProcessLayout* stockCullingProcess)
         noexcept
     {
-        if (ready())
+        if (ready() && !mPrivateRenderDispatchGate.active())
         {
+            // A new stock accumulation supersedes any unmatched prior stage.
+            // Every audited branch normally consumes its stage synchronously
+            // at the adjacent render call; this reset keeps an interrupted
+            // branch from leaking pointers into a later frame.
+            mPendingAccumulation = {};
             static_cast<void>(
                 mCenterRuntime.beginStockCullerCapture(stockCullingProcess));
         }
     }
 
-    void dispatchFromAccumulationAdapter(
+    bool finishStockCullerCaptureFromAccumulationAdapter(
+        engine::abi::RetailBSCullingProcessLayout* stockCullingProcess)
+        noexcept
+    {
+        return ready()
+            && !mPrivateRenderDispatchGate.active()
+            && mCenterRuntime.finishStockCullerCapture(stockCullingProcess);
+    }
+
+    bool stageFromAccumulationAdapter(
         engine::abi::RetailNiCameraLayout* stockCenterCamera,
         void* sceneObject,
         engine::abi::RetailBSCullingProcessLayout* stockCullingProcess)
         noexcept
     {
-        // The proxy's stack/register-preserving relay has already returned
-        // from the exact stock AccumulateScene target.  Run optional private
-        // work only after that return, while the enclosing
-        // RenderWorldSceneGraph scope is still live.
-        if (ready())
+        return stageFromAccumulationAdapter(
+            stockCenterCamera,
+            sceneObject,
+            stockCullingProcess,
+            false,
+            false,
+            engine::RetailCenterRendererDiagnosticStop::None);
+    }
+
+    bool stageDiagnosticFromAccumulationAdapter(
+        engine::abi::RetailNiCameraLayout* stockCenterCamera,
+        void* sceneObject,
+        engine::abi::RetailBSCullingProcessLayout* stockCullingProcess,
+        bool suppressPrivateRender,
+        bool suppressWorldPublication,
+        engine::RetailCenterRendererDiagnosticStop rendererStop =
+            engine::RetailCenterRendererDiagnosticStop::None) noexcept
+    {
+        return stageFromAccumulationAdapter(
+            stockCenterCamera,
+            sceneObject,
+            stockCullingProcess,
+            suppressPrivateRender,
+            suppressWorldPublication,
+            rendererStop);
+    }
+
+    bool dispatchPendingAfterStockRenderAdapter() noexcept
+    {
+        if (!ready()
+            || mPrivateRenderDispatchGate.active()
+            || !mPendingAccumulation.valid
+            || mPendingAccumulation.threadId != GetCurrentThreadId())
         {
-            static_cast<void>(
-                mCenterRuntime.finishStockCullerCapture(stockCullingProcess));
-            mFrameDiagnostics.renderer = {};
-            mFrameDiagnostics.eyeCamera = {};
-            mFrameDiagnostics.visibility = {};
-            mFrameDiagnostics.accumulatorSnapshot = {};
-            const engine::RetailWorldAccumulationControllerResult result =
-                mController.dispatch({
-                    stockCenterCamera,
-                    sceneObject,
-                    stockCullingProcess,
-                });
-            mFrameDiagnostics.controller = result;
-            ++mFrameDiagnostics.dispatchCount;
-            if (result.complete()
-                && result.disposition
-                    == engine::RetailWorldHookDisposition::StereoWorldComplete)
-            {
-                ++mFrameDiagnostics.stereoCompleteCount;
-            }
+            mPendingAccumulation = {};
+            return false;
         }
 
+        const PendingAccumulation pending = mPendingAccumulation;
+        // Clear before entering the controller. Private-eye rendering may
+        // execute nested stock accumulation/render helpers; those relays must
+        // never observe the outer transaction as pending.
+        mPendingAccumulation = {};
+        if (!mCenterRuntime.setRendererDiagnosticStop(pending.rendererStop))
+            return false;
+        mSuppressPrivateRenderForDiagnostic = pending.suppressPrivateRender;
+        mSuppressWorldPublicationForDiagnostic =
+            pending.suppressWorldPublication;
+        mFrameDiagnostics.renderer = {};
+        mFrameDiagnostics.eyeCamera = {};
+        mFrameDiagnostics.visibility = {};
+        mFrameDiagnostics.accumulatorSnapshot = {};
+        mFrameDiagnostics.rendererTiming = {};
+        const engine::RetailWorldAccumulationControllerResult result =
+            mController.dispatch(pending.frame);
+        mFrameDiagnostics.controller = result;
+        ++mFrameDiagnostics.dispatchCount;
+        if (result.complete()
+            && result.disposition
+                == engine::RetailWorldHookDisposition::StereoWorldComplete)
+        {
+            ++mFrameDiagnostics.stereoCompleteCount;
+        }
+        mSuppressWorldPublicationForDiagnostic = false;
+        mSuppressPrivateRenderForDiagnostic = false;
+        static_cast<void>(mCenterRuntime.setRendererDiagnosticStop(
+            engine::RetailCenterRendererDiagnosticStop::None));
+        return true;
     }
 
     bool publishMonoUiQuadFromPresent(
@@ -438,6 +562,49 @@ public:
     }
 
 private:
+    struct PendingAccumulation
+    {
+        engine::RetailWorldAccumulationCallFrame frame {};
+        engine::RetailCenterRendererDiagnosticStop rendererStop =
+            engine::RetailCenterRendererDiagnosticStop::None;
+        DWORD threadId = 0u;
+        bool suppressPrivateRender = false;
+        bool suppressWorldPublication = false;
+        bool valid = false;
+    };
+
+    bool stageFromAccumulationAdapter(
+        engine::abi::RetailNiCameraLayout* stockCenterCamera,
+        void* sceneObject,
+        engine::abi::RetailBSCullingProcessLayout* stockCullingProcess,
+        bool suppressPrivateRender,
+        bool suppressWorldPublication,
+        engine::RetailCenterRendererDiagnosticStop rendererStop) noexcept
+    {
+        if (!ready()
+            || mPrivateRenderDispatchGate.active()
+            || !stockCenterCamera
+            || !sceneObject
+            || !stockCullingProcess
+            || !mCenterRuntime.finishStockCullerCapture(stockCullingProcess))
+        {
+            mPendingAccumulation = {};
+            return false;
+        }
+        mPendingAccumulation.frame = {
+            stockCenterCamera,
+            sceneObject,
+            stockCullingProcess,
+        };
+        mPendingAccumulation.rendererStop = rendererStop;
+        mPendingAccumulation.threadId = GetCurrentThreadId();
+        mPendingAccumulation.suppressPrivateRender = suppressPrivateRender;
+        mPendingAccumulation.suppressWorldPublication =
+            suppressWorldPublication;
+        mPendingAccumulation.valid = true;
+        return true;
+    }
+
     bool fail(RetailVrBridgeFailure failure) noexcept
     {
         mFailure = failure;
@@ -493,13 +660,36 @@ private:
         RetailVrBridgeWin32* bridge = checked(opaque);
         if (!bridge)
             return {};
+        if (bridge->mSuppressPrivateRenderForDiagnostic)
+        {
+            const engine::RetailCenterRuntimeFrameResult result {
+                engine::RetailWorldHookDisposition::RejectGameplayFrame,
+                engine::RetailCenterRuntimeFailure::StereoRenderRejected,
+                {},
+            };
+            bridge->mFrameDiagnostics.renderer = result;
+            return result;
+        }
+        if (!bridge->mPrivateRenderDispatchGate.tryEnter())
+        {
+            const engine::RetailCenterRuntimeFrameResult result {
+                engine::RetailWorldHookDisposition::RejectGameplayFrame,
+                engine::RetailCenterRuntimeFailure::StereoRenderRejected,
+                {},
+            };
+            bridge->mFrameDiagnostics.renderer = result;
+            return result;
+        }
         const engine::RetailCenterRuntimeFrameResult result =
             bridge->mCenterRuntime.renderWorld(
             bridge->mAuthority.authority.centerRenderer(),
             frame);
+        bridge->mPrivateRenderDispatchGate.leave();
         bridge->mFrameDiagnostics.renderer = result;
         bridge->mFrameDiagnostics.accumulatorSnapshot =
             bridge->mCenterRuntime.accumulatorSnapshotDiagnostics();
+        bridge->mFrameDiagnostics.rendererTiming =
+            bridge->mCenterRuntime.timingDiagnostics();
         if (result.renderer.failure == engine::CenterRendererFailure::Visibility)
         {
             bridge->mFrameDiagnostics.visibility =
@@ -580,6 +770,8 @@ private:
     {
         RetailVrBridgeWin32* bridge = checked(opaque);
         if (!bridge)
+            return false;
+        if (bridge->mSuppressWorldPublicationForDiagnostic)
             return false;
         if (bridge->mCpuPublication)
         {
@@ -662,5 +854,10 @@ private:
     bool mCpuPublication = false;
     bool mInitialized = false;
     bool mAccumulationRelayArmed = false;
+    bool mRenderPhaseRelaysArmed = false;
+    RetailVrPrivateRenderDispatchGate mPrivateRenderDispatchGate {};
+    PendingAccumulation mPendingAccumulation {};
+    bool mSuppressPrivateRenderForDiagnostic = false;
+    bool mSuppressWorldPublicationForDiagnostic = false;
 };
 }

@@ -1523,6 +1523,9 @@ function Restore-FnvxrProductArtifactSet {
     # A broken backup must never prevent cleanup of the remaining staged files.
     # Attempt every record in reverse stage order, then report the complete set
     # of failures so a supervisor cannot mistake a partial rollback for a pass.
+    # Fallout can exit before Windows Error Reporting releases its mapped DLL
+    # handles. Retry only the two Win32 sharing-lock failures for a bounded
+    # interval; every other restore error remains immediate and fail-closed.
     $failures = @()
     foreach ($record in @($Records | Select-Object -Last 999 | Sort-Object key -Descending)) {
         try {
@@ -1531,13 +1534,17 @@ function Restore-FnvxrProductArtifactSet {
                 if (-not $record.backup -or -not (Test-Path -LiteralPath $record.backup -PathType Leaf)) {
                     throw "Cannot restore staged artifact; backup is missing: $destination"
                 }
-                Copy-Item -LiteralPath $record.backup -Destination $destination -Force
+                Invoke-FnvxrProductSharingViolationRetry -Action {
+                    Copy-Item -LiteralPath $record.backup -Destination $destination -Force
+                }
                 $restored = Get-FnvxrProductFileIdentity -Path $destination
                 if ($restored.sha256 -cne $record.previous.sha256) {
                     throw "Restored artifact hash mismatch: $destination"
                 }
             } elseif (Test-Path -LiteralPath $destination -PathType Leaf) {
-                Remove-Item -LiteralPath $destination -Force
+                Invoke-FnvxrProductSharingViolationRetry -Action {
+                    Remove-Item -LiteralPath $destination -Force
+                }
                 if (Test-Path -LiteralPath $destination -PathType Leaf) {
                     throw "New staged artifact remains after removal: $destination"
                 }
@@ -1552,6 +1559,39 @@ function Restore-FnvxrProductArtifactSet {
             $failures.Count,
             ($failures -join " | "))
     }
+}
+
+function Invoke-FnvxrProductSharingViolationRetry {
+    param(
+        [Parameter(Mandatory = $true)][scriptblock]$Action,
+        [ValidateRange(0, 10000)][int]$TimeoutMilliseconds = 5000,
+        [ValidateRange(10, 1000)][int]$RetryMilliseconds = 100
+    )
+
+    $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMilliseconds)
+    do {
+        try {
+            & $Action
+            return
+        } catch {
+            $exception = $_.Exception
+            $sharingViolation = $false
+            while ($exception) {
+                $win32Code = $exception.HResult -band 0xffff
+                if ($exception -is [System.IO.IOException] -and
+                    ($win32Code -eq 32 -or $win32Code -eq 33)) {
+                    $sharingViolation = $true
+                    break
+                }
+                $exception = $exception.InnerException
+            }
+            if (-not $sharingViolation -or
+                [DateTime]::UtcNow -ge $deadline) {
+                throw
+            }
+            Start-Sleep -Milliseconds $RetryMilliseconds
+        }
+    } while ($true)
 }
 
 function Get-FnvxrProductExactFalloutProcess {
@@ -1704,7 +1744,9 @@ function Wait-FnvxrProductRetailFixtureGameplay {
                 -and [bool]$snapshot.runtime.usable `
                 -and [uint64]$snapshot.runtime.frame -gt $MinimumFrame `
                 -and [uint32]$snapshot.runtime.phase -eq 3 `
-                -and [uint32]$snapshot.runtime.menuBits -eq 0 `
+                # RuntimeMenuModeBit (0x01) is diagnostic only and the shared
+                # protocol explicitly excludes it from RuntimeBlockingMenuBits.
+                -and (([uint32]$snapshot.runtime.menuBits -band 0xFE) -eq 0) `
                 -and -not [bool]$snapshot.runtime.uiInputAllowed `
                 -and [bool]$snapshot.runtime.cameraActive `
                 -and -not [bool]$snapshot.runtime.showroomActive
@@ -1775,6 +1817,24 @@ function Get-FnvxrProductMinimalEnvironment {
         [switch]$AutomateRetailFixture,
         [switch]$TtwFixture,
         [switch]$HeadsetDemoFixture,
+        [switch]$HeadsetWorldOnlyCapture,
+        [ValidateRange(1, 1200)]
+        [int]$HeadsetDemoGameplayWarmupFrames = 90,
+        [ValidateSet(
+            "Full",
+            "RelayOnly",
+            "CaptureOnly",
+            "PrepareOnly",
+            "RenderNoPublish",
+            "SnapshotOnly",
+            "CollectOnly",
+            "BindOnly",
+            "CameraOnly",
+            "PopulateOnly",
+            "RenderOnly",
+            "FinalizeOnly",
+            "LeftEyeOnly")]
+        [string]$RetailVrAccumulationDiagnosticMode = "Full",
         [ValidateSet("disabled", "create", "load")]
         [string]$RetailFixtureAction = "disabled",
         [string]$RetailFixtureSaveName = "",
@@ -1800,28 +1860,37 @@ function Get-FnvxrProductMinimalEnvironment {
     if ($AcknowledgeTribalPackPopup -and -not $AutomateRecoveryLoad) {
         throw "The exact official-pack acknowledgement requires recovery-load automation."
     }
-    if ($HeadsetDemoFixture -and -not $AutomateRetailFixture) {
-        throw "The headset demo requires the owned retail-fixture automation."
+    $headsetFixtureVisualTrial =
+        [bool]($HeadsetDemoFixture -or $HeadsetWorldOnlyCapture)
+    if ($HeadsetDemoFixture -and $HeadsetWorldOnlyCapture) {
+        throw "The headset demo and world-only capture are mutually exclusive."
+    }
+    if ($headsetFixtureVisualTrial -and -not $AutomateRetailFixture) {
+        throw "The headset fixture visual trial requires the owned retail-fixture automation."
+    }
+    if ($RetailVrAccumulationDiagnosticMode -cne "Full" -and
+        -not $HeadsetDemoFixture) {
+        throw "The retail VR accumulation diagnostic mode requires the bounded headset demo."
     }
     if ($TtwFixture -and -not $AutomateRetailFixture) {
         throw "The TTW fixture family requires the owned fixture automation."
     }
-    if ($AutomateRetailFixture -and -not $HeadsetDemoFixture -and
+    if ($AutomateRetailFixture -and -not $headsetFixtureVisualTrial -and
         -not [string]::IsNullOrWhiteSpace($HeadsetMirrorCaptureDirectory)) {
         throw "The isolated retail fixture profile cannot capture a headset mirror."
     }
 
-    $runProfile = if ($AutomateRetailFixture -and -not $HeadsetDemoFixture) {
+    $runProfile = if ($AutomateRetailFixture -and -not $headsetFixtureVisualTrial) {
         if ($TtwFixture) { "ttw-fixture-v1" } else { "retail-fixture-v1" }
     } else {
         "stereo-visual-trial-v5"
     }
-    $hostMode = if ($AutomateRetailFixture -and -not $HeadsetDemoFixture) {
+    $hostMode = if ($AutomateRetailFixture -and -not $headsetFixtureVisualTrial) {
         if ($TtwFixture) { "ttw-fixture" } else { "retail-fixture" }
     } else {
         "vr"
     }
-    $engineCenterStereo = if ($AutomateRetailFixture -and -not $HeadsetDemoFixture) {
+    $engineCenterStereo = if ($AutomateRetailFixture -and -not $headsetFixtureVisualTrial) {
         "0"
     } else {
         "1"
@@ -1843,7 +1912,7 @@ function Get-FnvxrProductMinimalEnvironment {
     # The isolated fixture runner has no OpenXR route.  The separately opted-in
     # headset demo still uses the normal visual-trial host, so retain the
     # loader hint for that one bounded recording route.
-    if (-not $AutomateRetailFixture -or $HeadsetDemoFixture) {
+    if (-not $AutomateRetailFixture -or $headsetFixtureVisualTrial) {
         $environment.FNVXR_OPENXR_LOADER_HINT = $OpenXrLoaderPath
     }
     if ($AutomateRecoveryLoad) {
@@ -1884,17 +1953,49 @@ function Get-FnvxrProductMinimalEnvironment {
         $environment.FNVXR_RETAIL_FIXTURE_SAVE_NAME = $fixtureSaveName
         $environment.FNVXR_RETAIL_FIXTURE_TRAIT_ONE = $fixtureTraits.first
         $environment.FNVXR_RETAIL_FIXTURE_TRAIT_TWO = $fixtureTraits.second
-        if (-not $TtwFixture) {
-            # Retail can present one of four known stock pre-order-pack notices
-            # even with the temporary FalloutNV.esm-only plugins profile. The
-            # plugin accepts only an exact native first-button OK target; it does
-            # not send an OS, controller, or simulator input event.
-            $environment.FNVXR_RETAIL_FIXTURE_ACK_OFFICIAL_PACK_POPUP = "1"
+        # Both the base-game and exact TTW-core fixture profiles can present
+        # one of four known stock pre-order-pack notices after an owned load.
+        # The plugin accepts only an exact title/body pair and its unique
+        # native first-button OK target; it does not send an OS, controller,
+        # keyboard, mouse, or simulator input event.
+        $environment.FNVXR_RETAIL_FIXTURE_ACK_OFFICIAL_PACK_POPUP = "1"
+        if ($TtwFixture) {
+            # TTW can present one exact, versioned dependency warning after an
+            # owned load. The plugin must independently match its complete
+            # title/body and unique native first-button OK tile. This grants
+            # no general MessageMenu, console, OS, or device-input authority.
+            $environment.FNVXR_RETAIL_FIXTURE_ACK_TTW_STEWIE_DEPENDENCY_WARNING =
+                "1"
+        }
+        if ($headsetFixtureVisualTrial) {
+            $environment.FNVXR_HEADSET_DEMO_FIXTURE = "1"
         }
         if ($HeadsetDemoFixture) {
-            $environment.FNVXR_HEADSET_DEMO_FIXTURE = "1"
-            $environment.FNVXR_HEADSET_DEMO_GAMEPLAY_WARMUP_FRAMES = "90"
+            $environment.FNVXR_HEADSET_DEMO_GAMEPLAY_WARMUP_FRAMES =
+                [string]$HeadsetDemoGameplayWarmupFrames
             $environment.FNVXR_HEADSET_DEMO_PIPBOY_HOLD_FRAMES = "240"
+            if ($RetailVrAccumulationDiagnosticMode -cne "Full") {
+                $environment.FNVXR_RETAIL_VR_ACCUMULATION_DIAGNOSTIC_MODE =
+                    switch ($RetailVrAccumulationDiagnosticMode) {
+                        "RelayOnly" { "relay-only" }
+                        "CaptureOnly" { "capture-only" }
+                        "PrepareOnly" { "prepare-only" }
+                        "RenderNoPublish" { "render-no-publish" }
+                        "SnapshotOnly" { "snapshot-only" }
+                        "CollectOnly" { "collect-only" }
+                        "BindOnly" { "bind-only" }
+                        "CameraOnly" { "camera-only" }
+                        "PopulateOnly" { "populate-only" }
+                        "RenderOnly" { "render-only" }
+                        "FinalizeOnly" { "finalize-only" }
+                        "LeftEyeOnly" { "left-eye-only" }
+                    }
+            }
+        }
+        if ($HeadsetWorldOnlyCapture) {
+            # This second key closes the demo UI gate inside xNVSE while
+            # retaining the exact owned-fixture/OpenXR route above.
+            $environment.FNVXR_HEADSET_WORLD_ONLY_CAPTURE = "1"
         }
     }
     if (-not [string]::IsNullOrWhiteSpace($HeadlessRuntimeManifest)) {
@@ -1921,14 +2022,47 @@ function Get-FnvxrProductMinimalEnvironment {
     return $environment
 }
 
+function Get-FnvxrProductProcessEnvironmentEntries {
+    param([string]$Prefix = "")
+
+    # The native process environment can legally contain differently-cased
+    # duplicates (for example Path and PATH). PowerShell's Env: provider tries
+    # to copy that block into a case-insensitive dictionary and throws before
+    # filtering it. The .NET process-environment table remains enumerable in
+    # that state, so use it for every FNVXR-scoped save/clear operation.
+    foreach ($entry in [Environment]::GetEnvironmentVariables(
+            [EnvironmentVariableTarget]::Process).GetEnumerator()) {
+        $name = [string]$entry.Key
+        if ([string]::IsNullOrEmpty($Prefix) -or
+            $name.StartsWith($Prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+            [pscustomobject][ordered]@{
+                Name = $name
+                Value = [string]$entry.Value
+            }
+        }
+    }
+}
+
+function Clear-FnvxrProductProcessEnvironmentVariables {
+    param([string]$Prefix = "FNVXR_")
+
+    foreach ($entry in @(Get-FnvxrProductProcessEnvironmentEntries -Prefix $Prefix)) {
+        [Environment]::SetEnvironmentVariable(
+            $entry.Name,
+            $null,
+            [EnvironmentVariableTarget]::Process)
+    }
+}
+
 function Set-FnvxrProductMinimalEnvironment {
     param([Parameter(Mandatory = $true)]$Environment)
 
-    Get-ChildItem Env: | Where-Object { $_.Name -like "FNVXR_*" } | ForEach-Object {
-        Remove-Item -LiteralPath ("Env:{0}" -f $_.Name) -ErrorAction SilentlyContinue
-    }
+    Clear-FnvxrProductProcessEnvironmentVariables
     foreach ($key in $Environment.Keys) {
-        Set-Item -LiteralPath ("Env:{0}" -f $key) -Value ([string]$Environment[$key])
+        [Environment]::SetEnvironmentVariable(
+            [string]$key,
+            [string]$Environment[$key],
+            [EnvironmentVariableTarget]::Process)
     }
 }
 

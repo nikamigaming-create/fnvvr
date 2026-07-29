@@ -945,12 +945,25 @@ bool ttwBaselineProfileSelected()
 
 bool headsetDemoFixtureProfileSelected()
 {
-    // This is the sole opt-in that lets an already-owned FNVXR_AutoRetail
-    // fixture participate in the bounded headless OpenXR visual demo.  It
-    // keeps the visual-trial plugin publication-only; it does not enable the
-    // normal input, camera, rig, weapon, or simulator-control bridge.
+    // This is the sole opt-in that lets an already-owned fixture participate
+    // in a bounded headless OpenXR visual run. The separate world-only key
+    // below can close the demo UI gate while retaining this exact fixture
+    // route. Neither mode enables the normal input, camera, rig, weapon, or
+    // simulator-control bridge.
     return stereoVisualTrialProfileSelected()
         && envEnabled("FNVXR_HEADSET_DEMO_FIXTURE", false);
+}
+
+bool headsetWorldOnlyCaptureProfileSelected()
+{
+    return headsetDemoFixtureProfileSelected()
+        && envEnabled("FNVXR_HEADSET_WORLD_ONLY_CAPTURE", false);
+}
+
+bool headsetDemoUiProfileSelected()
+{
+    return headsetDemoFixtureProfileSelected()
+        && !headsetWorldOnlyCaptureProfileSelected();
 }
 
 fnvxr::engine::RetailPluginMainLoopDisposition
@@ -1090,6 +1103,17 @@ bool exactOfficialPackAcknowledgementRequested()
 {
     return stereoVisualTrialTribalPackAcknowledgementRequested()
         || retailFixtureOfficialPackAcknowledgementRequested();
+}
+
+bool retailFixtureTtwStewieDependencyAcknowledgementRequested()
+{
+    // This opt-in is emitted only for the owned TTW fixture family. The
+    // decision point still requires the complete, versioned title/body pair
+    // and one native first-button OK tile; it grants no general menu input.
+    return retailFixtureAutomationRequested()
+        && envEnabled(
+            "FNVXR_RETAIL_FIXTURE_ACK_TTW_STEWIE_DEPENDENCY_WARNING",
+            false);
 }
 
 const fnvxr::engine::stereo_visual_trial_automation::ApprovedRetailSave*
@@ -7625,6 +7649,8 @@ struct ExactOfficialPackMessageMenuMatch
 {
     UInt32 observedTitleMask = 0u;
     UInt32 observedBodyMask = 0u;
+    bool observedTtwStewieDependencyTitle = false;
+    bool observedTtwStewieDependencyBody = false;
     void* firstButtonOkTile = nullptr;
     UInt32 firstButtonOkTileCount = 0u;
     UInt32 tileCount = 0u;
@@ -7690,6 +7716,18 @@ void collectExactOfficialPackMessageMenuMatch(
                         MessageMenuOkText)
                 {
                     exactOkOnVisibleTile = true;
+                }
+                if (valueText
+                    == fnvxr::engine::retail_fixture_automation::
+                        TtwStewieDependencyWarningTitle)
+                {
+                    match.observedTtwStewieDependencyTitle = true;
+                }
+                if (valueText
+                    == fnvxr::engine::retail_fixture_automation::
+                        TtwStewieDependencyWarningBody)
+                {
+                    match.observedTtwStewieDependencyBody = true;
                 }
             }
         }
@@ -7767,6 +7805,53 @@ bool findExactOfficialPackMessageMenuTarget(
     if (outExactlyOneFirstButtonOk)
         *outExactlyOneFirstButtonOk = exactlyOneFirstButtonOk;
     const bool exact = exactlyOneOfficialPackNotification
+        && exactlyOneFirstButtonOk;
+    if (!exact)
+        return false;
+
+    if (outMenu)
+        *outMenu = menu;
+    if (outOkTile)
+        *outOkTile = match.firstButtonOkTile;
+    return true;
+}
+
+bool findExactTtwStewieDependencyMessageMenuTarget(
+    void** outMenu,
+    void** outOkTile,
+    bool* outExactTitle = nullptr,
+    bool* outExactBody = nullptr,
+    bool* outExactlyOneFirstButtonOk = nullptr)
+{
+    if (outMenu)
+        *outMenu = nullptr;
+    if (outOkTile)
+        *outOkTile = nullptr;
+    if (outExactTitle)
+        *outExactTitle = false;
+    if (outExactBody)
+        *outExactBody = false;
+    if (outExactlyOneFirstButtonOk)
+        *outExactlyOneFirstButtonOk = false;
+
+    void* menu = nullptr;
+    void* tileMenu = nullptr;
+    if (!validatedVisibleMenu(kMenuTypeMessage, nullptr, &menu, &tileMenu))
+        return false;
+
+    ExactOfficialPackMessageMenuMatch match {};
+    collectExactOfficialPackMessageMenuMatch(
+        tileRootFromMenu(menu, tileMenu), 0u, match);
+    const bool exactlyOneFirstButtonOk = match.firstButtonOkTileCount == 1u
+        && match.firstButtonOkTile != nullptr;
+    if (outExactTitle)
+        *outExactTitle = match.observedTtwStewieDependencyTitle;
+    if (outExactBody)
+        *outExactBody = match.observedTtwStewieDependencyBody;
+    if (outExactlyOneFirstButtonOk)
+        *outExactlyOneFirstButtonOk = exactlyOneFirstButtonOk;
+    const bool exact = match.observedTtwStewieDependencyTitle
+        && match.observedTtwStewieDependencyBody
         && exactlyOneFirstButtonOk;
     if (!exact)
         return false;
@@ -11311,7 +11396,7 @@ bool ensureAuthorizedRuntimeObservationStarted()
             || (g_retailObservationAuthorityAttempts % 300u) == 0u)
         {
             logTelemetry(
-                "runtime observation authority deferred attempt=%lu failure=%u compatible=%d evidence=%d%d%d%d%d%d%d%d%d%d%d; no game state read performed\n",
+                "runtime observation authority deferred attempt=%lu failure=%u compatible=%d evidence=%d%d%d%d%d%d%d%d%d%d%d renderFirstPersonStage=%u jipTarget=0x%08lX/0x%08lX johnnyTarget=0x%08lX/0x%08lX; no game state read performed\n",
                 static_cast<unsigned long>(
                     g_retailObservationAuthorityAttempts),
                 static_cast<unsigned>(proof.failure),
@@ -11326,7 +11411,19 @@ bool ensureAuthorizedRuntimeObservationStarted()
                 static_cast<int>(proof.evidence.protectedFunctionInventoryMatched),
                 static_cast<int>(proof.evidence.protectedVtableSlotsMatched),
                 static_cast<int>(proof.evidence.protectedVtableBlocksMatched),
-                static_cast<int>(proof.evidence.synchronousSameProcess));
+                static_cast<int>(proof.evidence.synchronousSameProcess),
+                static_cast<unsigned>(
+                    proof.diagnostics.renderFirstPersonProofStage),
+                static_cast<unsigned long>(
+                    proof.diagnostics.observedJipRenderFirstPersonTarget),
+                static_cast<unsigned long>(
+                    proof.diagnostics.expectedJipRenderFirstPersonTarget),
+                static_cast<unsigned long>(
+                    proof.diagnostics
+                        .observedJohnnyGuitarRenderFirstPersonTarget),
+                static_cast<unsigned long>(
+                    proof.diagnostics
+                        .expectedJohnnyGuitarRenderFirstPersonTarget));
         }
         return false;
     }
@@ -11627,6 +11724,93 @@ void acknowledgeExactOfficialPackMessageMenu(
         static_cast<unsigned long long>(observation.frame));
 }
 
+void acknowledgeExactTtwStewieDependencyMessageMenu(
+    const RuntimeObservation& observation)
+{
+    namespace fixture = fnvxr::engine::retail_fixture_automation;
+    static bool acknowledged = false;
+    const bool explicitlyOptedIn =
+        retailFixtureTtwStewieDependencyAcknowledgementRequested();
+    if (!explicitlyOptedIn)
+        return;
+
+    void* menu = nullptr;
+    void* okTile = nullptr;
+    bool exactTitle = false;
+    bool exactBody = false;
+    bool exactlyOneFirstButtonOk = false;
+    const bool expectedMessageMenuState = observation.frame != 0u
+        && observation.phase == RuntimePhase::Menu
+        && observation.uiInputAllowed
+        && !g_showroomActive
+        && (observation.menuBits
+                & fnvxr::shared::RuntimeGenericMenuBit) != 0u;
+    if (expectedMessageMenuState)
+    {
+        findExactTtwStewieDependencyMessageMenuTarget(
+            &menu,
+            &okTile,
+            &exactTitle,
+            &exactBody,
+            &exactlyOneFirstButtonOk);
+    }
+    const bool visibleMessageMenu = expectedMessageMenuState && menu != nullptr;
+    const bool authorized =
+        fixture::exactTtwStewieDependencyAcknowledgementAuthorized(
+            explicitlyOptedIn,
+            visibleMessageMenu,
+            exactTitle,
+            exactBody,
+            exactlyOneFirstButtonOk,
+            acknowledged);
+    if (!authorized)
+        return;
+
+    // Mark before entering the retail vtable so a changed handler fails
+    // closed instead of turning this one exact warning into a retry loop.
+    acknowledged = true;
+    bool invoked = false;
+    bool nativeSelectionArmed = false;
+    __try
+    {
+        void** vtable = menu ? *reinterpret_cast<void***>(menu) : nullptr;
+        if (vtable && vtable[3] && vtable[4] && okTile)
+        {
+            setTileFloatByName(
+                okTile, "mouseover", TileValueMouseover, 1.0f);
+            setTileFloatByName(okTile, "clicked", TileValueClicked, 1.0f);
+            nativeSelectionArmed = armExactOfficialPackMessageMenuSelection(
+                menu,
+                okTile);
+            if (nativeSelectionArmed)
+            {
+                using HandleMouseoverFn =
+                    void (__thiscall*)(void*, UInt32, void*);
+                reinterpret_cast<HandleMouseoverFn>(vtable[4])(
+                    menu,
+                    0u,
+                    okTile);
+                using HandleClickFn =
+                    void (__thiscall*)(void*, UInt32, void*);
+                reinterpret_cast<HandleClickFn>(vtable[3])(
+                    menu,
+                    0u,
+                    okTile);
+                invoked = true;
+            }
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        invoked = false;
+    }
+    logTelemetry(
+        "{\"event\":\"fnvxrRetailFixtureTtwStewieDependencyAcknowledgement\",\"attempted\":true,\"exactTitle\":true,\"exactBody\":true,\"exactFirstButtonOk\":true,\"nativeTileArmed\":%s,\"buttonIndex\":0,\"invoked\":%s,\"frame\":%llu}\n",
+        nativeSelectionArmed ? "true" : "false",
+        invoked ? "true" : "false",
+        static_cast<unsigned long long>(observation.frame));
+}
+
 void completeStereoVisualTrialFreshCharacterRequest(
     UInt32 requestId,
     UInt64 frame,
@@ -11739,6 +11923,75 @@ void closeExactRetailFixtureOfficialPackMessageMenu(
         static_cast<unsigned long long>(observation.frame));
 }
 
+void closeExactRetailFixtureTtwStewieDependencyMessageMenu(
+    const RuntimeObservation& observation)
+{
+    namespace fixture = fnvxr::engine::retail_fixture_automation;
+    static UInt32 closeAttemptCount = 0u;
+    static bool exactWarningVisibleLastFrame = false;
+    const bool explicitlyOptedIn =
+        retailFixtureTtwStewieDependencyAcknowledgementRequested();
+    if (!explicitlyOptedIn)
+        return;
+
+    void* menu = nullptr;
+    void* okTile = nullptr;
+    bool exactTitle = false;
+    bool exactBody = false;
+    bool exactlyOneFirstButtonOk = false;
+    const bool expectedMessageMenuState = observation.frame != 0u
+        && observation.phase == RuntimePhase::Menu
+        && observation.uiInputAllowed
+        && !g_showroomActive
+        && (observation.menuBits
+                & fnvxr::shared::RuntimeGenericMenuBit) != 0u;
+    if (expectedMessageMenuState)
+    {
+        findExactTtwStewieDependencyMessageMenuTarget(
+            &menu,
+            &okTile,
+            &exactTitle,
+            &exactBody,
+            &exactlyOneFirstButtonOk);
+    }
+    const bool visibleMessageMenu = expectedMessageMenuState && menu != nullptr;
+    const bool exactVisible = visibleMessageMenu
+        && exactTitle
+        && exactBody
+        && exactlyOneFirstButtonOk;
+    if (!exactVisible)
+    {
+        exactWarningVisibleLastFrame = false;
+        return;
+    }
+
+    const bool newVisibleEpisode = !exactWarningVisibleLastFrame;
+    exactWarningVisibleLastFrame = true;
+    const bool alreadyAttempted = !newVisibleEpisode
+        || closeAttemptCount
+            >= fixture::MaxExactTtwStewieDependencyCloseAttemptsPerRun;
+    const bool authorized =
+        fixture::exactTtwStewieDependencyAcknowledgementAuthorized(
+            explicitlyOptedIn,
+            visibleMessageMenu,
+            exactTitle,
+            exactBody,
+            exactlyOneFirstButtonOk,
+            alreadyAttempted);
+    if (!authorized)
+        return;
+
+    ++closeAttemptCount;
+    const bool submitted = runPluginConsoleCommand(
+        "fnvxrRetailFixtureTtwStewieDependencyClose",
+        fixture::CloseExactOfficialPackMessageCommand.data());
+    logTelemetry(
+        "{\"event\":\"fnvxrRetailFixtureTtwStewieDependencyClose\",\"submitted\":%s,\"exactTitle\":true,\"exactBody\":true,\"exactFirstButtonOk\":true,\"attempt\":%lu,\"frame\":%llu}\n",
+        submitted ? "true" : "false",
+        static_cast<unsigned long>(closeAttemptCount),
+        static_cast<unsigned long long>(observation.frame));
+}
+
 enum class RetailFixtureAutomationStage : UInt8
 {
     AwaitingStartMenu = 0u,
@@ -11845,6 +12098,8 @@ void processRetailFixtureAutomation(const RuntimeObservation& observation)
     // body, unique first-button OK tile, and per-pack/attempt limits.
     acknowledgeExactOfficialPackMessageMenu(observation);
     closeExactRetailFixtureOfficialPackMessageMenu(observation);
+    acknowledgeExactTtwStewieDependencyMessageMenu(observation);
+    closeExactRetailFixtureTtwStewieDependencyMessageMenu(observation);
 
     // This owned fixture path intentionally contains no menu traversal or
     // device input. It accepts a single start-menu command, then uses only the
@@ -12124,7 +12379,7 @@ void processRetailFixtureAutomation(const RuntimeObservation& observation)
 
 void processHeadsetDemoFixtureUi(const RuntimeObservation& observation)
 {
-    if (!headsetDemoFixtureProfileSelected())
+    if (!headsetDemoUiProfileSelected())
         return;
 
     // Apart from the separately bounded exact official-pack acknowledgement
@@ -12859,12 +13114,20 @@ void handleNvseMessage(NVSEMessagingInterface::Message* message)
                 observation.menuBits,
                 observation.phase);
             processHeadsetDemoFixtureUi(observation);
-            static bool loggedHeadsetDemoFixturePublicationOnly = false;
-            if (!loggedHeadsetDemoFixturePublicationOnly)
+            static bool loggedHeadsetFixturePublicationOnly = false;
+            if (!loggedHeadsetFixturePublicationOnly)
             {
-                loggedHeadsetDemoFixturePublicationOnly = true;
-                logTelemetry(
-                    "headset demo fixture runtime publication ready; OpenXR display remains host-owned and the only in-game events are the fixed Pip-Boy open/close taps\n");
+                loggedHeadsetFixturePublicationOnly = true;
+                if (headsetWorldOnlyCaptureProfileSelected())
+                {
+                    logTelemetry(
+                        "headset world-only fixture runtime publication ready; OpenXR display remains host-owned and no Pip-Boy, controller, keyboard, mouse, weapon, or simulator input is enabled\n");
+                }
+                else
+                {
+                    logTelemetry(
+                        "headset demo fixture runtime publication ready; OpenXR display remains host-owned and the only in-game events are the fixed Pip-Boy open/close taps\n");
+                }
             }
             return;
         }

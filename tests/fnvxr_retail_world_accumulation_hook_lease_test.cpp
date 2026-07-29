@@ -24,7 +24,9 @@ namespace
 using namespace fnvxr::engine;
 
 constexpr std::uint32_t RuntimeWorldAddress = WorldRenderAddress;
-constexpr std::uint32_t AdapterAddress = 0x60001000u;
+constexpr std::uint32_t AccumulationAdapterAddress = 0x60001000u;
+constexpr std::uint32_t RenderAdapterAddress = 0x60002000u;
+constexpr std::uint32_t RenderAndFinalizeAdapterAddress = 0x60003000u;
 constexpr std::uintptr_t ProtectionToken = 0x7AA10C0Du;
 
 void require(bool condition, const char* message)
@@ -150,7 +152,7 @@ int main()
     try
     {
         static_assert(
-            RetailWorldAccumulationCallSiteContractInventory.size() == 3u);
+            RetailWorldAccumulationCallSiteContractInventory.size() == 6u);
 
         FakeMemory memory;
         const RetailWorldHookAuthorization authorization =
@@ -160,7 +162,9 @@ int main()
                 authorization,
                 memory.operations(),
                 RuntimeWorldAddress,
-                AdapterAddress);
+                AccumulationAdapterAddress,
+                RenderAdapterAddress,
+                RenderAndFinalizeAdapterAddress);
         require(installed.complete(), "audited callsite lease did not install");
         require(memory.writable == 0u, "install leaked a writable code page");
 
@@ -211,7 +215,9 @@ int main()
                 authorization,
                 wrongBytes.operations(),
                 RuntimeWorldAddress,
-                AdapterAddress);
+                AccumulationAdapterAddress,
+                RenderAdapterAddress,
+                RenderAndFinalizeAdapterAddress);
         require(
             rejected.failure
                     == RetailWorldAccumulationHookInstallFailure::
@@ -227,13 +233,16 @@ int main()
                 wrongAuthorization,
                 memory.operations(),
                 RuntimeWorldAddress,
-                AdapterAddress);
+                AccumulationAdapterAddress,
+                RenderAdapterAddress,
+                RenderAndFinalizeAdapterAddress);
         require(
             unauthorized.failure
                 == RetailWorldAccumulationHookInstallFailure::Unauthorized,
             "callsite installer accepted the wrong current-process authority");
 
-        std::cout << "retail AccumulateScene callsite lease tests passed\n";
+        std::cout
+            << "retail accumulation lifecycle callsite lease tests passed\n";
         return EXIT_SUCCESS;
     }
     catch (const std::exception& error)

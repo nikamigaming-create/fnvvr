@@ -259,6 +259,15 @@ using AccumulatorAddVisibleArrayFunction = void
     (FNVXR_RETAIL_THISCALL*)(
         RetailNiAccumulatorLayout* accumulator,
         RetailNiVisibleArrayLayout* visibleArray);
+using AccumulatorFinishAccumulatingFunction = void
+    (FNVXR_RETAIL_THISCALL*)(
+        RetailNiAccumulatorLayout* accumulator);
+// Auxiliary shader modes invoke this cdecl wrapper. It first dispatches the
+// +0xA4 NiAccumulator finish operation, then enters their shader-batch
+// builder. RenderWorldSceneGraph mode 0 does not use the latter stage.
+using FinishAccumulatingShaderAccumulatorFunction = void
+    (FNVXR_RETAIL_CDECL*)(
+        RetailBSShaderAccumulatorLayout* accumulator);
 using GeometryOnVisibleFunction = void
     (FNVXR_RETAIL_THISCALL*)(
         void* geometry,
@@ -327,7 +336,7 @@ struct RetailFunctionAbiDescriptor
 // and both world-branch/wrapper call frames, establishing the argument
 // semantics recorded here.  Runtime use still requires a synchronous match in
 // the exact target process; this static inventory is never sufficient alone.
-inline constexpr std::array<RetailFunctionAbiDescriptor, 26>
+inline constexpr std::array<RetailFunctionAbiDescriptor, 28>
     RetailFunctionAbiInventory {{
         {
             "Ni_Alloc",
@@ -473,6 +482,19 @@ inline constexpr std::array<RetailFunctionAbiDescriptor, 26>
             2u,
         },
         {
+            "NiAccumulator::FinishAccumulating",
+            0x00A9B570u,
+            437u,
+            sha256FromHex("192CA9CE2B5C39AC15A0DBFA4F6D2650471A17775AD3950032419C381A3FB20F"),
+            RetailX86CallingConvention::Thiscall,
+            0u,
+            0u,
+            true,
+            true,
+            true,
+            2u,
+        },
+        {
             "NiAccumulator::AddVisibleArray",
             0x00A9B790u,
             189u,
@@ -571,6 +593,19 @@ inline constexpr std::array<RetailFunctionAbiDescriptor, 26>
             RetailX86CallingConvention::Thiscall,
             1u,
             4u,
+            true,
+            true,
+            true,
+            2u,
+        },
+        {
+            "FinishAccumulatingShaderAccumulator",
+            0x00B65E80u,
+            51u,
+            sha256FromHex("9D03349FA8780CF4B1898D4B0355D03BD58343E6D514ABE5F44734C63F8E0684"),
+            RetailX86CallingConvention::Cdecl,
+            1u,
+            0u,
             true,
             true,
             true,

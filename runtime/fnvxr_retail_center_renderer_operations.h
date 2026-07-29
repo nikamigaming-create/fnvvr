@@ -4,6 +4,8 @@
 #include "fnvxr_private_geometry_collector.h"
 #include "fnvxr_retail_engine_calls.h"
 
+#include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -67,6 +69,8 @@ enum class RetailCenterVisibilityFailure : std::uint8_t
     VisibleArrayStorageAddressOutOfRange,
     VisibleArrayRejected,
     CullerAccumulatorUnavailable,
+    DiagnosticStop,
+    NoQueueSafeGeometry,
 };
 
 struct RetailCenterVisibilityDiagnostics
@@ -85,6 +89,9 @@ struct RetailCenterVisibilityDiagnostics
     std::uint32_t cullerTopCullMode = 0u;
     std::uint32_t cullerCullModeStackSize = 0u;
     std::uint32_t sealedItemCount = 0u;
+    std::uint32_t queueSafeItemCount = 0u;
+    std::uint32_t immediateGeometryRejectedCount = 0u;
+    std::uint8_t privateAccumulatorMode = 0u;
     std::uint8_t collectorPhase = 0xFFu;
     std::uint8_t collectorFailure = 0xFFu;
     std::uint8_t sealResult = 0xFFu;
@@ -100,7 +107,31 @@ enum class RetailCenterAccumulatorSnapshotFailure : std::uint8_t
     RendererUnavailable,
     OwnerStateRejected,
     EyeTargetsRejected,
+    RenderingLaneOwnershipRejected,
 };
+
+// Bounded live diagnostics can stop after an exact renderer boundary.  Every
+// stop is reported as failure so it exercises the normal rollback/restore
+// path and can never be mistaken for a completed stereo frame.
+enum class RetailCenterRendererDiagnosticStop : std::uint8_t
+{
+    None = 0u,
+    AfterSnapshot,
+    AfterVisibility,
+    AfterLeftBind,
+    AfterLeftCamera,
+    AfterLeftPopulate,
+    AfterLeftRender,
+    AfterLeftFinalize,
+    AfterLeftEye,
+};
+
+constexpr bool retailCenterRendererDiagnosticStopValid(
+    RetailCenterRendererDiagnosticStop stop) noexcept
+{
+    return stop >= RetailCenterRendererDiagnosticStop::None
+        && stop <= RetailCenterRendererDiagnosticStop::AfterLeftEye;
+}
 
 // Read-only evidence from the exact accumulator-owner snapshot that guards
 // the private-eye transaction. This separates a changed retail owner
@@ -115,7 +146,50 @@ struct RetailCenterAccumulatorSnapshotDiagnostics
     abi::RetailPointer32 accumulatingAccumulator = 0u;
     abi::RetailPointer32 renderingAccumulator = 0u;
     std::uint32_t rendererAccumulatorReferenceCount = 0u;
+    std::uint32_t renderingAccumulatorReferenceCount = 0u;
+    bool distinctRenderingAccumulatorRetained = false;
     bool captured = false;
+};
+
+struct RetailCenterRendererTimingDiagnostics
+{
+    double snapshotMilliseconds = 0.0;
+    double collectMilliseconds = 0.0;
+    double leftBindMilliseconds = 0.0;
+    double leftCameraMilliseconds = 0.0;
+    double leftPopulateMilliseconds = 0.0;
+    double leftRenderMilliseconds = 0.0;
+    double leftFinalizeMilliseconds = 0.0;
+    double leftEndMilliseconds = 0.0;
+    double rightBindMilliseconds = 0.0;
+    double rightCameraMilliseconds = 0.0;
+    double rightPopulateMilliseconds = 0.0;
+    double rightRenderMilliseconds = 0.0;
+    double rightFinalizeMilliseconds = 0.0;
+    double rightEndMilliseconds = 0.0;
+    double restoreMilliseconds = 0.0;
+    double rollbackMilliseconds = 0.0;
+    bool captured = false;
+
+    double totalMilliseconds() const noexcept
+    {
+        return snapshotMilliseconds
+            + collectMilliseconds
+            + leftBindMilliseconds
+            + leftCameraMilliseconds
+            + leftPopulateMilliseconds
+            + leftRenderMilliseconds
+            + leftFinalizeMilliseconds
+            + leftEndMilliseconds
+            + rightBindMilliseconds
+            + rightCameraMilliseconds
+            + rightPopulateMilliseconds
+            + rightRenderMilliseconds
+            + rightFinalizeMilliseconds
+            + rightEndMilliseconds
+            + restoreMilliseconds
+            + rollbackMilliseconds;
+    }
 };
 
 template <std::size_t CollectorCapacity>
@@ -207,6 +281,7 @@ public:
         mCollectionAccumulator = &collectionAccumulator;
         mStockCullerVtable = stockCullerVtable;
         mTargets = targets;
+        mDiagnosticStop = RetailCenterRendererDiagnosticStop::None;
         mInitialized = true;
         return true;
     }
@@ -230,6 +305,19 @@ public:
         mCalls = calls;
         mTargets = targets;
         mEngineSnapshot = {};
+        mDiagnosticStop = RetailCenterRendererDiagnosticStop::None;
+        return true;
+    }
+
+    bool setDiagnosticStop(
+        RetailCenterRendererDiagnosticStop stop) noexcept
+    {
+        if (!retailCenterRendererDiagnosticStopValid(stop)
+            || mEngineSnapshot.active)
+        {
+            return false;
+        }
+        mDiagnosticStop = stop;
         return true;
     }
 
@@ -359,6 +447,12 @@ public:
         return mLastAccumulatorSnapshot;
     }
 
+    const RetailCenterRendererTimingDiagnostics& timingDiagnostics() const
+        noexcept
+    {
+        return mLastTiming;
+    }
+
 private:
     struct EngineAccumulatorSnapshot
     {
@@ -366,6 +460,7 @@ private:
         abi::RetailPointer32 rendererAccumulator = 0u;
         abi::RetailPointer32 accumulatingAccumulator = 0u;
         abi::RetailPointer32 renderingAccumulator = 0u;
+        bool distinctRenderingAccumulatorRetained = false;
         bool active = false;
     };
 
@@ -407,11 +502,18 @@ private:
     abi::RetailBSShaderAccumulatorLayout* mCollectionAccumulator = nullptr;
     abi::RetailPointer32 mStockCullerVtable = 0u;
     RetailEyeTargetOperations mTargets {};
+    RetailCenterRendererDiagnosticStop mDiagnosticStop =
+        RetailCenterRendererDiagnosticStop::None;
     EngineAccumulatorSnapshot mEngineSnapshot {};
     StockCullerCapture mStockCapture {};
+    std::array<abi::RetailPointer32, CollectorCapacity>
+        mQueueSafeGeometryPointers {};
+    void* mFrameSceneObject = nullptr;
+    abi::RetailNiCameraLayout* mActiveEyeCamera = nullptr;
     std::uint64_t mNextStockCaptureGeneration = 0u;
     RetailCenterVisibilityDiagnostics mLastVisibility {};
     RetailCenterAccumulatorSnapshotDiagnostics mLastAccumulatorSnapshot {};
+    RetailCenterRendererTimingDiagnostics mLastTiming {};
     // Never replay ProcessAlt on a copied culler. The stock culler is captured
     // only during its own AccumulateScene call and restored before eye work.
 
@@ -426,6 +528,29 @@ struct RetailCenterRendererOperationsAdapter
 {
     using Context = RetailCenterRendererOperationsContext<CollectorCapacity>;
 
+    class ScopedStageTimer final
+    {
+    public:
+        explicit ScopedStageTimer(double& destination) noexcept
+            : mDestination(destination)
+            , mStarted(std::chrono::steady_clock::now())
+        {
+        }
+
+        ~ScopedStageTimer() noexcept
+        {
+            mDestination = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - mStarted).count();
+        }
+
+        ScopedStageTimer(const ScopedStageTimer&) = delete;
+        ScopedStageTimer& operator=(const ScopedStageTimer&) = delete;
+
+    private:
+        double& mDestination;
+        std::chrono::steady_clock::time_point mStarted;
+    };
+
     static Context* checked(void* opaque) noexcept
     {
         auto* context = static_cast<Context*>(opaque);
@@ -437,6 +562,60 @@ struct RetailCenterRendererOperationsAdapter
     {
         return reinterpret_cast<abi::RetailBSShaderAccumulatorLayout*>(
             static_cast<std::uintptr_t>(address));
+    }
+
+    static bool geometryQueuesWithoutImmediateDispatch(
+        const abi::RetailBSShaderAccumulatorLayout* accumulator,
+        abi::RetailPointer32 geometryAddress) noexcept
+    {
+        if (!accumulator || geometryAddress == 0u)
+            return false;
+
+        // Exact NiAccumulator::AddVisibleArray branch contract at 0x00A9B790.
+        // Any geometry that fails this predicate is immediately dispatched
+        // through vslot +0xDC. Replaying that class after stock AccumulateScene
+        // invalidates per-object render-pass data used by a later retail frame,
+        // so the private-eye transaction admits only the list-queue branch.
+        constexpr std::size_t GeometryFlagsOffset = 0x30u;
+        constexpr std::size_t GeometryPropertyOffset = 0x9Cu;
+        constexpr std::size_t PropertyFlagsOffset = 0x18u;
+        constexpr std::size_t AccumulatorModeOffset = 0x30u;
+        constexpr std::uint16_t PropertyAccumulatorQueue = 0x0001u;
+        constexpr std::uint16_t PropertyModeExcluded = 0x2000u;
+        constexpr std::uint32_t GeometryImmediateDispatch = 0x00000040u;
+
+        const auto* geometry = reinterpret_cast<const std::uint8_t*>(
+            static_cast<std::uintptr_t>(geometryAddress));
+        abi::RetailPointer32 propertyAddress = 0u;
+        std::uint32_t geometryFlags = 0u;
+        std::memcpy(
+            &propertyAddress,
+            geometry + GeometryPropertyOffset,
+            sizeof(propertyAddress));
+        std::memcpy(
+            &geometryFlags,
+            geometry + GeometryFlagsOffset,
+            sizeof(geometryFlags));
+        if (propertyAddress == 0u
+            || (geometryFlags & GeometryImmediateDispatch) != 0u)
+        {
+            return false;
+        }
+
+        const auto* property = reinterpret_cast<const std::uint8_t*>(
+            static_cast<std::uintptr_t>(propertyAddress));
+        std::uint16_t propertyFlags = 0u;
+        std::memcpy(
+            &propertyFlags,
+            property + PropertyFlagsOffset,
+            sizeof(propertyFlags));
+        const auto* accumulatorBytes =
+            reinterpret_cast<const std::uint8_t*>(accumulator);
+        const std::uint8_t accumulatorMode =
+            accumulatorBytes[AccumulatorModeOffset];
+        return (propertyFlags & PropertyAccumulatorQueue) != 0u
+            && (accumulatorMode == 0u
+                || (propertyFlags & PropertyModeExcluded) == 0u);
     }
 
     static void captureVisibilityDiagnostics(
@@ -569,10 +748,17 @@ struct RetailCenterRendererOperationsAdapter
         const abi::RetailPointer32 renderingAccumulator =
             *context.mCalls.renderingAccumulator;
         diagnostics.renderingAccumulator = renderingAccumulator;
+        auto* renderingLane =
+            accumulatorFromAddress(renderingAccumulator);
         if (ownedAccumulator)
         {
             diagnostics.rendererAccumulatorReferenceCount =
                 ownedAccumulator->referenceCount;
+        }
+        if (renderingLane)
+        {
+            diagnostics.renderingAccumulatorReferenceCount =
+                renderingLane->referenceCount;
         }
         // The renderer and accumulating globals share the coordinator-owned
         // accumulator at this call boundary. Retail may keep a distinct,
@@ -581,18 +767,46 @@ struct RetailCenterRendererOperationsAdapter
         if (!ownedAccumulator
             || ownedAccumulator->referenceCount < 4u
             || accumulatingAccumulator != rendererAccumulator
-            || renderingAccumulator == 0u)
+            || !renderingLane
+            || renderingLane->referenceCount == 0u)
         {
             diagnostics.failure =
                 RetailCenterAccumulatorSnapshotFailure::OwnerStateRejected;
             return false;
         }
 
+        const bool retainDistinctRenderingLane =
+            renderingAccumulator != rendererAccumulator;
+        if (retainDistinctRenderingLane)
+        {
+            if (renderingLane->referenceCount
+                == (std::numeric_limits<std::uint32_t>::max)())
+            {
+                diagnostics.failure =
+                    RetailCenterAccumulatorSnapshotFailure::
+                        RenderingLaneOwnershipRejected;
+                return false;
+            }
+            const std::uint32_t retained =
+                ++renderingLane->referenceCount;
+            if (retained <= 1)
+            {
+                --renderingLane->referenceCount;
+                diagnostics.failure =
+                    RetailCenterAccumulatorSnapshotFailure::
+                        RenderingLaneOwnershipRejected;
+                return false;
+            }
+            diagnostics.renderingAccumulatorReferenceCount =
+                retained;
+            diagnostics.distinctRenderingAccumulatorRetained = true;
+        }
         context.mEngineSnapshot = {
             renderer,
             rendererAccumulator,
             accumulatingAccumulator,
             renderingAccumulator,
+            retainDistinctRenderingLane,
             true,
         };
         diagnostics.failure = RetailCenterAccumulatorSnapshotFailure::None;
@@ -611,60 +825,91 @@ struct RetailCenterRendererOperationsAdapter
             snapshot.accumulatingAccumulator);
         auto* renderingAccumulator = accumulatorFromAddress(
             snapshot.renderingAccumulator);
-        context.mCalls.setRenderingAccumulator(renderingAccumulator);
-        context.mCalls.setAccumulatingAccumulator(accumulatingAccumulator);
-        context.mCalls.rendererSetAccumulator(
-            snapshot.renderer,
-            rendererAccumulator);
+        // The retail owner setters are replacement operations, not
+        // self-assignment-safe smart-pointer stores.  Calling one with its
+        // already-installed accumulator can release the object before it
+        // reloads the same raw address, leaving a null vtable for the next
+        // stock RenderWorld pass.  Restore only owners that the private-eye
+        // transaction actually changed.
+        if (*context.mCalls.renderingAccumulator
+            != snapshot.renderingAccumulator)
+        {
+            context.mCalls.setRenderingAccumulator(renderingAccumulator);
+        }
+        if (*context.mCalls.accumulatingAccumulator
+            != snapshot.accumulatingAccumulator)
+        {
+            context.mCalls.setAccumulatingAccumulator(
+                accumulatingAccumulator);
+        }
+        if (snapshot.renderer->accumulator
+            != snapshot.rendererAccumulator)
+        {
+            context.mCalls.rendererSetAccumulator(
+                snapshot.renderer,
+                rendererAccumulator);
+        }
         const bool restored = snapshot.renderer->accumulator
                 == snapshot.rendererAccumulator
             && *context.mCalls.accumulatingAccumulator
                 == snapshot.accumulatingAccumulator
             && *context.mCalls.renderingAccumulator
                 == snapshot.renderingAccumulator;
-        if (restored)
-            context.mEngineSnapshot = {};
+        if (!restored)
+            return false;
+        if (snapshot.distinctRenderingAccumulatorRetained)
+        {
+            // Restoring the rendering owner reacquires its ordinary engine
+            // reference before this temporary hold is released.  The
+            // authenticated NiRefObject::Free thunk is a deallocator used for
+            // factory-owned objects; it is not a reference decrement.  Match
+            // the explicit increment from snapshot with one direct decrement.
+            if (!renderingAccumulator
+                || renderingAccumulator->referenceCount < 2u)
+            {
+                return false;
+            }
+            --renderingAccumulator->referenceCount;
+        }
+        context.mEngineSnapshot = {};
         return restored;
     }
 
-    static bool registerEyeAccumulator(
-        Context& context,
-        abi::RetailBSShaderAccumulatorLayout* accumulator) noexcept
+    static void abandonEngineAccumulatorSnapshot(Context& context) noexcept
     {
-        if (!context.mEngineSnapshot.active || !accumulator)
-            return false;
-        const std::uintptr_t accumulatorAddress =
-            reinterpret_cast<std::uintptr_t>(accumulator);
-        if (accumulatorAddress
-            > (std::numeric_limits<abi::RetailPointer32>::max)())
+        if (!context.mEngineSnapshot.active)
+            return;
+        const typename Context::EngineAccumulatorSnapshot snapshot =
+            context.mEngineSnapshot;
+        if (snapshot.distinctRenderingAccumulatorRetained)
         {
-            return false;
+            auto* renderingAccumulator = accumulatorFromAddress(
+                snapshot.renderingAccumulator);
+            if (renderingAccumulator
+                && renderingAccumulator->referenceCount >= 2u)
+            {
+                --renderingAccumulator->referenceCount;
+            }
         }
-        const abi::RetailPointer32 address =
-            static_cast<abi::RetailPointer32>(accumulatorAddress);
-        context.mCalls.rendererSetAccumulator(
-            context.mEngineSnapshot.renderer,
-            accumulator);
-        context.mCalls.setAccumulatingAccumulator(accumulator);
-        // AddVisibleArray is permitted to draw immediately, before the
-        // explicit render call. Its rendering-global must therefore already
-        // name this eye's private accumulator; leaving the stock accumulator
-        // installed sends those draws through the wrong camera/state lane and
-        // produced the all-black private-eye payload seen in the live runs.
-        context.mCalls.setRenderingAccumulator(accumulator);
-        return context.mEngineSnapshot.renderer->accumulator == address
-            && *context.mCalls.accumulatingAccumulator == address
-            && *context.mCalls.renderingAccumulator == address;
+        context.mEngineSnapshot = {};
     }
 
     static bool snapshot(void* opaque) noexcept
     {
         Context* context = checked(opaque);
-        if (!context || !snapshotEngineAccumulatorState(*context))
+        if (!context)
+            return false;
+        context->mLastTiming = {};
+        context->mLastTiming.captured = true;
+        ScopedStageTimer timer(
+            context->mLastTiming.snapshotMilliseconds);
+        context->mFrameSceneObject = nullptr;
+        context->mActiveEyeCamera = nullptr;
+        if (!snapshotEngineAccumulatorState(*context))
             return false;
         if (!context->mTargets.snapshot(context->mTargets.context))
         {
-            context->mEngineSnapshot = {};
+            abandonEngineAccumulatorSnapshot(*context);
             context->mLastAccumulatorSnapshot.failure =
                 RetailCenterAccumulatorSnapshotFailure::EyeTargetsRejected;
             return false;
@@ -684,12 +929,22 @@ struct RetailCenterRendererOperationsAdapter
         Context* context = static_cast<Context*>(opaque);
         if (!context)
             return false;
+        ScopedStageTimer timer(
+            context->mLastTiming.collectMilliseconds);
         captureVisibilityDiagnostics(
             *context,
             camera,
             sceneObject,
             culler,
             generation);
+        if (context->mDiagnosticStop
+            == RetailCenterRendererDiagnosticStop::AfterSnapshot)
+        {
+            return rejectVisibility(
+                *context,
+                culler,
+                RetailCenterVisibilityFailure::DiagnosticStop);
+        }
         if (!context->ready())
         {
             return rejectVisibility(
@@ -781,24 +1036,61 @@ struct RetailCenterRendererOperationsAdapter
                 culler,
                 RetailCenterVisibilityFailure::NoVisibleGeometry);
         }
+        context->mLastVisibility.privateAccumulatorMode =
+            reinterpret_cast<const std::uint8_t*>(
+                context->mCollectionAccumulator)[0x30u];
+        std::uint32_t queueSafeItemCount = 0u;
         for (std::uint32_t index = 0u; index < view.itemCount; ++index)
         {
-            if (view.geometryPointers[index] == 0u)
+            const abi::RetailPointer32 geometry =
+                view.geometryPointers[index];
+            if (geometry == 0u)
             {
                 return rejectVisibility(
                     *context,
                     culler,
                     RetailCenterVisibilityFailure::VisibleArrayRejected);
             }
+            if (geometryQueuesWithoutImmediateDispatch(
+                    context->mCollectionAccumulator,
+                    geometry))
+            {
+                context->mQueueSafeGeometryPointers[queueSafeItemCount] =
+                    geometry;
+                ++queueSafeItemCount;
+            }
+        }
+        context->mLastVisibility.queueSafeItemCount = queueSafeItemCount;
+        context->mLastVisibility.immediateGeometryRejectedCount =
+            view.itemCount - queueSafeItemCount;
+        if (queueSafeItemCount == 0u)
+        {
+            return rejectVisibility(
+                *context,
+                culler,
+                RetailCenterVisibilityFailure::NoQueueSafeGeometry);
         }
 
+        const std::uintptr_t queueSafeGeometryAddress =
+            reinterpret_cast<std::uintptr_t>(
+                context->mQueueSafeGeometryPointers.data());
+        if (queueSafeGeometryAddress
+            > (std::numeric_limits<abi::RetailPointer32>::max)())
+        {
+            return rejectVisibility(
+                *context,
+                culler,
+                RetailCenterVisibilityFailure::
+                    VisibleArrayStorageAddressOutOfRange);
+        }
         visibleSet.array = {
-            static_cast<abi::RetailPointer32>(geometryAddress),
-            view.itemCount,
+            static_cast<abi::RetailPointer32>(queueSafeGeometryAddress),
+            queueSafeItemCount,
             static_cast<std::uint32_t>(CollectorCapacity),
             0u,
         };
         visibleSet.generation = generation;
+        context->mFrameSceneObject = sceneObject;
         static_cast<void>(rejectVisibility(
             *context,
             culler,
@@ -818,8 +1110,25 @@ struct RetailCenterRendererOperationsAdapter
         CenterRendererEyeIsolation& isolation) noexcept
     {
         Context* context = checked(opaque);
-        return context
-            && context->mTargets.bind(
+        if (!context)
+            return false;
+        ScopedStageTimer timer(
+            eye == CenterRendererEye::Left
+                ? context->mLastTiming.leftBindMilliseconds
+                : context->mLastTiming.rightBindMilliseconds);
+        if (context
+            && ((eye == CenterRendererEye::Left
+                    && context->mDiagnosticStop
+                        == RetailCenterRendererDiagnosticStop::
+                            AfterVisibility)
+                || (eye == CenterRendererEye::Right
+                    && context->mDiagnosticStop
+                        == RetailCenterRendererDiagnosticStop::
+                            AfterLeftEye)))
+        {
+            return false;
+        }
+        return context->mTargets.bind(
                 context->mTargets.context,
                 eye,
                 isolation);
@@ -833,8 +1142,29 @@ struct RetailCenterRendererOperationsAdapter
         Context* context = checked(opaque);
         if (!context || !accumulator || !camera)
             return false;
-        if (!registerEyeAccumulator(*context, accumulator))
+        ScopedStageTimer timer(
+            accumulator == context->mCollectionAccumulator
+                ? context->mLastTiming.leftCameraMilliseconds
+                : context->mLastTiming.rightCameraMilliseconds);
+        if (accumulator == context->mCollectionAccumulator
+            && context->mDiagnosticStop
+                == RetailCenterRendererDiagnosticStop::AfterLeftBind)
+        {
             return false;
+        }
+        if (!context->mEngineSnapshot.active)
+            return false;
+        auto* preparedRenderingLane = accumulatorFromAddress(
+            context->mEngineSnapshot.renderingAccumulator);
+        if (!preparedRenderingLane)
+            return false;
+        if (*context->mCalls.renderingAccumulator
+            != context->mEngineSnapshot.renderingAccumulator)
+        {
+            context->mCalls.setRenderingAccumulator(
+                preparedRenderingLane);
+        }
+        context->mActiveEyeCamera = camera;
         context->mCalls.accumulatorSetCamera(
             reinterpret_cast<abi::RetailNiAccumulatorLayout*>(accumulator),
             camera);
@@ -849,10 +1179,131 @@ struct RetailCenterRendererOperationsAdapter
         Context* context = checked(opaque);
         if (!context || !accumulator || !visibleArray)
             return false;
-        context->mCalls.accumulatorAddVisibleArray(
-            reinterpret_cast<abi::RetailNiAccumulatorLayout*>(accumulator),
-            const_cast<abi::RetailNiVisibleArrayLayout*>(visibleArray));
-        return true;
+        const auto populateStarted =
+            std::chrono::steady_clock::now();
+        if (accumulator == context->mCollectionAccumulator
+            && context->mDiagnosticStop
+                == RetailCenterRendererDiagnosticStop::AfterLeftCamera)
+        {
+            return false;
+        }
+        const auto* geometryPointers =
+            reinterpret_cast<const abi::RetailPointer32*>(
+                static_cast<std::uintptr_t>(
+                    visibleArray->geometryPointers));
+        if (!geometryPointers
+            || visibleArray->itemCount == 0u
+            || visibleArray->itemCount > visibleArray->capacity)
+        {
+            return false;
+        }
+        for (std::uint32_t index = 0u;
+             index < visibleArray->itemCount;
+             ++index)
+        {
+            if (!geometryQueuesWithoutImmediateDispatch(
+                    accumulator,
+                    geometryPointers[index]))
+            {
+                return false;
+            }
+        }
+#if defined(_MSC_VER) && defined(_M_IX86)
+        if (!context->mFrameSceneObject
+            || !context->mActiveEyeCamera
+            || !context->mBinding
+            || !context->mEngineSnapshot.active)
+        {
+            return false;
+        }
+        auto* stockAccumulator = accumulatorFromAddress(
+            context->mEngineSnapshot.rendererAccumulator);
+        if (!stockAccumulator
+            || stockAccumulator == accumulator
+            || stockAccumulator->shadowScene == 0u
+            || !context->mStockCapture.culler
+            || context->mStockCapture.culler->shaderAccumulator
+                != context->mEngineSnapshot.rendererAccumulator)
+        {
+            return false;
+        }
+        auto* privateCuller = context->mBinding->cullingProcess();
+        const abi::RetailPointer32 cloneVtable =
+            context->mBinding->ownedVtableAddressForDispatch();
+        if (!privateCuller
+            || cloneVtable == 0u
+            || privateCuller->base.vtable != cloneVtable)
+        {
+            return false;
+        }
+
+        const std::uintptr_t accumulatorAddress =
+            reinterpret_cast<std::uintptr_t>(accumulator);
+        if (accumulatorAddress
+            > (std::numeric_limits<abi::RetailPointer32>::max)())
+        {
+            return false;
+        }
+        const abi::RetailPointer32 accumulatorPointer =
+            static_cast<abi::RetailPointer32>(accumulatorAddress);
+
+        // Re-run the exact stock accumulation wrapper for each derived eye.
+        // A visible-array replay reconstructs only NiAccumulator's sorted
+        // geometry list; it does not execute the geometry/property callbacks
+        // that populate BSShaderAccumulator's mode-0 render passes. The
+        // private, constructor-owned culler gives each eye that complete stock
+        // preparation without touching the live stock culler a second time.
+        //
+        // The BSShaderAccumulator constructor does not initialize +0x194,
+        // while stock AccumulateScene immediately treats it as the raw
+        // ShadowScene coordinator. The destructor body at 0x00B656E0 releases
+        // the owned +0x198 and +0x1A0 fields but never releases +0x194. Copy
+        // only this proven non-owning frame dependency; copying the complete
+        // stock accumulator would alias its engine-owned pass lists.
+        accumulator->shadowScene = stockAccumulator->shadowScene;
+        bool accumulated = false;
+        privateCuller->base.vtable = context->mStockCullerVtable;
+        __try
+        {
+            context->mCalls.cullingProcessSetAccumulator(
+                privateCuller,
+                accumulator);
+            context->mCalls.accumulateScene(
+                context->mActiveEyeCamera,
+                context->mFrameSceneObject,
+                privateCuller);
+            accumulated =
+                privateCuller->shaderAccumulator == accumulatorPointer
+                && context->mEngineSnapshot.renderer->accumulator
+                    == accumulatorPointer
+                && *context->mCalls.accumulatingAccumulator
+                    == accumulatorPointer
+                && *context->mCalls.renderingAccumulator
+                    == context->mEngineSnapshot.renderingAccumulator;
+        }
+        __finally
+        {
+            privateCuller->base.vtable = cloneVtable;
+        }
+        context->mActiveEyeCamera = nullptr;
+        const double populateMilliseconds =
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - populateStarted).count();
+        if (accumulator == context->mCollectionAccumulator)
+        {
+            context->mLastTiming.leftPopulateMilliseconds =
+                populateMilliseconds;
+        }
+        else
+        {
+            context->mLastTiming.rightPopulateMilliseconds =
+                populateMilliseconds;
+        }
+        return accumulated
+            && context->mBinding->ownedVtableIntegrityValid();
+#else
+        return false;
+#endif
     }
 
     static bool render(
@@ -869,6 +1320,26 @@ struct RetailCenterRendererOperationsAdapter
         {
             return false;
         }
+        ScopedStageTimer timer(
+            accumulator == context->mCollectionAccumulator
+                ? context->mLastTiming.leftRenderMilliseconds
+                : context->mLastTiming.rightRenderMilliseconds);
+        if (accumulator == context->mCollectionAccumulator
+            && context->mDiagnosticStop
+                == RetailCenterRendererDiagnosticStop::AfterLeftPopulate)
+        {
+            return false;
+        }
+        // The private accumulator contains the same queue-safe world geometry
+        // consumed by stock mode 0. Enter the authenticated retail world
+        // wrapper once and let BSShaderAccumulator::Render select its native
+        // mode-0 path. An auxiliary mode-10 prepass is not part of
+        // RenderWorldSceneGraph: it enters a shader callback which assumes a
+        // separate renderer-global array was initialized by that auxiliary
+        // pipeline. Replaying it here faults before the world render begins.
+        constexpr std::uint32_t WorldRenderMode = 0u;
+        if (accumulator->renderMode != WorldRenderMode)
+            return false;
         context->mCalls.renderAccumulatorWithoutFinalize(
             camera,
             accumulator,
@@ -895,6 +1366,16 @@ struct RetailCenterRendererOperationsAdapter
         {
             return false;
         }
+        ScopedStageTimer timer(
+            accumulator == context->mCollectionAccumulator
+                ? context->mLastTiming.leftFinalizeMilliseconds
+                : context->mLastTiming.rightFinalizeMilliseconds);
+        if (accumulator == context->mCollectionAccumulator
+            && context->mDiagnosticStop
+                == RetailCenterRendererDiagnosticStop::AfterLeftRender)
+        {
+            return false;
+        }
         context->mCalls.finalizeAccumulator(
             camera,
             accumulator,
@@ -908,8 +1389,20 @@ struct RetailCenterRendererOperationsAdapter
         CenterRendererEyeIsolation& isolation) noexcept
     {
         Context* context = checked(opaque);
-        return context
-            && context->mTargets.end(
+        if (!context)
+            return false;
+        ScopedStageTimer timer(
+            eye == CenterRendererEye::Left
+                ? context->mLastTiming.leftEndMilliseconds
+                : context->mLastTiming.rightEndMilliseconds);
+        if (context
+            && eye == CenterRendererEye::Left
+            && context->mDiagnosticStop
+                == RetailCenterRendererDiagnosticStop::AfterLeftFinalize)
+        {
+            return false;
+        }
+        return context->mTargets.end(
                 context->mTargets.context,
                 eye,
                 isolation);
@@ -923,6 +1416,8 @@ struct RetailCenterRendererOperationsAdapter
         Context* context = checked(opaque);
         if (context)
         {
+            ScopedStageTimer timer(
+                context->mLastTiming.rollbackMilliseconds);
             context->mTargets.rollback(
                 context->mTargets.context,
                 eye,
@@ -936,6 +1431,8 @@ struct RetailCenterRendererOperationsAdapter
         Context* context = checked(opaque);
         if (!context)
             return false;
+        ScopedStageTimer timer(
+            context->mLastTiming.restoreMilliseconds);
         const bool targetsRestored =
             context->mTargets.restore(context->mTargets.context);
         const bool engineRestored = restoreEngineAccumulatorState(*context);
@@ -950,6 +1447,9 @@ struct RetailCenterRendererOperationsAdapter
         if (context)
         {
             context->discardStockCullerCapture();
+            context->mQueueSafeGeometryPointers.fill(0u);
+            context->mFrameSceneObject = nullptr;
+            context->mActiveEyeCamera = nullptr;
         }
         visibleSet = {};
     }

@@ -112,18 +112,22 @@ acceptance remain explicitly false.
 The process-local headless OpenXR Simulator now provides a non-interactive
 runtime, deterministic HMD/controller state, and final-eye capture without
 changing the active system runtime. The 2026-07-29 full source checkpoint
-passed 224/224 tests. The newest TTW simulator run started the host and retail
-process, verified advancing runtime/pose publication and the CPU-v8 bridge,
-created 1280x720 eye targets, and published repeated non-black mono Start Menu
-frames. A partial-probe schema exception stopped the supervisor before the
-owned fixture load; the launcher now treats incomplete probe objects as
-not-ready instead of aborting.
+passed 224/224 tests. Retained run
+`20260729-120130-129-4a961da02e23` completed its bounded TTW world-only trial
+with `trialReady=true`, no supervisor error, 68 unique CPU-v8 stereo
+transactions and pose sequences sustained for 19.254 seconds, and 119
+contiguous accepted final-swapchain eye pairs. Its deterministic 12.1-second
+head sweep published and consumed 82 commands spanning X/Y/Z translation plus
+yaw/pitch/roll, then restored the centered pose. The four staged game artifacts
+and plugin profile were restored, and the load-only save/NVSE files were
+unchanged.
 
-This is still not an S3D/6DoF acceptance result. At this checkpoint the local
-product history contains 92 manifests, with zero accepted runs, zero proven
-stereo-output runs, zero controller-authorized runs, and zero tracked-weapon
-runs. Simulator iteration must close those gates before a physical headset
-check is meaningful.
+This is a retained simulator S3D/6DoF visual-trial result, not full product or
+physical-headset acceptance. The run proves that commanded six-axis HMD motion
+can remain live through distinct retail engine eye rendering and OpenXR
+submission. It does not authorize game input, player/body mutation, controller
+interaction, tracked-weapon mutation, or projectile aiming; those product gates
+remain explicitly false.
 
 ### Head tracking
 
@@ -133,13 +137,18 @@ acceptable 6DoF camera: looking around pivoted too much of the player/body
 frame with the head. There is now a deterministic synthetic-pose assist
 harness, a headless simulator with scripted pose sweeps, and a rotation-local
 desktop camera transaction with a separate post-hook local-camera observation
-record. The same transaction has a separately scoped CPU menu-source capture
+record. The retained simulator trial exercised all three translation axes and
+all three rotation axes while advancing distinct eye transactions, then
+recentered without a crash, stereo loss, or supervisor watchdog failure. That
+is the current repeatable six-axis camera proof; physical-headset head/body
+decoupling and deliberate controller-relative body heading still have not
+passed. The same transaction has a separately scoped CPU menu-source capture
 record: it requires a confirmed menu state, current pose-producer epoch,
 matching runtime frame, and verified non-black pixel hash, then clears on
 non-UI Present. Unit/source tests pass and the product route has produced
-Start Menu source frames, but the desktop camera transaction and live
+Start Menu source frames, but the desktop camera transaction and physical
 head/body decoupling have not yet passed against gameplay. This does not yet
-constitute a stable headset camera or full UI transition.
+constitute physical-headset or full UI-transition acceptance.
 
 The same explicitly approved desktop session can now optionally collect the
 existing retail runtime probe after first-person body-root readiness. That
@@ -222,9 +231,11 @@ The bounded visual-trial backend now owns private left/right cameras,
 accumulators, color targets, and depth/stencil targets; collects one
 conservative visible set; binds and clears each complete eye target before
 population; restores retail state; and publishes only a complete distinct-eye
-transaction. This proves the intended engine schedule in code and tests, but
-does not yet prove every stock accumulation branch, scene class, transition,
-or performance requirement live.
+transaction. The retained TTW exterior-world trial proved that schedule live
+for 119 contiguous accepted final-swapchain pairs during a commanded six-axis
+head sweep. It does not yet prove every stock accumulation branch, scene
+class, exterior/interior transition, blocking-UI transition, or production
+performance requirement.
 
 The retained compatibility failure was not a new JIP accumulator/culler patch.
 The exact installed JIP 57.30 `RenderFirstPerson` call rewrite is already
@@ -256,10 +267,10 @@ executable checks, pointer validation, logging, and fail-closed rejection.
 
 ## Immediate Blockers
 
-1. Activate Quest Link/Air Link and run the post-fix attested visual trial in a
-   loaded gameplay world. Require advancing pose/runtime state, the exact
-   world-hook initialization record, and distinct nonzero left/right OpenXR
-   output hashes.
+1. Repeat the retained simulator six-axis visual trial on Quest Link/Air Link
+   in a loaded gameplay world. Require advancing pose/runtime state, the exact
+   world-hook initialization record, distinct nonzero left/right OpenXR output
+   hashes, clean recentering, and head/body decoupling under physical motion.
 2. Prove center/center and distinct-eye behavior live across both stock
    accumulation branches, exterior/interior transitions, first-person
    geometry, particles, transparency, and blocking UI transitions.
@@ -276,6 +287,11 @@ executable checks, pointer validation, logging, and fail-closed rejection.
 
 ## Safe Local Artifacts
 
+- current 224/224 product build attestation at
+  `local/product-build/fnvxr-product-Release.json`;
+- retained dynamic six-axis run manifest, raw final-eye captures, and verified
+  29.75-second 2560x720 side-by-side H.264 proof under
+  `local/product-runs/20260729-120130-129-4a961da02e23/`;
 - nonce-bound, tested no-launch StageOnly manifest under
   `local/openxr-retail-sidecar-runs/20260718-085015-525/`;
 - independent no-copy/no-launch ValidateOnly manifest under

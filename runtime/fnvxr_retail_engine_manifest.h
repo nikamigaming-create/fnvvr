@@ -108,7 +108,7 @@ struct LoadedFunctionManifestEntry
 // from two independent loaded-memory dumps. Both dumps produced identical
 // bytes. Do not widen a callable entry to cover adjacent alignment bytes or
 // functions: a matching cluster is not ABI evidence for the named function.
-inline constexpr std::array<LoadedFunctionManifestEntry, 13> RetailEngineManifest {{
+inline constexpr std::array<LoadedFunctionManifestEntry, 15> RetailEngineManifest {{
     {
         "DoRenderFrame",
         WholeFrameRenderAddress,
@@ -146,10 +146,22 @@ inline constexpr std::array<LoadedFunctionManifestEntry, 13> RetailEngineManifes
         sha256FromHex("F41A0EAAC2E0573BC25B8A7A5E3799601B29E5D298D68B1C9E7CA002124D9B2D"),
     },
     {
+        "NiAccumulator::FinishAccumulating",
+        0x00A9B570u,
+        437u,
+        sha256FromHex("192CA9CE2B5C39AC15A0DBFA4F6D2650471A17775AD3950032419C381A3FB20F"),
+    },
+    {
         "NiAccumulator::AddVisibleArray",
         0x00A9B790u,
         189u,
         sha256FromHex("A929F2C8289B45EC15F5A16E88A5052D5E1C3F1348880E07C66E223DCB592843"),
+    },
+    {
+        "FinishAccumulatingShaderAccumulator",
+        0x00B65E80u,
+        51u,
+        sha256FromHex("9D03349FA8780CF4B1898D4B0355D03BD58343E6D514ABE5F44734C63F8E0684"),
     },
     {
         "FinalizeAccumulator",

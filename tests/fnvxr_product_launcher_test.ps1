@@ -117,6 +117,13 @@ if (-not $launcher.Contains('[ValidateSet("Disabled", "Create", "Load", "Ensure"
     -not $launcher.Contains('FalloutNV.esm-only fixture plugins.txt profile')) {
     throw "Product launcher lost the owned retail fixture route or its retired unsafe profile guard."
 }
+if (-not $launcher.Contains('$fixtureArguments = @{') -or
+    $launcher.Contains('$fixtureArguments = @(') -or
+    -not $launcher.Contains('ReadyTimeoutSeconds = $RetailReadyTimeoutSeconds') -or
+    -not $launcher.Contains('$fixtureArguments["TtwCore"] = $true') -or
+    -not $launcher.Contains('$fixtureArguments["UseAttestedBuild"] = $true')) {
+    throw "Product launcher must forward the dedicated fixture runner through a named-parameter hashtable splat."
+}
 foreach ($fixtureContract in @(
     'schema = if ($TtwCore) { "fnvxr-ttw-fixture-v1" } else { "fnvxr-retail-fixture-v1" }',
     'Get-FnvxrProductRetailFixtureStagePlan',
@@ -177,7 +184,7 @@ foreach ($requiredFixtureGameplayText in @(
     '"--require-runtime"',
     '"--require-advancing"',
     '[uint32]$snapshot.runtime.phase -eq 3',
-    '[uint32]$snapshot.runtime.menuBits -eq 0',
+    '([uint32]$snapshot.runtime.menuBits -band 0xFE) -eq 0',
     '-not [bool]$snapshot.runtime.uiInputAllowed',
     '[bool]$snapshot.runtime.cameraActive',
     '-not [bool]$snapshot.runtime.showroomActive')) {
@@ -281,9 +288,11 @@ foreach ($defaultForbiddenKey in @(
     "FNVXR_RETAIL_FIXTURE_TRAIT_ONE",
     "FNVXR_RETAIL_FIXTURE_TRAIT_TWO",
     "FNVXR_RETAIL_FIXTURE_ACK_OFFICIAL_PACK_POPUP",
+    "FNVXR_RETAIL_FIXTURE_ACK_TTW_STEWIE_DEPENDENCY_WARNING",
     "FNVXR_HEADSET_DEMO_FIXTURE",
     "FNVXR_HEADSET_DEMO_GAMEPLAY_WARMUP_FRAMES",
     "FNVXR_HEADSET_DEMO_PIPBOY_HOLD_FRAMES",
+    "FNVXR_RETAIL_VR_ACCUMULATION_DIAGNOSTIC_MODE",
     "FNVXR_HMD_MIRROR_CAPTURE_DIR",
     "FNVXR_HMD_MIRROR_CAPTURE_EVERY_N_FRAMES",
     "FNVXR_HMD_MIRROR_CAPTURE_MAX_PAIRS",
@@ -452,11 +461,18 @@ if ([string]$ttwFixtureEnvironment.FNVXR_RUN_PROFILE -cne "ttw-fixture-v1" -or
     [string]$ttwFixtureEnvironment.FNVXR_HOST_MODE -cne "ttw-fixture" -or
     [string]$ttwFixtureEnvironment.FNVXR_ENABLE_ENGINE_CENTER_STEREO -cne "0" -or
     [string]$ttwFixtureEnvironment.FNVXR_RETAIL_FIXTURE_SAVE_NAME -cne
-        "FNVXR_AutoTTW_L1_FastShot_WildWasteland") {
+        "FNVXR_AutoTTW_L1_FastShot_WildWasteland" -or
+    [string]$ttwFixtureEnvironment.FNVXR_RETAIL_FIXTURE_ACK_OFFICIAL_PACK_POPUP -cne
+        "1" -or
+    [string]$ttwFixtureEnvironment.FNVXR_RETAIL_FIXTURE_ACK_TTW_STEWIE_DEPENDENCY_WARNING -cne
+        "1") {
     throw "TTW fixture environment must select the owned non-OpenXR TTW profile."
 }
+if ($fixtureEnvironment.Keys -ccontains
+        "FNVXR_RETAIL_FIXTURE_ACK_TTW_STEWIE_DEPENDENCY_WARNING") {
+    throw "Base-retail fixture must not receive TTW dependency-warning authority."
+}
 foreach ($forbiddenTtwFixtureKey in @(
-    "FNVXR_RETAIL_FIXTURE_ACK_OFFICIAL_PACK_POPUP",
     "FNVXR_OPENXR_LOADER_HINT",
     "XR_RUNTIME_JSON",
     "OPENXR_SIMULATOR_HEADLESS")) {
@@ -550,6 +566,137 @@ foreach ($key in $expectedHeadsetDemoEnvironment.Keys) {
             [string]$expectedHeadsetDemoEnvironment[$key]) {
         throw "Headset demo environment lost exact bounded recording value: $key"
     }
+}
+$headsetWorldEnvironment = Get-FnvxrProductMinimalEnvironment `
+    -RunId "headset-world-contract" `
+    -RunDirectory "C:\fnvxr-headset-world-contract" `
+    -OpenXrLoaderPath "C:\fnvxr-headset-world-contract\openxr_loader.dll" `
+    -SessionReadyTimeoutSeconds 60 `
+    -AutomateRetailFixture `
+    -HeadsetWorldOnlyCapture `
+    -RetailFixtureAction "load" `
+    -RetailFixtureSaveName "FNVXR_AutoRetail_L1_FastShot_WildWasteland" `
+    -RetailFixtureTraitOne "FastShot" `
+    -RetailFixtureTraitTwo "WildWasteland" `
+    -HeadlessRuntimeManifest "C:\fnvxr-headset-world-contract\openxr_simulator.json" `
+    -HeadsetMirrorCaptureDirectory "C:\fnvxr-headset-world-contract\headset-mirror" `
+    -HeadsetMirrorCaptureEveryFrames 1 `
+    -HeadsetMirrorCaptureMaxPairs 600
+if ([string]$headsetWorldEnvironment.FNVXR_RUN_PROFILE -cne
+        "stereo-visual-trial-v5" -or
+    [string]$headsetWorldEnvironment.FNVXR_HOST_MODE -cne "vr" -or
+    [string]$headsetWorldEnvironment.FNVXR_ENABLE_ENGINE_CENTER_STEREO -cne
+        "1" -or
+    [string]$headsetWorldEnvironment.FNVXR_HEADSET_DEMO_FIXTURE -cne "1" -or
+    [string]$headsetWorldEnvironment.FNVXR_HEADSET_WORLD_ONLY_CAPTURE -cne
+        "1") {
+    throw "Headset world-only capture lost its exact owned-fixture OpenXR route."
+}
+foreach ($forbiddenHeadsetWorldInputKey in @(
+    "FNVXR_HEADSET_DEMO_GAMEPLAY_WARMUP_FRAMES",
+    "FNVXR_HEADSET_DEMO_PIPBOY_HOLD_FRAMES",
+    "FNVXR_DESKTOP_ASSIST_ENABLE",
+    "FNVXR_ENABLE_CONTROLLER_BRIDGE",
+    "FNVXR_ENABLE_TRACKED_WEAPON")) {
+    if ($headsetWorldEnvironment.Keys -ccontains
+        $forbiddenHeadsetWorldInputKey) {
+        throw "Headset world-only capture broadened input authority through: $forbiddenHeadsetWorldInputKey"
+    }
+}
+Require-Throws -Fragment "mutually exclusive" -Action {
+    Get-FnvxrProductMinimalEnvironment `
+        -RunId "ambiguous-headset-capture-contract" `
+        -RunDirectory "C:\fnvxr-ambiguous-headset-capture-contract" `
+        -OpenXrLoaderPath "C:\fnvxr-ambiguous-headset-capture-contract\openxr_loader.dll" `
+        -SessionReadyTimeoutSeconds 60 `
+        -AutomateRetailFixture `
+        -HeadsetDemoFixture `
+        -HeadsetWorldOnlyCapture `
+        -RetailFixtureAction "load" `
+        -RetailFixtureSaveName "FNVXR_AutoRetail_L1_FastShot_WildWasteland"
+}
+$delayedHeadsetDemoEnvironment = Get-FnvxrProductMinimalEnvironment `
+    -RunId "delayed-headset-demo-contract" `
+    -RunDirectory "C:\fnvxr-delayed-headset-demo-contract" `
+    -OpenXrLoaderPath "C:\fnvxr-delayed-headset-demo-contract\openxr_loader.dll" `
+    -SessionReadyTimeoutSeconds 60 `
+    -AutomateRetailFixture `
+    -HeadsetDemoFixture `
+    -HeadsetDemoGameplayWarmupFrames 1200 `
+    -RetailFixtureAction "load" `
+    -RetailFixtureSaveName "FNVXR_AutoRetail_L1_FastShot_WildWasteland" `
+    -RetailFixtureTraitOne "FastShot" `
+    -RetailFixtureTraitTwo "WildWasteland"
+if ([string]$delayedHeadsetDemoEnvironment.FNVXR_HEADSET_DEMO_GAMEPLAY_WARMUP_FRAMES -cne
+    "1200") {
+    throw "Headset demo diagnostic warmup did not remain bounded and explicit."
+}
+$captureOnlyHeadsetDemoEnvironment = Get-FnvxrProductMinimalEnvironment `
+    -RunId "capture-only-headset-demo-contract" `
+    -RunDirectory "C:\fnvxr-capture-only-headset-demo-contract" `
+    -OpenXrLoaderPath "C:\fnvxr-capture-only-headset-demo-contract\openxr_loader.dll" `
+    -SessionReadyTimeoutSeconds 60 `
+    -AutomateRetailFixture `
+    -HeadsetDemoFixture `
+    -RetailVrAccumulationDiagnosticMode "CaptureOnly" `
+    -RetailFixtureAction "load" `
+    -RetailFixtureSaveName "FNVXR_AutoRetail_L1_FastShot_WildWasteland" `
+    -RetailFixtureTraitOne "FastShot" `
+    -RetailFixtureTraitTwo "WildWasteland"
+if ([string]$captureOnlyHeadsetDemoEnvironment.FNVXR_RETAIL_VR_ACCUMULATION_DIAGNOSTIC_MODE -cne
+    "capture-only") {
+    throw "Capture-only accumulation diagnostic did not remain narrowly and explicitly selected."
+}
+$renderNoPublishHeadsetDemoEnvironment = Get-FnvxrProductMinimalEnvironment `
+    -RunId "render-no-publish-headset-demo-contract" `
+    -RunDirectory "C:\fnvxr-render-no-publish-headset-demo-contract" `
+    -OpenXrLoaderPath "C:\fnvxr-render-no-publish-headset-demo-contract\openxr_loader.dll" `
+    -SessionReadyTimeoutSeconds 60 `
+    -AutomateRetailFixture `
+    -HeadsetDemoFixture `
+    -RetailVrAccumulationDiagnosticMode "RenderNoPublish" `
+    -RetailFixtureAction "load" `
+    -RetailFixtureSaveName "FNVXR_AutoRetail_L1_FastShot_WildWasteland" `
+    -RetailFixtureTraitOne "FastShot" `
+    -RetailFixtureTraitTwo "WildWasteland"
+if ([string]$renderNoPublishHeadsetDemoEnvironment.FNVXR_RETAIL_VR_ACCUMULATION_DIAGNOSTIC_MODE -cne
+    "render-no-publish") {
+    throw "Render-without-publication diagnostic did not remain narrowly and explicitly selected."
+}
+foreach ($rendererStageDiagnostic in ([ordered]@{
+    SnapshotOnly = "snapshot-only"
+    CollectOnly = "collect-only"
+    BindOnly = "bind-only"
+    CameraOnly = "camera-only"
+    PopulateOnly = "populate-only"
+    RenderOnly = "render-only"
+    FinalizeOnly = "finalize-only"
+    LeftEyeOnly = "left-eye-only"
+}).GetEnumerator()) {
+    $rendererStageEnvironment = Get-FnvxrProductMinimalEnvironment `
+        -RunId "$($rendererStageDiagnostic.Value)-headset-demo-contract" `
+        -RunDirectory "C:\fnvxr-$($rendererStageDiagnostic.Value)-headset-demo-contract" `
+        -OpenXrLoaderPath "C:\fnvxr-$($rendererStageDiagnostic.Value)-headset-demo-contract\openxr_loader.dll" `
+        -SessionReadyTimeoutSeconds 60 `
+        -AutomateRetailFixture `
+        -HeadsetDemoFixture `
+        -RetailVrAccumulationDiagnosticMode $rendererStageDiagnostic.Key `
+        -RetailFixtureAction "load" `
+        -RetailFixtureSaveName "FNVXR_AutoRetail_L1_FastShot_WildWasteland" `
+        -RetailFixtureTraitOne "FastShot" `
+        -RetailFixtureTraitTwo "WildWasteland"
+    if ([string]$rendererStageEnvironment.FNVXR_RETAIL_VR_ACCUMULATION_DIAGNOSTIC_MODE -cne
+        [string]$rendererStageDiagnostic.Value) {
+        throw "Renderer-stage accumulation diagnostic did not remain exact: $($rendererStageDiagnostic.Key)"
+    }
+}
+Require-Throws -Fragment "requires the bounded headset demo" -Action {
+    Get-FnvxrProductMinimalEnvironment `
+        -RunId "invalid-accumulation-diagnostic-contract" `
+        -RunDirectory "C:\fnvxr-invalid-accumulation-diagnostic-contract" `
+        -OpenXrLoaderPath "C:\fnvxr-invalid-accumulation-diagnostic-contract\openxr_loader.dll" `
+        -SessionReadyTimeoutSeconds 60 `
+        -RetailVrAccumulationDiagnosticMode "RelayOnly"
 }
 foreach ($forbiddenHeadsetDemoAuthorityKey in @(
     "FNVXR_DESKTOP_ASSIST_ENABLE",
@@ -666,7 +813,7 @@ foreach ($cliOnlyContract in @(
     '[uint32]$snapshot.runtime.phase -eq 1',
     '([uint32]$snapshot.runtime.menuBits -band 2)',
     '[uint32]$snapshot.runtime.phase -eq 3',
-    '[uint32]$snapshot.runtime.menuBits -eq 0',
+    '([uint32]$snapshot.runtime.menuBits -band 0xFE) -eq 0',
     '-not [bool]$snapshot.runtime.uiInputAllowed',
     '[bool]$snapshot.runtime.cameraActive',
     '"--require-player"',
@@ -729,13 +876,20 @@ foreach ($forbiddenAutomationMechanism in @(
 
 foreach ($headsetDemoContract in @(
     '[switch]$HeadsetDemoFixture',
+    '[switch]$HeadsetWorldOnlyCapture',
+    '[switch]$HeadsetPoseSweep',
     'Get-FnvxrProductPipBoyOutputProof',
     'Get-FnvxrProductHeadsetDemoInputProof',
     'Get-FnvxrProductHeadsetMirrorCaptureProof',
+    '$left.Name -replace ''_left\.png$'', ''_right.png''',
+    'Get-FnvxrProductStereoContinuityProof',
+    'invoke-openxr-simulator-head-sweep.ps1',
+    '$manifest.headsetPoseSweep.status = "complete-centered"',
     'Wait-FnvxrProductRetailFixtureGameplay',
-    'retailFixtureRequested -and -not $HeadsetDemoFixture',
+    'retailFixtureRequested -and -not $headsetFixtureVisualTrial',
     'No final-headset Pip-Boy UI frame reached OpenXR',
-    'FNVXR_HEADSET_DEMO_FIXTURE')) {
+    'FNVXR_HEADSET_DEMO_FIXTURE',
+    'FNVXR_HEADSET_WORLD_ONLY_CAPTURE')) {
     if (-not ($launcher.Contains($headsetDemoContract) -or
             $common.Contains($headsetDemoContract))) {
         throw "Product launcher lost headset demo/recording contract: $headsetDemoContract"
@@ -748,6 +902,7 @@ if ([string]::IsNullOrWhiteSpace($headsetDemoFunction)) {
     throw "Could not isolate the bounded headset demo input function."
 }
 foreach ($requiredHeadsetDemoInputText in @(
+    'headsetDemoUiProfileSelected()',
     'tapDirectInputKey(DIK_TAB)',
     'fnvxrHeadsetDemoPipBoyTap',
     'fnvxrHeadsetDemoPipBoyStage',
@@ -810,7 +965,8 @@ foreach ($required in @(
     'FNVXR_ALLOW_STEREO_WORLD_2D_FALLBACK = "0"',
     'FNVXR_SESSION_READY_TIMEOUT_SECONDS',
     '-WindowStyle Hidden',
-    'Get-ChildItem Env:',
+    'Get-FnvxrProductProcessEnvironmentEntries',
+    'Clear-FnvxrProductProcessEnvironmentVariables',
     'Get-FnvxrProductSourceSnapshot',
     'ctest --test-dir $win32Build',
     'ctest --test-dir $x64Build',
@@ -820,6 +976,14 @@ foreach ($required in @(
     if (-not ($launcher.Contains($required) -or $builder.Contains($required) -or
         (Get-Content -LiteralPath (Join-Path $SourceRoot "scripts\fnvxr-product-common.ps1") -Raw).Contains($required))) {
         throw "Product scripts are missing required contract text: $required"
+    }
+}
+foreach ($environmentProviderConsumer in @(
+    [pscustomobject]@{ name = "product launcher"; content = $launcher },
+    [pscustomobject]@{ name = "retail fixture launcher"; content = $fixtureLauncher },
+    [pscustomobject]@{ name = "product common"; content = $common })) {
+    if ($environmentProviderConsumer.content.Contains("Get-ChildItem Env:")) {
+        throw "$($environmentProviderConsumer.name) must tolerate case-duplicate native environment keys."
     }
 }
 $sessionTimeoutBinding = '-SessionReadyTimeoutSeconds $RetailReadyTimeoutSeconds'
@@ -834,7 +998,8 @@ foreach ($trialBoundary in @(
     '$manifest.trialReady = $true',
     '$manifest.readiness.retailVrBridge = $true',
     '$manifest.readiness.stereoOutput = $true',
-    'Get-FnvxrProductStereoOutputProof')) {
+    'Get-FnvxrProductStereoOutputProof',
+    'Get-FnvxrProductStereoContinuityProof')) {
     if (-not $launcher.Contains($trialBoundary)) {
         throw "Product launcher lost its honest visual-trial boundary: $trialBoundary"
     }
@@ -1176,6 +1341,34 @@ try {
         (Join-Path $destinationRoot "dinput8.dll"),
         (Join-Path $destinationRoot "xinput1_3.dll"))) {
         if (Test-Path -LiteralPath $newPath) { throw "Stage rollback left a newly-created artifact: $newPath" }
+    }
+
+    # Windows Error Reporting can retain a just-exited Fallout DLL briefly.
+    # The restore helper must retry exactly the Win32 sharing/lock codes, while
+    # keeping all unrelated failures fail-closed.
+    $sharingRetryState = [pscustomobject]@{ attempts = 0 }
+    Invoke-FnvxrProductSharingViolationRetry -TimeoutMilliseconds 1000 -RetryMilliseconds 10 -Action {
+        ++$sharingRetryState.attempts
+        if ($sharingRetryState.attempts -lt 3) {
+            throw [System.IO.IOException]::new(
+                "fixture sharing violation",
+                [int]0x80070020)
+        }
+    }
+    if ($sharingRetryState.attempts -ne 3) {
+        throw "Sharing-violation restoration retry did not converge exactly."
+    }
+    $nonSharingRetryState = [pscustomobject]@{ attempts = 0 }
+    Require-Throws -Fragment "fixture non-sharing failure" -Action {
+        Invoke-FnvxrProductSharingViolationRetry -TimeoutMilliseconds 1000 -RetryMilliseconds 10 -Action {
+            ++$nonSharingRetryState.attempts
+            throw [System.IO.IOException]::new(
+                "fixture non-sharing failure",
+                [int]0x80070002)
+        }
+    }
+    if ($nonSharingRetryState.attempts -ne 1) {
+        throw "Non-sharing restoration failure was retried instead of failing closed."
     }
 
     # A stage failure after the first file has been written must restore that

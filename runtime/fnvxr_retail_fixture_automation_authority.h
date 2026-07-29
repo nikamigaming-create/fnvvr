@@ -23,6 +23,19 @@ inline constexpr std::string_view SaveCommandPrefix = "save ";
 inline constexpr std::string_view CloseExactOfficialPackMessageCommand =
     "CloseAllMenus";
 inline constexpr std::uint32_t MaxExactOfficialPackCloseAttemptsPerRun = 8u;
+// TTW 3.3.3 emits this exact native MessageMenu when its optional Stewie
+// dependency is absent.  The isolated VR fixture intentionally does not load
+// that additional engine-hook DLL because it is outside the sealed retail
+// compatibility proof.  The fixture may acknowledge only this complete,
+// versioned warning and its unique native first-button OK tile.
+inline constexpr std::string_view TtwStewieDependencyWarningTitle =
+    "Missing/outdated dependency!";
+inline constexpr std::string_view TtwStewieDependencyWarningBody =
+    "TTW has detected that lStewieAl's Tweaks and Engine Fixes is missing or "
+    "you are using a version older than 9.41.    Please follow the Best of "
+    "Times guide for guidance on how to install it.";
+inline constexpr std::uint32_t
+    MaxExactTtwStewieDependencyCloseAttemptsPerRun = 1u;
 
 enum class Action : std::uint8_t
 {
@@ -188,6 +201,26 @@ constexpr bool exactOfficialPackCloseAuthorized(
     return explicitlyOptedIn
         && visibleMessageMenu
         && exactNotificationObserved
+        && exactlyOneFirstButtonOk
+        && !alreadyAttempted;
+}
+
+// This gate is deliberately distinct from the official-pack matcher.  It
+// grants one native acknowledgement/close only when the complete TTW title
+// and body above and exactly one first-button OK tile are independently
+// observed in the owned fixture process.
+constexpr bool exactTtwStewieDependencyAcknowledgementAuthorized(
+    bool explicitlyOptedIn,
+    bool visibleMessageMenu,
+    bool exactTitleObserved,
+    bool exactBodyObserved,
+    bool exactlyOneFirstButtonOk,
+    bool alreadyAttempted) noexcept
+{
+    return explicitlyOptedIn
+        && visibleMessageMenu
+        && exactTitleObserved
+        && exactBodyObserved
         && exactlyOneFirstButtonOk
         && !alreadyAttempted;
 }

@@ -245,7 +245,9 @@ struct SyntheticFixture
     RetailBSCullingProcessLayout culler {};
 
     std::array<ExecutableSectionLayout, 1> executableSections {};
-    std::array<LoadedFunctionManifestEntry, 13> coreManifest {};
+    std::array<
+        LoadedFunctionManifestEntry,
+        RetailEngineManifest.size()> coreManifest {};
     std::array<
         RetailFunctionAbiDescriptor,
         RetailFunctionAbiInventory.size()> functions {};
@@ -541,9 +543,9 @@ void testCompleteDecisionPointDerivesEveryEvidenceField()
     require(evidence.loadedExecutableSectionLayoutAndProtectionsVerified,
         "the exact executable-section layout and protections were not derived");
     require(evidence.coreManifestMatched,
-        "the 13-entry core manifest was not derived");
+        "the 15-entry core manifest was not derived");
     require(evidence.fullFunctionInventoryMatched,
-        "the 23-entry function inventory was not derived");
+        "the 28-entry function inventory was not derived");
     require(evidence.vtableSlotsMatched,
         "the 16 exact vtable slots were not derived");
     require(evidence.vtableBlocksMatched,
@@ -750,8 +752,8 @@ void testProductionEntryCannotAuthorizeThisTestProcess()
 
 int main()
 {
-    static_assert(RetailEngineManifest.size() == 13u);
-    static_assert(RetailFunctionAbiInventory.size() == 26u);
+    static_assert(RetailEngineManifest.size() == 15u);
+    static_assert(RetailFunctionAbiInventory.size() == 28u);
     static_assert(RetailVtableSlots.size() == 16u);
     static_assert(RetailVtableBlocks.size() == 1u);
     static_assert(sizeof(RetailBSCullingProcessLayout) == 0xC8u);

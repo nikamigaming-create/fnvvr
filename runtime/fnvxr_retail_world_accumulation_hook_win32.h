@@ -14,9 +14,9 @@ inline constexpr bool RetailWorldAccumulationHookWin32MemoryAvailable = true;
 inline constexpr bool RetailWorldAccumulationHookWin32MemoryAvailable = false;
 #endif
 
-// Current-process memory backend for the accumulation callsite lease.  It
-// cannot allocate executable memory and accepts a write only when the exact
-// address is one of the audited five-byte E8 instructions.
+// Current-process memory backend for the accumulation lifecycle callsite
+// lease. It cannot allocate executable memory and accepts a write only when
+// the exact address is one of the audited five-byte E8 instructions.
 class RetailWorldAccumulationHookWin32Memory final
 {
 public:

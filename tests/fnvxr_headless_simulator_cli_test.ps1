@@ -7,8 +7,10 @@ Set-StrictMode -Version Latest
 
 $buildPath = Join-Path $SourceRoot "scripts\build-openxr-simulator-headless.ps1"
 $inputPath = Join-Path $SourceRoot "scripts\invoke-openxr-simulator-input.ps1"
+$headSweepPath =
+    Join-Path $SourceRoot "scripts\invoke-openxr-simulator-head-sweep.ps1"
 $patchPath = Join-Path $SourceRoot "patches\openxr-simulator-fnvxr-headless.patch"
-foreach ($path in @($buildPath, $inputPath, $patchPath)) {
+foreach ($path in @($buildPath, $inputPath, $headSweepPath, $patchPath)) {
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
         throw "Headless simulator CLI contract file is missing: $path"
     }
@@ -16,11 +18,13 @@ foreach ($path in @($buildPath, $inputPath, $patchPath)) {
 
 $build = Get-Content -LiteralPath $buildPath -Raw
 $inputDriver = Get-Content -LiteralPath $inputPath -Raw
+$headSweepDriver = Get-Content -LiteralPath $headSweepPath -Raw
 $patch = Get-Content -LiteralPath $patchPath -Raw
 
 # Parse both scripts without executing a runtime, game, process, or input.
 [void][ScriptBlock]::Create($build)
 [void][ScriptBlock]::Create($inputDriver)
+[void][ScriptBlock]::Create($headSweepDriver)
 
 foreach ($contract in @(
     '48a70f440ac7d9bda385994937e3da8e15a4d9bb',
@@ -33,6 +37,23 @@ foreach ($contract in @(
     '"x64"')) {
     if (-not $build.Contains($contract)) {
         throw "Headless simulator build script lost contract: $contract"
+    }
+}
+
+foreach ($contract in @(
+    'head_pose_command.json',
+    '[System.IO.File]::Move($temporaryPath, $commandPath)',
+    'Wait-HeadPoseCommandConsumed',
+    'XAmplitudeMeters',
+    'YAmplitudeMeters',
+    'ZAmplitudeMeters',
+    'YawAmplitudeDegrees',
+    'PitchAmplitudeDegrees',
+    'RollAmplitudeDegrees',
+    'centerRestored = $true',
+    'per-run HMD pose file IPC only')) {
+    if (-not $headSweepDriver.Contains($contract)) {
+        throw "Headless simulator HMD sweep driver lost contract: $contract"
     }
 }
 
@@ -77,7 +98,8 @@ foreach ($forbidden in @(
     'mouse_event',
     'Start-Process')) {
     if ($build.Contains($forbidden) -or
-        $inputDriver.Contains($forbidden)) {
+        $inputDriver.Contains($forbidden) -or
+        $headSweepDriver.Contains($forbidden)) {
         throw "Headless simulator CLI scripts must not contain: $forbidden"
     }
 }

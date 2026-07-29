@@ -234,21 +234,24 @@ require_text(
     "Engine-center acceptance must receive a source-pixel event from the CPU pair publisher")
 
 # The verifier treats source order as part of the transaction proof: the CPU
-# pixels are logged by publishCpuPair during the in-scope accumulation
-# dispatch, and the E8 adapter emits the successful completion record only
-# after that dispatch returns.
+# pixels are logged by publishCpuPair during the in-scope post-stock-render
+# dispatch, and its adapter emits the successful completion record only after
+# that dispatch returns.
 extract_region(
     retail_adapter_body
     "${proxy_source}"
     "void __cdecl retailVrAccumulateSceneAdapter("
     "bool initializeRetailVrBridge(IDirect3DDevice9* device) noexcept\n{")
-string(FIND "${retail_adapter_body}" "bridge->dispatchFromAccumulationAdapter(" adapter_dispatch_at)
+string(FIND "${retail_adapter_body}" "bridge->stageFromAccumulationAdapter(" adapter_stage_at)
+string(FIND "${retail_adapter_body}" "bridge->dispatchPendingAfterStockRenderAdapter()" adapter_dispatch_at)
 string(FIND "${retail_adapter_body}" "fnvxrRetailEngineCenterFrame" adapter_completion_at)
-if(adapter_dispatch_at EQUAL -1
+if(adapter_stage_at EQUAL -1
+    OR adapter_dispatch_at EQUAL -1
     OR adapter_completion_at EQUAL -1
+    OR adapter_stage_at GREATER adapter_dispatch_at
     OR adapter_dispatch_at GREATER adapter_completion_at)
     message(FATAL_ERROR
-        "The engine-center completion event must be emitted after its dispatch returns")
+        "The engine-center transaction must stage before stock render and emit completion only after deferred dispatch returns")
 endif()
 extract_region(
     cpu_pair_publisher_body

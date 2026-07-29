@@ -91,6 +91,8 @@ void requireAddresses(
                 == 0x00B6BEE0u + delta
             && functionAddress(calls.accumulatorAddVisibleArray)
                 == 0x00A9B790u + delta
+            && functionAddress(calls.accumulatorFinishAccumulating)
+                == 0x00A9B570u + delta
             && functionAddress(calls.rendererSetAccumulator)
                 == 0x004DC540u + delta
             && functionAddress(calls.setAccumulatingAccumulator)
@@ -161,6 +163,9 @@ int main()
     static_assert(
         RetailEngineCallPreferredAddresses.accumulatorAddVisibleArray
         == 0x00A9B790u);
+    static_assert(
+        RetailEngineCallPreferredAddresses.accumulatorFinishAccumulating
+        == 0x00A9B570u);
     static_assert(
         RetailEngineCallPreferredAddresses.rendererSetAccumulator
         == 0x004DC540u);
@@ -274,7 +279,7 @@ int main()
                 == RelocatedBase + (0x00B6B930u - SupportedImageBase),
         "ASLR relocation must preserve the preferred-image offset");
 
-    const std::array<std::uintptr_t, 21> everyPreferredAddress {{
+    const std::array<std::uintptr_t, 22> everyPreferredAddress {{
         RetailEngineCallPreferredAddresses.niAllocate,
         RetailEngineCallPreferredAddresses.niFree,
         RetailEngineCallPreferredAddresses.niCameraCreate,
@@ -288,6 +293,7 @@ int main()
         RetailEngineCallPreferredAddresses.cullingProcessAlt,
         RetailEngineCallPreferredAddresses.accumulateScene,
         RetailEngineCallPreferredAddresses.accumulatorAddVisibleArray,
+        RetailEngineCallPreferredAddresses.accumulatorFinishAccumulating,
         RetailEngineCallPreferredAddresses.rendererSetAccumulator,
         RetailEngineCallPreferredAddresses.setAccumulatingAccumulator,
         RetailEngineCallPreferredAddresses.setRenderingAccumulator,

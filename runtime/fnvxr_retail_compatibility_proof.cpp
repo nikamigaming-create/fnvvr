@@ -698,11 +698,18 @@ bool verifyRenderFirstPerson(
     bool johnnyGuitarExact,
     const CompatibilityContract& contract,
     const LoadedFunctionManifestEntry& manifest,
+    RetailCompatibilityDiagnostics& diagnostics,
     bool& jipNormalizationApplied,
     bool& johnnyGuitarNormalizationObserved) noexcept
 {
     jipNormalizationApplied = false;
     johnnyGuitarNormalizationObserved = false;
+    diagnostics.renderFirstPersonProofStage =
+        RetailRenderFirstPersonProofStage::ContractRejected;
+    diagnostics.observedJipRenderFirstPersonTarget = 0u;
+    diagnostics.expectedJipRenderFirstPersonTarget = 0u;
+    diagnostics.observedJohnnyGuitarRenderFirstPersonTarget = 0u;
+    diagnostics.expectedJohnnyGuitarRenderFirstPersonTarget = 0u;
     const JipRewriteSeal& rewrite = contract.jipRewrite;
     const JohnnyGuitarRewriteSeal& johnnyRewrite =
         contract.johnnyGuitarRewrite;
@@ -716,8 +723,13 @@ bool verifyRenderFirstPerson(
         || johnnyRewrite.renderFirstPersonBytes != rewrite.functionBytes
         || johnnyRewrite.renderFirstPersonCallOffset > rewrite.functionBytes
         || rewrite.functionBytes
-            - johnnyRewrite.renderFirstPersonCallOffset < 5u
-        || !relocate(
+            - johnnyRewrite.renderFirstPersonCallOffset < 5u)
+    {
+        return false;
+    }
+    diagnostics.renderFirstPersonProofStage =
+        RetailRenderFirstPersonProofStage::FunctionAccessRejected;
+    if (!relocate(
             contract,
             mainModule.runtimeBase,
             rewrite.functionPreferredAddress,
@@ -747,10 +759,16 @@ bool verifyRenderFirstPerson(
                 function.size())
             || !sha256Bytes(function.data(), function.size(), rawDigest))
         {
+            diagnostics.renderFirstPersonProofStage =
+                RetailRenderFirstPersonProofStage::FunctionReadRejected;
             return false;
         }
         if (digestEqual(rawDigest, manifest.sha256))
+        {
+            diagnostics.renderFirstPersonProofStage =
+                RetailRenderFirstPersonProofStage::RawStockMatched;
             return true;
+        }
 
         std::uintptr_t stockTarget = 0u;
         std::uintptr_t actualTarget = 0u;
@@ -765,19 +783,28 @@ bool verifyRenderFirstPerson(
                 rewrite.callOffset,
                 actualTarget))
         {
+            diagnostics.renderFirstPersonProofStage =
+                RetailRenderFirstPersonProofStage::JipTargetRejected;
             return false;
         }
+        diagnostics.observedJipRenderFirstPersonTarget = actualTarget;
 
         bool jipRewriteObserved = false;
         if (actualTarget != stockTarget)
         {
             std::uintptr_t expectedStubAddress = 0u;
-            if (!jipModule
-                || !jipExact
-                || !checkedAdd(
+            if (jipModule)
+            {
+                static_cast<void>(checkedAdd(
                     jipModule->runtimeBase,
                     rewrite.stubRva,
-                    expectedStubAddress)
+                    expectedStubAddress));
+            }
+            diagnostics.expectedJipRenderFirstPersonTarget =
+                expectedStubAddress;
+            if (!jipModule
+                || !jipExact
+                || expectedStubAddress == 0u
                 || !rangeWithin(
                     jipModule->runtimeBase,
                     jipModule->runtimeBytes,
@@ -791,6 +818,8 @@ bool verifyRenderFirstPerson(
                     true)
                 || actualTarget != expectedStubAddress)
             {
+                diagnostics.renderFirstPersonProofStage =
+                    RetailRenderFirstPersonProofStage::JipRewriteRejected;
                 return false;
             }
 
@@ -812,10 +841,18 @@ bool verifyRenderFirstPerson(
                     expectedStubAddress,
                     stockTarget))
             {
+                diagnostics.renderFirstPersonProofStage =
+                    RetailRenderFirstPersonProofStage::JipRewriteRejected;
                 return false;
             }
             jipRewriteObserved = true;
         }
+        else
+        {
+            diagnostics.expectedJipRenderFirstPersonTarget = stockTarget;
+        }
+        diagnostics.renderFirstPersonProofStage =
+            RetailRenderFirstPersonProofStage::JipNormalized;
 
         Sha256Digest normalizedDigest {};
         if (!sha256Bytes(
@@ -828,11 +865,17 @@ bool verifyRenderFirstPerson(
         if (digestEqual(normalizedDigest, manifest.sha256))
         {
             jipNormalizationApplied = jipRewriteObserved;
+            diagnostics.renderFirstPersonProofStage =
+                RetailRenderFirstPersonProofStage::JipOnlyMatched;
             return true;
         }
 
         if (!johnnyGuitarModule || !johnnyGuitarExact)
+        {
+            diagnostics.renderFirstPersonProofStage =
+                RetailRenderFirstPersonProofStage::JohnnyGuitarUnavailable;
             return false;
+        }
         std::uintptr_t expectedJohnnyTarget = 0u;
         std::uintptr_t johnnyStockTarget = 0u;
         if (!checkedAdd(
@@ -843,23 +886,58 @@ bool verifyRenderFirstPerson(
                 contract,
                 mainModule.runtimeBase,
                 johnnyRewrite.renderFirstPersonStockTargetPreferredAddress,
-                johnnyStockTarget)
+                johnnyStockTarget))
+        {
+            diagnostics.renderFirstPersonProofStage =
+                RetailRenderFirstPersonProofStage::JohnnyGuitarTargetRejected;
+            return false;
+        }
+        diagnostics.expectedJohnnyGuitarRenderFirstPersonTarget =
+            expectedJohnnyTarget;
+        std::uintptr_t actualJohnnyTarget = 0u;
+        if (!readRel32Target(
+                function,
+                functionAddress,
+                johnnyRewrite.renderFirstPersonCallOffset,
+                actualJohnnyTarget))
+        {
+            diagnostics.renderFirstPersonProofStage =
+                RetailRenderFirstPersonProofStage::JohnnyGuitarTargetRejected;
+            return false;
+        }
+        diagnostics.observedJohnnyGuitarRenderFirstPersonTarget =
+            actualJohnnyTarget;
+        if (actualJohnnyTarget != expectedJohnnyTarget
             || !restoreExactRel32Call(
                 function,
                 functionAddress,
                 johnnyRewrite.renderFirstPersonCallOffset,
                 expectedJohnnyTarget,
-                johnnyStockTarget)
-            || !sha256Bytes(
+                johnnyStockTarget))
+        {
+            diagnostics.renderFirstPersonProofStage =
+                RetailRenderFirstPersonProofStage::JohnnyGuitarRewriteRejected;
+            return false;
+        }
+        if (!sha256Bytes(
                 function.data(),
                 function.size(),
-                normalizedDigest)
-            || !digestEqual(normalizedDigest, manifest.sha256))
+                normalizedDigest))
         {
+            diagnostics.renderFirstPersonProofStage =
+                RetailRenderFirstPersonProofStage::JohnnyGuitarDigestRejected;
+            return false;
+        }
+        if (!digestEqual(normalizedDigest, manifest.sha256))
+        {
+            diagnostics.renderFirstPersonProofStage =
+                RetailRenderFirstPersonProofStage::JohnnyGuitarDigestRejected;
             return false;
         }
         jipNormalizationApplied = jipRewriteObserved;
         johnnyGuitarNormalizationObserved = true;
+        diagnostics.renderFirstPersonProofStage =
+            RetailRenderFirstPersonProofStage::FullyNormalized;
         return true;
     }
     catch (...)
@@ -1150,6 +1228,7 @@ PassResult evaluatePass(
                     && result.evidence.johnnyGuitar528ExactOrAbsent,
                 contract,
                 entry,
+                result.diagnostics,
                 jipNormalizationApplied,
                 johnnyNormalizationObserved);
             result.evidence.renderFirstPersonStockOrJipNormalized = matched;
@@ -1509,10 +1588,10 @@ inline constexpr JohnnyGuitarRewriteSeal JohnnyGuitar528Rewrites {
     0x00440460u,
     0x0F95u,
     0x0043FA80u,
-    0x00019C20u,
-    0x00012D80u,
-    0x00012590u,
-    0x000125E0u,
+    JohnnyGuitar528RenderFirstPersonHookRva,
+    JohnnyGuitar528UpdateCameraOverwriteHookRva,
+    JohnnyGuitar528UpdateCameraFirstCallHookRva,
+    JohnnyGuitar528UpdateCameraSecondCallHookRva,
 };
 
 const CompatibilityContract& productionContract() noexcept

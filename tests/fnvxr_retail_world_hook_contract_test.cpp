@@ -270,8 +270,8 @@ int main()
     }
 
     require(
-        RetailWorldAccumulationCallSiteContractInventory.size() == 3u,
-        "all stock AccumulateScene callsites must be represented");
+        RetailWorldAccumulationCallSiteContractInventory.size() == 6u,
+        "all stock accumulation lifecycle callsites must be represented");
     require(
         RetailWorldAccumulationCallSiteContractInventory[0]
                 .preferredCallAddress == 0x0087415Bu
@@ -279,16 +279,43 @@ int main()
                     .preferredCallAddress == 0x008742B7u
             && RetailWorldAccumulationCallSiteContractInventory[2]
                     .preferredCallAddress == 0x0087436Du
-            && RetailWorldAccumulateSceneAddress == 0x00B6BEE0u,
-        "the accumulation inventory must pin the audited stock call addresses");
+            && RetailWorldAccumulationCallSiteContractInventory[3]
+                    .preferredCallAddress == 0x00874180u
+            && RetailWorldAccumulationCallSiteContractInventory[4]
+                    .preferredCallAddress == 0x008742D9u
+            && RetailWorldAccumulationCallSiteContractInventory[5]
+                    .preferredCallAddress == 0x0087438Fu
+            && RetailWorldAccumulateSceneAddress == 0x00B6BEE0u
+            && RetailWorldRenderAccumulatorWithoutFinalizeAddress
+                == 0x00B6BA20u
+            && RetailWorldRenderAndFinalizeAccumulatorAddress
+                == 0x00B6C0D0u,
+        "the lifecycle inventory must pin the audited stock call addresses");
     for (const RetailWorldAccumulationCallSiteContract& callSite
          : RetailWorldAccumulationCallSiteContractInventory)
     {
+        std::uintptr_t expectedTarget = RetailWorldAccumulateSceneAddress;
+        switch (callSite.relayKind)
+        {
+        case RetailWorldAccumulationCallSiteContract::RelayKind::
+            AccumulateScene:
+            expectedTarget = RetailWorldAccumulateSceneAddress;
+            break;
+        case RetailWorldAccumulationCallSiteContract::RelayKind::
+            RenderWithoutFinalize:
+            expectedTarget =
+                RetailWorldRenderAccumulatorWithoutFinalizeAddress;
+            break;
+        case RetailWorldAccumulationCallSiteContract::RelayKind::
+            RenderAndFinalize:
+            expectedTarget =
+                RetailWorldRenderAndFinalizeAccumulatorAddress;
+            break;
+        }
         require(
             callSite.independentLoadedProcessSamples == 2u
-                && callSite.preferredTargetAddress
-                    == RetailWorldAccumulateSceneAddress,
-            "each accumulation hook must target only stock AccumulateScene");
+                && callSite.preferredTargetAddress == expectedTarget,
+            "each lifecycle hook must target its exact stock helper");
         const RetailWorldAccumulationCallSiteObservation preferred =
             observeRetailWorldAccumulationCallSite(
                 callSite.bytes.data(),
@@ -298,7 +325,7 @@ int main()
                 callSite);
         require(
             preferred.complete(),
-            "an audited accumulation call must validate at the preferred base");
+            "an audited lifecycle call must validate at the preferred base");
 
         constexpr std::uintptr_t RelocationDelta = 0x00100000u;
         const RetailWorldAccumulationCallSiteObservation relocated =
@@ -310,7 +337,7 @@ int main()
                 callSite);
         require(
             relocated.complete(),
-            "same-module relocation must preserve the accumulation target");
+            "same-module relocation must preserve the lifecycle target");
 
         std::array<std::uint8_t, RetailWorldAccumulationCallPatchByteCount>
             changed = callSite.bytes;
@@ -323,7 +350,7 @@ int main()
                  WorldRenderAddress,
                  callSite)
                  .complete(),
-            "a redirected accumulation call must fail closed");
+            "a redirected lifecycle call must fail closed");
 
         const RetailWorldRelativeCall replacement = encodeRetailWorldX86Call(
             callSite.preferredCallAddress,
@@ -340,6 +367,6 @@ int main()
 
     std::cout
         << "retail world hook contract tests passed; entry and audited "
-           "AccumulateScene callsite plans are exact\n";
+           "accumulation lifecycle callsite plans are exact\n";
     return EXIT_SUCCESS;
 }

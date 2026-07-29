@@ -265,6 +265,12 @@ void FNVXR_TEST_CDECL fakeRender(
 {
 }
 
+void FNVXR_TEST_THISCALL_IMPL fakeFinishAccumulating(
+    abi::RetailNiAccumulatorLayout*
+    FNVXR_TEST_TRAILING_EDX)
+{
+}
+
 template <typename Target, typename Source>
 Target engineFunction(Source source) noexcept
 {
@@ -300,6 +306,9 @@ RetailEngineCallResolution fakeResolution()
         &fakeAccumulateScene);
     calls.accumulatorAddVisibleArray = engineFunction<
         abi::AccumulatorAddVisibleArrayFunction>(&fakeAddVisible);
+    calls.accumulatorFinishAccumulating = engineFunction<
+        abi::AccumulatorFinishAccumulatingFunction>(
+            &fakeFinishAccumulating);
     calls.renderAccumulatorWithoutFinalize = &fakeRender;
     calls.finalizeAccumulator = &fakeRender;
     return { calls, RetailEngineCallResolutionFailure::None };

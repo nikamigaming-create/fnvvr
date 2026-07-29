@@ -196,6 +196,12 @@ public:
         return mRendererContext.accumulatorSnapshotDiagnostics();
     }
 
+    const RetailCenterRendererTimingDiagnostics& timingDiagnostics() const
+        noexcept
+    {
+        return mRendererContext.timingDiagnostics();
+    }
+
     const Resources& resources() const noexcept
     {
         return mResources;
@@ -211,6 +217,12 @@ public:
         abi::RetailBSCullingProcessLayout* culler) noexcept
     {
         return ready() && mRendererContext.finishStockCullerCapture(culler);
+    }
+
+    bool setRendererDiagnosticStop(
+        RetailCenterRendererDiagnosticStop stop) noexcept
+    {
+        return ready() && mRendererContext.setDiagnosticStop(stop);
     }
 
     RetailCenterRuntimeFrameResult renderWorld(

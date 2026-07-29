@@ -27,6 +27,10 @@ inline constexpr bool RetailWorldHookContractHeaderContainsIssuer = false;
 // world function returns loses that setup and is not a valid equivalent.
 inline constexpr std::uintptr_t RetailWorldAccumulateSceneAddress =
     0x00B6BEE0u;
+inline constexpr std::uintptr_t
+    RetailWorldRenderAccumulatorWithoutFinalizeAddress = 0x00B6BA20u;
+inline constexpr std::uintptr_t RetailWorldRenderAndFinalizeAccumulatorAddress =
+    0x00B6C0D0u;
 inline constexpr std::size_t RetailWorldAccumulationCallPatchByteCount = 5u;
 
 // The five stolen bytes are three complete instructions:
@@ -188,19 +192,30 @@ inline constexpr std::array<RetailWorldCallSiteContract, 2>
 
 struct RetailWorldAccumulationCallSiteContract
 {
+    enum class RelayKind : std::uint8_t
+    {
+        AccumulateScene = 0u,
+        RenderWithoutFinalize,
+        RenderAndFinalize,
+    };
+
     const char* name = nullptr;
     std::uintptr_t preferredCallAddress = 0u;
     std::array<std::uint8_t, RetailWorldAccumulationCallPatchByteCount>
         bytes {};
     std::uintptr_t preferredTargetAddress = 0u;
     std::uint32_t independentLoadedProcessSamples = 0u;
+    RelayKind relayKind = RelayKind::AccumulateScene;
 };
 
-// Each entry is an exact `call AccumulateScene` instruction inside the same
-// 4698-byte retail RenderWorldSceneGraph body.  The three paths preserve the
-// identical cdecl `(camera, scene, culler)` stack contract.  Do not replace a
-// broader helper: these local calls retain the stock function's live state.
-inline constexpr std::array<RetailWorldAccumulationCallSiteContract, 3>
+// The first three entries are the exact `call AccumulateScene` instructions
+// inside the same 4698-byte retail RenderWorldSceneGraph body. The final three
+// are their branch-local render calls. The primary branch renders and
+// finalizes separately; the alternate branches use the stock combined
+// wrapper. Patching both phases lets a private stereo transaction run only
+// after the stock shader batches exist and before stock finalization tears
+// them down. No shared helper is hooked globally.
+inline constexpr std::array<RetailWorldAccumulationCallSiteContract, 6>
     RetailWorldAccumulationCallSiteContractInventory {{
         {
             "primary accumulation call",
@@ -208,6 +223,8 @@ inline constexpr std::array<RetailWorldAccumulationCallSiteContract, 3>
             {{ 0xE8u, 0x80u, 0x7Du, 0x2Fu, 0x00u }},
             RetailWorldAccumulateSceneAddress,
             2u,
+            RetailWorldAccumulationCallSiteContract::RelayKind::
+                AccumulateScene,
         },
         {
             "alternate accumulation call",
@@ -215,6 +232,8 @@ inline constexpr std::array<RetailWorldAccumulationCallSiteContract, 3>
             {{ 0xE8u, 0x24u, 0x7Cu, 0x2Fu, 0x00u }},
             RetailWorldAccumulateSceneAddress,
             2u,
+            RetailWorldAccumulationCallSiteContract::RelayKind::
+                AccumulateScene,
         },
         {
             "third accumulation call",
@@ -222,6 +241,35 @@ inline constexpr std::array<RetailWorldAccumulationCallSiteContract, 3>
             {{ 0xE8u, 0x6Eu, 0x7Bu, 0x2Fu, 0x00u }},
             RetailWorldAccumulateSceneAddress,
             2u,
+            RetailWorldAccumulationCallSiteContract::RelayKind::
+                AccumulateScene,
+        },
+        {
+            "primary post-accumulation render call",
+            0x00874180u,
+            {{ 0xE8u, 0x9Bu, 0x78u, 0x2Fu, 0x00u }},
+            RetailWorldRenderAccumulatorWithoutFinalizeAddress,
+            2u,
+            RetailWorldAccumulationCallSiteContract::RelayKind::
+                RenderWithoutFinalize,
+        },
+        {
+            "alternate post-accumulation render/finalize call",
+            0x008742D9u,
+            {{ 0xE8u, 0xF2u, 0x7Du, 0x2Fu, 0x00u }},
+            RetailWorldRenderAndFinalizeAccumulatorAddress,
+            2u,
+            RetailWorldAccumulationCallSiteContract::RelayKind::
+                RenderAndFinalize,
+        },
+        {
+            "third post-accumulation render/finalize call",
+            0x0087438Fu,
+            {{ 0xE8u, 0x3Cu, 0x7Du, 0x2Fu, 0x00u }},
+            RetailWorldRenderAndFinalizeAccumulatorAddress,
+            2u,
+            RetailWorldAccumulationCallSiteContract::RelayKind::
+                RenderAndFinalize,
         },
     }};
 

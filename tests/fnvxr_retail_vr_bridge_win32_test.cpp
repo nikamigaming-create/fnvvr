@@ -50,6 +50,16 @@ bool armAccumulationCallRelay(void*, std::uintptr_t) noexcept
 void disarmAccumulationCallRelay(void*) noexcept
 {
 }
+bool armRenderPhaseCallRelays(
+    void*,
+    std::uintptr_t,
+    std::uintptr_t) noexcept
+{
+    return true;
+}
+void disarmRenderPhaseCallRelays(void*) noexcept
+{
+}
 bool publishCpuPair(
     void*,
     const fnvxr::engine::RetailTrackedFrame&,
@@ -78,6 +88,19 @@ fnvxr::d3d9::color_transport::ProducerPublication produceColorPair(
 
 int main()
 {
+    fnvxr::d3d9::RetailVrPrivateRenderDispatchGate privateRenderGate;
+    require(
+        !privateRenderGate.active()
+            && privateRenderGate.tryEnter()
+            && privateRenderGate.active()
+            && !privateRenderGate.tryEnter(),
+        "private-render dispatch gate admitted a nested bridge transaction");
+    privateRenderGate.leave();
+    require(
+        !privateRenderGate.active() && privateRenderGate.tryEnter(),
+        "private-render dispatch gate did not reopen after the outer transaction");
+    privateRenderGate.leave();
+
     fnvxr::d3d9::RetailV5PublicationSequence publications;
     std::uint64_t firstWorld = 0u;
     std::uint64_t ui = 0u;
@@ -116,6 +139,9 @@ int main()
     };
     cpuOperations.armAccumulationCallRelay = &armAccumulationCallRelay;
     cpuOperations.disarmAccumulationCallRelay = &disarmAccumulationCallRelay;
+    cpuOperations.armRenderPhaseCallRelays = &armRenderPhaseCallRelays;
+    cpuOperations.disarmRenderPhaseCallRelays =
+        &disarmRenderPhaseCallRelays;
     cpuOperations.prepareDistinctCameraFrame = &prepareCameraFrame;
     cpuOperations.publicationTransport =
         fnvxr::d3d9::RetailVrPublicationTransport::CpuReadback;
@@ -146,6 +172,9 @@ int main()
     };
     gpuOperations.armAccumulationCallRelay = &armAccumulationCallRelay;
     gpuOperations.disarmAccumulationCallRelay = &disarmAccumulationCallRelay;
+    gpuOperations.armRenderPhaseCallRelays = &armRenderPhaseCallRelays;
+    gpuOperations.disarmRenderPhaseCallRelays =
+        &disarmRenderPhaseCallRelays;
     gpuOperations.prepareDistinctCameraFrame = &prepareCameraFrame;
     gpuOperations.publicationTransport =
         fnvxr::d3d9::RetailVrPublicationTransport::GpuSharedTextures;
@@ -179,7 +208,7 @@ int main()
             && !initialDiagnostics.eyeCamera.captured,
         "bridge diagnostics did not start empty");
     require(
-        !bridge.initialize({}, 0u),
+        !bridge.initialize({}, 0u, 0u, 0u),
         "empty bridge operations unexpectedly initialized");
 #if defined(_WIN32) && defined(_M_IX86)
     require(

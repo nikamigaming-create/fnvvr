@@ -43,12 +43,32 @@ int main()
     static_assert(fixture::CloseExactOfficialPackMessageCommand
         == "CloseAllMenus");
     static_assert(fixture::MaxExactOfficialPackCloseAttemptsPerRun == 8u);
+    static_assert(fixture::TtwStewieDependencyWarningTitle
+        == "Missing/outdated dependency!");
+    static_assert(fixture::TtwStewieDependencyWarningBody
+        == "TTW has detected that lStewieAl's Tweaks and Engine Fixes is "
+           "missing or you are using a version older than 9.41.    Please "
+           "follow the Best of Times guide for guidance on how to install it.");
+    static_assert(
+        fixture::MaxExactTtwStewieDependencyCloseAttemptsPerRun == 1u);
     static_assert(fixture::exactOfficialPackCloseAuthorized(
         true, true, true, true, false));
     static_assert(!fixture::exactOfficialPackCloseAuthorized(
         false, true, true, true, false));
     static_assert(!fixture::exactOfficialPackCloseAuthorized(
         true, true, true, true, true));
+    static_assert(
+        fixture::exactTtwStewieDependencyAcknowledgementAuthorized(
+            true, true, true, true, true, false));
+    static_assert(
+        !fixture::exactTtwStewieDependencyAcknowledgementAuthorized(
+            false, true, true, true, true, false));
+    static_assert(
+        !fixture::exactTtwStewieDependencyAcknowledgementAuthorized(
+            true, true, false, true, true, false));
+    static_assert(
+        !fixture::exactTtwStewieDependencyAcknowledgementAuthorized(
+            true, true, true, true, true, true));
 
     fixture::Plan create {
         Action::Create,

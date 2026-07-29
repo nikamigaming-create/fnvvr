@@ -8,6 +8,18 @@
 
 namespace fnvxr::engine::compatibility
 {
+// Exact loaded-image RVAs from the pinned JohnnyGuitar 5.28 module. Keep the
+// production proof and its synthetic rewrite-group test on one source of
+// truth; these are virtual addresses, not raw-file offsets.
+inline constexpr std::uint32_t JohnnyGuitar528RenderFirstPersonHookRva =
+    0x00029C20u;
+inline constexpr std::uint32_t JohnnyGuitar528UpdateCameraOverwriteHookRva =
+    0x00022D80u;
+inline constexpr std::uint32_t JohnnyGuitar528UpdateCameraFirstCallHookRva =
+    0x00022590u;
+inline constexpr std::uint32_t JohnnyGuitar528UpdateCameraSecondCallHookRva =
+    0x000225E0u;
+
 enum class RetailCompatibilityFailure : std::uint8_t
 {
     None = 0,
@@ -31,6 +43,24 @@ enum class RetailCompatibilityFailure : std::uint8_t
     DuplicateJohnnyGuitarModule,
     JohnnyGuitar528IdentityMismatch,
     JohnnyGuitarProtectedRewriteMismatch,
+};
+
+enum class RetailRenderFirstPersonProofStage : std::uint8_t
+{
+    NotEvaluated = 0,
+    ContractRejected,
+    FunctionAccessRejected,
+    FunctionReadRejected,
+    RawStockMatched,
+    JipTargetRejected,
+    JipRewriteRejected,
+    JipNormalized,
+    JipOnlyMatched,
+    JohnnyGuitarUnavailable,
+    JohnnyGuitarTargetRejected,
+    JohnnyGuitarRewriteRejected,
+    JohnnyGuitarDigestRejected,
+    FullyNormalized,
 };
 
 struct RetailCompatibilityEvidence
@@ -63,6 +93,12 @@ struct RetailCompatibilityDiagnostics
     bool johnnyGuitarPresent = false;
     bool johnnyGuitarNormalizationApplied = false;
     bool showOffPresent = false;
+    RetailRenderFirstPersonProofStage renderFirstPersonProofStage =
+        RetailRenderFirstPersonProofStage::NotEvaluated;
+    std::uintptr_t observedJipRenderFirstPersonTarget = 0;
+    std::uintptr_t expectedJipRenderFirstPersonTarget = 0;
+    std::uintptr_t observedJohnnyGuitarRenderFirstPersonTarget = 0;
+    std::uintptr_t expectedJohnnyGuitarRenderFirstPersonTarget = 0;
 };
 
 struct RetailCompatibilityProof

@@ -217,7 +217,7 @@ function Invoke-FixtureMailboxCommand {
 }
 
 $previousFnvxrEnvironment = @{}
-Get-ChildItem Env: | Where-Object { $_.Name -like "FNVXR_*" } | ForEach-Object {
+Get-FnvxrProductProcessEnvironmentEntries -Prefix "FNVXR_" | ForEach-Object {
     $previousFnvxrEnvironment[$_.Name] = $_.Value
 }
 $manifest = [ordered]@{
@@ -475,11 +475,12 @@ try {
         }
     }
 
-    Get-ChildItem Env: | Where-Object { $_.Name -like "FNVXR_*" } | ForEach-Object {
-        Remove-Item -LiteralPath ("Env:{0}" -f $_.Name) -ErrorAction SilentlyContinue
-    }
+    Clear-FnvxrProductProcessEnvironmentVariables
     foreach ($name in $previousFnvxrEnvironment.Keys) {
-        Set-Item -LiteralPath ("Env:{0}" -f $name) -Value $previousFnvxrEnvironment[$name]
+        [Environment]::SetEnvironmentVariable(
+            [string]$name,
+            [string]$previousFnvxrEnvironment[$name],
+            [EnvironmentVariableTarget]::Process)
     }
     $manifest.endedAtUtc = [DateTime]::UtcNow.ToString("o")
     $manifest.normalCompletion = $normalCompletion -and -not $manifest.error

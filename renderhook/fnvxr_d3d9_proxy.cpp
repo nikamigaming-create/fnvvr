@@ -189,9 +189,33 @@ volatile LONG gRenderOwnerThreadId = 0;
 volatile LONG gRenderThreadViolation = 0;
 volatile LONG gRenderShutdownRequested = 0;
 SRWLOCK gRenderPublishCommitLock = SRWLOCK_INIT;
+SRWLOCK gRetailCpuStereoPublicationLock = SRWLOCK_INIT;
+
+class ScopedSrwExclusiveLock final
+{
+public:
+    explicit ScopedSrwExclusiveLock(SRWLOCK& lock) noexcept
+        : mLock(&lock)
+    {
+        AcquireSRWLockExclusive(mLock);
+    }
+
+    ~ScopedSrwExclusiveLock() noexcept
+    {
+        ReleaseSRWLockExclusive(mLock);
+    }
+
+    ScopedSrwExclusiveLock(const ScopedSrwExclusiveLock&) = delete;
+    ScopedSrwExclusiveLock& operator=(
+        const ScopedSrwExclusiveLock&) = delete;
+
+private:
+    SRWLOCK* mLock = nullptr;
+};
 volatile LONG gStateBlockRecording = 0;
 volatile LONG gD3DQueryObjectsObserved = 0;
 DWORD gDeviceBehaviorFlags = 0;
+DWORD gDeviceCreationThreadId = 0;
 bool gInNativeStereoHook = false;
 bool gNativePostprocessFanoutActive = false;
 bool gNativePipelineTraceThisPair = false;
@@ -2355,6 +2379,28 @@ bool acquireNamedProducerMutex(const char* name, NamedProducerLease& lease)
     lease.ownerThreadId = ownerThreadId;
     lease.owned = true;
     return true;
+}
+
+// The CPU engine-center transport has two mutually-exclusive render routes:
+// Present publishes menu quads, while the retail AccumulateScene thread
+// publishes world pairs. They are one producer process and one mapping
+// lifetime even when Fallout schedules those routes on different live
+// threads. Keep the named mutex owned by its original live thread to exclude
+// other processes, but let this process's serialized CPU publication route
+// reuse that lease without attempting an impossible recursive mutex wait from
+// the second thread.
+bool acquireProcessLifetimeNamedProducerMutex(
+    const char* name,
+    NamedProducerLease& lease)
+{
+    if (lease.mutex
+        && lease.ownerThread
+        && lease.owned
+        && WaitForSingleObject(lease.ownerThread, 0) == WAIT_TIMEOUT)
+    {
+        return true;
+    }
+    return acquireNamedProducerMutex(name, lease);
 }
 
 void releaseNamedProducerMutex(NamedProducerLease& lease);
@@ -5374,11 +5420,11 @@ bool ensureSharedVideo()
 bool ensureSharedStereo()
 {
     if (gSharedStereoView)
-        return acquireNamedProducerMutex(
+        return acquireProcessLifetimeNamedProducerMutex(
             fnvxr::shared::D3D9StereoFrameProducerMutexName,
             gSharedStereoProducerLease);
 
-    if (!acquireNamedProducerMutex(
+    if (!acquireProcessLifetimeNamedProducerMutex(
             fnvxr::shared::D3D9StereoFrameProducerMutexName,
             gSharedStereoProducerLease))
     {
@@ -8031,9 +8077,14 @@ struct DesktopAssistUiProxyContext
 RetailVrProxyContext gRetailVrProxyContext {};
 RetailVrBridge* gRetailVrBridge = nullptr;
 // This is only the already-authorized retail AccumulateScene address.  It is
-// armed before the three exact E8 writes and cleared after their lease has
+// armed before the six exact E8 writes and cleared after their lease has
 // restored stock bytes, so the relay has no unresolved-target interval.
 volatile LONG gRetailVrAccumulateSceneOriginalAddress = 0;
+// These are the already-authorized cdecl stock wrappers. The exact local E8
+// leases are installed only after both addresses are armed and restore all
+// six stock calls before either address is cleared.
+volatile LONG gRetailVrRenderWithoutFinalizeOriginalAddress = 0;
+volatile LONG gRetailVrFinalizeAccumulatorOriginalAddress = 0;
 fnvxr::engine::RetailTrackedFrameWin32Reader gRetailUiTrackedFrames {};
 fnvxr::engine::RetailRuntimePublicationWin32Reader
     gRetailRuntimePublicationReadiness {};
@@ -8043,10 +8094,34 @@ fnvxr::d3d9::RetailUiQuadCaptureFailure gRetailUiLastWithhold =
     fnvxr::d3d9::RetailUiQuadCaptureFailure::NotInitialized;
 volatile LONG gRetailVrBridgeInitializationAttempts = 0;
 volatile LONG gRetailCpuStereoPublications = 0;
+volatile LONG gRetailCpuStereoWorldTimingPublications = 0;
+volatile LONG gRetailVrRendererTimingLogs = 0;
 volatile LONG gRetailCpuStereoRejections = 0;
+volatile LONG gRetailCpuStereoPreconditionRejections = 0;
 volatile LONG gRetailGlobalSceneSelectionLogged = 0;
 volatile LONG gRetailWorldArgumentLogged = 0;
 volatile LONG gRetailWorldFramePreparationFailureLogged = 0;
+enum class RetailVrAccumulationDiagnosticMode : LONG
+{
+    Full = 0,
+    RelayOnly = 1,
+    CaptureOnly = 2,
+    PrepareOnly = 3,
+    RenderNoPublish = 4,
+    SnapshotOnly = 5,
+    CollectOnly = 6,
+    BindOnly = 7,
+    CameraOnly = 8,
+    PopulateOnly = 9,
+    RenderOnly = 10,
+    FinalizeOnly = 11,
+    LeftEyeOnly = 12,
+};
+volatile LONG gRetailVrAccumulationDiagnosticMode =
+    static_cast<LONG>(RetailVrAccumulationDiagnosticMode::Full);
+volatile LONG gRetailVrAccumulationDiagnosticPostCalls = 0;
+PVOID gRetailVrExceptionObserver = nullptr;
+volatile LONG gRetailVrObservedAccessViolations = 0;
 DesktopAssistUiProxyContext gDesktopAssistUiProxyContext {};
 fnvxr::engine::RetailTrackedFrameWin32Reader gDesktopAssistUiTrackedFrames {};
 HANDLE gDesktopAssistUiQuadMapping = nullptr;
@@ -8069,6 +8144,124 @@ bool publishRetailVrCpuMonoUiQuad(
     void*,
     const fnvxr::engine::RetailTrackedFrame&,
     std::uint64_t) noexcept;
+
+RetailVrAccumulationDiagnosticMode
+readRetailVrAccumulationDiagnosticMode() noexcept
+{
+    char value[32] {};
+    if (GetEnvironmentVariableA(
+            "FNVXR_RETAIL_VR_ACCUMULATION_DIAGNOSTIC_MODE",
+            value,
+            static_cast<DWORD>(sizeof(value)))
+        == 0)
+    {
+        return RetailVrAccumulationDiagnosticMode::Full;
+    }
+    if (_stricmp(value, "relay-only") == 0)
+        return RetailVrAccumulationDiagnosticMode::RelayOnly;
+    if (_stricmp(value, "capture-only") == 0)
+        return RetailVrAccumulationDiagnosticMode::CaptureOnly;
+    if (_stricmp(value, "prepare-only") == 0)
+        return RetailVrAccumulationDiagnosticMode::PrepareOnly;
+    if (_stricmp(value, "render-no-publish") == 0)
+        return RetailVrAccumulationDiagnosticMode::RenderNoPublish;
+    if (_stricmp(value, "snapshot-only") == 0)
+        return RetailVrAccumulationDiagnosticMode::SnapshotOnly;
+    if (_stricmp(value, "collect-only") == 0)
+        return RetailVrAccumulationDiagnosticMode::CollectOnly;
+    if (_stricmp(value, "bind-only") == 0)
+        return RetailVrAccumulationDiagnosticMode::BindOnly;
+    if (_stricmp(value, "camera-only") == 0)
+        return RetailVrAccumulationDiagnosticMode::CameraOnly;
+    if (_stricmp(value, "populate-only") == 0)
+        return RetailVrAccumulationDiagnosticMode::PopulateOnly;
+    if (_stricmp(value, "render-only") == 0)
+        return RetailVrAccumulationDiagnosticMode::RenderOnly;
+    if (_stricmp(value, "finalize-only") == 0)
+        return RetailVrAccumulationDiagnosticMode::FinalizeOnly;
+    if (_stricmp(value, "left-eye-only") == 0)
+        return RetailVrAccumulationDiagnosticMode::LeftEyeOnly;
+    return RetailVrAccumulationDiagnosticMode::Full;
+}
+
+const char* retailVrAccumulationDiagnosticModeName(
+    RetailVrAccumulationDiagnosticMode mode) noexcept
+{
+    switch (mode)
+    {
+    case RetailVrAccumulationDiagnosticMode::RelayOnly:
+        return "relay-only";
+    case RetailVrAccumulationDiagnosticMode::CaptureOnly:
+        return "capture-only";
+    case RetailVrAccumulationDiagnosticMode::PrepareOnly:
+        return "prepare-only";
+    case RetailVrAccumulationDiagnosticMode::RenderNoPublish:
+        return "render-no-publish";
+    case RetailVrAccumulationDiagnosticMode::SnapshotOnly:
+        return "snapshot-only";
+    case RetailVrAccumulationDiagnosticMode::CollectOnly:
+        return "collect-only";
+    case RetailVrAccumulationDiagnosticMode::BindOnly:
+        return "bind-only";
+    case RetailVrAccumulationDiagnosticMode::CameraOnly:
+        return "camera-only";
+    case RetailVrAccumulationDiagnosticMode::PopulateOnly:
+        return "populate-only";
+    case RetailVrAccumulationDiagnosticMode::RenderOnly:
+        return "render-only";
+    case RetailVrAccumulationDiagnosticMode::FinalizeOnly:
+        return "finalize-only";
+    case RetailVrAccumulationDiagnosticMode::LeftEyeOnly:
+        return "left-eye-only";
+    default:
+        return "full";
+    }
+}
+
+fnvxr::engine::RetailCenterRendererDiagnosticStop
+retailVrRendererDiagnosticStop(
+    RetailVrAccumulationDiagnosticMode mode) noexcept
+{
+    using Stop = fnvxr::engine::RetailCenterRendererDiagnosticStop;
+    switch (mode)
+    {
+    case RetailVrAccumulationDiagnosticMode::SnapshotOnly:
+        return Stop::AfterSnapshot;
+    case RetailVrAccumulationDiagnosticMode::CollectOnly:
+        return Stop::AfterVisibility;
+    case RetailVrAccumulationDiagnosticMode::BindOnly:
+        return Stop::AfterLeftBind;
+    case RetailVrAccumulationDiagnosticMode::CameraOnly:
+        return Stop::AfterLeftCamera;
+    case RetailVrAccumulationDiagnosticMode::PopulateOnly:
+        return Stop::AfterLeftPopulate;
+    case RetailVrAccumulationDiagnosticMode::RenderOnly:
+        return Stop::AfterLeftRender;
+    case RetailVrAccumulationDiagnosticMode::FinalizeOnly:
+        return Stop::AfterLeftFinalize;
+    case RetailVrAccumulationDiagnosticMode::LeftEyeOnly:
+        return Stop::AfterLeftEye;
+    default:
+        return Stop::None;
+    }
+}
+
+bool retailVrRendererStageDiagnostic(
+    RetailVrAccumulationDiagnosticMode mode) noexcept
+{
+    return retailVrRendererDiagnosticStop(mode)
+        != fnvxr::engine::RetailCenterRendererDiagnosticStop::None;
+}
+
+RetailVrAccumulationDiagnosticMode
+retailVrAccumulationDiagnosticMode() noexcept
+{
+    return static_cast<RetailVrAccumulationDiagnosticMode>(
+        InterlockedCompareExchange(
+            &gRetailVrAccumulationDiagnosticMode,
+            0,
+            0));
+}
 
 bool retailVrReadableRange(
     std::uintptr_t address,
@@ -8123,6 +8316,137 @@ bool retailVrReadableRange(
         cursor = (std::min)(regionEnd, end);
     }
     return true;
+}
+
+LONG CALLBACK observeRetailVrAccessViolation(
+    EXCEPTION_POINTERS* exceptionPointers) noexcept
+{
+    if (!exceptionPointers
+        || !exceptionPointers->ExceptionRecord
+        || !exceptionPointers->ContextRecord
+        || exceptionPointers->ExceptionRecord->ExceptionCode
+            != EXCEPTION_ACCESS_VIOLATION)
+    {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    const LONG observation =
+        InterlockedIncrement(&gRetailVrObservedAccessViolations);
+    if (observation > 8)
+        return EXCEPTION_CONTINUE_SEARCH;
+
+    const EXCEPTION_RECORD& record =
+        *exceptionPointers->ExceptionRecord;
+    const CONTEXT& context = *exceptionPointers->ContextRecord;
+    const ULONG_PTR accessKind =
+        record.NumberParameters >= 1u
+            ? record.ExceptionInformation[0]
+            : static_cast<ULONG_PTR>(~0u);
+    const ULONG_PTR accessedAddress =
+        record.NumberParameters >= 2u
+            ? record.ExceptionInformation[1]
+            : 0u;
+#if defined(_M_IX86)
+    std::uint32_t stack[16] {};
+    if (retailVrReadableRange(
+            static_cast<std::uintptr_t>(context.Esp),
+            sizeof(stack)))
+    {
+        std::memcpy(
+            stack,
+            reinterpret_cast<const void*>(
+                static_cast<std::uintptr_t>(context.Esp)),
+            sizeof(stack));
+    }
+    std::uint8_t instructionBytes[32] {};
+    const std::uintptr_t instructionStart =
+        context.Eip >= 8u
+            ? static_cast<std::uintptr_t>(context.Eip) - 8u
+            : static_cast<std::uintptr_t>(context.Eip);
+    const bool instructionBytesReadable = retailVrReadableRange(
+        instructionStart,
+        sizeof(instructionBytes));
+    if (instructionBytesReadable)
+    {
+        std::memcpy(
+            instructionBytes,
+            reinterpret_cast<const void*>(instructionStart),
+            sizeof(instructionBytes));
+    }
+    char instructionHex[sizeof(instructionBytes) * 3u + 1u] {};
+    for (std::size_t index = 0u;
+         index < sizeof(instructionBytes);
+         ++index)
+    {
+        sprintf_s(
+            instructionHex + index * 3u,
+            sizeof(instructionHex) - index * 3u,
+            index + 1u == sizeof(instructionBytes) ? "%02X" : "%02X ",
+            instructionBytes[index]);
+    }
+    char message[2048] {};
+    sprintf_s(
+        message,
+        "retail VR first-chance access violation observation=%ld thread=%lu exception=0x%08lX access=%llu target=0x%08llX eip=0x%08lX esp=0x%08lX ebp=0x%08lX eax=0x%08lX ebx=0x%08lX ecx=0x%08lX edx=0x%08lX esi=0x%08lX edi=0x%08lX instructionStart=0x%08llX instructionReadable=%d instructionBytes=[%s] stack=[0x%08X,0x%08X,0x%08X,0x%08X,0x%08X,0x%08X,0x%08X,0x%08X,0x%08X,0x%08X,0x%08X,0x%08X,0x%08X,0x%08X,0x%08X,0x%08X]",
+        observation,
+        GetCurrentThreadId(),
+        record.ExceptionCode,
+        static_cast<unsigned long long>(accessKind),
+        static_cast<unsigned long long>(accessedAddress),
+        context.Eip,
+        context.Esp,
+        context.Ebp,
+        context.Eax,
+        context.Ebx,
+        context.Ecx,
+        context.Edx,
+        context.Esi,
+        context.Edi,
+        static_cast<unsigned long long>(instructionStart),
+        instructionBytesReadable ? 1 : 0,
+        instructionHex,
+        stack[0],
+        stack[1],
+        stack[2],
+        stack[3],
+        stack[4],
+        stack[5],
+        stack[6],
+        stack[7],
+        stack[8],
+        stack[9],
+        stack[10],
+        stack[11],
+        stack[12],
+        stack[13],
+        stack[14],
+        stack[15]);
+    logRetailVrLine(message);
+#else
+    char message[384] {};
+    sprintf_s(
+        message,
+        "retail VR first-chance access violation observation=%ld thread=%lu exception=0x%08lX access=%llu target=0x%llX address=0x%llX",
+        observation,
+        GetCurrentThreadId(),
+        record.ExceptionCode,
+        static_cast<unsigned long long>(accessKind),
+        static_cast<unsigned long long>(accessedAddress),
+        static_cast<unsigned long long>(
+            reinterpret_cast<std::uintptr_t>(record.ExceptionAddress)));
+    logRetailVrLine(message);
+#endif
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+void ensureRetailVrExceptionObserver() noexcept
+{
+    if (!gRetailVrExceptionObserver)
+    {
+        gRetailVrExceptionObserver =
+            AddVectoredExceptionHandler(
+                1u,
+                &observeRetailVrAccessViolation);
+    }
 }
 
 bool readRetailVrPointer32(
@@ -8877,7 +9201,10 @@ void __cdecl retailVrAccumulateScenePreAdapter(
     noexcept
 {
     RetailVrBridge* bridge = gRetailVrBridge;
-    if (bridge)
+    if (bridge
+        && !bridge->privateRenderDispatchActive()
+        && retailVrAccumulationDiagnosticMode()
+            != RetailVrAccumulationDiagnosticMode::RelayOnly)
     {
         bridge->beginStockCullerCaptureFromAccumulationAdapter(
             stockCullingProcess);
@@ -8891,12 +9218,173 @@ void __cdecl retailVrAccumulateSceneAdapter(
     noexcept
 {
     RetailVrBridge* bridge = gRetailVrBridge;
-    if (bridge)
+    if (bridge && !bridge->privateRenderDispatchActive())
     {
-        bridge->dispatchFromAccumulationAdapter(
+        const RetailVrAccumulationDiagnosticMode diagnosticMode =
+            retailVrAccumulationDiagnosticMode();
+        if (diagnosticMode
+                == RetailVrAccumulationDiagnosticMode::RelayOnly
+            || diagnosticMode
+                == RetailVrAccumulationDiagnosticMode::CaptureOnly)
+        {
+            const bool captureFinished =
+                diagnosticMode
+                    == RetailVrAccumulationDiagnosticMode::CaptureOnly
+                && bridge->finishStockCullerCaptureFromAccumulationAdapter(
+                    stockCullingProcess);
+            const LONG call = InterlockedIncrement(
+                &gRetailVrAccumulationDiagnosticPostCalls);
+            if (call <= 3 || call % 120 == 0)
+            {
+                char message[224] {};
+                sprintf_s(
+                    message,
+                    "retail VR accumulation diagnostic mode=%s postCall=%ld captureFinished=%d",
+                    diagnosticMode
+                            == RetailVrAccumulationDiagnosticMode::RelayOnly
+                        ? "relay-only"
+                        : "capture-only",
+                    call,
+                    captureFinished ? 1 : 0);
+                logRetailVrLine(message);
+            }
+            return;
+        }
+        if (diagnosticMode
+                == RetailVrAccumulationDiagnosticMode::PrepareOnly
+            || diagnosticMode
+                == RetailVrAccumulationDiagnosticMode::RenderNoPublish
+            || retailVrRendererStageDiagnostic(diagnosticMode))
+        {
+            static_cast<void>(
+                bridge->stageDiagnosticFromAccumulationAdapter(
+                stockCenterCamera,
+                sceneObject,
+                stockCullingProcess,
+                diagnosticMode
+                    == RetailVrAccumulationDiagnosticMode::PrepareOnly,
+                true,
+                retailVrRendererDiagnosticStop(diagnosticMode)));
+            return;
+        }
+        static_cast<void>(bridge->stageFromAccumulationAdapter(
             stockCenterCamera,
             sceneObject,
-            stockCullingProcess);
+            stockCullingProcess));
+    }
+}
+
+void __cdecl retailVrAfterStockRenderAdapter() noexcept
+{
+    RetailVrBridge* bridge = gRetailVrBridge;
+    if (bridge && !bridge->privateRenderDispatchActive())
+    {
+        const RetailVrAccumulationDiagnosticMode diagnosticMode =
+            retailVrAccumulationDiagnosticMode();
+        if (diagnosticMode == RetailVrAccumulationDiagnosticMode::RelayOnly
+            || diagnosticMode
+                == RetailVrAccumulationDiagnosticMode::CaptureOnly)
+        {
+            return;
+        }
+        LARGE_INTEGER dispatchStart {};
+        LARGE_INTEGER dispatchEnd {};
+        QueryPerformanceCounter(&dispatchStart);
+        const bool dispatched =
+            bridge->dispatchPendingAfterStockRenderAdapter();
+        QueryPerformanceCounter(&dispatchEnd);
+        if (!dispatched)
+            return;
+        const double dispatchMilliseconds =
+            secondsBetween(dispatchStart, dispatchEnd) * 1000.0;
+        const auto timingDiagnostics =
+            bridge->frameDiagnostics().rendererTiming;
+        if (timingDiagnostics.captured)
+        {
+            const LONG timingLog =
+                InterlockedIncrement(&gRetailVrRendererTimingLogs);
+            if (timingLog <= 8 || timingLog % 120 == 0)
+            {
+                char timingMessage[768] {};
+                sprintf_s(
+                    timingMessage,
+                    "retail VR renderer timing count=%ld mode=%s dispatchMs=%.3f measuredMs=%.3f snapshot=%.3f collect=%.3f left=%.3f/%.3f/%.3f/%.3f/%.3f/%.3f right=%.3f/%.3f/%.3f/%.3f/%.3f/%.3f restore=%.3f rollback=%.3f",
+                    timingLog,
+                    retailVrAccumulationDiagnosticModeName(diagnosticMode),
+                    dispatchMilliseconds,
+                    timingDiagnostics.totalMilliseconds(),
+                    timingDiagnostics.snapshotMilliseconds,
+                    timingDiagnostics.collectMilliseconds,
+                    timingDiagnostics.leftBindMilliseconds,
+                    timingDiagnostics.leftCameraMilliseconds,
+                    timingDiagnostics.leftPopulateMilliseconds,
+                    timingDiagnostics.leftRenderMilliseconds,
+                    timingDiagnostics.leftFinalizeMilliseconds,
+                    timingDiagnostics.leftEndMilliseconds,
+                    timingDiagnostics.rightBindMilliseconds,
+                    timingDiagnostics.rightCameraMilliseconds,
+                    timingDiagnostics.rightPopulateMilliseconds,
+                    timingDiagnostics.rightRenderMilliseconds,
+                    timingDiagnostics.rightFinalizeMilliseconds,
+                    timingDiagnostics.rightEndMilliseconds,
+                    timingDiagnostics.restoreMilliseconds,
+                    timingDiagnostics.rollbackMilliseconds);
+                logRetailVrLine(timingMessage);
+            }
+        }
+
+        if (diagnosticMode
+                == RetailVrAccumulationDiagnosticMode::PrepareOnly
+            || diagnosticMode
+                == RetailVrAccumulationDiagnosticMode::RenderNoPublish
+            || retailVrRendererStageDiagnostic(diagnosticMode))
+        {
+            const LONG call = InterlockedIncrement(
+                &gRetailVrAccumulationDiagnosticPostCalls);
+            const auto diagnostics = bridge->frameDiagnostics();
+            static bool firstSnapshotDiagnosticLogged = false;
+            const bool firstSnapshotDiagnostic =
+                diagnostics.accumulatorSnapshot.captured
+                && !firstSnapshotDiagnosticLogged;
+            if (firstSnapshotDiagnostic)
+                firstSnapshotDiagnosticLogged = true;
+            if (call <= 3 || call % 120 == 0 || firstSnapshotDiagnostic)
+            {
+                char message[768] {};
+                sprintf_s(
+                    message,
+                    "retail VR post-stock-render diagnostic mode=%s postCall=%ld dispatchMs=%.3f controllerFailure=%u centerFailure=%u rendererFailure=%u rendererComplete=%d snapshotCaptured=%d renderer=0x%08X rendererAccumulator=0x%08X accumulatingAccumulator=0x%08X renderingAccumulator=0x%08X rendererRefs=%u renderingRefs=%u renderingRetained=%d sealed=%u queueSafe=%u immediateRejected=%u accumulatorMode=%u",
+                    retailVrAccumulationDiagnosticModeName(diagnosticMode),
+                    call,
+                    dispatchMilliseconds,
+                    static_cast<unsigned>(
+                        diagnostics.controller.failure),
+                    static_cast<unsigned>(diagnostics.renderer.failure),
+                    static_cast<unsigned>(
+                        diagnostics.renderer.renderer.failure),
+                    diagnostics.renderer.renderer.complete ? 1 : 0,
+                    diagnostics.accumulatorSnapshot.captured ? 1 : 0,
+                    diagnostics.accumulatorSnapshot.rendererAddress,
+                    diagnostics.accumulatorSnapshot.rendererAccumulator,
+                    diagnostics.accumulatorSnapshot.accumulatingAccumulator,
+                    diagnostics.accumulatorSnapshot.renderingAccumulator,
+                    diagnostics.accumulatorSnapshot
+                        .rendererAccumulatorReferenceCount,
+                    diagnostics.accumulatorSnapshot
+                        .renderingAccumulatorReferenceCount,
+                    diagnostics.accumulatorSnapshot
+                            .distinctRenderingAccumulatorRetained
+                        ? 1
+                        : 0,
+                    diagnostics.visibility.sealedItemCount,
+                    diagnostics.visibility.queueSafeItemCount,
+                    diagnostics.visibility.immediateGeometryRejectedCount,
+                    static_cast<unsigned>(
+                        diagnostics.visibility.privateAccumulatorMode));
+                logRetailVrLine(message);
+            }
+            return;
+        }
         const auto diagnostics = bridge->frameDiagnostics();
         static std::uint64_t lastLoggedStereoComplete = 0u;
         static bool eyeCameraDerivationDiagnosticLogged = false;
@@ -8933,12 +9421,13 @@ void __cdecl retailVrAccumulateSceneAdapter(
                 && diagnostics.renderer.renderer.complete
                 && diagnostics.renderer.renderer.failure
                     == fnvxr::engine::CenterRendererFailure::None;
-            char message[640] {};
+            char message[896] {};
             sprintf_s(
                 message,
-                "retail center frame dispatch=%llu controllerFailure=%u disposition=%u transaction=%llu centerFailure=%u rendererFailure=%u visibilityFailure=%u visibilityCaptured=%d snapshotFailure=%u snapshotCaptured=%d eyeCameraFailure=%u visible=%u rendererComplete=%d stereoComplete=%llu",
+                "retail center frame dispatch=%llu dispatchMs=%.3f controllerFailure=%u disposition=%u transaction=%llu centerFailure=%u rendererFailure=%u visibilityFailure=%u visibilityCaptured=%d sealed=%u queueSafe=%u immediateRejected=%u accumulatorMode=%u snapshotFailure=%u snapshotCaptured=%d snapshotRendererRefs=%u snapshotRenderingRefs=%u snapshotRenderingRetained=%d eyeCameraFailure=%u visible=%u rendererComplete=%d stereoComplete=%llu",
                 static_cast<unsigned long long>(
                     diagnostics.dispatchCount),
+                dispatchMilliseconds,
                 static_cast<unsigned>(
                     diagnostics.controller.failure),
                 static_cast<unsigned>(
@@ -8950,9 +9439,22 @@ void __cdecl retailVrAccumulateSceneAdapter(
                     diagnostics.renderer.renderer.failure),
                 static_cast<unsigned>(diagnostics.visibility.failure),
                 diagnostics.visibility.captured ? 1 : 0,
+                diagnostics.visibility.sealedItemCount,
+                diagnostics.visibility.queueSafeItemCount,
+                diagnostics.visibility.immediateGeometryRejectedCount,
+                static_cast<unsigned>(
+                    diagnostics.visibility.privateAccumulatorMode),
                 static_cast<unsigned>(
                     diagnostics.accumulatorSnapshot.failure),
                 diagnostics.accumulatorSnapshot.captured ? 1 : 0,
+                diagnostics.accumulatorSnapshot
+                    .rendererAccumulatorReferenceCount,
+                diagnostics.accumulatorSnapshot
+                    .renderingAccumulatorReferenceCount,
+                diagnostics.accumulatorSnapshot
+                        .distinctRenderingAccumulatorRetained
+                    ? 1
+                    : 0,
                 static_cast<unsigned>(
                     diagnostics.eyeCamera.failure),
                 diagnostics.renderer.renderer.visibleGeometryCount,
@@ -8969,11 +9471,12 @@ void __cdecl retailVrAccumulateSceneAdapter(
             // verifier requires that exact order and transaction lineage; a
             // visually separated pair without the completed engine transaction
             // is never evidence of world stereo.
-            char event[1024] {};
+            char event[1408] {};
             sprintf_s(
                 event,
-                "{\"event\":\"fnvxrRetailEngineCenterFrame\",\"dispatch\":%llu,\"controllerFailure\":%u,\"disposition\":%u,\"transaction\":%llu,\"centerFailure\":%u,\"rendererFailure\":%u,\"visibilityFailure\":%u,\"visibilityCaptured\":%s,\"visibilitySealedItems\":%u,\"snapshotFailure\":%u,\"snapshotCaptured\":%s,\"eyeCameraFailure\":%u,\"rendererComplete\":%s,\"visible\":%u,\"visibleSetGeneration\":%llu,\"producerMode\":%u,\"delivered\":%s,\"stereoComplete\":%llu}",
+                "{\"event\":\"fnvxrRetailEngineCenterFrame\",\"dispatch\":%llu,\"dispatchMilliseconds\":%.3f,\"controllerFailure\":%u,\"disposition\":%u,\"transaction\":%llu,\"centerFailure\":%u,\"rendererFailure\":%u,\"visibilityFailure\":%u,\"visibilityCaptured\":%s,\"visibilitySealedItems\":%u,\"visibilityQueueSafeItems\":%u,\"visibilityImmediateRejected\":%u,\"visibilityAccumulatorMode\":%u,\"snapshotFailure\":%u,\"snapshotCaptured\":%s,\"snapshotRendererRefs\":%u,\"snapshotRenderingRefs\":%u,\"snapshotRenderingRetained\":%s,\"eyeCameraFailure\":%u,\"rendererComplete\":%s,\"visible\":%u,\"visibleSetGeneration\":%llu,\"producerMode\":%u,\"delivered\":%s,\"stereoComplete\":%llu}",
                 static_cast<unsigned long long>(diagnostics.dispatchCount),
+                dispatchMilliseconds,
                 static_cast<unsigned>(diagnostics.controller.failure),
                 static_cast<unsigned>(diagnostics.controller.disposition),
                 static_cast<unsigned long long>(
@@ -8984,9 +9487,21 @@ void __cdecl retailVrAccumulateSceneAdapter(
                 static_cast<unsigned>(diagnostics.visibility.failure),
                 diagnostics.visibility.captured ? "true" : "false",
                 diagnostics.visibility.sealedItemCount,
+                diagnostics.visibility.queueSafeItemCount,
+                diagnostics.visibility.immediateGeometryRejectedCount,
+                static_cast<unsigned>(
+                    diagnostics.visibility.privateAccumulatorMode),
                 static_cast<unsigned>(
                     diagnostics.accumulatorSnapshot.failure),
                 diagnostics.accumulatorSnapshot.captured ? "true" : "false",
+                diagnostics.accumulatorSnapshot
+                    .rendererAccumulatorReferenceCount,
+                diagnostics.accumulatorSnapshot
+                    .renderingAccumulatorReferenceCount,
+                diagnostics.accumulatorSnapshot
+                        .distinctRenderingAccumulatorRetained
+                    ? "true"
+                    : "false",
                 static_cast<unsigned>(
                     diagnostics.eyeCamera.failure),
                 diagnostics.renderer.renderer.complete ? "true" : "false",
@@ -9004,16 +9519,18 @@ void __cdecl retailVrAccumulateSceneAdapter(
                 && diagnostics.accumulatorSnapshot.captured)
             {
                 const auto& snapshot = diagnostics.accumulatorSnapshot;
-                char snapshotMessage[640] {};
+                char snapshotMessage[768] {};
                 sprintf_s(
                     snapshotMessage,
-                    "retail accumulator snapshot rejection failure=%u renderer=0x%08X rendererAccumulator=0x%08X accumulating=0x%08X rendering=0x%08X refCount=%u",
+                    "retail accumulator snapshot rejection failure=%u renderer=0x%08X rendererAccumulator=0x%08X accumulating=0x%08X rendering=0x%08X rendererRefCount=%u renderingRefCount=%u renderingRetained=%d",
                     static_cast<unsigned>(snapshot.failure),
                     static_cast<unsigned>(snapshot.rendererAddress),
                     static_cast<unsigned>(snapshot.rendererAccumulator),
                     static_cast<unsigned>(snapshot.accumulatingAccumulator),
                     static_cast<unsigned>(snapshot.renderingAccumulator),
-                    snapshot.rendererAccumulatorReferenceCount);
+                    snapshot.rendererAccumulatorReferenceCount,
+                    snapshot.renderingAccumulatorReferenceCount,
+                    snapshot.distinctRenderingAccumulatorRetained ? 1 : 0);
                 logRetailVrLine(snapshotMessage);
             }
             if (diagnostics.renderer.renderer.failure
@@ -9021,10 +9538,10 @@ void __cdecl retailVrAccumulateSceneAdapter(
                 && diagnostics.visibility.captured)
             {
                 const auto& visibility = diagnostics.visibility;
-                char visibilityMessage[768] {};
+                char visibilityMessage[896] {};
                 sprintf_s(
                     visibilityMessage,
-                    "retail visibility rejection failure=%u generation=%llu scene=0x%llX camera=0x%llX culler=0x%llX accumulatorRefs=%u cullerAccumulator=0x%08X collectorPhase=%u collectorFailure=%u seal=%u sealedItems=%u sealedGeneration=%llu",
+                    "retail visibility rejection failure=%u generation=%llu scene=0x%llX camera=0x%llX culler=0x%llX accumulatorRefs=%u cullerAccumulator=0x%08X collectorPhase=%u collectorFailure=%u seal=%u sealedItems=%u queueSafe=%u immediateRejected=%u accumulatorMode=%u sealedGeneration=%llu",
                     static_cast<unsigned>(visibility.failure),
                     static_cast<unsigned long long>(visibility.generation),
                     static_cast<unsigned long long>(
@@ -9037,6 +9554,10 @@ void __cdecl retailVrAccumulateSceneAdapter(
                     static_cast<unsigned>(visibility.collectorFailure),
                     static_cast<unsigned>(visibility.sealResult),
                     visibility.sealedItemCount,
+                    visibility.queueSafeItemCount,
+                    visibility.immediateGeometryRejectedCount,
+                    static_cast<unsigned>(
+                        visibility.privateAccumulatorMode),
                     static_cast<unsigned long long>(
                         visibility.sealedGeneration));
                 logRetailVrLine(visibilityMessage);
@@ -9139,7 +9660,110 @@ void disarmRetailVrAccumulateSceneRelay(void*) noexcept
     InterlockedExchange(&gRetailVrAccumulateSceneOriginalAddress, 0);
 }
 
+bool armRetailVrRenderPhaseRelays(
+    void*,
+    std::uintptr_t renderWithoutFinalizeAddress,
+    std::uintptr_t finalizeAddress) noexcept
+{
+#if !defined(_M_IX86)
+    (void)renderWithoutFinalizeAddress;
+    (void)finalizeAddress;
+    return false;
+#else
+    if (renderWithoutFinalizeAddress == 0u
+        || renderWithoutFinalizeAddress > 0xFFFFFFFFu
+        || finalizeAddress == 0u
+        || finalizeAddress > 0xFFFFFFFFu)
+    {
+        return false;
+    }
+    InterlockedExchange(
+        &gRetailVrRenderWithoutFinalizeOriginalAddress,
+        static_cast<LONG>(
+            static_cast<std::uint32_t>(renderWithoutFinalizeAddress)));
+    InterlockedExchange(
+        &gRetailVrFinalizeAccumulatorOriginalAddress,
+        static_cast<LONG>(static_cast<std::uint32_t>(finalizeAddress)));
+    const std::uint32_t armedRender = static_cast<std::uint32_t>(
+        InterlockedCompareExchange(
+            &gRetailVrRenderWithoutFinalizeOriginalAddress,
+            0,
+            0));
+    const std::uint32_t armedFinalize = static_cast<std::uint32_t>(
+        InterlockedCompareExchange(
+            &gRetailVrFinalizeAccumulatorOriginalAddress,
+            0,
+            0));
+    if (armedRender == static_cast<std::uint32_t>(
+            renderWithoutFinalizeAddress)
+        && armedFinalize == static_cast<std::uint32_t>(finalizeAddress))
+    {
+        return true;
+    }
+    InterlockedExchange(&gRetailVrRenderWithoutFinalizeOriginalAddress, 0);
+    InterlockedExchange(&gRetailVrFinalizeAccumulatorOriginalAddress, 0);
+    return false;
+#endif
+}
+
+void disarmRetailVrRenderPhaseRelays(void*) noexcept
+{
+    InterlockedExchange(&gRetailVrRenderWithoutFinalizeOriginalAddress, 0);
+    InterlockedExchange(&gRetailVrFinalizeAccumulatorOriginalAddress, 0);
+}
+
 #if defined(_M_IX86)
+// The primary world branch already has a later stock FinalizeAccumulator
+// call. Replace only its local RenderAccumulatorWithoutFinalize E8, execute
+// that exact stock target first, then consume the staged stereo transaction
+// while its shader state remains live.
+void __cdecl retailVrRenderWithoutFinalizeRelay(
+    fnvxr::engine::abi::RetailNiCameraLayout* camera,
+    fnvxr::engine::abi::RetailBSShaderAccumulatorLayout* accumulator,
+    std::uint32_t branchSelectorOrContext) noexcept
+{
+    const auto stockRender = reinterpret_cast<
+        fnvxr::engine::abi::AccumulatorRenderFunction>(
+        static_cast<std::uintptr_t>(static_cast<std::uint32_t>(
+            InterlockedCompareExchange(
+                &gRetailVrRenderWithoutFinalizeOriginalAddress,
+                0,
+                0))));
+    if (!stockRender)
+        return;
+    stockRender(camera, accumulator, branchSelectorOrContext);
+    retailVrAfterStockRenderAdapter();
+}
+
+// The two alternate branches use B6C0D0, a small stock render+finalize
+// wrapper. Split only those two local calls into their already-authenticated
+// component wrappers so the same post-render/pre-finalize gap exists.
+void __cdecl retailVrRenderAndFinalizeRelay(
+    fnvxr::engine::abi::RetailNiCameraLayout* camera,
+    fnvxr::engine::abi::RetailBSShaderAccumulatorLayout* accumulator,
+    std::uint32_t branchSelectorOrContext) noexcept
+{
+    const auto stockRender = reinterpret_cast<
+        fnvxr::engine::abi::AccumulatorRenderFunction>(
+        static_cast<std::uintptr_t>(static_cast<std::uint32_t>(
+            InterlockedCompareExchange(
+                &gRetailVrRenderWithoutFinalizeOriginalAddress,
+                0,
+                0))));
+    const auto stockFinalize = reinterpret_cast<
+        fnvxr::engine::abi::AccumulatorRenderFunction>(
+        static_cast<std::uintptr_t>(static_cast<std::uint32_t>(
+            InterlockedCompareExchange(
+                &gRetailVrFinalizeAccumulatorOriginalAddress,
+                0,
+                0))));
+    if (!stockRender || !stockFinalize)
+        return;
+    stockRender(camera, accumulator, branchSelectorOrContext);
+    retailVrAfterStockRenderAdapter();
+    stockFinalize(camera, accumulator, branchSelectorOrContext);
+}
+
 // E8 replacement relay for the exact retail (camera, scene, culler) cdecl
 // call. A normal C++ adapter subtly changes the entry stack and volatile
 // register state seen by AccumulateScene; that produces a null culler-side
@@ -9232,6 +9856,12 @@ bool initializeRetailVrBridge(IDirect3DDevice9* device) noexcept
     const LONG attempt =
         InterlockedIncrement(&gRetailVrBridgeInitializationAttempts);
     const bool logAttempt = attempt <= 3 || attempt % 120 == 0;
+    ensureRetailVrExceptionObserver();
+    const RetailVrAccumulationDiagnosticMode accumulationDiagnosticMode =
+        readRetailVrAccumulationDiagnosticMode();
+    InterlockedExchange(
+        &gRetailVrAccumulationDiagnosticMode,
+        static_cast<LONG>(accumulationDiagnosticMode));
 
     // The runtime publication may not exist during CreateDevice, while the
     // engine's auto-depth surface is still bound. Preserve that exact
@@ -9293,6 +9923,9 @@ bool initializeRetailVrBridge(IDirect3DDevice9* device) noexcept
     operations.armAccumulationCallRelay = &armRetailVrAccumulateSceneRelay;
     operations.disarmAccumulationCallRelay =
         &disarmRetailVrAccumulateSceneRelay;
+    operations.armRenderPhaseCallRelays = &armRetailVrRenderPhaseRelays;
+    operations.disarmRenderPhaseCallRelays =
+        &disarmRetailVrRenderPhaseRelays;
     operations.prepareDistinctCameraFrame = &prepareRetailVrFrame;
     operations.publishCpuPair = &publishRetailVrCpuPair;
     operations.publishCpuMonoUiQuad = &publishRetailVrCpuMonoUiQuad;
@@ -9302,7 +9935,11 @@ bool initializeRetailVrBridge(IDirect3DDevice9* device) noexcept
     gRetailVrBridge = bridge;
     if (!bridge->initialize(
             operations,
-            reinterpret_cast<std::uintptr_t>(&retailVrAccumulateSceneRelay)))
+            reinterpret_cast<std::uintptr_t>(&retailVrAccumulateSceneRelay),
+            reinterpret_cast<std::uintptr_t>(
+                &retailVrRenderWithoutFinalizeRelay),
+            reinterpret_cast<std::uintptr_t>(
+                &retailVrRenderAndFinalizeRelay)))
     {
         const auto& authority = bridge->authorityDecision();
         const auto& diagnostics = authority.revalidation.diagnostics;
@@ -9321,7 +9958,7 @@ bool initializeRetailVrBridge(IDirect3DDevice9* device) noexcept
         if (logAttempt)
             logRetailVrLine(message);
         delete bridge;
-        // The bridge destructor restores the three E8 instructions before
+        // The bridge destructor restores the six E8 instructions before
         // this pointer becomes null. Reversing that order could strand an
         // in-flight stock call without an original-target fallback.
         gRetailVrBridge = nullptr;
@@ -9330,8 +9967,17 @@ bool initializeRetailVrBridge(IDirect3DDevice9* device) noexcept
     // As with the bridge-owned gameplay reader, mapping names are configured
     // now and the first Present after NVSE publishes them opens them lazily.
     static_cast<void>(gRetailUiTrackedFrames.initialize());
-    logRetailVrLine(
-        "retail VR bridge initialized: exact AccumulateScene callsite hook, ordinary-D3D9 CPU-v8 stereo transport, and deferred Present bootstrap ready");
+    char initializedMessage[416] {};
+    sprintf_s(
+        initializedMessage,
+        "retail VR bridge initialized: exact AccumulateScene callsite hook, ordinary-D3D9 CPU-v8 stereo transport, and deferred Present bootstrap ready; exact post-stock-render lifecycle hook ready; accumulationMode=%s initThread=%lu deviceThread=%lu behaviorFlags=0x%08lX exceptionObserver=%d",
+        retailVrAccumulationDiagnosticModeName(
+            accumulationDiagnosticMode),
+        GetCurrentThreadId(),
+        gDeviceCreationThreadId,
+        gDeviceBehaviorFlags,
+        gRetailVrExceptionObserver ? 1 : 0);
+    logRetailVrLine(initializedMessage);
     return true;
 }
 
@@ -12822,25 +13468,71 @@ bool publishRetailVrCpuPair(
     const fnvxr::engine::RetailTrackedFrame& tracked,
     std::uint64_t transactionId) noexcept
 {
+    LARGE_INTEGER publicationStart {};
+    LARGE_INTEGER readbackEnd {};
+    LARGE_INTEGER proofEnd {};
+    LARGE_INTEGER publicationEnd {};
+    QueryPerformanceCounter(&publicationStart);
+    ScopedSrwExclusiveLock publicationLock(
+        gRetailCpuStereoPublicationLock);
     auto* context = static_cast<RetailVrProxyContext*>(opaque);
     IDirect3DDevice9* device = context ? context->device : nullptr;
+    const fnvxr::engine::RetailTrackedFrameValidation trackedValidation =
+        fnvxr::engine::validateRetailTrackedGameplayFrame(tracked);
+    const bool deviceMatches = device
+        && device == gRetailEngineEyeTargetDevice;
+    const bool surfacesReady = gLeftEyeSurface
+        && gRightEyeSurface
+        && gLeftEyeReadback
+        && gRightEyeReadback;
+    const bool dimensionsReady = gStereoTargetWidth != 0u
+        && gStereoTargetHeight != 0u
+        && gStereoTargetWidth <= SharedVideoMaxWidth
+        && gStereoTargetHeight <= SharedVideoMaxHeight;
+    const bool formatReady =
+        fnvxr::d3d9::retailCpuEyeTargetColorFormatAccepted(
+            static_cast<std::uint32_t>(gStereoTargetFormat));
+    const bool sharedReady = deviceMatches
+        && surfacesReady
+        && dimensionsReady
+        && formatReady
+        && ensureSharedStereo();
     if (!device
         || transactionId == 0u
-        || !fnvxr::engine::validateRetailTrackedGameplayFrame(tracked)
-                .complete()
-        || device != gRetailEngineEyeTargetDevice
-        || !gLeftEyeSurface
-        || !gRightEyeSurface
-        || !gLeftEyeReadback
-        || !gRightEyeReadback
-        || gStereoTargetWidth == 0u
-        || gStereoTargetHeight == 0u
-        || gStereoTargetWidth > SharedVideoMaxWidth
-        || gStereoTargetHeight > SharedVideoMaxHeight
-        || !fnvxr::d3d9::retailCpuEyeTargetColorFormatAccepted(
-            static_cast<std::uint32_t>(gStereoTargetFormat))
-        || !ensureSharedStereo())
+        || !trackedValidation.complete()
+        || !deviceMatches
+        || !surfacesReady
+        || !dimensionsReady
+        || !formatReady
+        || !sharedReady)
     {
+        const LONG rejected =
+            InterlockedIncrement(&gRetailCpuStereoPreconditionRejections);
+        if (rejected <= 12 || rejected % 120 == 0)
+        {
+            char message[640] {};
+            sprintf_s(
+                message,
+                "retail CPU-v8 stereo rejected: precondition count=%ld transaction=%llu device=%p engineDevice=%p deviceMatches=%d trackedFailure=%u surfaces=%d left=%p right=%p leftReadback=%p rightReadback=%p dimensions=%d size=%ux%u format=%u formatReady=%d shared=%d",
+                rejected,
+                static_cast<unsigned long long>(transactionId),
+                device,
+                gRetailEngineEyeTargetDevice,
+                deviceMatches ? 1 : 0,
+                static_cast<unsigned>(trackedValidation.failure),
+                surfacesReady ? 1 : 0,
+                gLeftEyeSurface,
+                gRightEyeSurface,
+                gLeftEyeReadback,
+                gRightEyeReadback,
+                dimensionsReady ? 1 : 0,
+                gStereoTargetWidth,
+                gStereoTargetHeight,
+                static_cast<unsigned>(gStereoTargetFormat),
+                formatReady ? 1 : 0,
+                sharedReady ? 1 : 0);
+            logRetailVrLine(message);
+        }
         return false;
     }
 
@@ -12852,6 +13544,7 @@ bool publishRetailVrCpuPair(
             gRightEyeSurface,
             gRightEyeReadback)
         : leftReadback;
+    QueryPerformanceCounter(&readbackEnd);
     if (FAILED(leftReadback) || FAILED(rightReadback))
     {
         writeInvalidSharedStereoRecord(
@@ -12888,6 +13581,7 @@ bool publishRetailVrCpuPair(
         difference,
         requiredDifferentSamples);
     const bool visible = stereoVisualCoverageAcceptable(coverage);
+    QueryPerformanceCounter(&proofEnd);
     if (!separated || !visible)
     {
         writeInvalidSharedStereoRecord(
@@ -13055,9 +13749,27 @@ bool publishRetailVrCpuPair(
     fnvxr::shared::incrementNonzeroSharedCounter(header->sequence);
     MemoryBarrier();
     InterlockedExchange(&header->writing, 0);
+    QueryPerformanceCounter(&publicationEnd);
 
     const LONG published =
         InterlockedIncrement(&gRetailCpuStereoPublications);
+    const LONG worldTimingPublication =
+        InterlockedIncrement(&gRetailCpuStereoWorldTimingPublications);
+    if (worldTimingPublication <= 8
+        || worldTimingPublication % 120 == 0)
+    {
+        char timing[320] {};
+        sprintf_s(
+            timing,
+            "retail CPU-v8 stereo timing count=%ld transaction=%llu totalMs=%.3f readbackMs=%.3f proofMs=%.3f copyPublishMs=%.3f",
+            worldTimingPublication,
+            static_cast<unsigned long long>(transactionId),
+            secondsBetween(publicationStart, publicationEnd) * 1000.0,
+            secondsBetween(publicationStart, readbackEnd) * 1000.0,
+            secondsBetween(readbackEnd, proofEnd) * 1000.0,
+            secondsBetween(proofEnd, publicationEnd) * 1000.0);
+        logRetailVrLine(timing);
+    }
     if (published <= 8 || published % 120 == 0)
     {
         // Keep source pixels tied to the exact engine-center transaction.
@@ -13126,6 +13838,8 @@ bool publishRetailVrCpuMonoUiQuad(
     const fnvxr::engine::RetailTrackedFrame& tracked,
     std::uint64_t transactionId) noexcept
 {
+    ScopedSrwExclusiveLock publicationLock(
+        gRetailCpuStereoPublicationLock);
     auto* context = static_cast<RetailVrProxyContext*>(opaque);
     IDirect3DDevice9* device = context ? context->device : nullptr;
     if (!device
@@ -17722,6 +18436,7 @@ public:
             fnvxr::d3d9::CompiledRetailVrBridgePolicy.exBackedGameDevice)
             forceImmediatePresentation(presentationParameters, "CreateDevice");
         gDeviceBehaviorFlags = behaviorFlags;
+        gDeviceCreationThreadId = GetCurrentThreadId();
         if (stereoProofModeArmed() && (behaviorFlags & D3DCREATE_MULTITHREADED) != 0)
         {
             if (returnedDevice)

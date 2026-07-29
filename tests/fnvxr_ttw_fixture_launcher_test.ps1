@@ -56,8 +56,8 @@ foreach ($required in @(
 foreach ($required in @(
     'function Get-FnvxrProductTtwFixtureSaveName',
     'function Assert-FnvxrProductTtwFixtureSaveName',
-    'if (-not $TtwFixture) {',
-    'FNVXR_RETAIL_FIXTURE_ACK_OFFICIAL_PACK_POPUP = "1"')) {
+    'FNVXR_RETAIL_FIXTURE_ACK_OFFICIAL_PACK_POPUP = "1"',
+    'FNVXR_RETAIL_FIXTURE_ACK_TTW_STEWIE_DEPENDENCY_WARNING')) {
     if (-not $common.Contains($required)) {
         throw "TTW fixture common helper is incomplete: $required"
     }
@@ -101,7 +101,10 @@ try {
 
 foreach ($required in @(
     'inline constexpr std::string_view TtwSaveNamePrefix',
-    'FNVXR_AutoTTW_')) {
+    'FNVXR_AutoTTW_',
+    'TtwStewieDependencyWarningTitle',
+    'TtwStewieDependencyWarningBody',
+    'exactTtwStewieDependencyAcknowledgementAuthorized')) {
     if (-not $authority.Contains($required)) {
         throw "Fixture authority lost TTW save-lineage contract: $required"
     }
@@ -109,6 +112,17 @@ foreach ($required in @(
 if (-not $plugin.Contains(
         'return runProfileIs("retail-fixture-v1") || runProfileIs("ttw-fixture-v1");')) {
     throw "Plugin lost the TTW fixture profile contract."
+}
+foreach ($required in @(
+    'retailFixtureTtwStewieDependencyAcknowledgementRequested',
+    'FNVXR_RETAIL_FIXTURE_ACK_TTW_STEWIE_DEPENDENCY_WARNING',
+    'findExactTtwStewieDependencyMessageMenuTarget',
+    'acknowledgeExactTtwStewieDependencyMessageMenu',
+    'closeExactRetailFixtureTtwStewieDependencyMessageMenu',
+    'MaxExactTtwStewieDependencyCloseAttemptsPerRun')) {
+    if (-not $plugin.Contains($required)) {
+        throw "Plugin lost exact TTW dependency-warning acknowledgement: $required"
+    }
 }
 
 # The visual headset route has a separate fixture-load helper. It must select
