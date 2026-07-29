@@ -138,7 +138,7 @@ int main()
             && !PrivateGeometryCollectorX86Abi::runtimeActivationAuthorized
             && !PrivateGeometryCollectorX86Abi::activatesHook
             && PrivateGeometryCollectorX86Abi::clonesVtable
-            && !PrivateGeometryCollectorX86Abi::callsEngine
+            && PrivateGeometryCollectorX86Abi::callsEngine
             && !PrivateGeometryCollectorX86Abi::writesProcessMemory
             && !privateGeometryCollectorProductionReady(),
         "implemented clone proofs must be true while runtime activation remains gated");
@@ -491,6 +491,23 @@ int main()
         PrivateGeometryCollectorVslotCallbackFunction<4u>>);
 
     Binding binding {};
+    const auto bindingAddress = static_cast<RetailGeometryPointer32>(
+        reinterpret_cast<std::uintptr_t>(&binding));
+    const auto liveSourceVtableAddress = static_cast<RetailGeometryPointer32>(
+        reinterpret_cast<std::uintptr_t>(sourceVtable.data()));
+    const auto liveCallbackAddress = static_cast<RetailGeometryPointer32>(
+        reinterpret_cast<std::uintptr_t>(
+            &privateGeometryCollectorVslotCallback<4u>));
+    binding.cullingProcess()->base.vtable = liveSourceVtableAddress;
+    require(
+        binding.installOwnedVtableClone(
+            sourceVtable.data(),
+            sourceVtable.size(),
+            liveSourceVtableAddress,
+            bindingAddress,
+            liveCallbackAddress)
+            == GeometryVtableInstallResult::Installed,
+        "the direct callback ABI test did not install its owned dispatch table");
     require(
         binding.beginCollection(generation),
         "the guarded private culler binding must begin on its owning thread");

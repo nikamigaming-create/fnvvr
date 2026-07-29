@@ -179,6 +179,30 @@ int main()
                 false).content == RoutedContent::SafetyBlank,
         "controller UI decision bypassed missing retained UI resources");
 
+    // A transport-level MonoUiQuad label must not turn gameplay into a flat
+    // panel by itself. A UI hold is legal only after this controller has
+    // actually selected a confirmed UI state; a new controller receiving an
+    // old or mislabeled UI candidate during gameplay must fail blank-safe.
+    RuntimeEvidence gameplayWithUiCandidate = runtime;
+    gameplayWithUiCandidate.phase = fnvxr::shared::RuntimePhaseGameplay;
+    gameplayWithUiCandidate.menuBits = 0u;
+    gameplayWithUiCandidate.cameraActive = true;
+    fnvxr::product::PresentationController staleUiController;
+    const fnvxr::product::PresentationDecision staleUiDecision =
+        staleUiController.advance(makePresentationInput(
+            gameplayWithUiCandidate,
+            ui,
+            false,
+            true));
+    require(staleUiDecision.mode == fnvxr::product::PresentationMode::SafetyBlank
+            && !staleUiDecision.transitionHold
+            && staleUiDecision.presentedUiSourceFrame == 0u
+            && selectProductComposition(
+                staleUiDecision,
+                false,
+                true).content == RoutedContent::SafetyBlank,
+        "a stale MonoUiQuad candidate flattened gameplay without a confirmed UI visit");
+
     ConsumerFrame newerWorld = world;
     newerWorld.transactionId = 10u;
     newerWorld.sourceFrame = 11u;

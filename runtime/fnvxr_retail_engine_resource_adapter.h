@@ -22,7 +22,7 @@ enum class RetailEngineResourceAdapterFailure : std::uint8_t
     CleanupTokenMismatch,
     ConstructorInputMismatch,
     AccumulatorReferenceOwnershipMismatch,
-    CullerVtableInstallFailed,
+    CullerVtableMismatch,
 };
 
 template <std::size_t CollectorCapacity>
@@ -448,31 +448,26 @@ struct RetailEngineResourceAdapter
         if (returned != storage)
             return { true, returned };
 
-        const auto bindingAddress = static_cast<abi::RetailPointer32>(
-            reinterpret_cast<std::uintptr_t>(binding));
+        // The constructor must retain the exact runtime-verified BSCulling
+        // table. A later scoped collector clones this table privately; it
+        // never accepts an arbitrary constructor dispatch target.
+        const std::uintptr_t verifiedVtableAddress =
+            reinterpret_cast<std::uintptr_t>(context->mVerifiedCullerVtable);
 #if defined(_MSC_VER) && defined(_M_IX86)
-        const auto callbackAddress = static_cast<abi::RetailPointer32>(
-            reinterpret_cast<std::uintptr_t>(
-                &geometry::privateGeometryCollectorVslotCallback<
-                    CollectorCapacity>));
+        const bool cullerVtableMatches = verifiedVtableAddress
+                <= (std::numeric_limits<abi::RetailPointer32>::max)()
+            && storage->base.vtable
+                == static_cast<abi::RetailPointer32>(verifiedVtableAddress);
 #else
-        // Audit builds cannot execute the x86 callback. A distinct address is
-        // used only to exercise clone ownership; engine-call authorization is
-        // architecture-blocked in those builds.
-        constexpr abi::RetailPointer32 callbackAddress = 0x0F00BA11u;
+        static_cast<void>(verifiedVtableAddress);
+        const bool cullerVtableMatches = storage->base.vtable
+            == static_cast<abi::RetailPointer32>(
+                abi::BSCullingProcessVtableAddress);
 #endif
-        const geometry::GeometryVtableInstallResult install =
-            binding->installOwnedVtableClone(
-                context->mVerifiedCullerVtable,
-                Binding::OwnedVtableEntryCount,
-                static_cast<abi::RetailPointer32>(
-                    abi::BSCullingProcessVtableAddress),
-                bindingAddress,
-                callbackAddress);
-        if (install != geometry::GeometryVtableInstallResult::Installed)
+        if (!cullerVtableMatches)
         {
             context->fail(
-                RetailEngineResourceAdapterFailure::CullerVtableInstallFailed);
+                RetailEngineResourceAdapterFailure::CullerVtableMismatch);
             return { true, nullptr };
         }
         return { true, returned };

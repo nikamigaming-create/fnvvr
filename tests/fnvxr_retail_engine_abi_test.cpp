@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstring>
 #include <cstdlib>
 #include <iostream>
 #include <string_view>
@@ -36,15 +37,52 @@ int main()
         "BSShaderAccumulator must be 0x280 bytes");
 
     require(
-        offsetof(RetailNiCameraLayout, worldToCamera) == 0x9Cu
+        offsetof(RetailNiCameraLayout, worldToCamera) == 0xACu
             && offsetof(RetailNiCameraLayout, frustum) == 0xDCu
             && offsetof(RetailNiCameraLayout, viewport) == 0x100u,
         "NiCamera world transform, frustum, and viewport offsets must stay exact");
     require(
         offsetof(RetailSceneGraphLayout, camera) == 0xACu
             && offsetof(RetailSceneGraphLayout, visibleArray) == 0xB0u
-            && offsetof(RetailSceneGraphLayout, cullingProcess) == 0xB4u,
-        "SceneGraph camera, visibility, and culler offsets must stay exact");
+            && offsetof(RetailSceneGraphLayout, cullingProcess) == 0xB4u
+            && offsetof(RetailSceneGraphLayout, opaqueUnknownB8) == 0xB8u,
+        "SceneGraph camera, visibility, culler, and opaque-field offsets must stay exact");
+
+    RetailSceneGraphLayout scene {};
+    constexpr RetailPointer32 unrelatedNodePointer = 0x00B664F0u;
+    constexpr RetailPointer32 cameraAtLiveRetailOffset = 0x12345678u;
+    constexpr RetailPointer32 cullerAtLiveRetailOffset = 0x23456789u;
+    std::memcpy(
+        reinterpret_cast<std::uint8_t*>(&scene) + 0x9Cu,
+        &unrelatedNodePointer,
+        sizeof(unrelatedNodePointer));
+    std::memcpy(
+        reinterpret_cast<std::uint8_t*>(&scene)
+            + offsetof(RetailSceneGraphLayout, camera),
+        &cameraAtLiveRetailOffset,
+        sizeof(cameraAtLiveRetailOffset));
+    std::memcpy(
+        reinterpret_cast<std::uint8_t*>(&scene)
+            + offsetof(RetailSceneGraphLayout, cullingProcess),
+        &cullerAtLiveRetailOffset,
+        sizeof(cullerAtLiveRetailOffset));
+    require(
+        scene.camera == cameraAtLiveRetailOffset
+            && scene.cullingProcess == cullerAtLiveRetailOffset
+            && scene.camera != unrelatedNodePointer,
+        "the SceneGraph overlay must read the live retail camera and culler slots");
+
+    RetailNiCameraLayout camera {};
+    const float retailNearDistance = 5.0f;
+    std::memcpy(
+        reinterpret_cast<std::uint8_t*>(&camera)
+            + offsetof(RetailNiCameraLayout, frustum)
+            + offsetof(RetailNiFrustumLayout, nearDistance),
+        &retailNearDistance,
+        sizeof(retailNearDistance));
+    require(
+        camera.frustum.nearDistance == retailNearDistance,
+        "the NiCamera overlay must read its frustum after the world-bound block");
     require(
         offsetof(RetailBSCullingProcessLayout, topCullMode) == 0x90u
             && offsetof(RetailBSCullingProcessLayout, shaderAccumulator) == 0xC4u,

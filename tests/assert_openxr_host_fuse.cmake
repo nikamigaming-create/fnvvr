@@ -27,6 +27,44 @@ foreach(required_trial_text IN ITEMS
     endif()
 endforeach()
 
+foreach(required_source_identity_text IN ITEMS
+        "stereoGamePublicationGeneration"
+        "lastSharedStereoPublicationGeneration"
+        "sourceStereoPublicationGeneration"
+        "nonzeroSharedGenerationAdvanced(")
+    string(FIND "${host_source}" "${required_source_identity_text}" source_identity_at)
+    if(source_identity_at EQUAL -1)
+        message(FATAL_ERROR
+            "Host lost the 64-bit shared-stereo publication identity: ${required_source_identity_text}")
+    endif()
+endforeach()
+
+foreach(required_cpu_transition_text IN ITEMS
+        "#include \"fnvxr_cpu_engine_presentation.h\""
+        "readSharedD3D9MonoUiFrame("
+        "uploadCpuEngineUiTexture("
+        "flatUiFrameEligible("
+        "binocularWorldFrameEligible("
+        "cpuUiBoundaryTransactionId"
+        "#include \"fnvxr_game_plane_surface.h\""
+        "game_plane_surface::select("
+        "game_plane_surface::permitsSourceSurround("
+        "Kind::CurvedGameplay"
+        "D3D9StereoFrameHostReaderMutexName"
+        "&& !productionCpuEngineStereo")
+    string(FIND "${host_source}" "${required_cpu_transition_text}" cpu_transition_at)
+    if(cpu_transition_at EQUAL -1)
+        message(FATAL_ERROR
+            "Host lost the CPU UI/world transition boundary: ${required_cpu_transition_text}")
+    endif()
+endforeach()
+
+string(FIND "${host_source}" "Stereo_HostReader_v7" retired_cpu_mutex_at)
+if(NOT retired_cpu_mutex_at EQUAL -1)
+    message(FATAL_ERROR
+        "Host still leases the retired v7 stereo reader mutex")
+endif()
+
 foreach(required_ui_capture_text IN ITEMS
         "#include \"fnvxr_host_ui_capture_gate.h\""
         "prepareProductUiWindowFallback("

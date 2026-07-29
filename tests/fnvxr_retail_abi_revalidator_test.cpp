@@ -338,7 +338,7 @@ struct SyntheticFixture
 
     void initializeLayouts()
     {
-        for (std::size_t row = 0; row < 4u; ++row)
+        for (std::size_t row = 0; row < 3u; ++row)
             camera.worldToCamera[row * 4u + row] = 1.0f;
         camera.frustum = validFrustum();
         camera.minimumNearPlane = 0.01f;
@@ -357,7 +357,9 @@ struct SyntheticFixture
         scene.camera = static_cast<RetailPointer32>(CameraAddress);
         scene.visibleArray = static_cast<RetailPointer32>(VisibleAddress);
         scene.cullingProcess = static_cast<RetailPointer32>(CullerAddress);
-        scene.isMenuSceneGraph = 0u;
+        // The retail SceneGraph field at 0xB8 is opaque. A non-boolean value
+        // must not invalidate ABI authority or classify a presentation route.
+        scene.opaqueUnknownB8 = 0xDEADBEEFu;
         scene.cameraFov = 75.0f;
 
         culler.base.vtable = static_cast<RetailPointer32>(
@@ -671,9 +673,9 @@ void testEveryLiveLayoutAndCensusRemainSynchronous()
     const float originalNear = fixture.camera.frustum.nearDistance;
     fixture.camera.frustum.nearDistance = -1.0f;
     rejected = fixture.evaluate();
-    require(!rejected.evidence.liveObjectLayoutsVerified,
-        "an invalid camera frustum was accepted");
-    requireRejected(rejected, "an invalid camera layout authorized calls");
+    require(rejected.evidence.liveObjectLayoutsVerified
+            && rejected.assessment.engineCallsAuthorized,
+        "early camera projection state must not block structural startup authority");
     fixture.camera.frustum.nearDistance = originalNear;
 
     const RetailPointer32 originalCullerCamera = fixture.culler.base.camera;

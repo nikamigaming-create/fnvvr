@@ -156,6 +156,632 @@ function Get-FnvxrProductRoot {
     return (Resolve-Path -LiteralPath (Split-Path -Parent $PSScriptRoot)).Path
 }
 
+function Get-FnvxrProductApprovedRetailSaveLoadCommand {
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet("FNVXR_StereoTest")]
+        [string]$RetailSaveName
+    )
+
+    switch ($RetailSaveName) {
+        # The load-only visual-trial route uses only the clean Goodsprings
+        # save created by the fixed fresh-character workflow. Suspect legacy
+        # saves remain untouched but cannot be selected here.
+        "FNVXR_StereoTest" { return "load FNVXR_StereoTest" }
+    }
+    throw "Unsupported approved retail save name: $RetailSaveName"
+}
+
+function Get-FnvxrProductFreshCharacterStartCommand {
+    # xNVSE treats CenterOnCell from the start menu as a new no-save game.
+    # Keep this exact command owned by the product; the plugin rejects every
+    # other fresh-character command and performs the fixed name/save steps.
+    return "coc Goodsprings"
+}
+
+function Get-FnvxrProductRetailFixtureTraitNames {
+    # These are the base FalloutNV.esm trait editor IDs used by the game's own
+    # trait script. The fixture path deliberately has no DLC or TTW traits:
+    # each fixture is created under a minimal, reproducible retail profile.
+    return @(
+        "None",
+        "BuiltToDestroy",
+        "FastShot",
+        "FourEyes",
+        "GoodNatured",
+        "HeavyHanded",
+        "Kamikaze",
+        "SmallFrame",
+        "TriggerDiscipline",
+        "WildWasteland")
+}
+
+function Resolve-FnvxrProductRetailFixtureTrait {
+    param([Parameter(Mandatory = $true)][string]$Trait)
+
+    foreach ($candidate in @(Get-FnvxrProductRetailFixtureTraitNames)) {
+        if ([string]::Equals(
+                $candidate,
+                $Trait,
+                [System.StringComparison]::OrdinalIgnoreCase)) {
+            return $candidate
+        }
+    }
+    throw "Unsupported retail fixture trait: $Trait"
+}
+
+function Resolve-FnvxrProductRetailFixtureTraits {
+    param(
+        [Parameter(Mandatory = $true)][string]$TraitOne,
+        [Parameter(Mandatory = $true)][string]$TraitTwo
+    )
+
+    $first = Resolve-FnvxrProductRetailFixtureTrait -Trait $TraitOne
+    $second = Resolve-FnvxrProductRetailFixtureTrait -Trait $TraitTwo
+    if ($first -cne "None" -and $first -ceq $second) {
+        throw "Retail fixture traits must be distinct when both slots are used: $first"
+    }
+    return [pscustomobject][ordered]@{
+        first = $first
+        second = $second
+    }
+}
+
+function Get-FnvxrProductRetailFixtureSaveName {
+    param(
+        [Parameter(Mandatory = $true)][string]$TraitOne,
+        [Parameter(Mandatory = $true)][string]$TraitTwo
+    )
+
+    $traits = Resolve-FnvxrProductRetailFixtureTraits `
+        -TraitOne $TraitOne `
+        -TraitTwo $TraitTwo
+    $selected = @(
+        @($traits.first, $traits.second) |
+            Where-Object { $_ -cne "None" } |
+            Sort-Object -CaseSensitive)
+    if ($selected.Count -eq 0) {
+        return "FNVXR_AutoRetail_L1_Base"
+    }
+    return "FNVXR_AutoRetail_L1_" + ($selected -join "_")
+}
+
+function Assert-FnvxrProductRetailFixtureSaveName {
+    param([Parameter(Mandatory = $true)][string]$SaveName)
+
+    if ($SaveName -notmatch '^FNVXR_AutoRetail_[A-Za-z0-9_]+$' -or
+        $SaveName.Length -ge 64) {
+        throw "Retail fixture save name is not owned or is too long: $SaveName"
+    }
+    return $SaveName
+}
+
+function Get-FnvxrProductTtwFixtureSaveName {
+    param(
+        [Parameter(Mandatory = $true)][string]$TraitOne,
+        [Parameter(Mandatory = $true)][string]$TraitTwo
+    )
+
+    $traits = Resolve-FnvxrProductRetailFixtureTraits `
+        -TraitOne $TraitOne `
+        -TraitTwo $TraitTwo
+    $selected = @(
+        @($traits.first, $traits.second) |
+            Where-Object { $_ -cne "None" } |
+            Sort-Object -CaseSensitive)
+    if ($selected.Count -eq 0) {
+        return "FNVXR_AutoTTW_L1_Base"
+    }
+    return "FNVXR_AutoTTW_L1_" + ($selected -join "_")
+}
+
+function Assert-FnvxrProductTtwFixtureSaveName {
+    param([Parameter(Mandatory = $true)][string]$SaveName)
+
+    if ($SaveName -notmatch '^FNVXR_AutoTTW_[A-Za-z0-9_]+$' -or
+        $SaveName.Length -ge 64) {
+        throw "TTW fixture save name is not owned or is too long: $SaveName"
+    }
+    return $SaveName
+}
+
+function Get-FnvxrProductDocumentsPath {
+    # Environment.GetFolderPath can return the unredirected profile default
+    # during the first call in a fresh non-interactive PowerShell process.
+    # Read the per-user known-folder value directly first so OneDrive and other
+    # Windows Documents redirections are honored deterministically.
+    $userKey = $null
+    $userShellFolders = $null
+    try {
+        $userKey = [Microsoft.Win32.RegistryKey]::OpenBaseKey(
+            [Microsoft.Win32.RegistryHive]::CurrentUser,
+            [Microsoft.Win32.RegistryView]::Default)
+        $userShellFolders = $userKey.OpenSubKey(
+            "Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders",
+            $false)
+        if ($userShellFolders) {
+            $rawPath = [string]$userShellFolders.GetValue(
+                "Personal",
+                $null,
+                [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+            if (-not [string]::IsNullOrWhiteSpace($rawPath)) {
+                $expandedPath = [Environment]::ExpandEnvironmentVariables($rawPath)
+                if ([System.IO.Path]::IsPathRooted($expandedPath)) {
+                    return [System.IO.Path]::GetFullPath($expandedPath)
+                }
+            }
+        }
+    } finally {
+        if ($userShellFolders) { $userShellFolders.Dispose() }
+        if ($userKey) { $userKey.Dispose() }
+    }
+
+    $fallbackPath = [Environment]::GetFolderPath("MyDocuments")
+    if ([string]::IsNullOrWhiteSpace($fallbackPath) -or
+        -not [System.IO.Path]::IsPathRooted($fallbackPath)) {
+        throw "Windows did not provide a rooted Documents known-folder path."
+    }
+    return [System.IO.Path]::GetFullPath($fallbackPath)
+}
+
+function Get-FnvxrProductRetailVisualTrialPluginNames {
+    # This is the exact official-master order recorded in the approved
+    # FNVXR_StereoTest NVSE sidecar.  It intentionally excludes TTW/Fallout 3
+    # content: the supervised product target is the installed retail New Vegas
+    # game root, not a mod-manager or TTW profile.
+    return @(
+        "FalloutNV.esm",
+        "DeadMoney.esm",
+        "HonestHearts.esm",
+        "OldWorldBlues.esm",
+        "LonesomeRoad.esm",
+        "TribalPack.esm",
+        "MercenaryPack.esm",
+        "ClassicPack.esm",
+        "CaravanPack.esm",
+        "GunRunnersArsenal.esm")
+}
+
+function Get-FnvxrProductRetailFixturePluginNames {
+    # A brand-new fixture must not activate DLC pre-order packs. That removes
+    # their modal first-load notifications from the automated path entirely.
+    return @("FalloutNV.esm")
+}
+
+function Get-FnvxrProductRetailVisualTrialPluginsPath {
+    $localAppData = [Environment]::GetFolderPath("LocalApplicationData")
+    if ([string]::IsNullOrWhiteSpace($localAppData) -or
+        -not [System.IO.Path]::IsPathRooted($localAppData)) {
+        throw "Windows did not provide a rooted LocalAppData known-folder path."
+    }
+    return Join-Path ([System.IO.Path]::GetFullPath($localAppData)) "FalloutNV\plugins.txt"
+}
+
+function Assert-FnvxrProductRetailVisualTrialPluginData {
+    param([Parameter(Mandatory = $true)][string]$GameRoot)
+
+    $dataRoot = Join-Path ([System.IO.Path]::GetFullPath($GameRoot)) "Data"
+    foreach ($plugin in @(Get-FnvxrProductRetailVisualTrialPluginNames)) {
+        $path = Join-Path $dataRoot $plugin
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            throw "Retail visual-trial plugin is missing from the retail game root: $path"
+        }
+    }
+}
+
+function Get-FnvxrProductRetailVisualTrialPluginProfileText {
+    return ((Get-FnvxrProductRetailVisualTrialPluginNames) -join "`r`n") + "`r`n"
+}
+
+function Install-FnvxrProductRetailVisualTrialPluginProfile {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$BackupRoot,
+        [Parameter(Mandatory = $true)][string]$RunId,
+        [Parameter(Mandatory = $true)][string]$GameRoot
+    )
+
+    # The profile is staged only after the launcher has confirmed that no
+    # unrelated Fallout/NVSE process is alive.  It contains only the exact
+    # retail masters from the approved save and is restored byte-for-byte in
+    # the supervisor's finally block.  No save, NVSE sidecar, or game data
+    # record is ever included in this operation.
+    Assert-FnvxrProductRetailVisualTrialPluginData -GameRoot $GameRoot
+    $destination = [System.IO.Path]::GetFullPath($Path)
+    $directory = Split-Path -Parent $destination
+    if (-not (Test-Path -LiteralPath $directory -PathType Container)) {
+        throw "Retail plugin-profile directory is missing: $directory"
+    }
+    $expectedText = Get-FnvxrProductRetailVisualTrialPluginProfileText
+    $expectedSha256 = Get-FnvxrProductStringSha256 -Value $expectedText
+    $previousExists = Test-Path -LiteralPath $destination -PathType Leaf
+    $previous = if ($previousExists) {
+        Get-FnvxrProductFileIdentity -Path $destination
+    } else {
+        $null
+    }
+    if ($previous -and $previous.sha256 -ceq $expectedSha256) {
+        return [pscustomobject][ordered]@{
+            key = "retail-plugin-profile"
+            path = $destination
+            entries = @(Get-FnvxrProductRetailVisualTrialPluginNames)
+            expectedSha256 = $expectedSha256
+            previousExists = $true
+            previous = $previous
+            backup = $null
+            changed = $false
+            staged = $previous
+        }
+    }
+
+    $backup = $null
+    if ($previousExists) {
+        $backup = Join-Path $BackupRoot "retail-plugin-profile\plugins.txt"
+        New-Item -ItemType Directory -Path (Split-Path -Parent $backup) -Force | Out-Null
+        Copy-Item -LiteralPath $destination -Destination $backup -Force
+        $backupIdentity = Get-FnvxrProductFileIdentity -Path $backup
+        if ($backupIdentity.sha256 -cne $previous.sha256) {
+            throw "Retail plugin-profile backup hash mismatch: $destination -> $backup"
+        }
+    }
+
+    $temporary = "$destination.fnvxr-profile-$RunId"
+    try {
+        if (Test-Path -LiteralPath $temporary -PathType Leaf) {
+            Remove-Item -LiteralPath $temporary -Force
+        }
+        [System.IO.File]::WriteAllText(
+            $temporary,
+            $expectedText,
+            [System.Text.UTF8Encoding]::new($false))
+        $temporaryIdentity = Get-FnvxrProductFileIdentity -Path $temporary
+        if ($temporaryIdentity.sha256 -cne $expectedSha256) {
+            throw "Retail plugin-profile temporary hash mismatch: $temporary"
+        }
+        Move-Item -LiteralPath $temporary -Destination $destination -Force
+    } finally {
+        if (Test-Path -LiteralPath $temporary -PathType Leaf) {
+            Remove-Item -LiteralPath $temporary -Force
+        }
+    }
+
+    $staged = Get-FnvxrProductFileIdentity -Path $destination
+    if ($staged.sha256 -cne $expectedSha256) {
+        throw "Retail plugin-profile staged hash mismatch: $destination"
+    }
+    return [pscustomobject][ordered]@{
+        key = "retail-plugin-profile"
+        path = $destination
+        entries = @(Get-FnvxrProductRetailVisualTrialPluginNames)
+        expectedSha256 = $expectedSha256
+        previousExists = [bool]$previousExists
+        previous = $previous
+        backup = $backup
+        changed = $true
+        staged = $staged
+    }
+}
+
+function Restore-FnvxrProductRetailVisualTrialPluginProfile {
+    param([Parameter(Mandatory = $true)]$Record)
+
+    if (-not [bool]$Record.changed) {
+        return Get-FnvxrProductFileIdentity -Path ([string]$Record.path)
+    }
+
+    $destination = [string]$Record.path
+    if ([bool]$Record.previousExists) {
+        if (-not $Record.backup -or
+            -not (Test-Path -LiteralPath ([string]$Record.backup) -PathType Leaf)) {
+            throw "Retail plugin-profile backup is missing: $destination"
+        }
+        Copy-Item -LiteralPath ([string]$Record.backup) -Destination $destination -Force
+        $restored = Get-FnvxrProductFileIdentity -Path $destination
+        if ($restored.sha256 -cne $Record.previous.sha256) {
+            throw "Retail plugin-profile restore hash mismatch: $destination"
+        }
+        return $restored
+    }
+
+    if (Test-Path -LiteralPath $destination -PathType Leaf) {
+        Remove-Item -LiteralPath $destination -Force
+    }
+    if (Test-Path -LiteralPath $destination -PathType Leaf) {
+        throw "Retail plugin-profile remains after removal: $destination"
+    }
+    return $null
+}
+
+function Assert-FnvxrProductRetailFixturePluginData {
+    param([Parameter(Mandatory = $true)][string]$GameRoot)
+
+    $dataRoot = Join-Path ([System.IO.Path]::GetFullPath($GameRoot)) "Data"
+    foreach ($plugin in @(Get-FnvxrProductRetailFixturePluginNames)) {
+        $path = Join-Path $dataRoot $plugin
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            throw "Retail fixture plugin is missing from the retail game root: $path"
+        }
+    }
+}
+
+function Get-FnvxrProductRetailFixturePluginProfileText {
+    return ((Get-FnvxrProductRetailFixturePluginNames) -join "`r`n") + "`r`n"
+}
+
+function Install-FnvxrProductRetailFixturePluginProfile {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$BackupRoot,
+        [Parameter(Mandatory = $true)][string]$RunId,
+        [Parameter(Mandatory = $true)][string]$GameRoot
+    )
+
+    Assert-FnvxrProductRetailFixturePluginData -GameRoot $GameRoot
+    $destination = [System.IO.Path]::GetFullPath($Path)
+    $directory = Split-Path -Parent $destination
+    if (-not (Test-Path -LiteralPath $directory -PathType Container)) {
+        throw "Retail fixture plugin-profile directory is missing: $directory"
+    }
+    $expectedText = Get-FnvxrProductRetailFixturePluginProfileText
+    $expectedSha256 = Get-FnvxrProductStringSha256 -Value $expectedText
+    $previousExists = Test-Path -LiteralPath $destination -PathType Leaf
+    $previous = if ($previousExists) {
+        Get-FnvxrProductFileIdentity -Path $destination
+    } else {
+        $null
+    }
+    if ($previous -and $previous.sha256 -ceq $expectedSha256) {
+        return [pscustomobject][ordered]@{
+            key = "retail-fixture-plugin-profile"
+            path = $destination
+            entries = @(Get-FnvxrProductRetailFixturePluginNames)
+            expectedSha256 = $expectedSha256
+            previousExists = $true
+            previous = $previous
+            backup = $null
+            changed = $false
+            staged = $previous
+        }
+    }
+
+    $backup = $null
+    if ($previousExists) {
+        $backup = Join-Path $BackupRoot "retail-fixture-plugin-profile\plugins.txt"
+        New-Item -ItemType Directory -Path (Split-Path -Parent $backup) -Force | Out-Null
+        Copy-Item -LiteralPath $destination -Destination $backup -Force
+        $backupIdentity = Get-FnvxrProductFileIdentity -Path $backup
+        if ($backupIdentity.sha256 -cne $previous.sha256) {
+            throw "Retail fixture plugin-profile backup hash mismatch: $destination -> $backup"
+        }
+    }
+
+    $temporary = "$destination.fnvxr-fixture-$RunId"
+    try {
+        if (Test-Path -LiteralPath $temporary -PathType Leaf) {
+            Remove-Item -LiteralPath $temporary -Force
+        }
+        [System.IO.File]::WriteAllText(
+            $temporary,
+            $expectedText,
+            [System.Text.UTF8Encoding]::new($false))
+        $temporaryIdentity = Get-FnvxrProductFileIdentity -Path $temporary
+        if ($temporaryIdentity.sha256 -cne $expectedSha256) {
+            throw "Retail fixture plugin-profile temporary hash mismatch: $temporary"
+        }
+        Move-Item -LiteralPath $temporary -Destination $destination -Force
+    } finally {
+        if (Test-Path -LiteralPath $temporary -PathType Leaf) {
+            Remove-Item -LiteralPath $temporary -Force
+        }
+    }
+
+    $staged = Get-FnvxrProductFileIdentity -Path $destination
+    if ($staged.sha256 -cne $expectedSha256) {
+        throw "Retail fixture plugin-profile staged hash mismatch: $destination"
+    }
+    return [pscustomobject][ordered]@{
+        key = "retail-fixture-plugin-profile"
+        path = $destination
+        entries = @(Get-FnvxrProductRetailFixturePluginNames)
+        expectedSha256 = $expectedSha256
+        previousExists = [bool]$previousExists
+        previous = $previous
+        backup = $backup
+        changed = $true
+        staged = $staged
+    }
+}
+
+function Restore-FnvxrProductRetailFixturePluginProfile {
+    param([Parameter(Mandatory = $true)]$Record)
+
+    if (-not [bool]$Record.changed) {
+        return Get-FnvxrProductFileIdentity -Path ([string]$Record.path)
+    }
+
+    $destination = [string]$Record.path
+    if ([bool]$Record.previousExists) {
+        if (-not $Record.backup -or
+            -not (Test-Path -LiteralPath ([string]$Record.backup) -PathType Leaf)) {
+            throw "Retail fixture plugin-profile backup is missing: $destination"
+        }
+        Copy-Item -LiteralPath ([string]$Record.backup) -Destination $destination -Force
+        $restored = Get-FnvxrProductFileIdentity -Path $destination
+        if ($restored.sha256 -cne $Record.previous.sha256) {
+            throw "Retail fixture plugin-profile restore hash mismatch: $destination"
+        }
+        return $restored
+    }
+
+    if (Test-Path -LiteralPath $destination -PathType Leaf) {
+        Remove-Item -LiteralPath $destination -Force
+    }
+    if (Test-Path -LiteralPath $destination -PathType Leaf) {
+        throw "Retail fixture plugin-profile remains after removal: $destination"
+    }
+    return $null
+}
+
+function Get-FnvxrProductTtwBaselinePluginNames {
+    # Current TTW core order from Wasteland Survival Guide.  This is a
+    # deliberately minimal verification profile: it excludes all gameplay,
+    # UI, camera, and compatibility additions until core TTW reaches the real
+    # Start Menu on its own.
+    return @(
+        "FalloutNV.esm",
+        "DeadMoney.esm",
+        "HonestHearts.esm",
+        "OldWorldBlues.esm",
+        "LonesomeRoad.esm",
+        "GunRunnersArsenal.esm",
+        "Fallout3.esm",
+        "Anchorage.esm",
+        "ThePitt.esm",
+        "BrokenSteel.esm",
+        "PointLookout.esm",
+        "Zeta.esm",
+        "CaravanPack.esm",
+        "ClassicPack.esm",
+        "MercenaryPack.esm",
+        "TribalPack.esm",
+        "TaleOfTwoWastelands.esm",
+        "YUPTTW.esm")
+}
+
+function Assert-FnvxrProductTtwBaselinePluginData {
+    param([Parameter(Mandatory = $true)][string]$GameRoot)
+
+    $dataRoot = Join-Path ([System.IO.Path]::GetFullPath($GameRoot)) "Data"
+    foreach ($plugin in @(Get-FnvxrProductTtwBaselinePluginNames)) {
+        $path = Join-Path $dataRoot $plugin
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            throw "TTW baseline plugin is missing from the isolated game root: $path"
+        }
+    }
+}
+
+function Get-FnvxrProductTtwBaselinePluginProfileText {
+    return ((Get-FnvxrProductTtwBaselinePluginNames) -join "`r`n") + "`r`n"
+}
+
+function Install-FnvxrProductTtwBaselinePluginProfile {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$BackupRoot,
+        [Parameter(Mandatory = $true)][string]$RunId,
+        [Parameter(Mandatory = $true)][string]$GameRoot
+    )
+
+    # plugins.txt is the engine's load-order selector.  The supervisor stages
+    # this exact baseline only after it has established that no pre-existing
+    # runtime exists, then restores any prior bytes in its finally path.
+    # No save, NVSE sidecar, or source game data is included in this operation.
+    Assert-FnvxrProductTtwBaselinePluginData -GameRoot $GameRoot
+    $destination = [System.IO.Path]::GetFullPath($Path)
+    $directory = Split-Path -Parent $destination
+    if (-not (Test-Path -LiteralPath $directory -PathType Container)) {
+        throw "TTW baseline plugin-profile directory is missing: $directory"
+    }
+    $expectedText = Get-FnvxrProductTtwBaselinePluginProfileText
+    $expectedSha256 = Get-FnvxrProductStringSha256 -Value $expectedText
+    $previousExists = Test-Path -LiteralPath $destination -PathType Leaf
+    $previous = if ($previousExists) {
+        Get-FnvxrProductFileIdentity -Path $destination
+    } else {
+        $null
+    }
+    if ($previous -and $previous.sha256 -ceq $expectedSha256) {
+        return [pscustomobject][ordered]@{
+            key = "ttw-baseline-plugin-profile"
+            path = $destination
+            entries = @(Get-FnvxrProductTtwBaselinePluginNames)
+            expectedSha256 = $expectedSha256
+            previousExists = $true
+            previous = $previous
+            backup = $null
+            changed = $false
+            staged = $previous
+        }
+    }
+
+    $backup = $null
+    if ($previousExists) {
+        $backup = Join-Path $BackupRoot "ttw-baseline-plugin-profile\plugins.txt"
+        New-Item -ItemType Directory -Path (Split-Path -Parent $backup) -Force | Out-Null
+        Copy-Item -LiteralPath $destination -Destination $backup -Force
+        $backupIdentity = Get-FnvxrProductFileIdentity -Path $backup
+        if ($backupIdentity.sha256 -cne $previous.sha256) {
+            throw "TTW baseline plugin-profile backup hash mismatch: $destination -> $backup"
+        }
+    }
+
+    $temporary = "$destination.fnvxr-ttw-baseline-$RunId"
+    try {
+        if (Test-Path -LiteralPath $temporary -PathType Leaf) {
+            Remove-Item -LiteralPath $temporary -Force
+        }
+        [System.IO.File]::WriteAllText(
+            $temporary,
+            $expectedText,
+            [System.Text.UTF8Encoding]::new($false))
+        $temporaryIdentity = Get-FnvxrProductFileIdentity -Path $temporary
+        if ($temporaryIdentity.sha256 -cne $expectedSha256) {
+            throw "TTW baseline plugin-profile temporary hash mismatch: $temporary"
+        }
+        Move-Item -LiteralPath $temporary -Destination $destination -Force
+    } finally {
+        if (Test-Path -LiteralPath $temporary -PathType Leaf) {
+            Remove-Item -LiteralPath $temporary -Force
+        }
+    }
+
+    $staged = Get-FnvxrProductFileIdentity -Path $destination
+    if ($staged.sha256 -cne $expectedSha256) {
+        throw "TTW baseline plugin-profile staged hash mismatch: $destination"
+    }
+    return [pscustomobject][ordered]@{
+        key = "ttw-baseline-plugin-profile"
+        path = $destination
+        entries = @(Get-FnvxrProductTtwBaselinePluginNames)
+        expectedSha256 = $expectedSha256
+        previousExists = [bool]$previousExists
+        previous = $previous
+        backup = $backup
+        changed = $true
+        staged = $staged
+    }
+}
+
+function Restore-FnvxrProductTtwBaselinePluginProfile {
+    param([Parameter(Mandatory = $true)]$Record)
+
+    if (-not [bool]$Record.changed) {
+        return Get-FnvxrProductFileIdentity -Path ([string]$Record.path)
+    }
+
+    $destination = [string]$Record.path
+    if ([bool]$Record.previousExists) {
+        if (-not $Record.backup -or
+            -not (Test-Path -LiteralPath ([string]$Record.backup) -PathType Leaf)) {
+            throw "TTW baseline plugin-profile backup is missing: $destination"
+        }
+        Copy-Item -LiteralPath ([string]$Record.backup) -Destination $destination -Force
+        $restored = Get-FnvxrProductFileIdentity -Path $destination
+        if ($restored.sha256 -cne $Record.previous.sha256) {
+            throw "TTW baseline plugin-profile restore hash mismatch: $destination"
+        }
+        return $restored
+    }
+
+    if (Test-Path -LiteralPath $destination -PathType Leaf) {
+        Remove-Item -LiteralPath $destination -Force
+    }
+    if (Test-Path -LiteralPath $destination -PathType Leaf) {
+        throw "TTW baseline plugin-profile remains after removal: $destination"
+    }
+    return $null
+}
+
 function Write-FnvxrProductJsonAtomic {
     param(
         [Parameter(Mandatory = $true)]$Value,
@@ -357,6 +983,7 @@ function Get-FnvxrProductArtifactDescriptors {
     return @(
         [pscustomobject]@{ key = "x64/fnvxr_openxr_pose_host.exe"; path = Join-Path $x64 "fnvxr_openxr_pose_host.exe"; machine = "0x8664" },
         [pscustomobject]@{ key = "x64/fnvxr_shared_state_probe.exe"; path = Join-Path $x64 "fnvxr_shared_state_probe.exe"; machine = "0x8664" },
+        [pscustomobject]@{ key = "x64/fnvxr_command.exe"; path = Join-Path $x64 "fnvxr_command.exe"; machine = "0x8664" },
         [pscustomobject]@{ key = "x64/openxr_loader.dll"; path = Join-Path $x64 "openxr_loader.dll"; machine = "0x8664" },
         [pscustomobject]@{ key = "x86/nvse_fnvxr.dll"; path = Join-Path $x86 "nvse_fnvxr.dll"; machine = "0x014c" },
         [pscustomobject]@{ key = "x86/d3d9.dll"; path = Join-Path $x86 "d3d9.dll"; machine = "0x014c" },
@@ -521,6 +1148,205 @@ function Resolve-FnvxrProductOpenXrLoader {
     throw "No x64 openxr_loader.dll was found. Pass -OpenXrLoaderPath explicitly."
 }
 
+function Test-FnvxrProductProcessElevated {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = [Security.Principal.WindowsPrincipal]::new($identity)
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Get-FnvxrProductHklmActiveRuntimeSnapshot {
+    $records = @()
+    foreach ($view in @(
+        [Microsoft.Win32.RegistryView]::Registry64,
+        [Microsoft.Win32.RegistryView]::Registry32)) {
+        $baseKey = $null
+        $openXrKey = $null
+        try {
+            $baseKey = [Microsoft.Win32.RegistryKey]::OpenBaseKey(
+                [Microsoft.Win32.RegistryHive]::LocalMachine,
+                $view)
+            $openXrKey = $baseKey.OpenSubKey(
+                "SOFTWARE\Khronos\OpenXR\1",
+                $false)
+            $present = $false
+            $value = $null
+            if ($openXrKey) {
+                $present = @($openXrKey.GetValueNames()) -contains "ActiveRuntime"
+                if ($present) {
+                    $value = [string]$openXrKey.GetValue(
+                        "ActiveRuntime",
+                        $null,
+                        [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+                }
+            }
+            $records += [pscustomobject][ordered]@{
+                hive = "HKLM"
+                view = [string]$view
+                key = "SOFTWARE\Khronos\OpenXR\1"
+                valueName = "ActiveRuntime"
+                present = [bool]$present
+                value = $value
+            }
+        } finally {
+            if ($openXrKey) { $openXrKey.Dispose() }
+            if ($baseKey) { $baseKey.Dispose() }
+        }
+    }
+    return [pscustomobject][ordered]@{
+        schema = "fnvxr-hklm-openxr-active-runtime-v1"
+        records = $records
+    }
+}
+
+function Assert-FnvxrProductHklmActiveRuntimeUnchanged {
+    param([Parameter(Mandatory = $true)]$Before)
+
+    $after = Get-FnvxrProductHklmActiveRuntimeSnapshot
+    $beforeJson = $Before | ConvertTo-Json -Depth 6 -Compress
+    $afterJson = $after | ConvertTo-Json -Depth 6 -Compress
+    if (-not [string]::Equals(
+            $beforeJson,
+            $afterJson,
+            [System.StringComparison]::Ordinal)) {
+        throw "HKLM OpenXR ActiveRuntime changed during a process-local product run; no registry mutation is authorized."
+    }
+    return $after
+}
+
+function Resolve-FnvxrProductHeadlessRuntimeManifest {
+    param([Parameter(Mandatory = $true)][string]$ManifestPath)
+
+    if (-not (Test-Path -LiteralPath $ManifestPath -PathType Leaf)) {
+        throw "Headless OpenXR runtime manifest is missing: $ManifestPath"
+    }
+    $resolvedManifestPath = (Resolve-Path -LiteralPath $ManifestPath).Path
+    try {
+        $document = Get-Content -LiteralPath $resolvedManifestPath -Raw |
+            ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        throw "Headless OpenXR runtime manifest is not valid JSON: $resolvedManifestPath"
+    }
+    if (-not ($document.PSObject.Properties.Name -ccontains "file_format_version") -or
+        [string]$document.file_format_version -cne "1.0.0") {
+        throw "Headless OpenXR runtime manifest must use file_format_version 1.0.0: $resolvedManifestPath"
+    }
+    if (-not ($document.PSObject.Properties.Name -ccontains "runtime") -or
+        -not $document.runtime -or
+        -not ($document.runtime.PSObject.Properties.Name -ccontains "library_path") -or
+        [string]::IsNullOrWhiteSpace([string]$document.runtime.library_path)) {
+        throw "Headless OpenXR runtime manifest has no runtime.library_path: $resolvedManifestPath"
+    }
+
+    $declaredLibraryPath = [string]$document.runtime.library_path
+    $libraryPath = if ([System.IO.Path]::IsPathRooted($declaredLibraryPath)) {
+        $declaredLibraryPath
+    } else {
+        Join-Path (Split-Path -Parent $resolvedManifestPath) $declaredLibraryPath
+    }
+    if (-not (Test-Path -LiteralPath $libraryPath -PathType Leaf)) {
+        throw "Headless OpenXR runtime DLL is missing: $libraryPath"
+    }
+    $runtimeIdentity = Get-FnvxrProductFileIdentity -Path $libraryPath -RequirePe
+    if ($runtimeIdentity.peMachine -cne "0x8664") {
+        throw "Headless OpenXR runtime DLL is not x64: $($runtimeIdentity.path)"
+    }
+
+    return [pscustomobject][ordered]@{
+        selection = "process-local-environment-only"
+        headless = $true
+        registryMutationAuthorized = $false
+        manifest = Get-FnvxrProductFileIdentity -Path $resolvedManifestPath
+        declaredLibraryPath = $declaredLibraryPath
+        runtimeDll = $runtimeIdentity
+    }
+}
+
+function Resolve-FnvxrProductMetaXrOperatorLayer {
+    param(
+        [Parameter(Mandatory = $true)][string]$Root,
+        [Parameter(Mandatory = $true)][string]$LayerDirectory
+    )
+
+    if ([string]::IsNullOrWhiteSpace($LayerDirectory) -or
+        -not [System.IO.Path]::IsPathRooted($LayerDirectory)) {
+        throw "Meta XR Operator layer directory must be an absolute workspace path."
+    }
+    $resolvedRoot = [System.IO.Path]::GetFullPath($Root)
+    $allowedRoot = [System.IO.Path]::GetFullPath(
+        (Join-Path $resolvedRoot "local\meta-xr-operator"))
+    $resolvedLayerDirectory = [System.IO.Path]::GetFullPath($LayerDirectory)
+    $allowedPrefix = $allowedRoot.TrimEnd('\', '/') +
+        [System.IO.Path]::DirectorySeparatorChar
+    if (-not $resolvedLayerDirectory.StartsWith(
+            $allowedPrefix,
+            [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Meta XR Operator layer directory must remain in the workspace-owned dependency root: $allowedRoot"
+    }
+
+    $stageRoot = Split-Path -Parent $resolvedLayerDirectory
+    $stageManifestPath = Join-Path $stageRoot "fnvxr-meta-xr-operator-stage.json"
+    if (-not (Test-Path -LiteralPath $stageManifestPath -PathType Leaf)) {
+        throw "Meta XR Operator layer requires its owned stage manifest: $stageManifestPath"
+    }
+    try {
+        $stageManifest = Get-Content -LiteralPath $stageManifestPath -Raw |
+            ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        throw "Meta XR Operator stage manifest is not valid JSON: $stageManifestPath"
+    }
+    if ($stageManifest.schema -cne "fnvxr-meta-xr-operator-stage-v1" -or
+        $stageManifest.operatorLayerDirectory -cne $resolvedLayerDirectory -or
+        $stageManifest.apiLayerName -cne "XR_APILAYER_METAX_operator") {
+        throw "Meta XR Operator stage manifest does not authorize this exact layer directory: $stageManifestPath"
+    }
+
+    $manifestPath = Join-Path $resolvedLayerDirectory "XrApiLayer_METAX_operator.json"
+    $libraryPath = Join-Path $resolvedLayerDirectory "XrApiLayer_METAX_operator.dll"
+    $proxyPath = Join-Path $resolvedLayerDirectory "meta-xr-operator-mcp-proxy.exe"
+    foreach ($path in @($manifestPath, $libraryPath, $proxyPath)) {
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            throw "Meta XR Operator staged layer is incomplete: $path"
+        }
+    }
+    try {
+        $document = Get-Content -LiteralPath $manifestPath -Raw |
+            ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        throw "Meta XR Operator API-layer manifest is not valid JSON: $manifestPath"
+    }
+    if ($document.file_format_version -cne "1.0.0" -or
+        $document.api_layer.name -cne "XR_APILAYER_METAX_operator" -or
+        $document.api_layer.library_path -cne "./XrApiLayer_METAX_operator.dll") {
+        throw "Meta XR Operator API-layer manifest identity is not exact: $manifestPath"
+    }
+
+    $manifestIdentity = Get-FnvxrProductFileIdentity -Path $manifestPath
+    $libraryIdentity = Get-FnvxrProductFileIdentity -Path $libraryPath -RequirePe
+    $proxyIdentity = Get-FnvxrProductFileIdentity -Path $proxyPath -RequirePe
+    if ($libraryIdentity.peMachine -cne "0x8664" -or
+        $proxyIdentity.peMachine -cne "0x8664") {
+        throw "Meta XR Operator staged layer must contain x64 Windows binaries."
+    }
+    if ($stageManifest.staged.manifest.sha256 -cne $manifestIdentity.sha256 -or
+        $stageManifest.staged.library.sha256 -cne $libraryIdentity.sha256 -or
+        $stageManifest.staged.proxy.sha256 -cne $proxyIdentity.sha256) {
+        throw "Meta XR Operator staged layer no longer matches its owned stage manifest."
+    }
+
+    return [pscustomobject][ordered]@{
+        schema = "fnvxr-meta-xr-operator-layer-v1"
+        directory = $resolvedLayerDirectory
+        apiLayerName = "XR_APILAYER_METAX_operator"
+        stageManifest = Get-FnvxrProductFileIdentity -Path $stageManifestPath
+        manifest = $manifestIdentity
+        library = $libraryIdentity
+        proxy = $proxyIdentity
+        observationOnly = $true
+        mcpProxyLaunched = $false
+        controllerOrPoseOverrideAuthorized = $false
+    }
+}
+
 function Assert-FnvxrProductGameRoot {
     param([Parameter(Mandatory = $true)][string]$GameRoot)
 
@@ -590,6 +1416,27 @@ function Get-FnvxrProductStagePlan {
     )
 }
 
+function Get-FnvxrProductRetailFixtureStagePlan {
+    param(
+        [Parameter(Mandatory = $true)][string]$Root,
+        [Parameter(Mandatory = $true)][string]$Configuration,
+        [Parameter(Mandatory = $true)][string]$GameRoot
+    )
+
+    # A command-line fixture needs only the xNVSE plugin. Do not stage the
+    # D3D9, DirectInput, or XInput proxies: that keeps OpenXR, rendering, and
+    # input systems completely out of the fixture process.
+    $x86 = Join-Path $Root "build-product-win32\$Configuration"
+    $pluginRoot = Join-Path $GameRoot "Data\NVSE\Plugins"
+    return @(
+        [pscustomobject]@{
+            key = "x86/nvse_fnvxr.dll"
+            source = Join-Path $x86 "nvse_fnvxr.dll"
+            destination = Join-Path $pluginRoot "nvse_fnvxr.dll"
+            machine = "0x014c"
+        })
+}
+
 function Install-FnvxrProductArtifactSet {
     param(
         [Parameter(Mandatory = $true)][object[]]$Plan,
@@ -655,8 +1502,16 @@ function Install-FnvxrProductArtifactSet {
         }
         return $records
     } catch {
+        $stageFailure = $_.Exception.Message
         if ($records.Count -gt 0) {
-            Restore-FnvxrProductArtifactSet -Records $records
+            try {
+                Restore-FnvxrProductArtifactSet -Records $records
+            } catch {
+                throw (
+                    "Artifact staging failed: {0}. Rollback also failed after attempting every staged record: {1}" -f
+                    $stageFailure,
+                    $_.Exception.Message)
+            }
         }
         throw
     }
@@ -665,48 +1520,405 @@ function Install-FnvxrProductArtifactSet {
 function Restore-FnvxrProductArtifactSet {
     param([Parameter(Mandatory = $true)][object[]]$Records)
 
+    # A broken backup must never prevent cleanup of the remaining staged files.
+    # Attempt every record in reverse stage order, then report the complete set
+    # of failures so a supervisor cannot mistake a partial rollback for a pass.
+    $failures = @()
     foreach ($record in @($Records | Select-Object -Last 999 | Sort-Object key -Descending)) {
-        $destination = [string]$record.destination.path
-        if ($record.previousExists) {
-            if (-not $record.backup -or -not (Test-Path -LiteralPath $record.backup -PathType Leaf)) {
-                throw "Cannot restore staged artifact; backup is missing: $destination"
+        try {
+            $destination = [string]$record.destination.path
+            if ($record.previousExists) {
+                if (-not $record.backup -or -not (Test-Path -LiteralPath $record.backup -PathType Leaf)) {
+                    throw "Cannot restore staged artifact; backup is missing: $destination"
+                }
+                Copy-Item -LiteralPath $record.backup -Destination $destination -Force
+                $restored = Get-FnvxrProductFileIdentity -Path $destination
+                if ($restored.sha256 -cne $record.previous.sha256) {
+                    throw "Restored artifact hash mismatch: $destination"
+                }
+            } elseif (Test-Path -LiteralPath $destination -PathType Leaf) {
+                Remove-Item -LiteralPath $destination -Force
+                if (Test-Path -LiteralPath $destination -PathType Leaf) {
+                    throw "New staged artifact remains after removal: $destination"
+                }
             }
-            Copy-Item -LiteralPath $record.backup -Destination $destination -Force
-            $restored = Get-FnvxrProductFileIdentity -Path $destination
-            if ($restored.sha256 -cne $record.previous.sha256) {
-                throw "Restored artifact hash mismatch: $destination"
-            }
-        } elseif (Test-Path -LiteralPath $destination -PathType Leaf) {
-            Remove-Item -LiteralPath $destination -Force
+        } catch {
+            $failures += ("{0}: {1}" -f [string]$record.key, $_.Exception.Message)
         }
     }
+    if ($failures.Count -gt 0) {
+        throw (
+            "Failed to restore {0} staged artifact(s); attempted every record. Failures: {1}" -f
+            $failures.Count,
+            ($failures -join " | "))
+    }
+}
+
+function Get-FnvxrProductExactFalloutProcess {
+    param([Parameter(Mandatory = $true)][string]$ExpectedPath)
+
+    foreach ($candidate in @(Get-Process FalloutNV -ErrorAction SilentlyContinue)) {
+        try {
+            if ([string]::Equals(
+                    $candidate.Path,
+                    $ExpectedPath,
+                    [System.StringComparison]::OrdinalIgnoreCase)) {
+                return $candidate
+            }
+        } catch {}
+    }
+    return $null
+}
+
+function Wait-FnvxrProductExactLoadedModule {
+    param(
+        [Parameter(Mandatory = $true)][System.Diagnostics.Process]$Process,
+        [Parameter(Mandatory = $true)][string]$ExpectedPath,
+        [Parameter(Mandatory = $true)][string]$ExpectedSha256,
+        [Parameter(Mandatory = $true)][int]$TimeoutSeconds
+    )
+
+    $expectedFullPath = [System.IO.Path]::GetFullPath($ExpectedPath)
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    do {
+        $Process.Refresh()
+        if ($Process.HasExited) {
+            throw "Fallout exited before loading the owned retail-fixture module: $ExpectedPath"
+        }
+        foreach ($module in @(Get-FnvxrProductLoadedModuleCensus -ProcessId ([uint32]$Process.Id))) {
+            if ([string]::Equals(
+                    $module.path,
+                    $expectedFullPath,
+                    [System.StringComparison]::OrdinalIgnoreCase)) {
+                $identity = Get-FnvxrProductFileIdentity -Path $module.path -RequirePe
+                if ($identity.sha256 -cne $ExpectedSha256) {
+                    throw "Loaded retail-fixture module hash differs from the staged module: $ExpectedPath"
+                }
+                return $identity
+            }
+        }
+        Start-Sleep -Milliseconds 200
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw "Timed out waiting for the exact owned retail-fixture module: $ExpectedPath"
+}
+
+function Get-FnvxrProductProbeSnapshot {
+    param(
+        [Parameter(Mandatory = $true)][string]$ProbePath,
+        [Parameter(Mandatory = $true)][string[]]$Arguments,
+        [Parameter(Mandatory = $true)][string]$LogPath
+    )
+
+    $output = & $ProbePath @Arguments 2>&1 | Out-String
+    $exitCode = $LASTEXITCODE
+    Add-Content -LiteralPath $LogPath -Value $output -Encoding UTF8
+    $json = $null
+    try { $json = $output | ConvertFrom-Json -ErrorAction Stop } catch {}
+    return [pscustomobject][ordered]@{
+        exitCode = $exitCode
+        json = $json
+    }
+}
+
+function Wait-FnvxrProductProbeCondition {
+    param(
+        [Parameter(Mandatory = $true)][string]$ProbePath,
+        [Parameter(Mandatory = $true)][string[]]$Arguments,
+        [Parameter(Mandatory = $true)][System.Diagnostics.Process]$RequiredProcess,
+        [Parameter(Mandatory = $true)][int]$TimeoutSeconds,
+        [Parameter(Mandatory = $true)][string]$LogPath,
+        [Parameter(Mandatory = $true)][string]$Description,
+        [Parameter(Mandatory = $true)][scriptblock]$Accept
+    )
+
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    do {
+        $RequiredProcess.Refresh()
+        if ($RequiredProcess.HasExited) {
+            $exitCode = try { [string]$RequiredProcess.ExitCode } catch { "unknown" }
+            throw "$Description failed because FalloutNV:$($RequiredProcess.Id) exited with code $exitCode."
+        }
+        $sample = Get-FnvxrProductProbeSnapshot `
+            -ProbePath $ProbePath `
+            -Arguments $Arguments `
+            -LogPath $LogPath
+        if ($sample.exitCode -eq 0 -and $sample.json -and (& $Accept $sample.json)) {
+            return $sample
+        }
+        Start-Sleep -Milliseconds 200
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw "Timed out after $TimeoutSeconds seconds waiting for $Description."
+}
+
+function Wait-FnvxrProductRetailFixtureStartMenu {
+    param(
+        [Parameter(Mandatory = $true)][string]$ProbePath,
+        [Parameter(Mandatory = $true)][System.Diagnostics.Process]$RequiredProcess,
+        [Parameter(Mandatory = $true)][int]$TimeoutSeconds,
+        [Parameter(Mandatory = $true)][string]$LogPath
+    )
+
+    return Wait-FnvxrProductProbeCondition `
+        -ProbePath $ProbePath `
+        -Arguments @("--require-runtime", "--require-advancing", "--sample-delay-ms", "100") `
+        -RequiredProcess $RequiredProcess `
+        -TimeoutSeconds $TimeoutSeconds `
+        -LogPath $LogPath `
+        -Description "a real retail Start Menu before the owned fixture command" `
+        -Accept {
+            param($snapshot)
+            return [bool]$snapshot.runtime.present `
+                -and [bool]$snapshot.runtime.stable `
+                -and [bool]$snapshot.runtime.usable `
+                -and [uint64]$snapshot.runtime.frame -gt 0 `
+                -and [uint32]$snapshot.runtime.phase -eq 1 `
+                -and (([uint32]$snapshot.runtime.menuBits -band 2) -ne 0) `
+                -and [bool]$snapshot.runtime.uiInputAllowed `
+                -and -not [bool]$snapshot.runtime.showroomActive
+        }
+}
+
+function Wait-FnvxrProductRetailFixtureGameplay {
+    param(
+        [Parameter(Mandatory = $true)][string]$ProbePath,
+        [Parameter(Mandatory = $true)][System.Diagnostics.Process]$RequiredProcess,
+        [Parameter(Mandatory = $true)][int]$TimeoutSeconds,
+        [Parameter(Mandatory = $true)][string]$LogPath,
+        [Parameter(Mandatory = $true)][uint64]$MinimumFrame
+    )
+
+    # The fixture profile intentionally publishes no player bridge. The
+    # native fixture authority verifies player/cell/camera state in-process
+    # before saving; this outer guard proves stable, advancing gameplay.
+    return Wait-FnvxrProductProbeCondition `
+        -ProbePath $ProbePath `
+        -Arguments @("--require-runtime", "--require-advancing", "--sample-delay-ms", "100") `
+        -RequiredProcess $RequiredProcess `
+        -TimeoutSeconds $TimeoutSeconds `
+        -LogPath $LogPath `
+        -Description "a real owned retail-fixture gameplay scene" `
+        -Accept {
+            param($snapshot)
+            return [bool]$snapshot.runtime.present `
+                -and [bool]$snapshot.runtime.stable `
+                -and [bool]$snapshot.runtime.usable `
+                -and [uint64]$snapshot.runtime.frame -gt $MinimumFrame `
+                -and [uint32]$snapshot.runtime.phase -eq 3 `
+                -and [uint32]$snapshot.runtime.menuBits -eq 0 `
+                -and -not [bool]$snapshot.runtime.uiInputAllowed `
+                -and [bool]$snapshot.runtime.cameraActive `
+                -and -not [bool]$snapshot.runtime.showroomActive
+        }
+}
+
+function Wait-FnvxrProductRetailFixtureSavePair {
+    param(
+        [Parameter(Mandatory = $true)][string]$SavePath,
+        [Parameter(Mandatory = $true)][string]$NvsePath,
+        [Parameter(Mandatory = $true)][System.Diagnostics.Process]$RequiredProcess,
+        [Parameter(Mandatory = $true)][int]$TimeoutSeconds
+    )
+
+    # A loadable xNVSE fixture is a pair, not merely a .fos that happened to
+    # appear while the engine was still writing. Require both files to be
+    # nonempty and unchanged across a short second sample before ending the
+    # owned fixture process. Historical saves are never touched here.
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    do {
+        $RequiredProcess.Refresh()
+        if ($RequiredProcess.HasExited) {
+            throw "Fallout exited before the owned retail fixture save pair appeared: $SavePath, $NvsePath"
+        }
+        if ((Test-Path -LiteralPath $SavePath -PathType Leaf) -and
+            (Test-Path -LiteralPath $NvsePath -PathType Leaf)) {
+            $saveBefore = Get-FnvxrProductFileIdentity -Path $SavePath
+            $nvseBefore = Get-FnvxrProductFileIdentity -Path $NvsePath
+            if ($saveBefore.length -gt 0 -and $nvseBefore.length -gt 0) {
+                Start-Sleep -Milliseconds 500
+                $RequiredProcess.Refresh()
+                if ($RequiredProcess.HasExited) {
+                    throw "Fallout exited while the owned retail fixture save pair was settling: $SavePath, $NvsePath"
+                }
+                if ((Test-Path -LiteralPath $SavePath -PathType Leaf) -and
+                    (Test-Path -LiteralPath $NvsePath -PathType Leaf)) {
+                    $saveAfter = Get-FnvxrProductFileIdentity -Path $SavePath
+                    $nvseAfter = Get-FnvxrProductFileIdentity -Path $NvsePath
+                    if ($saveBefore.sha256 -ceq $saveAfter.sha256 -and
+                        $saveBefore.length -eq $saveAfter.length -and
+                        $nvseBefore.sha256 -ceq $nvseAfter.sha256 -and
+                        $nvseBefore.length -eq $nvseAfter.length) {
+                        return [ordered]@{
+                            save = $saveAfter
+                            nvse = $nvseAfter
+                            settled = $true
+                        }
+                    }
+                }
+            }
+        }
+        Start-Sleep -Milliseconds 100
+    } while ([DateTime]::UtcNow -lt $deadline)
+
+    throw "Timed out waiting for a stable owned retail fixture save and NVSE sidecar: $SavePath, $NvsePath"
 }
 
 function Get-FnvxrProductMinimalEnvironment {
     param(
         [Parameter(Mandatory = $true)][string]$RunId,
         [Parameter(Mandatory = $true)][string]$RunDirectory,
-        [Parameter(Mandatory = $true)][string]$OpenXrLoaderPath,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$OpenXrLoaderPath,
         [Parameter(Mandatory = $true)]
         [ValidateRange(5, 900)]
-        [int]$SessionReadyTimeoutSeconds
+        [int]$SessionReadyTimeoutSeconds,
+        [switch]$AutomateRecoveryLoad,
+        [switch]$AutomateFreshCharacter,
+        [switch]$AutomateRetailFixture,
+        [switch]$TtwFixture,
+        [switch]$HeadsetDemoFixture,
+        [ValidateSet("disabled", "create", "load")]
+        [string]$RetailFixtureAction = "disabled",
+        [string]$RetailFixtureSaveName = "",
+        [string]$RetailFixtureTraitOne = "None",
+        [string]$RetailFixtureTraitTwo = "None",
+        [switch]$AcknowledgeTribalPackPopup,
+        [ValidateSet("FNVXR_StereoTest")]
+        [string]$AutomateRecoverySaveName = "FNVXR_StereoTest",
+        [string]$HeadlessRuntimeManifest = "",
+        [string]$HeadsetMirrorCaptureDirectory = "",
+        [ValidateRange(1, 600)][int]$HeadsetMirrorCaptureEveryFrames = 6,
+        [ValidateRange(1, 3600)][int]$HeadsetMirrorCaptureMaxPairs = 180,
+        [string]$MetaXrOperatorLayerDirectory = ""
     )
 
-    return [ordered]@{
-        FNVXR_RUN_PROFILE = "stereo-visual-trial-v5"
-        FNVXR_HOST_MODE = "vr"
+    $automationModes = @()
+    if ($AutomateRecoveryLoad) { $automationModes += "recovery-load" }
+    if ($AutomateFreshCharacter) { $automationModes += "fresh-character" }
+    if ($AutomateRetailFixture) { $automationModes += "retail-fixture" }
+    if ($automationModes.Count -gt 1) {
+        throw "Recovery-load, fresh-character, and retail-fixture automation are mutually exclusive."
+    }
+    if ($AcknowledgeTribalPackPopup -and -not $AutomateRecoveryLoad) {
+        throw "The exact official-pack acknowledgement requires recovery-load automation."
+    }
+    if ($HeadsetDemoFixture -and -not $AutomateRetailFixture) {
+        throw "The headset demo requires the owned retail-fixture automation."
+    }
+    if ($TtwFixture -and -not $AutomateRetailFixture) {
+        throw "The TTW fixture family requires the owned fixture automation."
+    }
+    if ($AutomateRetailFixture -and -not $HeadsetDemoFixture -and
+        -not [string]::IsNullOrWhiteSpace($HeadsetMirrorCaptureDirectory)) {
+        throw "The isolated retail fixture profile cannot capture a headset mirror."
+    }
+
+    $runProfile = if ($AutomateRetailFixture -and -not $HeadsetDemoFixture) {
+        if ($TtwFixture) { "ttw-fixture-v1" } else { "retail-fixture-v1" }
+    } else {
+        "stereo-visual-trial-v5"
+    }
+    $hostMode = if ($AutomateRetailFixture -and -not $HeadsetDemoFixture) {
+        if ($TtwFixture) { "ttw-fixture" } else { "retail-fixture" }
+    } else {
+        "vr"
+    }
+    $engineCenterStereo = if ($AutomateRetailFixture -and -not $HeadsetDemoFixture) {
+        "0"
+    } else {
+        "1"
+    }
+    $environment = [ordered]@{
+        FNVXR_RUN_PROFILE = $runProfile
+        FNVXR_HOST_MODE = $hostMode
         FNVXR_RUN_ID = $RunId
         FNVXR_RUN_LOG_DIR = $RunDirectory
-        FNVXR_OPENXR_LOADER_HINT = $OpenXrLoaderPath
         FNVXR_SESSION_READY_TIMEOUT_SECONDS = [string]$SessionReadyTimeoutSeconds
         FNVXR_ENABLE_LEGACY_IMAGE_DIAGNOSTICS = "0"
-        FNVXR_ENABLE_ENGINE_CENTER_STEREO = "1"
+        FNVXR_ENABLE_ENGINE_CENTER_STEREO = $engineCenterStereo
         FNVXR_ALLOW_STEREO_WORLD_2D_FALLBACK = "0"
         FNVXR_SHOW_GAME_PLANE_ON_STEREO_LOSS = "0"
         FNVXR_STEREO_FALLBACK_MONO_FULLSCREEN = "0"
         FNVXR_TELEMETRY_HAMMER = "0"
         FNVXR_D3D9_TELEMETRY_HAMMER = "0"
     }
+    # The isolated fixture runner has no OpenXR route.  The separately opted-in
+    # headset demo still uses the normal visual-trial host, so retain the
+    # loader hint for that one bounded recording route.
+    if (-not $AutomateRetailFixture -or $HeadsetDemoFixture) {
+        $environment.FNVXR_OPENXR_LOADER_HINT = $OpenXrLoaderPath
+    }
+    if ($AutomateRecoveryLoad) {
+        # This opt-in does not enable the general command or input bridge.
+        # The publication-only plugin path accepts only a compile-time
+        # approved retail save load.  A post-load acknowledgement remains off
+        # unless the separate, exact official-pack opt-in is also supplied.
+        $environment.FNVXR_STEREO_VISUAL_TRIAL_AUTOMATE_RECOVERY_LOAD = "1"
+        $environment.FNVXR_STEREO_VISUAL_TRIAL_AUTOMATE_RECOVERY_SAVE_NAME =
+            $AutomateRecoverySaveName
+    }
+    if ($AcknowledgeTribalPackPopup) {
+        # This legacy-named switch authorizes only the native acknowledgement
+        # of each exact observed official pre-order pack notification and its
+        # unique native first-button OK tile.
+        # It does not enable desktop, keyboard, mouse, controller, or
+        # simulator input.
+        $environment.FNVXR_STEREO_VISUAL_TRIAL_ACK_TRIBAL_PACK_POPUP = "1"
+    }
+    if ($AutomateFreshCharacter) {
+        # This opt-in maps the same narrow mailbox, but the visual-trial
+        # plugin accepts only the fixed start command and owns its fixed
+        # no-menu COC/name/save sequence. It does not enable input, camera,
+        # rig, weapon, or general console authority.
+        $environment.FNVXR_STEREO_VISUAL_TRIAL_AUTOMATE_FRESH_CHARACTER = "1"
+    }
+    if ($AutomateRetailFixture) {
+        $fixtureTraits = Resolve-FnvxrProductRetailFixtureTraits `
+            -TraitOne $RetailFixtureTraitOne `
+            -TraitTwo $RetailFixtureTraitTwo
+        $fixtureSaveName = if ($TtwFixture) {
+            Assert-FnvxrProductTtwFixtureSaveName -SaveName $RetailFixtureSaveName
+        } else {
+            Assert-FnvxrProductRetailFixtureSaveName -SaveName $RetailFixtureSaveName
+        }
+        $environment.FNVXR_RETAIL_FIXTURE_AUTOMATION = "1"
+        $environment.FNVXR_RETAIL_FIXTURE_ACTION = $RetailFixtureAction
+        $environment.FNVXR_RETAIL_FIXTURE_SAVE_NAME = $fixtureSaveName
+        $environment.FNVXR_RETAIL_FIXTURE_TRAIT_ONE = $fixtureTraits.first
+        $environment.FNVXR_RETAIL_FIXTURE_TRAIT_TWO = $fixtureTraits.second
+        if (-not $TtwFixture) {
+            # Retail can present one of four known stock pre-order-pack notices
+            # even with the temporary FalloutNV.esm-only plugins profile. The
+            # plugin accepts only an exact native first-button OK target; it does
+            # not send an OS, controller, or simulator input event.
+            $environment.FNVXR_RETAIL_FIXTURE_ACK_OFFICIAL_PACK_POPUP = "1"
+        }
+        if ($HeadsetDemoFixture) {
+            $environment.FNVXR_HEADSET_DEMO_FIXTURE = "1"
+            $environment.FNVXR_HEADSET_DEMO_GAMEPLAY_WARMUP_FRAMES = "90"
+            $environment.FNVXR_HEADSET_DEMO_PIPBOY_HOLD_FRAMES = "240"
+        }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($HeadlessRuntimeManifest)) {
+        $environment.XR_RUNTIME_JSON = $HeadlessRuntimeManifest
+        $environment.OPENXR_SIMULATOR_HEADLESS = "1"
+        $environment.OPENXR_SIMULATOR_DATA_DIR =
+            Join-Path $RunDirectory "openxr-simulator"
+        $environment.OPENXR_SIMULATOR_LOG_PATH =
+            Join-Path $RunDirectory "openxr-simulator.log"
+    }
+    if (-not [string]::IsNullOrWhiteSpace($HeadsetMirrorCaptureDirectory)) {
+        $environment.FNVXR_HMD_MIRROR_CAPTURE_DIR = $HeadsetMirrorCaptureDirectory
+        $environment.FNVXR_HMD_MIRROR_CAPTURE_EVERY_N_FRAMES =
+            [string]$HeadsetMirrorCaptureEveryFrames
+        $environment.FNVXR_HMD_MIRROR_CAPTURE_MAX_PAIRS =
+            [string]$HeadsetMirrorCaptureMaxPairs
+    }
+    if (-not [string]::IsNullOrWhiteSpace($MetaXrOperatorLayerDirectory)) {
+        # This API layer is observation-only in FNVXR: the launcher never
+        # starts its MCP proxy or calls pose/controller automation tools.
+        $environment.XR_API_LAYER_PATH = $MetaXrOperatorLayerDirectory
+        $environment.XR_ENABLE_API_LAYERS = "XR_APILAYER_METAX_operator"
+    }
+    return $environment
 }
 
 function Set-FnvxrProductMinimalEnvironment {
@@ -731,6 +1943,42 @@ function Test-FnvxrProductProbeReady {
     $exitCode = $LASTEXITCODE
     Add-Content -LiteralPath $LogPath -Value $output -Encoding UTF8
     return $exitCode -eq 0
+}
+
+function Invoke-FnvxrProductReadOnlyRetailRuntimeProbe {
+    param(
+        [Parameter(Mandatory = $true)][string]$ProbePath,
+        [Parameter(Mandatory = $true)][uint32]$ProcessId,
+        [ValidateRange(0, 60000)][int]$WaitMilliseconds = 1000,
+        [Parameter(Mandatory = $true)][string]$LogPath
+    )
+
+    # The retail runtime probe opens the target with QUERY_INFORMATION and
+    # VM_READ only. Its normal incomplete-proof exit is useful evidence, not
+    # an authorization failure or a reason to mutate the game process.
+    if (-not (Test-Path -LiteralPath $ProbePath -PathType Leaf)) {
+        throw "Read-only retail runtime probe is missing: $ProbePath"
+    }
+    $output = & $ProbePath `
+        "--pid" ([string]$ProcessId) `
+        "--wait-ms" ([string]$WaitMilliseconds) 2>&1 | Out-String
+    $exitCode = $LASTEXITCODE
+    Add-Content -LiteralPath $LogPath -Value $output -Encoding UTF8
+
+    return [pscustomobject][ordered]@{
+        schema = "fnvxr-read-only-retail-runtime-probe-v1"
+        scope = "external read-only loaded-process observation; no patch, suspend, resume, input, OpenXR, or game-tree mutation"
+        probePath = (Resolve-Path -LiteralPath $ProbePath).Path
+        processId = $ProcessId
+        waitMilliseconds = $WaitMilliseconds
+        captured = $true
+        exitCode = $exitCode
+        probeReportedEngineCapability = ($exitCode -eq 0)
+        sceneGraphObserved = $output -match "non_null_pointer_observation=MATCH"
+        loadedIdentityMatched = $output -match "loaded_pe .*proof=MATCH"
+        capabilityProofObserved = $output -match "retail_engine_capability_proof=PASS"
+        logPath = $LogPath
+    }
 }
 
 function Wait-FnvxrProductProbeReady {

@@ -20,8 +20,11 @@ int main()
     using fnvxr::d3d9::CompiledRetailVrBridgePolicy;
     using fnvxr::d3d9::ProductionRendererAuthorized;
     using fnvxr::d3d9::ProductionRendererProof;
+    using fnvxr::d3d9::RetailVrBridgePolicy;
+    using fnvxr::d3d9::RetailVrVisualTrialRequest;
     using fnvxr::d3d9::interpositionPolicy;
     using fnvxr::d3d9::productionRendererAuthorized;
+    using fnvxr::d3d9::retailVrVisualTrialAuthorized;
 
     if (ProductionRendererAuthorized
         || CompiledProductionRendererProof.exactRetailExecutableMatched
@@ -55,6 +58,68 @@ int main()
         || CompiledRetailVrBridgePolicy.legacyDrawReplay)
     {
         return fail("retail bridge must preserve ordinary D3D9 and isolate its CPU transport and Present lease");
+    }
+
+    const RetailVrVisualTrialRequest visualTrial {
+        true,
+        true,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+    };
+    if (!retailVrVisualTrialAuthorized(
+            CompiledRetailVrBridgePolicy,
+            visualTrial))
+    {
+        return fail("the exact isolated engine-center visual trial must authorize");
+    }
+    if (ProductionRendererAuthorized
+        || CompiledInterpositionPolicy.patchDeviceVtable)
+    {
+        return fail("visual-trial authority must not authorize the legacy interposer");
+    }
+
+    const std::array<RetailVrVisualTrialRequest, 9> rejectedRequests {{
+        { false, true, false, false, false, false, false, false, false },
+        { true, false, false, false, false, false, false, false, false },
+        { true, true, true, false, false, false, false, false, false },
+        { true, true, false, true, false, false, false, false, false },
+        { true, true, false, false, true, false, false, false, false },
+        { true, true, false, false, false, true, false, false, false },
+        { true, true, false, false, false, false, true, false, false },
+        { true, true, false, false, false, false, false, true, false },
+        { true, true, false, false, false, false, false, false, true },
+    }};
+    for (const auto& request : rejectedRequests)
+    {
+        if (retailVrVisualTrialAuthorized(
+                CompiledRetailVrBridgePolicy,
+                request))
+        {
+            return fail("wrong profile, missing opt-in, or any fallback must reject the visual trial");
+        }
+    }
+
+    const std::array<RetailVrBridgePolicy, 8> rejectedPolicies {{
+        { false, true, false, true, false, true, true, false },
+        { true, false, false, true, false, true, true, false },
+        { true, true, true, true, false, true, true, false },
+        { true, true, false, false, false, true, true, false },
+        { true, true, false, true, true, true, true, false },
+        { true, true, false, true, false, false, true, false },
+        { true, true, false, true, false, true, false, false },
+        { true, true, false, true, false, true, true, true },
+    }};
+    for (const auto& policy : rejectedPolicies)
+    {
+        if (retailVrVisualTrialAuthorized(policy, visualTrial))
+        {
+            return fail("the visual trial must not widen an incomplete bridge policy");
+        }
     }
 
     ProductionRendererProof complete {

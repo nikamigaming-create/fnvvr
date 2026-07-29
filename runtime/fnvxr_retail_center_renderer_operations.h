@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 
 namespace fnvxr::engine
@@ -39,6 +40,84 @@ constexpr bool retailEyeTargetOperationsComplete(
         && operations.restore;
 }
 
+// This is intentionally a diagnostic-only classification for the one
+// conservative center cull. It does not authorize a fallback or alter either
+// eye transaction; it lets the in-process bridge distinguish an empty engine
+// traversal from an explicit-visible-list/culling failure.
+enum class RetailCenterVisibilityFailure : std::uint8_t
+{
+    None = 0u,
+    ContextNotReady,
+    InvalidInput,
+    CollectionAccumulatorAddressOutOfRange,
+    CullerAlreadyHasAccumulator,
+    BeginCollectionRejected,
+    CullerAccumulatorInstallRejected,
+    CullerAccumulatorReleaseRejected,
+    SealCollectionRejected,
+    SealedViewRejected,
+    NoVisibleGeometry,
+    GeometryAddressOutOfRange,
+    UnsupportedArchitecture,
+    CullerVtableRejected,
+    PrivateCullerRejected,
+    CullerListModeRejected,
+    CullerAccumulatorDetachRejected,
+    CullerStateRestoreRejected,
+    VisibleArrayStorageAddressOutOfRange,
+    VisibleArrayRejected,
+    CullerAccumulatorUnavailable,
+};
+
+struct RetailCenterVisibilityDiagnostics
+{
+    RetailCenterVisibilityFailure failure =
+        RetailCenterVisibilityFailure::ContextNotReady;
+    std::uintptr_t cameraAddress = 0u;
+    std::uintptr_t sceneObjectAddress = 0u;
+    std::uintptr_t cullerAddress = 0u;
+    std::uint64_t generation = 0u;
+    std::uint64_t sealedGeneration = 0u;
+    std::uint32_t collectionAccumulatorReferenceCount = 0u;
+    abi::RetailPointer32 cullerVisibleArray = 0u;
+    abi::RetailPointer32 cullerCamera = 0u;
+    abi::RetailPointer32 cullerShaderAccumulator = 0u;
+    std::uint32_t cullerTopCullMode = 0u;
+    std::uint32_t cullerCullModeStackSize = 0u;
+    std::uint32_t sealedItemCount = 0u;
+    std::uint8_t collectorPhase = 0xFFu;
+    std::uint8_t collectorFailure = 0xFFu;
+    std::uint8_t sealResult = 0xFFu;
+    bool captured = false;
+};
+
+enum class RetailCenterAccumulatorSnapshotFailure : std::uint8_t
+{
+    NotAttempted = 0u,
+    None,
+    AlreadyActive,
+    RegistrationIncomplete,
+    RendererUnavailable,
+    OwnerStateRejected,
+    EyeTargetsRejected,
+};
+
+// Read-only evidence from the exact accumulator-owner snapshot that guards
+// the private-eye transaction. This separates a changed retail owner
+// relationship from a D3D eye-target snapshot rejection without weakening
+// either condition.
+struct RetailCenterAccumulatorSnapshotDiagnostics
+{
+    RetailCenterAccumulatorSnapshotFailure failure =
+        RetailCenterAccumulatorSnapshotFailure::NotAttempted;
+    abi::RetailPointer32 rendererAddress = 0u;
+    abi::RetailPointer32 rendererAccumulator = 0u;
+    abi::RetailPointer32 accumulatingAccumulator = 0u;
+    abi::RetailPointer32 renderingAccumulator = 0u;
+    std::uint32_t rendererAccumulatorReferenceCount = 0u;
+    bool captured = false;
+};
+
 template <std::size_t CollectorCapacity>
 class RetailCenterRendererOperationsContext;
 
@@ -52,6 +131,12 @@ template <std::size_t CollectorCapacity>
 class RetailCenterRendererOperationsContext final
 {
 public:
+    static_assert(
+        CollectorCapacity > 0u
+            && CollectorCapacity
+                <= (std::numeric_limits<std::uint32_t>::max)(),
+        "the retail collector must have a representable capacity");
+
     using Binding =
         geometry::PrivateGeometryCollectorBinding<CollectorCapacity>;
 
@@ -61,25 +146,189 @@ public:
     RetailCenterRendererOperationsContext& operator=(
         const RetailCenterRendererOperationsContext&) = delete;
 
+    ~RetailCenterRendererOperationsContext() noexcept
+    {
+#if defined(_MSC_VER) && defined(_M_IX86)
+        discardStockCullerCapture();
+        if (mBinding && mBinding->ownedVtableCloneInstalled())
+            static_cast<void>(mBinding->reset());
+#endif
+    }
+
     bool initialize(
         const RetailEngineCalls& calls,
         Binding& binding,
         abi::RetailBSShaderAccumulatorLayout& collectionAccumulator,
+        const abi::RetailPointer32* verifiedCullerVtable,
         const RetailEyeTargetOperations& targets) noexcept
     {
+        const abi::RetailPointer32 stockCullerVtable =
+            binding.cullingProcess()->base.vtable;
         if (!calls.privateStereoComplete()
-            || !binding.ownedVtableCloneInstalled()
+            || binding.ownedVtableCloneInstalled()
             || !binding.ownedVtableIntegrityValid()
             || !retailEyeTargetOperationsComplete(targets))
         {
             return false;
         }
+#if defined(_MSC_VER) && defined(_M_IX86)
+        const std::uintptr_t sourceVtableAddress =
+            reinterpret_cast<std::uintptr_t>(verifiedCullerVtable);
+        const std::uintptr_t bindingAddress =
+            reinterpret_cast<std::uintptr_t>(&binding);
+        const std::uintptr_t callbackAddress =
+            reinterpret_cast<std::uintptr_t>(
+                &geometry::privateGeometryCollectorVslotCallback<
+                    CollectorCapacity>);
+        if (!verifiedCullerVtable
+            || sourceVtableAddress
+                > (std::numeric_limits<abi::RetailPointer32>::max)()
+            || bindingAddress
+                > (std::numeric_limits<abi::RetailPointer32>::max)()
+            || callbackAddress
+                > (std::numeric_limits<abi::RetailPointer32>::max)()
+            || stockCullerVtable
+                != static_cast<abi::RetailPointer32>(sourceVtableAddress)
+            || binding.installOwnedVtableClone(
+                    verifiedCullerVtable,
+                    Binding::OwnedVtableEntryCount,
+                    static_cast<abi::RetailPointer32>(sourceVtableAddress),
+                    static_cast<abi::RetailPointer32>(bindingAddress),
+                    static_cast<abi::RetailPointer32>(callbackAddress))
+                != geometry::GeometryVtableInstallResult::Installed)
+        {
+            return false;
+        }
+#else
+        static_cast<void>(verifiedCullerVtable);
+#endif
         mCalls = calls;
         mBinding = &binding;
         mCollectionAccumulator = &collectionAccumulator;
+        mStockCullerVtable = stockCullerVtable;
         mTargets = targets;
         mInitialized = true;
         return true;
+    }
+
+    bool rebind(
+        const RetailEngineCalls& calls,
+        const RetailEyeTargetOperations& targets) noexcept
+    {
+        if (!mInitialized || !calls.privateStereoComplete()
+            || !mBinding || !mCollectionAccumulator
+            || !mBinding->ownedVtableIntegrityValid()
+#if defined(_MSC_VER) && defined(_M_IX86)
+            || !mBinding->ownedVtableCloneInstalled()
+#else
+            || mBinding->ownedVtableCloneInstalled()
+#endif
+            || !retailEyeTargetOperationsComplete(targets))
+        {
+            return false;
+        }
+        mCalls = calls;
+        mTargets = targets;
+        mEngineSnapshot = {};
+        return true;
+    }
+
+    // Record the exact stock culler that is about to traverse the scene.  For
+    // this one synchronous traversal, replace only its verified Append slot
+    // with the binding-owned forwarding shim.  The shim records every visible
+    // geometry then tail-enters the exact stock routine with its original x86
+    // call frame intact; finishStockCullerCapture restores the stock vtable
+    // before any private-eye work begins.
+    bool beginStockCullerCapture(
+        abi::RetailBSCullingProcessLayout* culler) noexcept
+    {
+#if !defined(_MSC_VER) || !defined(_M_IX86)
+        static_cast<void>(culler);
+        return false;
+#else
+        if (!ready() || !culler || mStockCapture.active)
+            return false;
+        if (culler == mBinding->cullingProcess()
+            || culler->base.vtable != mStockCullerVtable)
+        {
+            return false;
+        }
+        if (!mBinding->resetCollectedGeometryPreservingOwnedVtable())
+            return false;
+        const std::uintptr_t cullerAddress =
+            reinterpret_cast<std::uintptr_t>(culler);
+        const abi::RetailPointer32 cloneVtable =
+            mBinding->ownedVtableAddressForDispatch();
+        if (cullerAddress
+                > (std::numeric_limits<abi::RetailPointer32>::max)()
+            || cloneVtable == 0u)
+        {
+            return false;
+        }
+        ++mNextStockCaptureGeneration;
+        if (mNextStockCaptureGeneration == 0u)
+            ++mNextStockCaptureGeneration;
+        if (!mBinding->beginCollectionFor(
+                culler,
+                mNextStockCaptureGeneration,
+                true))
+        {
+            return false;
+        }
+        const abi::RetailPointer32 sourceVtable = culler->base.vtable;
+        culler->base.vtable = cloneVtable;
+        if (culler->base.vtable != cloneVtable)
+        {
+            static_cast<void>(
+                mBinding->resetCollectedGeometryPreservingOwnedVtable());
+            return false;
+        }
+        mStockCapture = {
+            culler,
+            sourceVtable,
+            mNextStockCaptureGeneration,
+            true,
+            false,
+        };
+        return true;
+#endif
+    }
+
+    bool finishStockCullerCapture(
+        abi::RetailBSCullingProcessLayout* culler) noexcept
+    {
+#if !defined(_MSC_VER) || !defined(_M_IX86)
+        static_cast<void>(culler);
+        return false;
+#else
+        if (!mBinding || !mStockCapture.active
+            || !culler || culler != mStockCapture.culler)
+        {
+            return false;
+        }
+        const abi::RetailPointer32 cloneVtable =
+            mBinding->ownedVtableAddressForDispatch();
+        const bool cloneStillInstalled = cloneVtable != 0u
+            && culler->base.vtable == cloneVtable;
+        if (cloneStillInstalled)
+            culler->base.vtable = mStockCapture.sourceVtable;
+        const bool stockVtableRestored = cloneStillInstalled
+            && culler->base.vtable == mStockCapture.sourceVtable;
+        const geometry::GeometrySealResult sealResult = stockVtableRestored
+            ? mBinding->sealCollectionFor(culler)
+            : geometry::GeometrySealResult::OwnerMismatchInvalidated;
+        mStockCapture.active = false;
+        mStockCapture.sealed = stockVtableRestored
+            && sealResult == geometry::GeometrySealResult::Sealed;
+        if (!mStockCapture.sealed)
+        {
+            static_cast<void>(
+                mBinding->resetCollectedGeometryPreservingOwnedVtable());
+            mStockCapture = {};
+            return false;
+        }
+        return true;
+#endif
     }
 
     bool ready() const noexcept
@@ -88,9 +337,26 @@ public:
             && mCalls.privateStereoComplete()
             && mBinding
             && mCollectionAccumulator
-            && mBinding->ownedVtableCloneInstalled()
+            && mStockCullerVtable != 0u
             && mBinding->ownedVtableIntegrityValid()
+#if defined(_MSC_VER) && defined(_M_IX86)
+            && mBinding->ownedVtableCloneInstalled()
+#else
+            && !mBinding->ownedVtableCloneInstalled()
+#endif
             && retailEyeTargetOperationsComplete(mTargets);
+    }
+
+    const RetailCenterVisibilityDiagnostics& visibilityDiagnostics() const
+        noexcept
+    {
+        return mLastVisibility;
+    }
+
+    const RetailCenterAccumulatorSnapshotDiagnostics&
+    accumulatorSnapshotDiagnostics() const noexcept
+    {
+        return mLastAccumulatorSnapshot;
     }
 
 private:
@@ -103,12 +369,51 @@ private:
         bool active = false;
     };
 
+    struct StockCullerCapture
+    {
+        abi::RetailBSCullingProcessLayout* culler = nullptr;
+        abi::RetailPointer32 sourceVtable = 0u;
+        std::uint64_t generation = 0u;
+        bool active = false;
+        bool sealed = false;
+    };
+
+    void discardStockCullerCapture() noexcept
+    {
+#if defined(_MSC_VER) && defined(_M_IX86)
+        if (mBinding && mStockCapture.active && mStockCapture.culler)
+        {
+            const abi::RetailPointer32 cloneVtable =
+                mBinding->ownedVtableAddressForDispatch();
+            if (cloneVtable != 0u
+                && mStockCapture.culler->base.vtable == cloneVtable)
+            {
+                mStockCapture.culler->base.vtable =
+                    mStockCapture.sourceVtable;
+            }
+        }
+        if (mBinding && mBinding->ownedVtableCloneInstalled())
+        {
+            static_cast<void>(
+                mBinding->resetCollectedGeometryPreservingOwnedVtable());
+        }
+#endif
+        mStockCapture = {};
+    }
+
     bool mInitialized = false;
     RetailEngineCalls mCalls {};
     Binding* mBinding = nullptr;
     abi::RetailBSShaderAccumulatorLayout* mCollectionAccumulator = nullptr;
+    abi::RetailPointer32 mStockCullerVtable = 0u;
     RetailEyeTargetOperations mTargets {};
     EngineAccumulatorSnapshot mEngineSnapshot {};
+    StockCullerCapture mStockCapture {};
+    std::uint64_t mNextStockCaptureGeneration = 0u;
+    RetailCenterVisibilityDiagnostics mLastVisibility {};
+    RetailCenterAccumulatorSnapshotDiagnostics mLastAccumulatorSnapshot {};
+    // Never replay ProcessAlt on a copied culler. The stock culler is captured
+    // only during its own AccumulateScene call and restored before eye work.
 
     friend struct detail::RetailCenterRendererOperationsAdapter<
         CollectorCapacity>;
@@ -134,35 +439,152 @@ struct RetailCenterRendererOperationsAdapter
             static_cast<std::uintptr_t>(address));
     }
 
+    static void captureVisibilityDiagnostics(
+        Context& context,
+        abi::RetailNiCameraLayout* camera,
+        void* sceneObject,
+        abi::RetailBSCullingProcessLayout* culler,
+        std::uint64_t generation) noexcept
+    {
+        RetailCenterVisibilityDiagnostics& diagnostics =
+            context.mLastVisibility;
+        diagnostics = {};
+        diagnostics.failure = RetailCenterVisibilityFailure::None;
+        diagnostics.cameraAddress = reinterpret_cast<std::uintptr_t>(camera);
+        diagnostics.sceneObjectAddress =
+            reinterpret_cast<std::uintptr_t>(sceneObject);
+        diagnostics.cullerAddress = reinterpret_cast<std::uintptr_t>(culler);
+        diagnostics.generation = generation;
+        diagnostics.captured = true;
+        if (context.mCollectionAccumulator)
+        {
+            diagnostics.collectionAccumulatorReferenceCount =
+                context.mCollectionAccumulator->referenceCount;
+        }
+        if (context.mBinding)
+        {
+            diagnostics.collectorPhase = static_cast<std::uint8_t>(
+                context.mBinding->phase());
+            diagnostics.collectorFailure = static_cast<std::uint8_t>(
+                context.mBinding->failure());
+            if (culler)
+            {
+                diagnostics.cullerVisibleArray = culler->base.visibleArray;
+                diagnostics.cullerCamera = culler->base.camera;
+                diagnostics.cullerShaderAccumulator =
+                    culler->shaderAccumulator;
+                diagnostics.cullerTopCullMode = culler->topCullMode;
+                diagnostics.cullerCullModeStackSize = culler->cullModeStackSize;
+            }
+        }
+    }
+
+    static bool rejectVisibility(
+        Context& context,
+        abi::RetailBSCullingProcessLayout* culler,
+        RetailCenterVisibilityFailure failure) noexcept
+    {
+        RetailCenterVisibilityDiagnostics& diagnostics =
+            context.mLastVisibility;
+        if (context.mCollectionAccumulator)
+        {
+            diagnostics.collectionAccumulatorReferenceCount =
+                context.mCollectionAccumulator->referenceCount;
+        }
+        if (context.mBinding)
+        {
+            diagnostics.collectorPhase = static_cast<std::uint8_t>(
+                context.mBinding->phase());
+            diagnostics.collectorFailure = static_cast<std::uint8_t>(
+                context.mBinding->failure());
+            if (culler)
+            {
+                diagnostics.cullerVisibleArray = culler->base.visibleArray;
+                diagnostics.cullerCamera = culler->base.camera;
+                diagnostics.cullerShaderAccumulator =
+                    culler->shaderAccumulator;
+                diagnostics.cullerTopCullMode = culler->topCullMode;
+                diagnostics.cullerCullModeStackSize = culler->cullModeStackSize;
+            }
+        }
+        diagnostics.failure = failure;
+        diagnostics.captured = true;
+        return false;
+    }
+
+    static bool restorePrivateCullerState(
+        Context& context,
+        const abi::RetailBSCullingProcessLayout& snapshot) noexcept
+    {
+        if (!context.mBinding)
+            return false;
+        auto* privateCuller = context.mBinding->cullingProcess();
+        if (!privateCuller)
+            return false;
+        *privateCuller = snapshot;
+        return std::memcmp(
+                   privateCuller,
+                   &snapshot,
+                   sizeof(snapshot)) == 0
+            && context.mBinding->ownedVtableIntegrityValid();
+    }
+
     static bool snapshotEngineAccumulatorState(Context& context) noexcept
     {
-        if (context.mEngineSnapshot.active
-            || !context.mCalls.privateStereoRegistrationComplete())
+        RetailCenterAccumulatorSnapshotDiagnostics& diagnostics =
+            context.mLastAccumulatorSnapshot;
+        diagnostics = {};
+        diagnostics.captured = true;
+        if (context.mEngineSnapshot.active)
         {
+            diagnostics.failure =
+                RetailCenterAccumulatorSnapshotFailure::AlreadyActive;
+            return false;
+        }
+        if (!context.mCalls.privateStereoRegistrationComplete())
+        {
+            diagnostics.failure =
+                RetailCenterAccumulatorSnapshotFailure::RegistrationIncomplete;
             return false;
         }
         const abi::RetailPointer32 rendererAddress =
             *context.mCalls.rendererSingleton;
+        diagnostics.rendererAddress = rendererAddress;
         if (rendererAddress == 0u)
+        {
+            diagnostics.failure =
+                RetailCenterAccumulatorSnapshotFailure::RendererUnavailable;
             return false;
+        }
         auto* renderer =
             reinterpret_cast<abi::RetailRendererAccumulatorOwnerLayout*>(
                 static_cast<std::uintptr_t>(rendererAddress));
         const abi::RetailPointer32 rendererAccumulator =
             renderer->accumulator;
+        diagnostics.rendererAccumulator = rendererAccumulator;
         auto* ownedAccumulator = accumulatorFromAddress(rendererAccumulator);
         const abi::RetailPointer32 accumulatingAccumulator =
             *context.mCalls.accumulatingAccumulator;
+        diagnostics.accumulatingAccumulator = accumulatingAccumulator;
         const abi::RetailPointer32 renderingAccumulator =
             *context.mCalls.renderingAccumulator;
-        // At the stock world boundary these are three owners of the same
-        // coordinator-owned accumulator. Requiring that exact state keeps the
-        // saved pointer alive while the private eyes are temporarily installed.
+        diagnostics.renderingAccumulator = renderingAccumulator;
+        if (ownedAccumulator)
+        {
+            diagnostics.rendererAccumulatorReferenceCount =
+                ownedAccumulator->referenceCount;
+        }
+        // The renderer and accumulating globals share the coordinator-owned
+        // accumulator at this call boundary. Retail may keep a distinct,
+        // live rendering lane after its AccumulateScene call; preserve that
+        // non-null lane exactly and restore it after the private eye work.
         if (!ownedAccumulator
             || ownedAccumulator->referenceCount < 4u
             || accumulatingAccumulator != rendererAccumulator
-            || renderingAccumulator != rendererAccumulator)
+            || renderingAccumulator == 0u)
         {
+            diagnostics.failure =
+                RetailCenterAccumulatorSnapshotFailure::OwnerStateRejected;
             return false;
         }
 
@@ -173,6 +595,7 @@ struct RetailCenterRendererOperationsAdapter
             renderingAccumulator,
             true,
         };
+        diagnostics.failure = RetailCenterAccumulatorSnapshotFailure::None;
         return true;
     }
 
@@ -242,6 +665,8 @@ struct RetailCenterRendererOperationsAdapter
         if (!context->mTargets.snapshot(context->mTargets.context))
         {
             context->mEngineSnapshot = {};
+            context->mLastAccumulatorSnapshot.failure =
+                RetailCenterAccumulatorSnapshotFailure::EyeTargetsRejected;
             return false;
         }
         return true;
@@ -256,94 +681,134 @@ struct RetailCenterRendererOperationsAdapter
         CenterRendererVisibleSet& visibleSet) noexcept
     {
         visibleSet = {};
-        Context* context = checked(opaque);
+        Context* context = static_cast<Context*>(opaque);
+        if (!context)
+            return false;
+        captureVisibilityDiagnostics(
+            *context,
+            camera,
+            sceneObject,
+            culler,
+            generation);
+        if (!context->ready())
+        {
+            return rejectVisibility(
+                *context,
+                culler,
+                RetailCenterVisibilityFailure::ContextNotReady);
+        }
         if (!context
             || !camera
             || !sceneObject
             || !culler
             || !context->mCollectionAccumulator
-            || context->mCollectionAccumulator->referenceCount != 1u
-            || generation == 0u
-            || culler != context->mBinding->cullingProcess())
+            || generation == 0u)
         {
-            return false;
+            return rejectVisibility(
+                *context,
+                culler,
+                RetailCenterVisibilityFailure::InvalidInput);
         }
 
 #if defined(_MSC_VER) && defined(_M_IX86)
-        const std::uintptr_t collectionAccumulatorAddress =
-            reinterpret_cast<std::uintptr_t>(
-                context->mCollectionAccumulator);
-        if (collectionAccumulatorAddress
-                > (std::numeric_limits<abi::RetailPointer32>::max)()
-            || culler->shaderAccumulator != 0u)
+        if (culler->base.vtable != context->mStockCullerVtable)
         {
-            return false;
+            return rejectVisibility(
+                *context,
+                culler,
+                RetailCenterVisibilityFailure::CullerVtableRejected);
         }
-        if (!context->mBinding->beginCollection(generation))
-            return false;
-        context->mCalls.accumulatorSetCamera(
-            reinterpret_cast<abi::RetailNiAccumulatorLayout*>(
-                context->mCollectionAccumulator),
-            camera);
-        context->mCalls.cullingProcessSetAccumulator(
-            culler,
-            context->mCollectionAccumulator);
-        if (culler->shaderAccumulator
-                != static_cast<abi::RetailPointer32>(
-                    collectionAccumulatorAddress)
-            || context->mCollectionAccumulator->referenceCount != 2u)
+        if (culler == context->mBinding->cullingProcess())
         {
-            if (culler->shaderAccumulator
-                == static_cast<abi::RetailPointer32>(
-                    collectionAccumulatorAddress))
-            {
-                context->mCalls.cullingProcessSetAccumulator(culler, nullptr);
-            }
-            return false;
+            return rejectVisibility(
+                *context,
+                culler,
+                RetailCenterVisibilityFailure::PrivateCullerRejected);
         }
-        context->mCalls.cullingProcessAlt(
-            culler,
-            camera,
-            sceneObject,
-            nullptr);
-        context->mCalls.cullingProcessSetAccumulator(culler, nullptr);
-        if (culler->shaderAccumulator != 0u
-            || context->mCollectionAccumulator->referenceCount != 1u)
-            return false;
-        if (context->mBinding->sealCollection()
-            != geometry::GeometrySealResult::Sealed)
+        if (!context->mBinding->ownedVtableCloneInstalled()
+            || !context->mBinding->ownedVtableIntegrityValid())
         {
-            return false;
+            return rejectVisibility(
+                *context,
+                culler,
+                RetailCenterVisibilityFailure::PrivateCullerRejected);
         }
-
-        geometry::PrivateGeometrySealedView sealed {};
-        if (!context->mBinding->tryGetSealedView(sealed)
-            || !sealed.geometryPointers
-            || sealed.itemCount == 0u
-            || sealed.itemCount > CollectorCapacity
-            || sealed.generation != generation)
+        if (context->mStockCapture.active
+            || !context->mStockCapture.sealed
+            || context->mStockCapture.culler != culler
+            || context->mStockCapture.sourceVtable
+                != context->mStockCullerVtable
+            || context->mStockCapture.generation == 0u)
         {
-            return false;
+            return rejectVisibility(
+                *context,
+                culler,
+                RetailCenterVisibilityFailure::CullerStateRestoreRejected);
+        }
+        geometry::PrivateGeometrySealedView view {};
+        if (!context->mBinding->tryGetSealedView(view))
+        {
+            return rejectVisibility(
+                *context,
+                culler,
+                RetailCenterVisibilityFailure::SealedViewRejected);
         }
         const std::uintptr_t geometryAddress =
-            reinterpret_cast<std::uintptr_t>(sealed.geometryPointers);
+            reinterpret_cast<std::uintptr_t>(view.geometryPointers);
         if (geometryAddress
             > (std::numeric_limits<abi::RetailPointer32>::max)())
         {
-            return false;
+            return rejectVisibility(
+                *context,
+                culler,
+                RetailCenterVisibilityFailure::VisibleArrayStorageAddressOutOfRange);
+        }
+        context->mLastVisibility.sealedItemCount = view.itemCount;
+        context->mLastVisibility.sealedGeneration = view.generation;
+        if (!view.geometryPointers
+            || view.generation != context->mStockCapture.generation
+            || view.itemCount > static_cast<std::uint32_t>(CollectorCapacity))
+        {
+            return rejectVisibility(
+                *context,
+                culler,
+                RetailCenterVisibilityFailure::SealedViewRejected);
+        }
+        if (view.itemCount == 0u)
+        {
+            return rejectVisibility(
+                *context,
+                culler,
+                RetailCenterVisibilityFailure::NoVisibleGeometry);
+        }
+        for (std::uint32_t index = 0u; index < view.itemCount; ++index)
+        {
+            if (view.geometryPointers[index] == 0u)
+            {
+                return rejectVisibility(
+                    *context,
+                    culler,
+                    RetailCenterVisibilityFailure::VisibleArrayRejected);
+            }
         }
 
-        visibleSet.array.geometryPointers =
-            static_cast<abi::RetailPointer32>(geometryAddress);
-        visibleSet.array.itemCount = sealed.itemCount;
-        visibleSet.array.capacity = static_cast<std::uint32_t>(
-            CollectorCapacity);
-        visibleSet.array.growBy = 0u;
-        visibleSet.generation = sealed.generation;
+        visibleSet.array = {
+            static_cast<abi::RetailPointer32>(geometryAddress),
+            view.itemCount,
+            static_cast<std::uint32_t>(CollectorCapacity),
+            0u,
+        };
+        visibleSet.generation = generation;
+        static_cast<void>(rejectVisibility(
+            *context,
+            culler,
+            RetailCenterVisibilityFailure::None));
         return true;
 #else
-        (void)generation;
-        return false;
+        return rejectVisibility(
+            *context,
+            culler,
+            RetailCenterVisibilityFailure::UnsupportedArchitecture);
 #endif
     }
 
@@ -484,8 +949,7 @@ struct RetailCenterRendererOperationsAdapter
         Context* context = checked(opaque);
         if (context)
         {
-            (void)context->mBinding
-                ->resetCollectedGeometryPreservingOwnedVtable();
+            context->discardStockCullerCapture();
         }
         visibleSet = {};
     }

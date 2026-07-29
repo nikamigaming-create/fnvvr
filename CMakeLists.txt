@@ -42,6 +42,28 @@ add_test(
     NAME fnvxr_openxr_live_authority_test
     COMMAND fnvxr_openxr_live_authority_test)
 
+add_executable(fnvxr_headset_mirror_capture_test
+    tests/fnvxr_headset_mirror_capture_test.cpp)
+target_include_directories(fnvxr_headset_mirror_capture_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/host)
+if(MSVC)
+    target_compile_options(fnvxr_headset_mirror_capture_test PRIVATE /W4 /WX)
+endif()
+add_test(
+    NAME fnvxr_headset_mirror_capture_test
+    COMMAND fnvxr_headset_mirror_capture_test)
+
+add_executable(fnvxr_headset_demo_authority_test
+    tests/fnvxr_headset_demo_authority_test.cpp)
+target_include_directories(fnvxr_headset_demo_authority_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/runtime)
+if(MSVC)
+    target_compile_options(fnvxr_headset_demo_authority_test PRIVATE /W4 /WX)
+endif()
+add_test(
+    NAME fnvxr_headset_demo_authority_test
+    COMMAND fnvxr_headset_demo_authority_test)
+
 if(WIN32)
     add_test(
         NAME fnvxr_build_attestation_test
@@ -65,6 +87,70 @@ if(WIN32)
             -NoProfile
             -ExecutionPolicy Bypass
             -File ${CMAKE_CURRENT_SOURCE_DIR}/tests/fnvxr_product_launcher_test.ps1
+            -SourceRoot ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    add_test(
+        NAME fnvxr_ttw_retail_sandbox_script_test
+        COMMAND powershell.exe
+            -NoProfile
+            -ExecutionPolicy Bypass
+            -File ${CMAKE_CURRENT_SOURCE_DIR}/tests/fnvxr_ttw_retail_sandbox_script_test.ps1
+            -SourceRoot ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    add_test(
+        NAME fnvxr_ttw_baseline_launcher_test
+        COMMAND powershell.exe
+            -NoProfile
+            -ExecutionPolicy Bypass
+            -File ${CMAKE_CURRENT_SOURCE_DIR}/tests/fnvxr_ttw_baseline_launcher_test.ps1
+            -SourceRoot ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    add_test(
+        NAME fnvxr_ttw_fixture_launcher_test
+        COMMAND powershell.exe
+            -NoProfile
+            -ExecutionPolicy Bypass
+            -File ${CMAKE_CURRENT_SOURCE_DIR}/tests/fnvxr_ttw_fixture_launcher_test.ps1
+            -SourceRoot ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    add_test(
+        NAME fnvxr_ttw_johnnyguitar_staging_test
+        COMMAND powershell.exe
+            -NoProfile
+            -ExecutionPolicy Bypass
+            -File ${CMAKE_CURRENT_SOURCE_DIR}/tests/fnvxr_ttw_johnnyguitar_staging_test.ps1
+            -SourceRoot ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    add_test(
+        NAME fnvxr_meta_xr_operator_staging_test
+        COMMAND powershell.exe
+            -NoProfile
+            -ExecutionPolicy Bypass
+            -File ${CMAKE_CURRENT_SOURCE_DIR}/tests/fnvxr_meta_xr_operator_staging_test.ps1
+            -SourceRoot ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    add_test(
+        NAME fnvxr_private_stereo_live_verifier_test
+        COMMAND powershell.exe
+            -NoProfile
+            -ExecutionPolicy Bypass
+            -File ${CMAKE_CURRENT_SOURCE_DIR}/tests/fnvxr_private_stereo_live_verifier_test.ps1
+            -SourceRoot ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    add_test(
+        NAME fnvxr_desktop_assist_automation_script_test
+        COMMAND powershell.exe
+            -NoProfile
+            -ExecutionPolicy Bypass
+            -File ${CMAKE_CURRENT_SOURCE_DIR}/tests/fnvxr_desktop_assist_automation_script_test.ps1
+            -SourceRoot ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    add_test(
+        NAME fnvxr_headless_simulator_cli_test
+        COMMAND powershell.exe
+            -NoProfile
+            -ExecutionPolicy Bypass
+            -File ${CMAKE_CURRENT_SOURCE_DIR}/tests/fnvxr_headless_simulator_cli_test.ps1
             -SourceRoot ${CMAKE_CURRENT_SOURCE_DIR}
     )
 endif()
@@ -177,7 +263,7 @@ if(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 4)
         fnvxr_retail_ui_quad_capture_win32
         fnvxr_retail_runtime_authority
         fnvxr_retail_tracked_frame_win32
-        fnvxr_retail_world_hook_win32)
+        fnvxr_retail_world_accumulation_hook_win32)
     if(MSVC)
         target_compile_options(fnvxr_d3d9_proxy PRIVATE /fp:strict /arch:SSE2)
     endif()
@@ -326,7 +412,7 @@ target_link_libraries(fnvxr_retail_vr_bridge_win32_test PRIVATE
     fnvxr_gpu_color_publisher_win32
     fnvxr_retail_runtime_authority
     fnvxr_retail_tracked_frame_win32
-    fnvxr_retail_world_hook_win32)
+    fnvxr_retail_world_accumulation_hook_win32)
 if(MSVC)
     target_compile_options(
         fnvxr_retail_vr_bridge_win32_test PRIVATE /W4 /WX)
@@ -368,6 +454,17 @@ add_test(
         -DACTIVATION_HEADER=${CMAKE_CURRENT_SOURCE_DIR}/renderhook/fnvxr_d3d9_activation.h
         -DBRIDGE_HEADER=${CMAKE_CURRENT_SOURCE_DIR}/renderhook/fnvxr_retail_vr_bridge_win32.h
         -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_d3d9_proxy_inert_fuse.cmake
+)
+
+add_test(
+    NAME fnvxr_retail_runtime_publication_bootstrap_fuse
+    COMMAND ${CMAKE_COMMAND}
+        -DPROXY_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/renderhook/fnvxr_d3d9_proxy.cpp
+        -DPLUGIN_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/plugin/fnvxr_nvse_plugin.cpp
+        -DCONTRACT_HEADER=${CMAKE_CURRENT_SOURCE_DIR}/runtime/fnvxr_retail_runtime_publication.h
+        -DREADER_HEADER=${CMAKE_CURRENT_SOURCE_DIR}/runtime/fnvxr_retail_runtime_publication_win32.h
+        -DREADER_SOURCE=${CMAKE_CURRENT_SOURCE_DIR}/runtime/fnvxr_retail_runtime_publication_win32.cpp
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_retail_runtime_publication_bootstrap_fuse.cmake
 )
 
 add_test(
@@ -676,8 +773,22 @@ add_test(
     NAME fnvxr_retail_tracked_frame_test
     COMMAND fnvxr_retail_tracked_frame_test)
 
+add_executable(fnvxr_retail_runtime_publication_test
+    tests/fnvxr_retail_runtime_publication_test.cpp)
+target_include_directories(fnvxr_retail_runtime_publication_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/runtime
+    ${CMAKE_CURRENT_SOURCE_DIR}/protocol)
+if(MSVC)
+    target_compile_options(
+        fnvxr_retail_runtime_publication_test PRIVATE /W4 /WX)
+endif()
+add_test(
+    NAME fnvxr_retail_runtime_publication_test
+    COMMAND fnvxr_retail_runtime_publication_test)
+
 add_library(fnvxr_retail_tracked_frame_win32 STATIC
-    runtime/fnvxr_retail_tracked_frame_win32.cpp)
+    runtime/fnvxr_retail_tracked_frame_win32.cpp
+    runtime/fnvxr_retail_runtime_publication_win32.cpp)
 target_include_directories(fnvxr_retail_tracked_frame_win32 PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/runtime
     ${CMAKE_CURRENT_SOURCE_DIR}/protocol)
@@ -722,6 +833,58 @@ add_test(
     NAME fnvxr_retail_world_controller_test
     COMMAND fnvxr_retail_world_controller_test)
 
+add_executable(fnvxr_retail_world_accumulation_controller_test
+    tests/fnvxr_retail_world_accumulation_controller_test.cpp)
+target_include_directories(fnvxr_retail_world_accumulation_controller_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/runtime
+)
+if(MSVC)
+    target_compile_options(
+        fnvxr_retail_world_accumulation_controller_test PRIVATE /W4 /WX)
+endif()
+add_test(
+    NAME fnvxr_retail_world_accumulation_controller_test
+    COMMAND fnvxr_retail_world_accumulation_controller_test)
+
+add_executable(fnvxr_presentation_route_transition_test
+    tests/fnvxr_presentation_route_transition_test.cpp)
+target_include_directories(fnvxr_presentation_route_transition_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/renderhook
+    ${CMAKE_CURRENT_SOURCE_DIR}/runtime
+    ${CMAKE_CURRENT_SOURCE_DIR}/protocol)
+if(MSVC)
+    target_compile_options(
+        fnvxr_presentation_route_transition_test PRIVATE /W4 /WX)
+endif()
+add_test(
+    NAME fnvxr_presentation_route_transition_test
+    COMMAND fnvxr_presentation_route_transition_test)
+
+add_executable(fnvxr_cpu_engine_presentation_test
+    tests/fnvxr_cpu_engine_presentation_test.cpp)
+target_include_directories(fnvxr_cpu_engine_presentation_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/host
+    ${CMAKE_CURRENT_SOURCE_DIR}/protocol)
+if(MSVC)
+    target_compile_options(
+        fnvxr_cpu_engine_presentation_test PRIVATE /W4 /WX)
+endif()
+add_test(
+    NAME fnvxr_cpu_engine_presentation_test
+    COMMAND fnvxr_cpu_engine_presentation_test)
+
+add_executable(fnvxr_game_plane_surface_test
+    tests/fnvxr_game_plane_surface_test.cpp)
+target_include_directories(fnvxr_game_plane_surface_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/host)
+if(MSVC)
+    target_compile_options(
+        fnvxr_game_plane_surface_test PRIVATE /W4 /WX)
+endif()
+add_test(
+    NAME fnvxr_game_plane_surface_test
+    COMMAND fnvxr_game_plane_surface_test)
+
 add_executable(fnvxr_retail_world_hook_lease_test
     tests/fnvxr_retail_world_hook_lease_test.cpp)
 target_include_directories(fnvxr_retail_world_hook_lease_test PRIVATE
@@ -755,6 +918,41 @@ endif()
 add_test(
     NAME fnvxr_retail_world_hook_win32_test
     COMMAND fnvxr_retail_world_hook_win32_test)
+
+add_library(fnvxr_retail_world_accumulation_hook_win32 STATIC
+    runtime/fnvxr_retail_world_accumulation_hook_win32.cpp)
+target_include_directories(fnvxr_retail_world_accumulation_hook_win32 PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/runtime
+)
+if(MSVC)
+    target_compile_options(
+        fnvxr_retail_world_accumulation_hook_win32 PRIVATE /W4 /WX)
+endif()
+
+add_executable(fnvxr_retail_world_accumulation_hook_lease_test
+    tests/fnvxr_retail_world_accumulation_hook_lease_test.cpp)
+target_include_directories(
+    fnvxr_retail_world_accumulation_hook_lease_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/runtime)
+if(MSVC)
+    target_compile_options(
+        fnvxr_retail_world_accumulation_hook_lease_test PRIVATE /W4 /WX)
+endif()
+add_test(
+    NAME fnvxr_retail_world_accumulation_hook_lease_test
+    COMMAND fnvxr_retail_world_accumulation_hook_lease_test)
+
+add_executable(fnvxr_retail_world_accumulation_hook_win32_test
+    tests/fnvxr_retail_world_accumulation_hook_win32_test.cpp)
+target_link_libraries(fnvxr_retail_world_accumulation_hook_win32_test PRIVATE
+    fnvxr_retail_world_accumulation_hook_win32)
+if(MSVC)
+    target_compile_options(
+        fnvxr_retail_world_accumulation_hook_win32_test PRIVATE /W4 /WX)
+endif()
+add_test(
+    NAME fnvxr_retail_world_accumulation_hook_win32_test
+    COMMAND fnvxr_retail_world_accumulation_hook_win32_test)
 
 add_executable(fnvxr_private_geometry_collector_test
     tests/fnvxr_private_geometry_collector_test.cpp
@@ -818,6 +1016,13 @@ if(WIN32)
     add_test(
         NAME fnvxr_retail_runtime_probe_help
         COMMAND fnvxr_retail_runtime_probe --help
+    )
+    add_test(
+        NAME fnvxr_retail_runtime_probe_dump_guard
+        COMMAND ${CMAKE_COMMAND}
+            -DPROBE=$<TARGET_FILE:fnvxr_retail_runtime_probe>
+            -DEXISTING_DIR=${CMAKE_CURRENT_BINARY_DIR}
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_retail_runtime_probe_dump_guard.cmake
     )
 endif()
 
@@ -891,6 +1096,100 @@ add_test(
     NAME fnvxr_retail_observation_authority_test
     COMMAND fnvxr_retail_observation_authority_test)
 
+add_executable(
+    fnvxr_desktop_assist_authority_test
+    tests/fnvxr_desktop_assist_authority_test.cpp)
+target_include_directories(fnvxr_desktop_assist_authority_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/runtime)
+if(MSVC)
+    target_compile_options(
+        fnvxr_desktop_assist_authority_test PRIVATE /W4 /WX)
+endif()
+add_test(
+    NAME fnvxr_desktop_assist_authority_test
+    COMMAND fnvxr_desktop_assist_authority_test)
+
+add_executable(
+    fnvxr_tracked_prop_assist_authority_test
+    tests/fnvxr_tracked_prop_assist_authority_test.cpp)
+target_include_directories(fnvxr_tracked_prop_assist_authority_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/runtime)
+if(MSVC)
+    target_compile_options(
+        fnvxr_tracked_prop_assist_authority_test PRIVATE /W4 /WX)
+endif()
+add_test(
+    NAME fnvxr_tracked_prop_assist_authority_test
+    COMMAND fnvxr_tracked_prop_assist_authority_test)
+
+add_executable(
+    fnvxr_desktop_assist_automation_authority_test
+    tests/fnvxr_desktop_assist_automation_authority_test.cpp)
+target_include_directories(fnvxr_desktop_assist_automation_authority_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/runtime)
+if(MSVC)
+    target_compile_options(
+        fnvxr_desktop_assist_automation_authority_test PRIVATE /W4 /WX)
+endif()
+add_test(
+    NAME fnvxr_desktop_assist_automation_authority_test
+    COMMAND fnvxr_desktop_assist_automation_authority_test)
+
+add_executable(
+    fnvxr_stereo_visual_trial_automation_authority_test
+    tests/fnvxr_stereo_visual_trial_automation_authority_test.cpp)
+target_include_directories(
+    fnvxr_stereo_visual_trial_automation_authority_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/runtime)
+target_link_libraries(
+    fnvxr_stereo_visual_trial_automation_authority_test PRIVATE fnvxr_protocol)
+if(MSVC)
+    target_compile_options(
+        fnvxr_stereo_visual_trial_automation_authority_test PRIVATE /W4 /WX)
+endif()
+add_test(
+    NAME fnvxr_stereo_visual_trial_automation_authority_test
+    COMMAND fnvxr_stereo_visual_trial_automation_authority_test)
+
+add_executable(
+    fnvxr_retail_fixture_automation_authority_test
+    tests/fnvxr_retail_fixture_automation_authority_test.cpp)
+target_include_directories(
+    fnvxr_retail_fixture_automation_authority_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/runtime)
+if(MSVC)
+    target_compile_options(
+        fnvxr_retail_fixture_automation_authority_test PRIVATE /W4 /WX)
+endif()
+add_test(
+    NAME fnvxr_retail_fixture_automation_authority_test
+    COMMAND fnvxr_retail_fixture_automation_authority_test)
+
+add_executable(
+    fnvxr_desktop_assist_ui_authority_test
+    tests/fnvxr_desktop_assist_ui_authority_test.cpp)
+target_include_directories(fnvxr_desktop_assist_ui_authority_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/runtime)
+if(MSVC)
+    target_compile_options(
+        fnvxr_desktop_assist_ui_authority_test PRIVATE /W4 /WX)
+endif()
+add_test(
+    NAME fnvxr_desktop_assist_ui_authority_test
+    COMMAND fnvxr_desktop_assist_ui_authority_test)
+
+add_executable(
+    fnvxr_desktop_assist_ui_evidence_test
+    tests/fnvxr_desktop_assist_ui_evidence_test.cpp)
+target_link_libraries(fnvxr_desktop_assist_ui_evidence_test PRIVATE fnvxr_protocol)
+if(MSVC)
+    target_compile_options(
+        fnvxr_desktop_assist_ui_evidence_test PRIVATE /W4 /WX)
+endif()
+add_test(
+    NAME fnvxr_desktop_assist_ui_evidence_test
+    COMMAND fnvxr_desktop_assist_ui_evidence_test)
+
 add_executable(fnvxr_stereo_visual_trial_test
     tests/fnvxr_stereo_visual_trial_test.cpp)
 target_link_libraries(fnvxr_stereo_visual_trial_test PRIVATE
@@ -927,16 +1226,144 @@ add_test(
         -DSOURCE_ROOT=${CMAKE_CURRENT_SOURCE_DIR}
         -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_retail_input_weapon_inert_fuse.cmake
 )
+add_test(
+    NAME fnvxr_desktop_assist_camera_fuse
+    COMMAND ${CMAKE_COMMAND}
+        -DSOURCE_ROOT=${CMAKE_CURRENT_SOURCE_DIR}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_desktop_assist_camera_fuse.cmake
+)
+add_test(
+    NAME fnvxr_tracked_prop_assist_fuse
+    COMMAND ${CMAKE_COMMAND}
+        -DSOURCE_ROOT=${CMAKE_CURRENT_SOURCE_DIR}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_tracked_prop_assist_fuse.cmake
+)
+add_test(
+    NAME fnvxr_desktop_assist_preflight_fuse
+    COMMAND ${CMAKE_COMMAND}
+        -DSOURCE_ROOT=${CMAKE_CURRENT_SOURCE_DIR}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_desktop_assist_preflight.cmake
+)
+add_test(
+    NAME fnvxr_desktop_assist_launcher_fuse
+    COMMAND ${CMAKE_COMMAND}
+        -DSOURCE_ROOT=${CMAKE_CURRENT_SOURCE_DIR}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_desktop_assist_launcher.cmake
+)
+add_test(
+    NAME fnvxr_desktop_assist_ui_fuse
+    COMMAND ${CMAKE_COMMAND}
+        -DSOURCE_ROOT=${CMAKE_CURRENT_SOURCE_DIR}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_desktop_assist_ui_fuse.cmake
+)
 
 add_executable(fnvxr_shared_state_probe tools/fnvxr_shared_state_probe.cpp)
 target_link_libraries(fnvxr_shared_state_probe PRIVATE fnvxr_protocol)
 add_test(NAME fnvxr_shared_state_probe_smoke COMMAND fnvxr_shared_state_probe)
 
+add_executable(
+    fnvxr_shared_state_probe_ui_quad_test
+    tests/fnvxr_shared_state_probe_ui_quad_test.cpp)
+target_link_libraries(fnvxr_shared_state_probe_ui_quad_test PRIVATE fnvxr_protocol)
+add_dependencies(fnvxr_shared_state_probe_ui_quad_test fnvxr_shared_state_probe)
+if(MSVC)
+    target_compile_options(
+        fnvxr_shared_state_probe_ui_quad_test PRIVATE /W4 /WX)
+endif()
+add_test(
+    NAME fnvxr_shared_state_probe_ui_quad_test
+    COMMAND fnvxr_shared_state_probe_ui_quad_test $<TARGET_FILE:fnvxr_shared_state_probe>)
+
+add_executable(
+    fnvxr_shared_state_probe_desktop_assist_ready_test
+    tests/fnvxr_shared_state_probe_desktop_assist_ready_test.cpp)
+target_link_libraries(fnvxr_shared_state_probe_desktop_assist_ready_test PRIVATE fnvxr_protocol)
+add_dependencies(fnvxr_shared_state_probe_desktop_assist_ready_test fnvxr_shared_state_probe)
+if(MSVC)
+    target_compile_options(
+        fnvxr_shared_state_probe_desktop_assist_ready_test PRIVATE /W4 /WX)
+endif()
+add_test(
+    NAME fnvxr_shared_state_probe_desktop_assist_ready_test
+    COMMAND fnvxr_shared_state_probe_desktop_assist_ready_test $<TARGET_FILE:fnvxr_shared_state_probe>)
+
+add_executable(
+    fnvxr_shared_state_probe_stereo_test
+    tests/fnvxr_shared_state_probe_stereo_test.cpp)
+target_link_libraries(fnvxr_shared_state_probe_stereo_test PRIVATE fnvxr_protocol)
+add_dependencies(fnvxr_shared_state_probe_stereo_test fnvxr_shared_state_probe)
+if(MSVC)
+    target_compile_options(
+        fnvxr_shared_state_probe_stereo_test PRIVATE /W4 /WX)
+endif()
+add_test(
+    NAME fnvxr_shared_state_probe_stereo_test
+    COMMAND fnvxr_shared_state_probe_stereo_test $<TARGET_FILE:fnvxr_shared_state_probe>)
+
+add_executable(
+    fnvxr_shared_state_probe_ui_then_world_test
+    tests/fnvxr_shared_state_probe_ui_then_world_test.cpp)
+target_link_libraries(
+    fnvxr_shared_state_probe_ui_then_world_test PRIVATE fnvxr_protocol)
+add_dependencies(
+    fnvxr_shared_state_probe_ui_then_world_test fnvxr_shared_state_probe)
+if(MSVC)
+    target_compile_options(
+        fnvxr_shared_state_probe_ui_then_world_test PRIVATE /W4 /WX)
+endif()
+add_test(
+    NAME fnvxr_shared_state_probe_ui_then_world_test
+    COMMAND fnvxr_shared_state_probe_ui_then_world_test $<TARGET_FILE:fnvxr_shared_state_probe>)
+set_tests_properties(
+    fnvxr_shared_state_probe_stereo_test
+    fnvxr_shared_state_probe_ui_then_world_test
+    PROPERTIES RESOURCE_LOCK fnvxr_d3d9_stereo_frame_mapping)
+
 add_executable(fnvxr_pose_fixture tools/fnvxr_pose_fixture.cpp)
 target_link_libraries(fnvxr_pose_fixture PRIVATE fnvxr_protocol)
 add_test(NAME fnvxr_pose_fixture_help COMMAND fnvxr_pose_fixture --help)
 
+add_executable(fnvxr_assist tools/fnvxr_assist.cpp)
+target_link_libraries(fnvxr_assist PRIVATE fnvxr_protocol)
+target_include_directories(fnvxr_assist PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tools)
+if(MSVC)
+    target_compile_options(fnvxr_assist PRIVATE /W4 /WX)
+endif()
+add_test(NAME fnvxr_assist_validate_scenario COMMAND fnvxr_assist --validate-scenario)
+add_test(NAME fnvxr_assist_self_test COMMAND fnvxr_assist --self-test)
+add_test(
+    NAME fnvxr_assist_head_body_fixture
+    COMMAND fnvxr_assist --scenario head-body --step-ms 1 --period-ms 1 --cycles 1 --no-observe)
+add_test(
+    NAME fnvxr_assist_tracked_prop_fixture
+    COMMAND fnvxr_assist --scenario head-body --tracked-prop --step-ms 1 --period-ms 1 --cycles 1 --no-observe)
+
+add_executable(fnvxr_assist_scenario_test tests/fnvxr_assist_scenario_test.cpp)
+target_include_directories(fnvxr_assist_scenario_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/tools)
+if(MSVC)
+    target_compile_options(fnvxr_assist_scenario_test PRIVATE /W4 /WX)
+endif()
+add_test(NAME fnvxr_assist_scenario_test COMMAND fnvxr_assist_scenario_test)
+
+add_executable(
+    fnvxr_assist_mapping_integration_test
+    tests/fnvxr_assist_mapping_integration_test.cpp)
+target_link_libraries(fnvxr_assist_mapping_integration_test PRIVATE fnvxr_protocol)
+add_dependencies(fnvxr_assist_mapping_integration_test fnvxr_assist)
+if(MSVC)
+    target_compile_options(fnvxr_assist_mapping_integration_test PRIVATE /W4 /WX)
+endif()
+add_test(
+    NAME fnvxr_assist_mapping_integration_test
+    COMMAND fnvxr_assist_mapping_integration_test $<TARGET_FILE:fnvxr_assist>)
+# The test owns the same process-wide named mappings as a live assist run.
+# Keep it alone even when a caller asks CTest to run tests in parallel.
+set_tests_properties(
+    fnvxr_assist_mapping_integration_test
+    PROPERTIES RUN_SERIAL TRUE TIMEOUT 30)
+
 add_executable(fnvxr_command tools/fnvxr_command.cpp)
+target_include_directories(fnvxr_command PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/runtime)
 target_link_libraries(fnvxr_command PRIVATE fnvxr_protocol)
 add_test(NAME fnvxr_command_help COMMAND fnvxr_command --help)
 

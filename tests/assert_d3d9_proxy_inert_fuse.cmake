@@ -44,6 +44,36 @@ require_text(
     "${activation_header}"
     "inline constexpr bool ProductionRendererAuthorized ="
     "The D3D9 side-effect decision must be compile-time data")
+require_text(
+    "${activation_header}"
+    "struct RetailVrVisualTrialRequest"
+    "The bounded engine-center trial must have a separate request contract")
+require_text(
+    "${activation_header}"
+    "constexpr bool retailVrVisualTrialAuthorized("
+    "The bounded engine-center trial must use a pure activation predicate")
+foreach(required IN ITEMS
+        "policy.exactCurrentProcessAuthorityRequired"
+        "!policy.exBackedGameDevice"
+        "policy.retailWorldHookOnly"
+        "!policy.replaceD3D9DeviceVtablePointer"
+        "policy.leaseNativePresentSlot"
+        "policy.cpuImageTransfer"
+        "!policy.legacyDrawReplay"
+        "request.exactProfileMatched"
+        "request.engineCenterStereoRequested"
+        "!request.stereoWorldDisabled"
+        "!request.legacyImageDiagnosticsRequested"
+        "!request.retainedStereoGameTexturesRequested"
+        "!request.unprovenColorOnlyStereoDiagnosticRequested"
+        "!request.allowStereoWorld2dFallback"
+        "!request.showGamePlaneOnStereoLoss"
+        "!request.stereoFallbackMonoFullscreen")
+    require_text(
+        "${activation_header}"
+        "${required}"
+        "The bounded visual-trial predicate widened its authority")
+endforeach()
 
 require_text(
     "${proxy_source}"
@@ -91,6 +121,29 @@ require_text(
     "Legacy runtime environment switches must be subordinate to exact renderer authorization")
 
 extract_region(
+    visual_trial_request_body
+    "${proxy_source}"
+    "bool retailVrVisualTrialRequested()\n{"
+    "bool rockSolidProfile()\n{")
+foreach(required IN ITEMS
+        "runProfileIs(\"stereo-visual-trial-v5\")"
+        "FNVXR_ENABLE_ENGINE_CENTER_STEREO"
+        "FNVXR_DISABLE_STEREO_WORLD"
+        "FNVXR_ENABLE_LEGACY_IMAGE_DIAGNOSTICS"
+        "FNVXR_USE_STEREO_GAME_TEXTURES"
+        "FNVXR_ENABLE_UNPROVEN_COLOR_ONLY_STEREO_DIAGNOSTIC"
+        "FNVXR_ALLOW_STEREO_WORLD_2D_FALLBACK"
+        "FNVXR_SHOW_GAME_PLANE_ON_STEREO_LOSS"
+        "FNVXR_STEREO_FALLBACK_MONO_FULLSCREEN"
+        "retailVrVisualTrialAuthorized("
+        "CompiledRetailVrBridgePolicy")
+    require_text(
+        "${visual_trial_request_body}"
+        "${required}"
+        "The proxy visual-trial request is not exact and fallback-free")
+endforeach()
+
+extract_region(
     create9_body
     "${proxy_source}"
     "extern \"C\" IDirect3D9* WINAPI FNVXR_Direct3DCreate9(UINT sdkVersion)\n{"
@@ -124,6 +177,9 @@ extract_region(
 foreach(required IN ITEMS
         "explicit Direct3D9Proxy(IDirect3D9* real)"
         "const HRESULT result = mReal->CreateDevice("
+        "if constexpr (fnvxr::d3d9::ProductionRendererAuthorized)"
+        "if (!installDeviceHooks(*returnedDevice)"
+        "else if (retailVrVisualTrialRequested())"
         "initializeRetailVrPresentBootstrap(*returnedDevice)"
         "static_cast<void>(initializeRetailVrBridge(*returnedDevice))")
     string(FIND "${game_proxy_body}" "${required}" required_at)
@@ -140,12 +196,21 @@ foreach(forbidden IN ITEMS "mRealEx" "CreateDeviceEx(")
     endif()
 endforeach()
 string(FIND "${game_proxy_body}" "const HRESULT result = mReal->CreateDevice(" create_device_at)
+string(FIND "${game_proxy_body}" "if constexpr (fnvxr::d3d9::ProductionRendererAuthorized)" production_gate_at)
+string(FIND "${game_proxy_body}" "if (!installDeviceHooks(*returnedDevice)" install_hooks_at)
+string(FIND "${game_proxy_body}" "else if (retailVrVisualTrialRequested())" visual_trial_gate_at)
 string(FIND "${game_proxy_body}" "initializeRetailVrPresentBootstrap(*returnedDevice)" present_bootstrap_at)
 string(FIND "${game_proxy_body}" "static_cast<void>(initializeRetailVrBridge(*returnedDevice))" bridge_attempt_at)
 if(create_device_at GREATER present_bootstrap_at
+    OR production_gate_at EQUAL -1
+    OR install_hooks_at EQUAL -1
+    OR visual_trial_gate_at EQUAL -1
+    OR production_gate_at GREATER install_hooks_at
+    OR install_hooks_at GREATER visual_trial_gate_at
+    OR visual_trial_gate_at GREATER present_bootstrap_at
     OR present_bootstrap_at GREATER bridge_attempt_at)
     message(FATAL_ERROR
-        "The retail device must exist before its one-slot Present bootstrap, and the bootstrap must exist before bridge initialization")
+        "Legacy device hooks and the narrow visual-trial bridge are not independently ordered and gated")
 endif()
 require_text(
     "${proxy_source}"
@@ -159,6 +224,46 @@ require_text(
     "${proxy_source}"
     "operations.publishCpuPair = &publishRetailVrCpuPair;"
     "The retail bridge must select the isolated CPU pair publisher")
+require_text(
+    "${proxy_source}"
+    "fnvxrRetailEngineCenterFrame"
+    "Engine-center acceptance must receive an exact completed-render transaction event")
+require_text(
+    "${proxy_source}"
+    "fnvxrRetailEngineCenterCpuStereo"
+    "Engine-center acceptance must receive a source-pixel event from the CPU pair publisher")
+
+# The verifier treats source order as part of the transaction proof: the CPU
+# pixels are logged by publishCpuPair during the in-scope accumulation
+# dispatch, and the E8 adapter emits the successful completion record only
+# after that dispatch returns.
+extract_region(
+    retail_adapter_body
+    "${proxy_source}"
+    "void __cdecl retailVrAccumulateSceneAdapter("
+    "bool initializeRetailVrBridge(IDirect3DDevice9* device) noexcept\n{")
+string(FIND "${retail_adapter_body}" "bridge->dispatchFromAccumulationAdapter(" adapter_dispatch_at)
+string(FIND "${retail_adapter_body}" "fnvxrRetailEngineCenterFrame" adapter_completion_at)
+if(adapter_dispatch_at EQUAL -1
+    OR adapter_completion_at EQUAL -1
+    OR adapter_dispatch_at GREATER adapter_completion_at)
+    message(FATAL_ERROR
+        "The engine-center completion event must be emitted after its dispatch returns")
+endif()
+extract_region(
+    cpu_pair_publisher_body
+    "${proxy_source}"
+    "bool publishRetailVrCpuPair("
+    "void publishSharedStereoInvalid(bool uiActive, const char* reason)\n{")
+string(FIND "${cpu_pair_publisher_body}" "fnvxrRetailEngineCenterCpuStereo" cpu_pair_event_at)
+if(cpu_pair_event_at EQUAL -1)
+    message(FATAL_ERROR
+        "The publishCpuPair callback must emit the source-pixel lineage event")
+endif()
+require_text(
+    "${cpu_pair_publisher_body}"
+    [[\"publicationGeneration\":\"%llu\"]]
+    "The engine-center CPU event must carry the exact nonzero 64-bit publication identity")
 
 extract_region(
     create9ex_body

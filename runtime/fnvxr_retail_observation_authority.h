@@ -15,6 +15,7 @@ constexpr bool retailObservationAuthorized(
         && proof.evidence.retailExecutableIdentityMatched
         && proof.evidence.moduleSnapshotStable
         && proof.evidence.jip5730ExactOrAbsent
+        && proof.evidence.johnnyGuitar528ExactOrAbsent
         && proof.evidence.showOff184ExactOrAbsent
         && proof.evidence.renderFirstPersonStockOrJipNormalized
         && proof.evidence.protectedCoreBodiesMatched

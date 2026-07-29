@@ -43,22 +43,14 @@ enum class RetailLiveLayoutFailure : std::uint8_t
     CameraUnreadable,
     CullerUnreadable,
     VisibleArrayUnreadable,
-    MenuFlagInvalid,
     CameraFovInvalid,
     CullerVtableMismatch,
     CullerAppendFlagInvalid,
     CullerCameraMismatch,
     CullerVisibleArrayMismatch,
     CullerStackInvalid,
-    CameraFrustumInvalid,
-    CullerFrustumInvalid,
-    CameraNearPlaneInvalid,
-    CameraFarNearRatioInvalid,
-    CameraViewportInvalid,
-    CameraLodInvalid,
     VisibleArrayCountsInvalid,
     VisibleArrayStorageMissing,
-    CameraWorldMatrixInvalid,
 };
 
 struct RetailAbiRevalidationDiagnostics

@@ -169,34 +169,27 @@ void testWorldToCameraContract()
     world.translation[1] = 20.0f;
     world.translation[2] = 30.0f;
     world.scale = 1.0f;
-    abi::RetailNiFrustumLayout frustum {};
-    frustum.left = -2.0f;
-    frustum.right = 1.0f;
-    frustum.top = 1.5f;
-    frustum.bottom = -0.5f;
-    frustum.nearDistance = 5.0f;
-    frustum.farDistance = 100.0f;
-    float matrix[16] {};
+    float matrix[12] {};
     require(
-        detail::buildRetailWorldToCamera(world, frustum, matrix),
+        detail::buildRetailWorldToCamera(world, matrix),
         "known retail right/up/back camera did not produce a matrix");
     require(
-        nearlyEqual(matrix[0], -1.0f / 3.0f)
-            && nearlyEqual(matrix[1], 2.0f / 3.0f)
+        nearlyEqual(matrix[0], 0.0f)
+            && nearlyEqual(matrix[1], 1.0f)
             && nearlyEqual(matrix[2], 0.0f)
-            && nearlyEqual(matrix[3], -10.0f)
-            && nearlyEqual(matrix[4], 0.5f)
+            && nearlyEqual(matrix[3], -20.0f)
+            && nearlyEqual(matrix[4], 0.0f)
             && nearlyEqual(matrix[5], 0.0f)
             && nearlyEqual(matrix[6], 1.0f)
-            && nearlyEqual(matrix[7], -35.0f)
-            && nearlyEqual(matrix[8], -100.0f / 95.0f)
-            && nearlyEqual(matrix[11], 5.0f / 95.0f * 100.0f)
-            && nearlyEqual(matrix[12], -1.0f)
-            && nearlyEqual(matrix[15], 10.0f),
-        "world-to-clip signs or off-center projection terms changed");
+            && nearlyEqual(matrix[7], -30.0f)
+            && nearlyEqual(matrix[8], -1.0f)
+            && nearlyEqual(matrix[9], 0.0f)
+            && nearlyEqual(matrix[10], 0.0f)
+            && nearlyEqual(matrix[11], 10.0f),
+        "world-to-camera affine signs or translation changed");
 }
 
-void testCapturedRetailWorldToCamera()
+void testCapturedRetailWorldMatrices()
 {
     // One loaded retail transaction logged these camera/frustum/matrix values
     // together. The rotation columns below are the normalized right/up/back
@@ -223,10 +216,30 @@ void testCapturedRetailWorldToCamera()
     frustum.bottom = -1.42814791f;
     frustum.nearDistance = 5.0f;
     frustum.farDistance = 353840.0f;
+    float worldToCamera[12] {};
+    require(
+        detail::buildRetailWorldToCamera(world, worldToCamera),
+        "captured retail camera did not pass the affine matrix contract");
+    const float capturedWorldToCamera[12] {
+        0.29196088f, -0.95642990f, 0.0f, 19949.9493f,
+        0.0f, 0.0f, 1.0f, -8258.8574f,
+        0.95643002f, 0.29196101f, 0.0f, 69601.5485f,
+    };
+    for (std::size_t index = 0u; index < 12u; ++index)
+    {
+        const float tolerance = index % 4u == 3u ? 0.1f : 0.00005f;
+        require(
+            nearlyEqual(
+                worldToCamera[index],
+                capturedWorldToCamera[index],
+                tolerance),
+            "captured retail affine world-to-camera diverged");
+    }
+
     float actual[16] {};
     require(
-        detail::buildRetailWorldToCamera(world, frustum, actual),
-        "captured retail camera did not pass the matrix contract");
+        detail::buildRetailWorldToClip(world, frustum, actual),
+        "captured retail camera did not pass the world-to-clip contract");
     const float captured[16] {
         0.212122f, -0.694887f, 0.0f, 14494.5f,
         0.184770f, 0.0564031f, 0.835479f, 6546.05f,
@@ -238,7 +251,7 @@ void testCapturedRetailWorldToCamera()
         const float tolerance = index % 4u == 3u ? 0.1f : 0.00005f;
         require(
             nearlyEqual(actual[index], captured[index], tolerance),
-            "direct camera matrix diverged from loaded retail capture");
+            "derived world-to-clip matrix diverged from loaded retail capture");
     }
 }
 
@@ -432,7 +445,7 @@ int main()
     static_assert(sizeof(RetailNiTransformLayout) == 0x34u);
     static_assert(sizeof(RetailNiCameraSpatialEvidenceLayout) == 0x114u);
     testWorldToCameraContract();
-    testCapturedRetailWorldToCamera();
+    testCapturedRetailWorldMatrices();
     testOriginAndRig();
     testPrivateCameraOwnership();
     std::cout << "retail distinct-eye camera transaction passed\n";

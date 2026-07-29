@@ -32,6 +32,27 @@ int main()
     if (sizeof(fnvxr::shared::SharedPlayerState) != 160)
         return fail("SharedPlayerState size mismatch");
 
+    if (sizeof(fnvxr::shared::SharedDesktopAssistState) != 240
+        || fnvxr::shared::DesktopAssistSharedVersion != 2
+        || offsetof(fnvxr::shared::SharedDesktopAssistState, sequence) != 8
+        || offsetof(fnvxr::shared::SharedDesktopAssistState, flags) != 12
+        || offsetof(fnvxr::shared::SharedDesktopAssistState, frame) != 16
+        || offsetof(fnvxr::shared::SharedDesktopAssistState, cameraNodeAddress) != 24
+        || offsetof(fnvxr::shared::SharedDesktopAssistState, poseSequence) != 28
+        || offsetof(fnvxr::shared::SharedDesktopAssistState, poseProducerEpoch) != 32
+        || offsetof(fnvxr::shared::SharedDesktopAssistState, playerWorldRot) != 40
+        || offsetof(fnvxr::shared::SharedDesktopAssistState, playerWorldPos) != 76
+        || offsetof(fnvxr::shared::SharedDesktopAssistState, cameraLocalRot) != 88
+        || offsetof(fnvxr::shared::SharedDesktopAssistState, cameraLocalPos) != 124
+        || offsetof(fnvxr::shared::SharedDesktopAssistState, cameraWorldRot) != 136
+        || offsetof(fnvxr::shared::SharedDesktopAssistState, cameraWorldPos) != 172
+        || offsetof(fnvxr::shared::SharedDesktopAssistState, bodyRootAddress) != 184
+        || offsetof(fnvxr::shared::SharedDesktopAssistState, bodyRootWorldRot) != 192
+        || offsetof(fnvxr::shared::SharedDesktopAssistState, bodyRootWorldPos) != 228)
+    {
+        return fail("SharedDesktopAssistState local-camera layout mismatch");
+    }
+
     if (sizeof(fnvxr::shared::SharedCommandState) != 216)
         return fail("SharedCommandState size mismatch");
 
@@ -168,18 +189,48 @@ int main()
         return fail("SharedVrOriginState authoritative recenter layout mismatch");
     }
 
-    if (fnvxr::shared::D3D9StereoFrameSharedVersion != 7
-        || sizeof(fnvxr::shared::SharedD3D9StereoFrameHeader) != 216
+    if (fnvxr::shared::DesktopAssistUiQuadSharedVersion != 1
+        || sizeof(fnvxr::shared::SharedDesktopAssistUiQuadHeader) != 96
+        || offsetof(fnvxr::shared::SharedDesktopAssistUiQuadHeader, writing) != 12
+        || offsetof(fnvxr::shared::SharedDesktopAssistUiQuadHeader, sequence) != 16
+        || offsetof(fnvxr::shared::SharedDesktopAssistUiQuadHeader, runtimeStateSample) != 40
+        || offsetof(fnvxr::shared::SharedDesktopAssistUiQuadHeader, poseProducerEpoch) != 80
+        || offsetof(fnvxr::shared::SharedDesktopAssistUiQuadHeader, captureOrdinal) != 88)
+    {
+        return fail("SharedDesktopAssistUiQuadHeader lineage layout mismatch");
+    }
+
+    if (fnvxr::shared::D3D9StereoFrameSharedVersion != 8
+        || sizeof(fnvxr::shared::SharedD3D9StereoFrameHeader) != 240
         || offsetof(fnvxr::shared::SharedD3D9StereoFrameHeader, producerEpoch) != 176
         || offsetof(fnvxr::shared::SharedD3D9StereoFrameHeader, rendererProducerEpoch) != 184
         || offsetof(fnvxr::shared::SharedD3D9StereoFrameHeader, producerProcessId) != 192
         || offsetof(fnvxr::shared::SharedD3D9StereoFrameHeader, publishedSlot) != 196
         || offsetof(fnvxr::shared::SharedD3D9StereoFrameHeader, readerSlots) != 200
         || offsetof(fnvxr::shared::SharedD3D9StereoFrameHeader, publicationGeneration) != 208
+        || offsetof(fnvxr::shared::SharedD3D9StereoFrameHeader, transactionId) != 216
+        || offsetof(fnvxr::shared::SharedD3D9StereoFrameHeader, sourceFrame) != 224
+        || offsetof(fnvxr::shared::SharedD3D9StereoFrameHeader, runtimeStateSample) != 232
         || fnvxr::shared::D3D9StereoFrameReaderLaneCount != 2
         || fnvxr::shared::D3D9StereoFrameSlotCount != 4)
     {
         return fail("SharedD3D9StereoFrameHeader 64-bit producer identity mismatch");
+    }
+    if (std::strcmp(
+            fnvxr::shared::D3D9StereoFrameSharedMappingName,
+            "Local\\FNVXR_D3D9_StereoFrame_v8") != 0
+        || std::strcmp(
+            fnvxr::shared::D3D9StereoFrameProducerMutexName,
+            "Local\\FNVXR_D3D9_Stereo_Producer_v8") != 0
+        || std::strcmp(
+            fnvxr::shared::D3D9StereoFrameHostReaderMutexName,
+            "Local\\FNVXR_D3D9_Stereo_HostReader_v8") != 0
+        || std::strcmp(
+            fnvxr::shared::D3D9StereoFrameCaptureReaderMutexName,
+            "Local\\FNVXR_D3D9_Stereo_CaptureReader_v8") != 0
+        || fnvxr::shared::StereoProducerMonoUiQuad != 5u)
+    {
+        return fail("SharedD3D9StereoFrameHeader v8 names or mono UI producer mismatch");
     }
 
     LONG highSequence = 0;
@@ -223,6 +274,45 @@ int main()
         || fnvxr::shared::nonzeroSharedCounterDistance(0u, 1u) != 0u)
     {
         return fail("nonzero publication distance mishandled wrap or sentinel zero");
+    }
+
+    LONG64 generationBeforeHighBit = 0;
+    LONG64 generationAfterHighBit = 0;
+    const std::uint64_t generationBeforeHighBitBits = 0x7fffffffffffffffull;
+    const std::uint64_t generationAfterHighBitBits = 0x8000000000000000ull;
+    std::memcpy(
+        &generationBeforeHighBit,
+        &generationBeforeHighBitBits,
+        sizeof(generationBeforeHighBit));
+    std::memcpy(
+        &generationAfterHighBit,
+        &generationAfterHighBitBits,
+        sizeof(generationAfterHighBit));
+    if (!fnvxr::shared::nonzeroSharedGenerationAdvanced(
+            generationAfterHighBit,
+            generationBeforeHighBit))
+    {
+        return fail("64-bit publication generation rejected a valid high-bit transition");
+    }
+
+    LONG64 generationBeforeWrap = 0;
+    LONG64 generationAfterWrap = 1;
+    const std::uint64_t generationBeforeWrapBits = 0xffffffffffffffffull;
+    std::memcpy(
+        &generationBeforeWrap,
+        &generationBeforeWrapBits,
+        sizeof(generationBeforeWrap));
+    if (!fnvxr::shared::nonzeroSharedGenerationAdvanced(
+            generationAfterWrap,
+            generationBeforeWrap)
+        || fnvxr::shared::nonzeroSharedGenerationAdvanced(
+            generationBeforeWrap,
+            generationAfterWrap)
+        || fnvxr::shared::nonzeroSharedGenerationAdvanced(
+            generationAfterWrap,
+            0))
+    {
+        return fail("64-bit publication generation modular ordering mismatch");
     }
 
     if (fnvxr::shared::StereoProducerDrawReplay != 1
@@ -348,8 +438,19 @@ int main()
     if (sizeof(fnvxr::shared::SharedD3D9FrameHeader) != 28)
         return fail("SharedD3D9FrameHeader size mismatch");
 
-    if (fnvxr::shared::D3D9StereoFrameSharedVersion != 7
-        || sizeof(fnvxr::shared::SharedD3D9StereoFrameHeader) != 216)
+    if (fnvxr::shared::DesktopAssistUiQuadSharedMagic != 0x55585646u
+        || fnvxr::shared::DesktopAssistUiQuadFlagLeaseCurrent == 0u
+        || fnvxr::shared::DesktopAssistUiQuadFlagPresentHookInstalled == 0u
+        || fnvxr::shared::DesktopAssistUiQuadFlagRuntimeUiConfirmed == 0u
+        || fnvxr::shared::DesktopAssistUiQuadFlagPixelCopyComplete == 0u
+        || fnvxr::shared::DesktopAssistUiQuadFlagPixelContentNonBlack == 0u
+        || fnvxr::shared::DesktopAssistUiQuadFlagPoseEpochCurrent == 0u)
+    {
+        return fail("desktop assist UI quad protocol flags mismatch");
+    }
+
+    if (fnvxr::shared::D3D9StereoFrameSharedVersion != 8
+        || sizeof(fnvxr::shared::SharedD3D9StereoFrameHeader) != 240)
         return fail("SharedD3D9StereoFrameHeader size mismatch");
 
     for (LONG publishedSlot = -1; publishedSlot < 4; ++publishedSlot)

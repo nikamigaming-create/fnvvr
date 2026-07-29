@@ -16,6 +16,7 @@
 #include <cwctype>
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -28,6 +29,7 @@ namespace
 constexpr std::uintptr_t PreferredWorldSceneGraphPointer = 0x011DEB7Cu;
 constexpr std::size_t SceneGraphCameraOffset = 0xACu;
 constexpr std::size_t SceneGraphCullerOffset = 0xB4u;
+constexpr std::size_t SceneGraphLayoutSnapshotBytes = 0x200u;
 
 struct ProcessModule
 {
@@ -387,6 +389,297 @@ bool calculateSha256(
     return fnvxr::probe::abi::finalizeComputedSha256Digest(success, result);
 }
 
+std::string compactHexBytes(const std::uint8_t* bytes, std::size_t count)
+{
+    if (!bytes && count != 0u)
+        return {};
+    std::ostringstream output;
+    output << std::hex << std::uppercase << std::setfill('0');
+    for (std::size_t index = 0; index < count; ++index)
+        output << std::setw(2) << static_cast<unsigned>(bytes[index]);
+    return output.str();
+}
+
+bool writeAll(HANDLE file, const void* bytes, std::size_t byteCount)
+{
+    if (!file || file == INVALID_HANDLE_VALUE || (!bytes && byteCount != 0u))
+        return false;
+    const auto* cursor = static_cast<const std::uint8_t*>(bytes);
+    std::size_t remaining = byteCount;
+    while (remaining != 0u)
+    {
+        const DWORD requested = static_cast<DWORD>(
+            (std::min)(
+                remaining,
+                static_cast<std::size_t>((std::numeric_limits<DWORD>::max)())));
+        DWORD written = 0u;
+        if (!WriteFile(file, cursor, requested, &written, nullptr)
+            || written != requested)
+        {
+            return false;
+        }
+        cursor += written;
+        remaining -= written;
+    }
+    return true;
+}
+
+bool dumpDirectoryDoesNotExist(const std::filesystem::path& directory)
+{
+    if (directory.empty())
+    {
+        std::cerr << "invalid --dump-dir value\n";
+        return false;
+    }
+
+    SetLastError(ERROR_SUCCESS);
+    const DWORD attributes = GetFileAttributesW(directory.c_str());
+    if (attributes != INVALID_FILE_ATTRIBUTES)
+    {
+        std::cerr
+            << "dump directory already exists; refusing to overwrite: "
+            << directory << '\n';
+        return false;
+    }
+    const DWORD error = GetLastError();
+    if (error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND)
+    {
+        std::cerr << "could not inspect --dump-dir path error=" << error
+                  << " path=" << directory << '\n';
+        return false;
+    }
+    return true;
+}
+
+class RuntimeBodyDump final
+{
+public:
+    RuntimeBodyDump() = default;
+    RuntimeBodyDump(const RuntimeBodyDump&) = delete;
+    RuntimeBodyDump& operator=(const RuntimeBodyDump&) = delete;
+
+    ~RuntimeBodyDump()
+    {
+        if (mIndex != INVALID_HANDLE_VALUE)
+            CloseHandle(mIndex);
+    }
+
+    bool initialize(
+        const std::filesystem::path& directory,
+        DWORD processId,
+        std::uintptr_t moduleBase,
+        std::size_t moduleBytes)
+    {
+        if (mIndex != INVALID_HANDLE_VALUE || directory.empty())
+            return fail("dump output initialized more than once");
+        if (!CreateDirectoryW(directory.c_str(), nullptr))
+        {
+            const DWORD error = GetLastError();
+            if (error == ERROR_ALREADY_EXISTS)
+            {
+                std::cerr
+                    << "dump directory already exists; refusing to overwrite: "
+                    << directory << '\n';
+                mFailed = true;
+                return false;
+            }
+            std::cerr << "could not create dump directory error=" << error
+                      << " path=" << directory << '\n';
+            mFailed = true;
+            return false;
+        }
+
+        mDirectory = directory;
+        const std::filesystem::path indexPath = mDirectory / L"index.txt";
+        mIndex = CreateFileW(
+            indexPath.c_str(),
+            GENERIC_WRITE,
+            0u,
+            nullptr,
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL,
+            nullptr);
+        if (mIndex == INVALID_HANDLE_VALUE)
+        {
+            std::cerr << "could not create dump index error=" << GetLastError()
+                      << " path=" << indexPath << '\n';
+            mFailed = true;
+            return false;
+        }
+
+        std::ostringstream header;
+        header << "format=fnvxr-retail-runtime-body-dump-v1\n"
+               << "target_pid=" << processId
+               << " module_base=0x" << std::hex << std::uppercase << moduleBase
+               << " module_size=0x" << moduleBytes << std::dec << '\n';
+        if (!appendIndex(header.str()))
+            return false;
+        return true;
+    }
+
+    bool record(
+        const char* inventory,
+        const char* name,
+        std::uintptr_t preferredAddress,
+        std::uintptr_t runtimeAddress,
+        std::size_t byteCount,
+        const fnvxr::engine::Sha256Digest& expected,
+        const std::vector<std::uint8_t>& bytes,
+        bool readable,
+        const fnvxr::engine::Sha256Digest& actual,
+        bool hashed,
+        bool matches)
+    {
+        if (mIndex == INVALID_HANDLE_VALUE)
+            return fail("dump output is not initialized");
+
+        std::string fileName = "UNAVAILABLE";
+        const char* dumpProof = "UNAVAILABLE";
+        if (readable)
+        {
+            fileName = bodyFileName(preferredAddress);
+            const auto found = std::find_if(
+                mBodies.begin(),
+                mBodies.end(),
+                [preferredAddress](const DumpedBody& body) {
+                    return body.preferredAddress == preferredAddress;
+                });
+            if (found != mBodies.end())
+            {
+                if (found->bytes != bytes)
+                {
+                    dumpProof = "CONFLICT";
+                    fail("one preferred address produced different body bytes");
+                }
+                else
+                {
+                    dumpProof = "REUSED";
+                }
+            }
+            else if (writeBodyFile(fileName, bytes))
+            {
+                mBodies.push_back({ preferredAddress, bytes });
+                dumpProof = "WRITTEN";
+            }
+            else
+            {
+                dumpProof = "WRITE_FAILED";
+            }
+        }
+
+        std::ostringstream line;
+        line << "inventory=" << (inventory ? inventory : "UNKNOWN")
+             << " name=" << std::quoted(name ? name : "")
+             << " preferred=0x" << std::hex << std::uppercase
+             << preferredAddress
+             << " runtime=0x" << runtimeAddress << std::dec
+             << " size=" << byteCount
+             << " sha256="
+             << (hashed
+                     ? compactHexBytes(actual.bytes.data(), actual.bytes.size())
+                     : "UNAVAILABLE")
+             << " expected_sha256="
+             << (expected.valid
+                     ? compactHexBytes(
+                           expected.bytes.data(),
+                           expected.bytes.size())
+                     : "UNAVAILABLE")
+             << " proof=" << (matches ? "MATCH" : "MISMATCH")
+             << " file=" << fileName
+             << " dump=" << dumpProof << '\n';
+        ++mIndexEntries;
+        return appendIndex(line.str()) && !mFailed;
+    }
+
+    bool finish()
+    {
+        if (mIndex == INVALID_HANDLE_VALUE)
+            return !mFailed;
+        const bool flushed = FlushFileBuffers(mIndex) != FALSE;
+        const bool closed = CloseHandle(mIndex) != FALSE;
+        mIndex = INVALID_HANDLE_VALUE;
+        if (!flushed || !closed)
+            fail("could not flush and close dump index");
+        std::cout << "retail_runtime_body_dump="
+                  << (!mFailed ? "COMPLETE" : "FAIL")
+                  << " files=" << mBodies.size()
+                  << " index_entries=" << mIndexEntries
+                  << " directory=" << mDirectory << '\n';
+        return !mFailed;
+    }
+
+private:
+    struct DumpedBody
+    {
+        std::uintptr_t preferredAddress = 0u;
+        std::vector<std::uint8_t> bytes;
+    };
+
+    bool fail(const char* reason)
+    {
+        if (reason)
+            std::cerr << "retail runtime body dump failed: " << reason << '\n';
+        mFailed = true;
+        return false;
+    }
+
+    bool appendIndex(const std::string& text)
+    {
+        if (mIndex == INVALID_HANDLE_VALUE
+            || !writeAll(mIndex, text.data(), text.size()))
+        {
+            return fail("could not write dump index");
+        }
+        return true;
+    }
+
+    static std::string bodyFileName(std::uintptr_t preferredAddress)
+    {
+        std::ostringstream name;
+        name << std::hex << std::uppercase << std::setfill('0')
+             << std::setw(8) << preferredAddress << ".bin";
+        return name.str();
+    }
+
+    bool writeBodyFile(
+        const std::string& fileName,
+        const std::vector<std::uint8_t>& bytes)
+    {
+        const std::filesystem::path filePath =
+            mDirectory / std::filesystem::path(fileName);
+        const HANDLE file = CreateFileW(
+            filePath.c_str(),
+            GENERIC_WRITE,
+            0u,
+            nullptr,
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL,
+            nullptr);
+        if (file == INVALID_HANDLE_VALUE)
+        {
+            std::cerr << "could not create body dump error=" << GetLastError()
+                      << " path=" << filePath << '\n';
+            return fail("body file creation rejected");
+        }
+        const bool written = writeAll(file, bytes.data(), bytes.size());
+        const bool flushed = written && FlushFileBuffers(file) != FALSE;
+        const bool closed = CloseHandle(file) != FALSE;
+        if (!written || !flushed || !closed)
+        {
+            std::cerr << "could not complete body dump path=" << filePath
+                      << '\n';
+            return fail("body file write failed");
+        }
+        return true;
+    }
+
+    std::filesystem::path mDirectory;
+    HANDLE mIndex = INVALID_HANDLE_VALUE;
+    std::vector<DumpedBody> mBodies;
+    std::size_t mIndexEntries = 0u;
+    bool mFailed = false;
+};
+
 bool readLoadedNtHeaders32(
     HANDLE process,
     std::uintptr_t moduleBase,
@@ -527,7 +820,8 @@ bool printManifestProof(
     HANDLE process,
     std::uintptr_t moduleBase,
     std::size_t moduleBytes,
-    const fnvxr::engine::LoadedFunctionManifestEntry& entry)
+    const fnvxr::engine::LoadedFunctionManifestEntry& entry,
+    RuntimeBodyDump* dump)
 {
     const std::uintptr_t address = relocate(moduleBase, entry.preferredAddress);
     const bool inMainModule = fnvxr::probe::abi::rangeContained(
@@ -561,6 +855,21 @@ bool printManifestProof(
                       ? hexBytes(actual.bytes.data(), actual.bytes.size())
                       : "UNAVAILABLE")
               << " proof=" << (matches ? "MATCH" : "MISMATCH") << '\n';
+    if (dump)
+    {
+        static_cast<void>(dump->record(
+            "RetailEngineManifest",
+            entry.name,
+            entry.preferredAddress,
+            address,
+            entry.byteCount,
+            entry.sha256,
+            bytes,
+            readable,
+            actual,
+            hashed,
+            matches));
+    }
     return matches;
 }
 
@@ -569,7 +878,8 @@ bool printAbiEvidenceProof(
     HANDLE process,
     std::uintptr_t moduleBase,
     std::size_t moduleBytes,
-    const Entry& entry)
+    const Entry& entry,
+    RuntimeBodyDump* dump)
 {
     const std::uintptr_t address = relocate(moduleBase, entry.preferredAddress);
     const bool inMainModule = fnvxr::probe::abi::rangeContained(
@@ -604,6 +914,21 @@ bool printAbiEvidenceProof(
                       ? hexBytes(actual.bytes.data(), actual.bytes.size())
                       : "UNAVAILABLE")
               << " proof=" << (matches ? "MATCH" : "MISMATCH") << '\n';
+    if (dump)
+    {
+        static_cast<void>(dump->record(
+            "RetailFunctionAbiInventory",
+            entry.name,
+            entry.preferredAddress,
+            address,
+            entry.byteCount,
+            entry.sha256,
+            bytes,
+            readable,
+            actual,
+            hashed,
+            matches));
+    }
     return matches;
 }
 
@@ -1064,8 +1389,17 @@ bool printJip5730NormalizationProof(
 void printUsage()
 {
     std::cout
-        << "Usage: fnvxr_retail_runtime_probe [--pid <process id>] [--wait-ms <0..60000>]\n"
+        << "Usage: fnvxr_retail_runtime_probe [--pid <process id>]"
+           " [--wait-ms <0..60000>] [--dump-dir <path>]"
+           " [--scene-layout-only]"
+           " [--dump-code <preferred-address> <bytes>]\n"
         << "Read-only proof of the loaded engine manifest, ABI map, and live world objects.\n"
+        << "--dump-dir writes deterministic local body files and index.txt;"
+           " the path must not already exist.\n"
+        << "--scene-layout-only prints a 0x200-byte raw snapshot of the live"
+           " scene-graph object and exits without making an ABI authorization claim.\n"
+        << "--dump-code prints one bounded raw code range from the loaded retail"
+           " module and exits without making an ABI authorization claim.\n"
         << "It never patches, suspends, resumes, or terminates the target process.\n";
 }
 
@@ -1090,6 +1424,35 @@ bool parseWaitMilliseconds(const char* text, DWORD& result)
     if (!end || *end != '\0' || value > 60000ul)
         return false;
     result = static_cast<DWORD>(value);
+    return true;
+}
+
+bool parsePreferredCodeAddress(const char* text, std::uintptr_t& result)
+{
+    if (!text || !*text)
+        return false;
+    char* end = nullptr;
+    const unsigned long value = std::strtoul(text, &end, 0);
+    if (!end || *end != '\0'
+        || value < fnvxr::engine::SupportedImageBase
+        || value >= fnvxr::engine::SupportedImageBase
+            + fnvxr::engine::SupportedSizeOfImage)
+    {
+        return false;
+    }
+    result = static_cast<std::uintptr_t>(value);
+    return true;
+}
+
+bool parseCodeDumpByteCount(const char* text, std::size_t& result)
+{
+    if (!text || !*text)
+        return false;
+    char* end = nullptr;
+    const unsigned long value = std::strtoul(text, &end, 10);
+    if (!end || *end != '\0' || value == 0u || value > 4096u)
+        return false;
+    result = static_cast<std::size_t>(value);
     return true;
 }
 
@@ -1134,12 +1497,76 @@ LiveSceneGraphPointerObservation readLiveSceneGraph(
             observation.culler);
     return observation;
 }
+
+bool printSceneGraphLayoutSnapshot(
+    HANDLE process,
+    std::uint32_t sceneGraphAddress)
+{
+    if (!process || sceneGraphAddress == 0u)
+        return false;
+
+    std::array<std::uint8_t, SceneGraphLayoutSnapshotBytes> bytes {};
+    SIZE_T transferred = 0u;
+    const bool readable = ReadProcessMemory(
+                              process,
+                              reinterpret_cast<const void*>(
+                                  static_cast<std::uintptr_t>(sceneGraphAddress)),
+                              bytes.data(),
+                              bytes.size(),
+                              &transferred)
+            != FALSE
+        && transferred == bytes.size();
+    std::cout << "scene_layout_snapshot scene_graph=0x" << std::hex
+              << std::uppercase << sceneGraphAddress << std::dec
+              << " bytes=" << bytes.size()
+              << " readable=" << (readable ? 1 : 0) << '\n';
+    if (!readable)
+        return false;
+
+    for (std::size_t offset = 0u; offset < bytes.size(); offset += sizeof(std::uint32_t))
+    {
+        std::uint32_t value = 0u;
+        std::memcpy(&value, bytes.data() + offset, sizeof(value));
+        std::cout << "scene_layout_word offset=0x" << std::hex
+                  << std::uppercase << std::setw(3) << std::setfill('0') << offset
+                  << " value=0x" << std::setw(8) << value << std::dec
+                  << std::setfill(' ');
+
+        // This extra observation is deliberately read-only. A successful
+        // first-word read distinguishes a likely live pointer from scalar
+        // node data without assuming any particular SceneGraph ABI.
+        if (value >= 0x00010000u && value <= 0x7FFFFFFFu)
+        {
+            std::uint32_t pointeeFirstWord = 0u;
+            const bool pointeeReadable = readValue(
+                process,
+                static_cast<std::uintptr_t>(value),
+                pointeeFirstWord);
+            std::cout << " pointee_readable=" << (pointeeReadable ? 1 : 0);
+            if (pointeeReadable)
+            {
+                std::cout << " pointee_first=0x" << std::hex
+                          << std::uppercase << std::setw(8)
+                          << std::setfill('0') << pointeeFirstWord << std::dec
+                          << std::setfill(' ');
+            }
+        }
+        std::cout << '\n';
+    }
+    return true;
+}
 }
 
 int main(int argc, char** argv)
 {
     DWORD processId = 0;
     DWORD waitMilliseconds = 0;
+    std::filesystem::path dumpDirectory;
+    bool dumpRequested = false;
+    bool sceneLayoutOnly = false;
+    bool rawCodeDumpRequested = false;
+    std::uintptr_t rawCodeDumpPreferredAddress = 0u;
+    std::size_t rawCodeDumpByteCount = 0u;
     for (int index = 1; index < argc; ++index)
     {
         const std::string argument = argv[index];
@@ -1166,8 +1593,64 @@ int main(int argc, char** argv)
             }
             continue;
         }
+        if (argument == "--dump-dir" && index + 1 < argc)
+        {
+            if (dumpRequested)
+            {
+                std::cerr << "--dump-dir may be specified only once\n";
+                return EXIT_FAILURE;
+            }
+            try
+            {
+                dumpDirectory = std::filesystem::path(argv[++index]);
+            }
+            catch (const std::filesystem::filesystem_error&)
+            {
+                std::cerr << "invalid --dump-dir value\n";
+                return EXIT_FAILURE;
+            }
+            dumpRequested = true;
+            continue;
+        }
+        if (argument == "--scene-layout-only")
+        {
+            if (sceneLayoutOnly)
+            {
+                std::cerr << "--scene-layout-only may be specified only once\n";
+                return EXIT_FAILURE;
+            }
+            sceneLayoutOnly = true;
+            continue;
+        }
+        if (argument == "--dump-code" && index + 2 < argc)
+        {
+            if (rawCodeDumpRequested
+                || !parsePreferredCodeAddress(
+                    argv[++index], rawCodeDumpPreferredAddress)
+                || !parseCodeDumpByteCount(
+                    argv[++index], rawCodeDumpByteCount))
+            {
+                std::cerr << "invalid or duplicate --dump-code value\n";
+                return EXIT_FAILURE;
+            }
+            rawCodeDumpRequested = true;
+            continue;
+        }
         std::cerr << "unknown or incomplete argument: " << argument << '\n';
         printUsage();
+        return EXIT_FAILURE;
+    }
+
+    if (dumpRequested && !dumpDirectoryDoesNotExist(dumpDirectory))
+        return EXIT_FAILURE;
+    if (dumpRequested && sceneLayoutOnly)
+    {
+        std::cerr << "--dump-dir and --scene-layout-only cannot be combined\n";
+        return EXIT_FAILURE;
+    }
+    if (rawCodeDumpRequested && (dumpRequested || sceneLayoutOnly))
+    {
+        std::cerr << "--dump-code cannot be combined with --dump-dir or --scene-layout-only\n";
         return EXIT_FAILURE;
     }
 
@@ -1215,6 +1698,46 @@ int main(int argc, char** argv)
                << L" module_base=0x" << std::hex << std::uppercase << module.base
                << L" module_size=0x" << module.size << std::dec << L'\n';
 
+    if (rawCodeDumpRequested)
+    {
+        const std::uintptr_t runtimeAddress = relocate(
+            module.base,
+            rawCodeDumpPreferredAddress);
+        std::vector<std::uint8_t> bytes;
+        const bool readable = addressInModule(module, runtimeAddress)
+            && fnvxr::probe::abi::rangeContained(
+                module.base,
+                module.size,
+                runtimeAddress,
+                rawCodeDumpByteCount)
+            && readBytes(
+                process,
+                runtimeAddress,
+                rawCodeDumpByteCount,
+                bytes);
+        fnvxr::engine::Sha256Digest digest {};
+        if (readable)
+            static_cast<void>(calculateSha256(
+                bytes.data(), bytes.size(), digest));
+        std::cout << "raw_code_dump preferred=0x" << std::hex
+                  << std::uppercase << rawCodeDumpPreferredAddress
+                  << " runtime=0x" << runtimeAddress << std::dec
+                  << " bytes=" << rawCodeDumpByteCount
+                  << " readable=" << (readable ? 1 : 0)
+                  << " sha256="
+                  << (digest.valid
+                          ? compactHexBytes(
+                              digest.bytes.data(), digest.bytes.size())
+                          : "UNAVAILABLE")
+                  << " hex="
+                  << (readable
+                          ? compactHexBytes(bytes.data(), bytes.size())
+                          : "UNAVAILABLE")
+                  << '\n';
+        CloseHandle(process);
+        return readable && digest.valid ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+
     const std::uintptr_t singletonAddress = relocate(
         module.base,
         PreferredWorldSceneGraphPointer);
@@ -1238,6 +1761,15 @@ int main(int argc, char** argv)
               << " non_null_pointer_observation="
               << (scene.nonNullPointersObserved() ? "MATCH" : "MISMATCH") << '\n';
 
+    if (sceneLayoutOnly)
+    {
+        const bool snapshotCaptured = scene.singletonReadable
+            && scene.sceneGraph != 0u
+            && printSceneGraphLayoutSnapshot(process, scene.sceneGraph);
+        CloseHandle(process);
+        return snapshotCaptured ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+
     // Hash only after the initialized world boundary is observable. Hashing
     // first and waiting afterward allowed NVSE plugins to patch code between
     // the proof and the final verdict.
@@ -1260,6 +1792,22 @@ int main(int argc, char** argv)
               << " readable=" << (identityReadable ? 1 : 0)
               << " proof=" << (identityMatches ? "MATCH" : "MISMATCH") << '\n';
 
+    RuntimeBodyDump bodyDump;
+    RuntimeBodyDump* activeBodyDump = nullptr;
+    if (dumpRequested)
+    {
+        if (!bodyDump.initialize(
+                dumpDirectory,
+                processId,
+                module.base,
+                module.size))
+        {
+            CloseHandle(process);
+            return EXIT_FAILURE;
+        }
+        activeBodyDump = &bodyDump;
+    }
+
     bool unnormalizedManifestEntriesMatch = true;
     bool rawFirstPersonManifestMatches = false;
     bool firstPersonManifestPresent = false;
@@ -1270,7 +1818,8 @@ int main(int argc, char** argv)
             process,
             module.base,
             module.size,
-            entry);
+            entry,
+            activeBodyDump);
         if (entry.preferredAddress == fnvxr::probe::jip::
                 Jip5730RenderFirstPersonPreferredAddress)
         {
@@ -1292,9 +1841,12 @@ int main(int argc, char** argv)
                                  process,
                                  module.base,
                                  module.size,
-                                 entry)
+                                 entry,
+                                 activeBodyDump)
             && abiEvidenceMatches;
     }
+    const bool bodyDumpComplete =
+        !activeBodyDump || activeBodyDump->finish();
     bool vtableSlotsMatch = true;
     for (const fnvxr::engine::abi::RetailVtableSlotDescriptor& slot
          : fnvxr::engine::abi::RetailVtableSlots)
@@ -1559,7 +2111,8 @@ int main(int argc, char** argv)
               << " live_layouts=0 constructor_ownership=0"
               << " both_branch_semantics=0 synchronous_revalidation=0\n";
 
-    const bool complete = engineAbiAssessment.engineCallsAuthorized
+    const bool complete = bodyDumpComplete
+        && engineAbiAssessment.engineCallsAuthorized
         && renderWorldAbiMapMatches
         && scene.nonNullPointersObserved();
     std::cout << "retail_engine_capability_proof="

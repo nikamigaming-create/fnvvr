@@ -53,6 +53,10 @@ int main()
     require(
         validateRetailTrackedGameplayFrame(frame).complete(),
         "complete tracked gameplay frame rejected");
+    require(
+        retailTrackedPresentationRoute(frame)
+            == RetailTrackedPresentationRoute::BinocularWorld,
+        "confirmed gameplay did not select the binocular world route");
 
     frame.poseSequence = 3;
     require(
@@ -81,6 +85,10 @@ int main()
     require(
         validateRetailTrackedUiFrame(frame).complete(),
         "dialogue runtime rejected as confirmed UI");
+    require(
+        retailTrackedPresentationRoute(frame)
+            == RetailTrackedPresentationRoute::MonoUiQuad,
+        "dialogue runtime did not select the flat UI quad route");
     frame = validFrame();
     require(
         validateRetailTrackedUiFrame(frame).failure
@@ -96,6 +104,18 @@ int main()
     require(
         validateRetailTrackedUiFrame(frame).complete(),
         "confirmed Pip-Boy rejected as UI quad");
+    frame = validFrame();
+    frame.runtime.phase = fnvxr::shared::RuntimePhaseUnknown;
+    require(
+        retailTrackedPresentationRoute(frame)
+            == RetailTrackedPresentationRoute::Withhold,
+        "unknown runtime was guessed as UI or binocular world");
+    frame = validFrame();
+    frame.runtime.cameraActive = 0u;
+    require(
+        retailTrackedPresentationRoute(frame)
+            == RetailTrackedPresentationRoute::Withhold,
+        "camera-inactive gameplay was admitted to either presentation route");
 
     std::cout << "retail tracked frame validation passed\n";
     return EXIT_SUCCESS;

@@ -3,9 +3,16 @@
 #include "fnvxr_protocol.h"
 #include "fnvxr_shared_state.h"
 #include "fnvxr_fabrik.h"
+#include "fnvxr_desktop_assist_authority.h"
+#include "fnvxr_desktop_assist_automation_authority.h"
+#include "fnvxr_tracked_prop_assist_authority.h"
 #include "fnvxr_retail_observation_authority.h"
+#include "fnvxr_retail_runtime_publication.h"
 #include "fnvxr_retail_runtime_authority.h"
 #include "fnvxr_retail_safety.h"
+#include "fnvxr_retail_fixture_automation_authority.h"
+#include "fnvxr_headset_demo_authority.h"
+#include "fnvxr_stereo_visual_trial_automation_authority.h"
 
 #include <windows.h>
 #include <dbghelp.h>
@@ -44,6 +51,7 @@ constexpr UInt32 InterfaceData = 7;
 constexpr UInt32 InterfacePlayerControls = 10;
 constexpr UInt32 NvseDataDiHookControl = 1;
 constexpr const char* GamePluginProducerMutexName = "Local\\FNVXR_GamePlugin_Producer_v1";
+constexpr const char* DesktopAssistRecoveryLoadCommand = "load FNVXR_HostExitRecovery";
 // The OpenXR host is the sole producer for XInput, DInput, and VR pose in the
 // supported architecture.  Retained in-plugin writers stay source-disabled
 // until they acquire the same lifetime/epoch protocol as the host.
@@ -87,6 +95,12 @@ constexpr UInt32 TileValueMouseover = 0x0FC6;
 constexpr UInt32 TileValueHeight = 0x0FAF;
 constexpr UInt32 TileValueWidth = 0x0FB0;
 constexpr UInt32 InterfaceManagerAddress = 0x011D8A80;
+// xNVSE GameUI.h identifies these as InterfaceManager::activeTile and
+// InterfaceManager::activeMenu.  The exact official-pack path below sets them
+// only for the single verified native MessageMenu response; it never routes
+// OS, controller, or simulator input through the interface manager.
+constexpr UInt32 InterfaceManagerActiveTileOffset = 0x0CC;
+constexpr UInt32 InterfaceManagerActiveMenuOffset = 0x0D0;
 constexpr UInt32 PlayerCharacterAddress = 0x011DEA3C;
 constexpr UInt32 Camera1stNodeAddress = 0x011E07D0;
 constexpr UInt32 Camera3rdNodeAddress = 0x011E07D4;
@@ -148,6 +162,8 @@ constexpr UInt32 VrPoseSharedMagic = fnvxr::shared::VrPoseSharedMagic;
 constexpr UInt32 VrPoseSharedVersion = fnvxr::shared::VrPoseSharedVersion;
 constexpr UInt32 CameraSharedMagic = fnvxr::shared::CameraSharedMagic;
 constexpr UInt32 CameraSharedVersion = fnvxr::shared::CameraSharedVersion;
+constexpr UInt32 DesktopAssistSharedMagic = fnvxr::shared::DesktopAssistSharedMagic;
+constexpr UInt32 DesktopAssistSharedVersion = fnvxr::shared::DesktopAssistSharedVersion;
 constexpr UInt32 RuntimeSharedMagic = fnvxr::shared::RuntimeSharedMagic;
 constexpr UInt32 RuntimeSharedVersion = fnvxr::shared::RuntimeSharedVersion;
 constexpr UInt32 PlayerSharedMagic = fnvxr::shared::PlayerSharedMagic;
@@ -162,6 +178,11 @@ constexpr LONG SharedVideoPointerHeight = 720;
 
 constexpr UInt32 kMenuTypeInventory = 0x3EA;
 constexpr UInt32 kMenuTypeMin = 0x3E9;
+// xNVSE GameUI.h: the first menu slot is the modal MessageMenu.  It is kept
+// explicit because a visible MessageMenu after a load is useful diagnostic
+// evidence.  It remains non-mutating by default; only the separately opted-in
+// one-time exact Tribal Pack acknowledgement below may advance it.
+constexpr UInt32 kMenuTypeMessage = kMenuTypeMin;
 constexpr UInt32 kMenuTypeStats = 0x3EB;
 constexpr UInt32 kMenuTypeHUDMain = 0x3EC;
 constexpr UInt32 kMenuTypeLoading = 0x3EF;
@@ -196,6 +217,7 @@ using fnvxr::shared::SharedDInputState;
 using fnvxr::shared::SharedVrPoseState;
 using fnvxr::shared::SharedVrOriginState;
 using fnvxr::shared::SharedCameraState;
+using fnvxr::shared::SharedDesktopAssistState;
 using fnvxr::shared::SharedRuntimeState;
 using fnvxr::shared::SharedPlayerState;
 using fnvxr::shared::SharedCommandState;
@@ -440,6 +462,21 @@ enum class RuntimePhase : UInt32
     Gameplay = 3,
 };
 
+enum class CameraHookAuthorization : UInt8
+{
+    None = 0,
+    DesktopAssist = 1,
+    TrackedPropAssist = 2,
+    FullRetail = 3,
+};
+
+enum class RetailRigOriginSource : UInt8
+{
+    None = 0,
+    NativeStereo = 1,
+    TrackedPropAssist = 2,
+};
+
 PluginHandle g_pluginHandle = InvalidPluginHandle;
 const NVSEInterface* g_nvse = nullptr;
 // Intentionally empty until a production in-process validator reads and
@@ -449,7 +486,13 @@ fnvxr::safety::RetailMutationEvidenceToken g_retailMutationEvidence {};
 fnvxr::engine::RetailRuntimeAuthorityDecision g_retailRuntimeAuthority {};
 bool g_authorizedSharedBridgeStarted = false;
 UInt32 g_retailRuntimeAuthorityAttempts = 0;
+bool g_desktopAssistBridgeStarted = false;
+UInt32 g_desktopAssistAuthorityAttempts = 0;
+bool g_trackedPropAssistBridgeStarted = false;
+UInt32 g_trackedPropAssistAuthorityAttempts = 0;
+CameraHookAuthorization g_cameraHookAuthorization = CameraHookAuthorization::None;
 bool g_authorizedRuntimeObservationStarted = false;
+bool g_headsetDemoFixtureReady = false;
 UInt32 g_retailObservationAuthorityAttempts = 0;
 UInt64 g_runtimeObservationFrame = 0;
 NVSEConsoleInterface* g_console = nullptr;
@@ -523,6 +566,8 @@ HANDLE g_vrOriginMapping = nullptr;
 SharedVrOriginState* g_vrOriginState = nullptr;
 HANDLE g_cameraMapping = nullptr;
 SharedCameraState* g_cameraState = nullptr;
+HANDLE g_desktopAssistMapping = nullptr;
+SharedDesktopAssistState* g_desktopAssistState = nullptr;
 HANDLE g_runtimeMapping = nullptr;
 SharedRuntimeState* g_runtimeState = nullptr;
 HANDLE g_playerMapping = nullptr;
@@ -554,6 +599,7 @@ UInt32 g_lastKnownWeaponFavoriteSlot = 0;
 void* g_updateCameraTrampoline = nullptr;
 bool g_cameraHookInstalled = false;
 bool g_retailRigHookInstalled = false;
+RetailRigOriginSource g_retailRigOriginSource = RetailRigOriginSource::None;
 RetailRigNodes g_retailRigNodes {};
 RetailHandCalibration g_retailLeftCalibration {};
 RetailHandCalibration g_retailRightCalibration {};
@@ -605,6 +651,7 @@ bool g_haveVrOrigin = false;
 Quat g_vrOriginRot { 0.0f, 0.0f, 0.0f, 1.0f };
 Vec3 g_vrOriginPos {};
 LONG g_lastCameraPoseSequence = 0;
+UInt64 g_lastCameraPoseProducerEpoch = 0;
 LONG g_lastAppliedCameraPoseSequence = 0;
 void* g_lastAppliedCamera = nullptr;
 bool g_haveCameraBase = false;
@@ -631,6 +678,7 @@ bool g_previousUiFavoritePipBoyVisible = false;
 
 bool allowUiInput();
 UInt32 currentMenuBits();
+void logReadOnlyMessageMenuDiagnostic(UInt64 generation);
 bool playerWeaponOut();
 UInt32 currentWeaponClass();
 bool weaponClassKnown(UInt32 weaponClass);
@@ -762,6 +810,32 @@ const char* sharedCameraReasonName(UInt32 reason)
     }
 }
 
+const char* retailRigOriginSourceName()
+{
+    switch (g_retailRigOriginSource)
+    {
+    case RetailRigOriginSource::NativeStereo:
+        return "d3d9-native-camera";
+    case RetailRigOriginSource::TrackedPropAssist:
+        return "tracked-prop-assist-body";
+    default:
+        return "unlatched";
+    }
+}
+
+const char* retailRigAnchorSourceName()
+{
+    switch (g_retailRigOriginSource)
+    {
+    case RetailRigOriginSource::NativeStereo:
+        return "exact-d3d9-render-camera";
+    case RetailRigOriginSource::TrackedPropAssist:
+        return "first-person-rig-root-at-latch";
+    default:
+        return "unlatched";
+    }
+}
+
 bool isCompatibleRuntime(const NVSEInterface* nvse)
 {
     if (!nvse)
@@ -821,6 +895,234 @@ bool rockSolidProfile()
 bool retailSidecarProfile()
 {
     return runProfileIs("retail-sidecar") || runProfileIs("openxr-sidecar");
+}
+
+bool envEnabled(const char* name, bool fallback);
+
+bool desktopAssistProfileSelected()
+{
+    return runProfileIs("desktop-assist");
+}
+
+bool desktopAssistProfileRequested()
+{
+    return desktopAssistProfileSelected()
+        && envEnabled("FNVXR_DESKTOP_ASSIST_CAMERA_ONLY", false);
+}
+
+bool trackedPropAssistProfileSelected()
+{
+    return runProfileIs("tracked-prop-assist");
+}
+
+bool trackedPropAssistProfileRequested()
+{
+    return trackedPropAssistProfileSelected()
+        && envEnabled("FNVXR_TRACKED_PROP_ASSIST_VISUAL_ONLY", false);
+}
+
+bool stereoVisualTrialProfileSelected()
+{
+    return runProfileIs("stereo-visual-trial-v5");
+}
+
+bool retailFixtureProfileSelected()
+{
+    // These profiles exist solely for command-line-owned save fixtures. They
+    // deliberately does not initialize OpenXR, a simulator, a renderer bridge,
+    // camera/rig hooks, controller paths, or desktop input.
+    return runProfileIs("retail-fixture-v1") || runProfileIs("ttw-fixture-v1");
+}
+
+bool ttwBaselineProfileSelected()
+{
+    // A TTW baseline check is deliberately less authoritative than the owned
+    // retail fixture.  It observes only the real Start Menu after the exact
+    // TTW core profile has loaded.  It has no mailbox, console, save, input,
+    // camera, renderer, bridge, OpenXR, or simulator behavior.
+    return runProfileIs("ttw-baseline-v1");
+}
+
+bool headsetDemoFixtureProfileSelected()
+{
+    // This is the sole opt-in that lets an already-owned FNVXR_AutoRetail
+    // fixture participate in the bounded headless OpenXR visual demo.  It
+    // keeps the visual-trial plugin publication-only; it does not enable the
+    // normal input, camera, rig, weapon, or simulator-control bridge.
+    return stereoVisualTrialProfileSelected()
+        && envEnabled("FNVXR_HEADSET_DEMO_FIXTURE", false);
+}
+
+fnvxr::engine::RetailPluginMainLoopDisposition
+stereoVisualTrialMainLoopDisposition()
+{
+    return fnvxr::engine::retailPluginMainLoopDisposition({
+        stereoVisualTrialProfileSelected(),
+        envEnabled("FNVXR_ENABLE_ENGINE_CENTER_STEREO", false),
+    });
+}
+
+bool stereoVisualTrialAutomationRequested()
+{
+    // Publication-only visual trials remain command-inert by default.  This
+    // opt-in maps only the command mailbox consumed by the fixed automation
+    // authority gate; it does not start the plugin bridge or any input,
+    // camera, rig, renderer, or weapon authority.  The two workflows are
+    // deliberately mutually exclusive so no caller can combine a load with a
+    // fresh-character creation sequence.
+    const bool recoveryLoadRequested = envEnabled(
+        "FNVXR_STEREO_VISUAL_TRIAL_AUTOMATE_RECOVERY_LOAD",
+        false);
+    const bool freshCharacterRequested = envEnabled(
+        "FNVXR_STEREO_VISUAL_TRIAL_AUTOMATE_FRESH_CHARACTER",
+        false);
+    return stereoVisualTrialMainLoopDisposition()
+            == fnvxr::engine::RetailPluginMainLoopDisposition::
+                PublishRuntimeOnly
+        && recoveryLoadRequested != freshCharacterRequested;
+}
+
+bool stereoVisualTrialRecoveryLoadRequested()
+{
+    return stereoVisualTrialAutomationRequested()
+        && envEnabled(
+            "FNVXR_STEREO_VISUAL_TRIAL_AUTOMATE_RECOVERY_LOAD",
+            false);
+}
+
+bool stereoVisualTrialFreshCharacterRequested()
+{
+    return stereoVisualTrialAutomationRequested()
+        && envEnabled(
+            "FNVXR_STEREO_VISUAL_TRIAL_AUTOMATE_FRESH_CHARACTER",
+            false);
+}
+
+bool retailFixtureAutomationRequested()
+{
+    // Fixture ownership is deliberately distinct from the legacy single-save
+    // visual trial. The dedicated profile never starts an input bridge, camera
+    // hook, rig hook, renderer mutation, OpenXR host, or simulator control.
+    return (retailFixtureProfileSelected()
+            || headsetDemoFixtureProfileSelected())
+        && envEnabled("FNVXR_RETAIL_FIXTURE_AUTOMATION", false);
+}
+
+struct RetailFixtureAutomationPlan
+{
+    fnvxr::engine::retail_fixture_automation::Plan plan {};
+    char saveName[64] {};
+};
+
+bool readRetailFixtureAutomationPlan(RetailFixtureAutomationPlan& output)
+{
+    namespace fixture = fnvxr::engine::retail_fixture_automation;
+    constexpr char actionEnvironmentName[] = "FNVXR_RETAIL_FIXTURE_ACTION";
+    constexpr char saveEnvironmentName[] = "FNVXR_RETAIL_FIXTURE_SAVE_NAME";
+    constexpr char firstTraitEnvironmentName[] = "FNVXR_RETAIL_FIXTURE_TRAIT_ONE";
+    constexpr char secondTraitEnvironmentName[] = "FNVXR_RETAIL_FIXTURE_TRAIT_TWO";
+    char action[16] {};
+    char firstTrait[32] {};
+    char secondTrait[32] {};
+    size_t actionRequired = 0u;
+    size_t saveRequired = 0u;
+    size_t firstTraitRequired = 0u;
+    size_t secondTraitRequired = 0u;
+    if (getenv_s(&actionRequired, action, sizeof(action), actionEnvironmentName) != 0
+        || actionRequired == 0u || actionRequired > sizeof(action)
+        || getenv_s(&saveRequired, output.saveName, sizeof(output.saveName), saveEnvironmentName) != 0
+        || saveRequired == 0u || saveRequired > sizeof(output.saveName)
+        || getenv_s(&firstTraitRequired, firstTrait, sizeof(firstTrait), firstTraitEnvironmentName) != 0
+        || firstTraitRequired == 0u || firstTraitRequired > sizeof(firstTrait)
+        || getenv_s(&secondTraitRequired, secondTrait, sizeof(secondTrait), secondTraitEnvironmentName) != 0
+        || secondTraitRequired == 0u || secondTraitRequired > sizeof(secondTrait))
+    {
+        return false;
+    }
+
+    const fixture::TraitCommand* const first = fixture::findTrait(
+        std::string_view { firstTrait, firstTraitRequired - 1u });
+    const fixture::TraitCommand* const second = fixture::findTrait(
+        std::string_view { secondTrait, secondTraitRequired - 1u });
+    fixture::Action requestedAction = fixture::Action::None;
+    if (std::strcmp(action, "create") == 0)
+        requestedAction = fixture::Action::Create;
+    else if (std::strcmp(action, "load") == 0)
+        requestedAction = fixture::Action::Load;
+    if (first == nullptr || second == nullptr)
+        return false;
+
+    output.plan = {
+        requestedAction,
+        first->trait,
+        second->trait,
+        std::string_view { output.saveName, saveRequired - 1u },
+    };
+    return fixture::authorized(output.plan);
+}
+
+bool stereoVisualTrialTribalPackAcknowledgementRequested()
+{
+    // This is deliberately narrower than visual-trial automation itself:
+    // only the fixed recovery-save workflow can request the four known
+    // official-pack MessageMenu acknowledgements.  It does not enable an
+    // input bridge.
+    return stereoVisualTrialRecoveryLoadRequested()
+        && envEnabled(
+            "FNVXR_STEREO_VISUAL_TRIAL_ACK_TRIBAL_PACK_POPUP",
+            false);
+}
+
+bool retailFixtureOfficialPackAcknowledgementRequested()
+{
+    // Retail keeps the four pre-order packs available even with an
+    // FalloutNV.esm-only plugins.txt profile. A fixture can therefore opt in
+    // to the same exact native acknowledgement only for the known title/body
+    // pairs and their unique stock first-button OK tile. This is not desktop,
+    // keyboard, mouse, controller, or simulator input.
+    return retailFixtureAutomationRequested()
+        && envEnabled(
+            "FNVXR_RETAIL_FIXTURE_ACK_OFFICIAL_PACK_POPUP",
+            false);
+}
+
+bool exactOfficialPackAcknowledgementRequested()
+{
+    return stereoVisualTrialTribalPackAcknowledgementRequested()
+        || retailFixtureOfficialPackAcknowledgementRequested();
+}
+
+const fnvxr::engine::stereo_visual_trial_automation::ApprovedRetailSave*
+stereoVisualTrialSelectedRetailSave()
+{
+    namespace automation =
+        fnvxr::engine::stereo_visual_trial_automation;
+    constexpr char selectionEnvironmentName[] =
+        "FNVXR_STEREO_VISUAL_TRIAL_AUTOMATE_RECOVERY_SAVE_NAME";
+    char saveName[64] {};
+    size_t required = 0u;
+    if (getenv_s(
+            &required,
+            saveName,
+            sizeof(saveName),
+            selectionEnvironmentName) != 0
+        || required == 0u
+        || required > sizeof(saveName))
+    {
+        return nullptr;
+    }
+
+    return automation::findApprovedRetailSave(
+        std::string_view { saveName, required - 1u });
+}
+
+bool desktopAssistAutomationRequested()
+{
+    // This does not broaden desktop assist into a general command or input
+    // bridge.  It enables only the fixed recovery-load action checked again
+    // at the point where the command is consumed.
+    return desktopAssistProfileRequested()
+        && envEnabled("FNVXR_DESKTOP_ASSIST_AUTOMATION", false);
 }
 
 bool scenePipelineModeIs(const char* expected)
@@ -1237,6 +1539,7 @@ bool readLatestCameraPose(Quat& rotationDelta, Vec3& positionDelta)
         return false;
 
     LONG sequence = 0;
+    UInt64 producerEpoch = 0;
     Quat currentRot {};
     Vec3 currentPos {};
     bool haveStableSnapshot = false;
@@ -1260,6 +1563,7 @@ bool readLatestCameraPose(Quat& rotationDelta, Vec3& positionDelta)
                 g_vrPoseState->hmdPos[1],
                 g_vrPoseState->hmdPos[2]
             };
+            producerEpoch = g_vrPoseState->producerEpoch;
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
@@ -1275,8 +1579,21 @@ bool readLatestCameraPose(Quat& rotationDelta, Vec3& positionDelta)
         }
     }
 
-    if (!haveStableSnapshot)
+    if (!haveStableSnapshot || producerEpoch == 0)
         return false;
+
+    if (g_lastCameraPoseProducerEpoch != 0
+        && g_lastCameraPoseProducerEpoch != producerEpoch)
+    {
+        // A new pose producer has its own local origin. Never carry a prior
+        // headset or synthetic-fixture origin into this trace.
+        g_haveVrOrigin = false;
+        g_lastAppliedCameraPoseSequence = 0;
+        logTelemetry(
+            "camera pose producer changed oldEpoch=%llu newEpoch=%llu; origin reset\n",
+            static_cast<unsigned long long>(g_lastCameraPoseProducerEpoch),
+            static_cast<unsigned long long>(producerEpoch));
+    }
 
     if (!g_haveVrOrigin || envEnabled("FNVXR_CAMERA_RESET_ORIGIN", false))
     {
@@ -1298,6 +1615,7 @@ bool readLatestCameraPose(Quat& rotationDelta, Vec3& positionDelta)
     rotationDelta = multiplyQuat(conjugateQuat(g_vrOriginRot), currentRot);
     positionDelta = xrPositionInOriginFrame(g_vrOriginRot, g_vrOriginPos, currentPos);
     g_lastCameraPoseSequence = sequence;
+    g_lastCameraPoseProducerEpoch = producerEpoch;
     return true;
 }
 
@@ -1925,6 +2243,59 @@ void initSharedCamera()
         static_cast<int>(createError == ERROR_ALREADY_EXISTS));
 }
 
+void initSharedDesktopAssist()
+{
+    if (g_desktopAssistState)
+        return;
+
+    g_desktopAssistMapping = CreateFileMappingA(
+        INVALID_HANDLE_VALUE,
+        nullptr,
+        PAGE_READWRITE,
+        0,
+        sizeof(SharedDesktopAssistState),
+        fnvxr::shared::DesktopAssistSharedMappingName);
+    if (!g_desktopAssistMapping)
+    {
+        logTelemetry("desktopAssist shared CreateFileMapping failed err=%lu\n", GetLastError());
+        return;
+    }
+    const DWORD createError = GetLastError();
+
+    g_desktopAssistState = static_cast<SharedDesktopAssistState*>(
+        MapViewOfFile(
+            g_desktopAssistMapping,
+            FILE_MAP_ALL_ACCESS,
+            0,
+            0,
+            sizeof(SharedDesktopAssistState)));
+    if (!g_desktopAssistState)
+    {
+        logTelemetry("desktopAssist shared MapViewOfFile failed err=%lu\n", GetLastError());
+        CloseHandle(g_desktopAssistMapping);
+        g_desktopAssistMapping = nullptr;
+        return;
+    }
+
+    if (!publishNeutralPluginOwnedState(
+            g_desktopAssistState,
+            DesktopAssistSharedMagic,
+            DesktopAssistSharedVersion))
+    {
+        logTelemetry("desktopAssist shared neutral publication failed; disabling publisher\n");
+        UnmapViewOfFile(g_desktopAssistState);
+        g_desktopAssistState = nullptr;
+        CloseHandle(g_desktopAssistMapping);
+        g_desktopAssistMapping = nullptr;
+        return;
+    }
+    logTelemetry("desktopAssist shared ready state=%p mapping=%p bytes=%zu retained=%d\n",
+        g_desktopAssistState,
+        g_desktopAssistMapping,
+        sizeof(SharedDesktopAssistState),
+        static_cast<int>(createError == ERROR_ALREADY_EXISTS));
+}
+
 void initSharedRuntime()
 {
     if (g_runtimeState)
@@ -2252,7 +2623,12 @@ bool publishInputEvent(UInt32 type, UInt32 code, std::int32_t value0 = 0, std::i
     return true;
 }
 
-void publishRuntimeState(UInt64 frame, UInt32 menuBits, RuntimePhase phase, bool uiInputAllowed)
+void publishRuntimeState(
+    UInt64 frame,
+    UInt32 menuBits,
+    RuntimePhase phase,
+    bool uiInputAllowed,
+    bool cameraActive)
 {
     if (!g_runtimeState || !gamePluginProducerLeaseHeldByCurrentThread())
         return;
@@ -2265,7 +2641,7 @@ void publishRuntimeState(UInt64 frame, UInt32 menuBits, RuntimePhase phase, bool
     g_runtimeState->menuBits = menuBits;
     g_runtimeState->phase = static_cast<UInt32>(phase);
     g_runtimeState->uiInputAllowed = uiInputAllowed ? 1u : 0u;
-    g_runtimeState->cameraActive = (g_cameraState && g_cameraState->active) ? 1u : 0u;
+    g_runtimeState->cameraActive = cameraActive ? 1u : 0u;
     g_runtimeState->showroomActive = g_showroomActive ? 1u : 0u;
     g_runtimeState->showroomPhase = static_cast<UInt32>(g_showroomPhase);
     g_runtimeState->showroomSceneIndex = g_showroomSceneIndex;
@@ -2861,6 +3237,8 @@ UInt32 currentMenuBits()
             static_cast<unsigned long>(activeMenuType),
             genericMenuType != 0 ? 1 : 0,
             menuMode ? 1 : 0);
+        if (genericMenuType == kMenuTypeMessage)
+            logReadOnlyMessageMenuDiagnostic(menuLifecycleGeneration);
     }
     return (menuMode ? menuModeBit : 0)
         | (startVisible ? startBit : 0)
@@ -3804,6 +4182,157 @@ void updateSharedPlayer(UInt64 frame, RuntimePhase phase)
     }
 }
 
+bool desktopAssistCameraLeaseCurrent();
+bool finiteVec3(Vec3 value);
+bool finiteMatrix33(const Matrix33& matrix);
+void* retrievePlayerRootNode(bool firstPerson);
+
+void updateSharedDesktopAssist(UInt64 frame)
+{
+    if (!g_desktopAssistState || !gamePluginProducerLeaseHeldByCurrentThread())
+        return;
+    if (!fnvxr::shared::beginSequencedSharedWrite(g_desktopAssistState->sequence))
+        return;
+
+    g_desktopAssistState->magic = DesktopAssistSharedMagic;
+    g_desktopAssistState->version = DesktopAssistSharedVersion;
+    g_desktopAssistState->flags = 0u;
+    g_desktopAssistState->frame = frame;
+    g_desktopAssistState->cameraNodeAddress = 0u;
+    g_desktopAssistState->poseSequence = 0u;
+    g_desktopAssistState->poseProducerEpoch = 0u;
+    std::memset(g_desktopAssistState->playerWorldRot, 0, sizeof(g_desktopAssistState->playerWorldRot));
+    std::memset(g_desktopAssistState->playerWorldPos, 0, sizeof(g_desktopAssistState->playerWorldPos));
+    std::memset(g_desktopAssistState->cameraLocalRot, 0, sizeof(g_desktopAssistState->cameraLocalRot));
+    std::memset(g_desktopAssistState->cameraLocalPos, 0, sizeof(g_desktopAssistState->cameraLocalPos));
+    std::memset(g_desktopAssistState->cameraWorldRot, 0, sizeof(g_desktopAssistState->cameraWorldRot));
+    std::memset(g_desktopAssistState->cameraWorldPos, 0, sizeof(g_desktopAssistState->cameraWorldPos));
+    g_desktopAssistState->bodyRootAddress = 0u;
+    g_desktopAssistState->bodyRootReserved = 0u;
+    std::memset(g_desktopAssistState->bodyRootWorldRot, 0, sizeof(g_desktopAssistState->bodyRootWorldRot));
+    std::memset(g_desktopAssistState->bodyRootWorldPos, 0, sizeof(g_desktopAssistState->bodyRootWorldPos));
+
+    const bool leaseCurrent = g_cameraHookAuthorization
+            == CameraHookAuthorization::DesktopAssist
+        && desktopAssistCameraLeaseCurrent();
+    if (leaseCurrent)
+        g_desktopAssistState->flags |= fnvxr::shared::DesktopAssistFlagLeaseCurrent;
+    if (g_cameraHookInstalled
+        && g_cameraHookAuthorization == CameraHookAuthorization::DesktopAssist)
+    {
+        g_desktopAssistState->flags |= fnvxr::shared::DesktopAssistFlagCameraHookInstalled;
+    }
+
+    void* player = readPointer(PlayerCharacterAddress);
+    const bool thirdPerson = playerThirdPersonActive();
+    if (!thirdPerson)
+        g_desktopAssistState->flags |= fnvxr::shared::DesktopAssistFlagFirstPerson;
+    void* playerNode = player
+        ? readPointer(reinterpret_cast<std::uintptr_t>(player) + PlayerCharacterFirstPersonNodeOffset)
+        : nullptr;
+    if (looksLikeNiObject(playerNode))
+    {
+        const auto playerBase = reinterpret_cast<std::uintptr_t>(playerNode);
+        const Matrix33 playerWorldRotation = readMatrix33(
+            playerBase + NiAvObjectWorldRotationOffset);
+        const Vec3 playerWorldPosition = readVec3(
+            playerBase + NiAvObjectWorldTranslationOffset);
+        if (finiteMatrix33(playerWorldRotation) && finiteVec3(playerWorldPosition))
+        {
+            std::memcpy(
+                g_desktopAssistState->playerWorldRot,
+                playerWorldRotation.m,
+                sizeof(g_desktopAssistState->playerWorldRot));
+            g_desktopAssistState->playerWorldPos[0] = playerWorldPosition.x;
+            g_desktopAssistState->playerWorldPos[1] = playerWorldPosition.y;
+            g_desktopAssistState->playerWorldPos[2] = playerWorldPosition.z;
+            g_desktopAssistState->flags |= fnvxr::shared::DesktopAssistFlagPlayerTransformValid;
+        }
+    }
+
+    void* camera = activeGameCameraObject();
+    if (looksLikeNiObject(camera))
+    {
+        const auto base = reinterpret_cast<std::uintptr_t>(camera);
+        const Matrix33 localRotation = readMatrix33(base + NiAvObjectLocalRotationOffset);
+        const Vec3 localPosition = readVec3(base + NiAvObjectLocalTranslationOffset);
+        g_desktopAssistState->cameraNodeAddress = sharedPointerAddress(camera);
+        if (finiteMatrix33(localRotation) && finiteVec3(localPosition))
+        {
+            std::memcpy(
+                g_desktopAssistState->cameraLocalRot,
+                localRotation.m,
+                sizeof(g_desktopAssistState->cameraLocalRot));
+            g_desktopAssistState->cameraLocalPos[0] = localPosition.x;
+            g_desktopAssistState->cameraLocalPos[1] = localPosition.y;
+            g_desktopAssistState->cameraLocalPos[2] = localPosition.z;
+            g_desktopAssistState->flags |= fnvxr::shared::DesktopAssistFlagCameraLocalTransformValid;
+        }
+        const Matrix33 worldRotation = readMatrix33(base + NiAvObjectWorldRotationOffset);
+        const Vec3 worldPosition = readVec3(base + NiAvObjectWorldTranslationOffset);
+        if (finiteMatrix33(worldRotation) && finiteVec3(worldPosition))
+        {
+            std::memcpy(
+                g_desktopAssistState->cameraWorldRot,
+                worldRotation.m,
+                sizeof(g_desktopAssistState->cameraWorldRot));
+            g_desktopAssistState->cameraWorldPos[0] = worldPosition.x;
+            g_desktopAssistState->cameraWorldPos[1] = worldPosition.y;
+            g_desktopAssistState->cameraWorldPos[2] = worldPosition.z;
+            g_desktopAssistState->flags |= fnvxr::shared::DesktopAssistFlagCameraWorldTransformValid;
+        }
+        if (leaseCurrent
+            && !thirdPerson
+            && inCameraGameplay()
+            && g_lastAppliedCamera == camera
+            && g_lastAppliedCameraPoseSequence != 0
+            && g_lastCameraPoseProducerEpoch != 0u)
+        {
+            g_desktopAssistState->poseSequence = static_cast<UInt32>(
+                g_lastAppliedCameraPoseSequence);
+            g_desktopAssistState->poseProducerEpoch = g_lastCameraPoseProducerEpoch;
+            g_desktopAssistState->flags |= fnvxr::shared::DesktopAssistFlagCameraPoseApplied;
+        }
+    }
+
+    // The first-person node above is useful diagnostic context, but it is not
+    // the body proof. Read the engine's explicit non-first-person root only
+    // after the already-authorized camera-local transaction is active. This
+    // is a read-only getter plus transform copy; it does not touch any actor,
+    // camera, animation, or world state.
+    if (leaseCurrent
+        && g_cameraHookInstalled
+        && !thirdPerson
+        && inCameraGameplay())
+    {
+        void* bodyRoot = retrievePlayerRootNode(false);
+        if (bodyRoot && bodyRoot != camera && looksLikeNiObject(bodyRoot))
+        {
+            const auto bodyBase = reinterpret_cast<std::uintptr_t>(bodyRoot);
+            const Matrix33 bodyWorldRotation = readMatrix33(
+                bodyBase + NiAvObjectWorldRotationOffset);
+            const Vec3 bodyWorldPosition = readVec3(
+                bodyBase + NiAvObjectWorldTranslationOffset);
+            if (finiteMatrix33(bodyWorldRotation) && finiteVec3(bodyWorldPosition))
+            {
+                g_desktopAssistState->bodyRootAddress = sharedPointerAddress(bodyRoot);
+                std::memcpy(
+                    g_desktopAssistState->bodyRootWorldRot,
+                    bodyWorldRotation.m,
+                    sizeof(g_desktopAssistState->bodyRootWorldRot));
+                g_desktopAssistState->bodyRootWorldPos[0] = bodyWorldPosition.x;
+                g_desktopAssistState->bodyRootWorldPos[1] = bodyWorldPosition.y;
+                g_desktopAssistState->bodyRootWorldPos[2] = bodyWorldPosition.z;
+                g_desktopAssistState->flags |= fnvxr::shared::DesktopAssistFlagBodyRootTransformValid;
+            }
+        }
+    }
+
+    // This is an observation record only. It never invokes a transform update,
+    // writes a transform, or creates a render/OpenXR transaction.
+    fnvxr::shared::endSequencedSharedWrite(g_desktopAssistState->sequence);
+}
+
 void updateNiAvObjectTransform(void* object)
 {
     // Runtime evidence from the retail NiCamera path shows this vtable slot
@@ -3815,6 +4344,178 @@ void updateNiAvObjectTransform(void* object)
         logTelemetry("camera UpdateTransform refused object=%p reason=unverified-vtable-signature\n", object);
 }
 
+fnvxr::engine::DesktopAssistCameraRequest desktopAssistCameraRequest()
+{
+    fnvxr::engine::DesktopAssistCameraRequest request {};
+    request.desktopAssistProfile = desktopAssistProfileRequested();
+    request.cameraOnlyRequested = request.desktopAssistProfile;
+    request.cameraPoseApplicationRequested =
+        envEnabled("FNVXR_CAMERA_HOOK", false)
+        && envEnabled("FNVXR_CAMERA_APPLY", false);
+    request.appliesLocalRotation = envEnabled("FNVXR_CAMERA_APPLY_ROTATION", true);
+    request.yawPitchRollEnabled = !envEnabled("FNVXR_CAMERA_YAW_ONLY", false);
+    request.writesWorldTransform = envEnabled("FNVXR_CAMERA_WRITE_WORLD", false);
+    request.callsUnverifiedTransformUpdate =
+        envEnabled("FNVXR_CAMERA_UPDATE_TRANSFORM", false);
+    request.appliesLocalTranslation =
+        envEnabled("FNVXR_CAMERA_APPLY_TRANSLATION", false);
+    return request;
+}
+
+bool desktopAssistCameraMutationAllowedAtDecision()
+{
+    const fnvxr::engine::DesktopAssistCameraRequest request =
+        desktopAssistCameraRequest();
+    const fnvxr::engine::compatibility::RetailCompatibilityProof proof =
+        fnvxr::engine::compatibility::proveCurrentRetailCompatibilityAtDecisionPoint();
+    const bool authorized = fnvxr::engine::desktopAssistCameraAuthorized(
+        proof,
+        request);
+    if (!authorized)
+    {
+        static UInt32 rejected = 0;
+        ++rejected;
+        if (rejected <= 12u || (rejected % 300u) == 0u)
+        {
+            logTelemetry(
+                "desktopAssist camera authority rejected count=%lu profile=%d requested=%d apply=%d rotation=%d yawPitchRoll=%d world=%d updateTransform=%d translation=%d compatibility=%d failure=%u evidence=%d%d%d%d%d%d%d%d%d%d%d\n",
+                static_cast<unsigned long>(rejected),
+                static_cast<int>(request.desktopAssistProfile),
+                static_cast<int>(request.cameraOnlyRequested),
+                static_cast<int>(request.cameraPoseApplicationRequested),
+                static_cast<int>(request.appliesLocalRotation),
+                static_cast<int>(request.yawPitchRollEnabled),
+                static_cast<int>(request.writesWorldTransform),
+                static_cast<int>(request.callsUnverifiedTransformUpdate),
+                static_cast<int>(request.appliesLocalTranslation),
+                static_cast<int>(proof.compatible),
+                static_cast<unsigned>(proof.failure),
+                static_cast<int>(proof.evidence.retailExecutableIdentityMatched),
+                static_cast<int>(proof.evidence.moduleSnapshotStable),
+                static_cast<int>(proof.evidence.jip5730ExactOrAbsent),
+                static_cast<int>(proof.evidence.johnnyGuitar528ExactOrAbsent),
+                static_cast<int>(proof.evidence.showOff184ExactOrAbsent),
+                static_cast<int>(proof.evidence.renderFirstPersonStockOrJipNormalized),
+                static_cast<int>(proof.evidence.protectedCoreBodiesMatched),
+                static_cast<int>(proof.evidence.protectedFunctionInventoryMatched),
+                static_cast<int>(proof.evidence.protectedVtableSlotsMatched),
+                static_cast<int>(proof.evidence.protectedVtableBlocksMatched),
+                static_cast<int>(proof.evidence.synchronousSameProcess));
+        }
+    }
+    return authorized;
+}
+
+bool desktopAssistCameraLeaseCurrent()
+{
+    return g_cameraHookAuthorization == CameraHookAuthorization::DesktopAssist
+        && fnvxr::engine::desktopAssistCameraRequestIsNarrow(
+            desktopAssistCameraRequest());
+}
+
+fnvxr::engine::TrackedPropAssistRequest trackedPropAssistRequest()
+{
+    fnvxr::engine::TrackedPropAssistRequest request {};
+    request.trackedPropAssistProfile = trackedPropAssistProfileRequested();
+    request.visualOnlyRequested = request.trackedPropAssistProfile;
+    request.cameraPoseApplicationRequested =
+        envEnabled("FNVXR_CAMERA_HOOK", false)
+        && envEnabled("FNVXR_CAMERA_APPLY", false);
+    request.appliesLocalCameraRotation =
+        envEnabled("FNVXR_CAMERA_APPLY_ROTATION", true);
+    request.yawPitchRollEnabled = !envEnabled("FNVXR_CAMERA_YAW_ONLY", false);
+    request.appliesLocalCameraTranslation =
+        envEnabled("FNVXR_CAMERA_APPLY_TRANSLATION", false);
+    request.writesWorldTransform = envEnabled("FNVXR_CAMERA_WRITE_WORLD", false);
+    request.callsUnverifiedTransformUpdate =
+        envEnabled("FNVXR_CAMERA_UPDATE_TRANSFORM", false);
+    request.rigHookRequested = envEnabled("FNVXR_RETAIL_RIG_ENABLE", false);
+    request.rigTransformWritesRequested =
+        envEnabled("FNVXR_RETAIL_RIG_APPLY", false);
+    request.weaponTransformWritesRequested =
+        envEnabled("FNVXR_RETAIL_WEAPON_APPLY", false);
+    // The trial rejects a pose that lacks either the grip or the aim source;
+    // it must not silently fall back to a head-locked weapon orientation.
+    request.rightGripAndAimRequired = true;
+    request.projectileNodeHookRequested =
+        envEnabled("FNVXR_RETAIL_PROJECTILE_NODE_HOOK", false);
+    request.projectileOrHitMutationRequested =
+        envEnabled("FNVXR_TRACKED_PROP_ASSIST_PROJECTILE_OR_HIT_MUTATION", false);
+    request.inputInjectionRequested =
+        envEnabled("FNVXR_NVSE_WRITES_VR_POSE", false)
+        || envEnabled("FNVXR_CLICK_SENDINPUT_MOUSE", false)
+        || envEnabled("FNVXR_PLUGIN_SENDINPUT_CLICK", false)
+        || envEnabled("FNVXR_EXTERNAL_XINPUT_WRITER", false)
+        || envEnabled("FNVXR_EXTERNAL_DINPUT_WRITER", false)
+        || envEnabled("FNVXR_DESKTOP_ASSIST_AUTOMATION", false);
+    request.worldStereoRequested =
+        envEnabled("FNVXR_ENABLE_ENGINE_CENTER_STEREO", false)
+        || !envEnabled("FNVXR_DISABLE_STEREO_WORLD", true);
+    request.legacyReplayRequested =
+        envEnabled("FNVXR_D3D9_STEREO_REPLAY", false)
+        || envEnabled("FNVXR_D3D9_NATIVE_SINGLE_TRAVERSAL_REPLAY", false)
+        || envEnabled("FNVXR_D3D9_WIDE_WORLD_REPLAY", false);
+    request.openXrPresentationRequested =
+        envEnabled("FNVXR_TRACKED_PROP_ASSIST_OPENXR_PRESENTATION", false);
+    request.uiCaptureRequested =
+        envEnabled("FNVXR_DESKTOP_ASSIST_UI_CAPTURE", false);
+    return request;
+}
+
+bool trackedPropAssistMutationAllowedAtDecision()
+{
+    const fnvxr::engine::TrackedPropAssistRequest request =
+        trackedPropAssistRequest();
+    const fnvxr::engine::compatibility::RetailCompatibilityProof proof =
+        fnvxr::engine::compatibility::proveCurrentRetailCompatibilityAtDecisionPoint();
+    const bool authorized = fnvxr::engine::trackedPropAssistAuthorized(
+        proof,
+        request);
+    if (!authorized)
+    {
+        static UInt32 rejected = 0;
+        ++rejected;
+        if (rejected <= 12u || (rejected % 300u) == 0u)
+        {
+            logTelemetry(
+                "trackedPropAssist authority rejected count=%lu profile=%d visualOnly=%d camera=%d rotation=%d yawPitchRoll=%d rig=%d rigApply=%d weaponApply=%d projectile=%d input=%d stereo=%d replay=%d openxr=%d ui=%d compatibility=%d failure=%u\n",
+                static_cast<unsigned long>(rejected),
+                static_cast<int>(request.trackedPropAssistProfile),
+                static_cast<int>(request.visualOnlyRequested),
+                static_cast<int>(request.cameraPoseApplicationRequested),
+                static_cast<int>(request.appliesLocalCameraRotation),
+                static_cast<int>(request.yawPitchRollEnabled),
+                static_cast<int>(request.rigHookRequested),
+                static_cast<int>(request.rigTransformWritesRequested),
+                static_cast<int>(request.weaponTransformWritesRequested),
+                static_cast<int>(request.projectileNodeHookRequested
+                    || request.projectileOrHitMutationRequested),
+                static_cast<int>(request.inputInjectionRequested),
+                static_cast<int>(request.worldStereoRequested),
+                static_cast<int>(request.legacyReplayRequested),
+                static_cast<int>(request.openXrPresentationRequested),
+                static_cast<int>(request.uiCaptureRequested),
+                static_cast<int>(proof.compatible),
+                static_cast<unsigned>(proof.failure));
+        }
+    }
+    return authorized;
+}
+
+bool trackedPropAssistLeaseCurrent()
+{
+    return g_cameraHookAuthorization == CameraHookAuthorization::TrackedPropAssist
+        && g_retailRigHookInstalled
+        && fnvxr::engine::trackedPropAssistRequestIsNarrow(
+            trackedPropAssistRequest());
+}
+
+bool cameraHookUsesAssistAuthority()
+{
+    return g_cameraHookAuthorization == CameraHookAuthorization::DesktopAssist
+        || g_cameraHookAuthorization == CameraHookAuthorization::TrackedPropAssist;
+}
+
 void restoreVrPoseFromGameCamera()
 {
     if (!g_haveCameraBase || !g_cameraBaseObject || g_lastAppliedCamera != g_cameraBaseObject)
@@ -3823,7 +4524,8 @@ void restoreVrPoseFromGameCamera()
     const auto base = reinterpret_cast<std::uintptr_t>(g_cameraBaseObject);
     writeMatrix33(base + NiAvObjectLocalRotationOffset, g_cameraBaseLocalRotation);
     writeVec3(base + NiAvObjectLocalTranslationOffset, g_cameraBaseLocalTranslation);
-    if (envEnabled("FNVXR_CAMERA_WRITE_WORLD", false))
+    if (!cameraHookUsesAssistAuthority()
+        && envEnabled("FNVXR_CAMERA_WRITE_WORLD", false))
         writeMatrix33(base + NiAvObjectWorldRotationOffset, g_cameraBaseWorldRotation);
 
     // The engine must always begin UpdateCamera from its own unmodified result.
@@ -3836,6 +4538,40 @@ void applyVrPoseToGameCamera()
 {
     if (!envEnabled("FNVXR_CAMERA_HOOK", false))
         return;
+    if (g_cameraHookAuthorization == CameraHookAuthorization::DesktopAssist)
+    {
+        if (!desktopAssistCameraLeaseCurrent())
+            return;
+        if (playerThirdPersonActive())
+        {
+            static UInt32 thirdPersonRejected = 0;
+            ++thirdPersonRejected;
+            if (thirdPersonRejected <= 12u || (thirdPersonRejected % 300u) == 0u)
+            {
+                logTelemetry(
+                    "desktopAssist camera apply skipped count=%lu reason=third-person\n",
+                    static_cast<unsigned long>(thirdPersonRejected));
+            }
+            return;
+        }
+    }
+    else if (g_cameraHookAuthorization == CameraHookAuthorization::TrackedPropAssist)
+    {
+        if (!trackedPropAssistLeaseCurrent())
+            return;
+        if (playerThirdPersonActive())
+        {
+            static UInt32 thirdPersonRejected = 0;
+            ++thirdPersonRejected;
+            if (thirdPersonRejected <= 12u || (thirdPersonRejected % 300u) == 0u)
+            {
+                logTelemetry(
+                    "trackedPropAssist camera apply skipped count=%lu reason=third-person\n",
+                    static_cast<unsigned long>(thirdPersonRejected));
+            }
+            return;
+        }
+    }
     if (!inCameraGameplay())
     {
         g_haveCameraBase = false;
@@ -4022,6 +4758,12 @@ bool writeJump(UInt32 source, void* target)
 
 bool installCameraHook()
 {
+    if (stereoVisualTrialProfileSelected())
+    {
+        logTelemetry(
+            "cameraHook hard-blocked: stereo visual trial reserves world-render authority for the D3D bridge\n");
+        return false;
+    }
     if (g_cameraHookInstalled)
         return true;
     const bool requested = envEnabled("FNVXR_INSTALL_CAMERA_HOOK", true);
@@ -4030,7 +4772,27 @@ bool installCameraHook()
         logTelemetry("cameraHook install disabled\n");
         return true;
     }
-    if (!retailMutationAllowedForCurrentProcess(requested))
+    const bool desktopAssist = desktopAssistProfileRequested();
+    const bool trackedPropAssist = trackedPropAssistProfileRequested();
+    if (desktopAssist)
+    {
+        if (!desktopAssistCameraMutationAllowedAtDecision())
+        {
+            logTelemetry(
+                "cameraHook hard-blocked: desktop assist compatibility/configuration proof incomplete\n");
+            return true;
+        }
+    }
+    else if (trackedPropAssist)
+    {
+        if (!trackedPropAssistMutationAllowedAtDecision())
+        {
+            logTelemetry(
+                "cameraHook hard-blocked: tracked-prop assist compatibility/configuration proof incomplete\n");
+            return true;
+        }
+    }
+    else if (!retailMutationAllowedForCurrentProcess(requested))
     {
         logTelemetry("cameraHook hard-blocked: retail mutation source/evidence proof incomplete\n");
         return true;
@@ -4081,11 +4843,21 @@ bool installCameraHook()
     }
 
     g_cameraHookInstalled = true;
+    g_cameraHookAuthorization = desktopAssist
+        ? CameraHookAuthorization::DesktopAssist
+        : trackedPropAssist
+            ? CameraHookAuthorization::TrackedPropAssist
+            : CameraHookAuthorization::FullRetail;
     logTelemetry(
-        "cameraHook installed target=%p hook=%p trampoline=%p\n",
+        "cameraHook installed target=%p hook=%p trampoline=%p authority=%s\n",
         pointerFromAddress32<void*>(PlayerCharacterUpdateCameraAddress),
         reinterpret_cast<void*>(hookedUpdateCamera),
-        g_updateCameraTrampoline);
+        g_updateCameraTrampoline,
+        desktopAssist
+            ? "desktop-assist"
+            : trackedPropAssist
+                ? "tracked-prop-assist"
+                : "full-retail");
     return true;
 }
 
@@ -4957,6 +5729,7 @@ bool captureRetailRigOrigin(
     g_retailRigOriginPoseSequence = authoritativeOrigin.poseSequence;
     g_retailRigOriginAuthoritySequence = authoritativeOrigin.sequence;
     g_retailRigOriginBodyRoot = bodyRoot;
+    g_retailRigOriginSource = RetailRigOriginSource::NativeStereo;
     g_retailRigBodyAnchorLocal = transformVec3(
         transposeMatrix33(bodyWorldRotation),
         subtractVec3(stableCameraWorld, bodyWorldPosition));
@@ -4980,6 +5753,80 @@ bool captureRetailRigOrigin(
         g_retailRigOriginHmdRot.w,
         static_cast<unsigned long>(authoritativeOrigin.renderCameraAddress),
         bodyRoot,
+        g_retailRigBodyAnchorLocal.x,
+        g_retailRigBodyAnchorLocal.y,
+        g_retailRigBodyAnchorLocal.z);
+    return true;
+}
+
+bool captureTrackedPropAssistRigOrigin(
+    const VrRigPoseSnapshot& pose,
+    void* bodyRoot,
+    void* firstPersonRigRoot)
+{
+    if (!bodyRoot || !firstPersonRigRoot
+        || !looksLikeNiObject(bodyRoot)
+        || !looksLikeNiObject(firstPersonRigRoot)
+        || !finiteUsableQuat(pose.hmdRot)
+        || !finiteVec3(pose.hmdPos)
+        || pose.referenceSpaceGeneration == 0u
+        || pose.producerEpoch == 0u)
+    {
+        return false;
+    }
+
+    const auto bodyBase = reinterpret_cast<std::uintptr_t>(bodyRoot);
+    const auto rigBase = reinterpret_cast<std::uintptr_t>(firstPersonRigRoot);
+    const Matrix33 bodyWorldRotation = readMatrix33(
+        bodyBase + NiAvObjectWorldRotationOffset);
+    const Vec3 bodyWorldPosition = readVec3(
+        bodyBase + NiAvObjectWorldTranslationOffset);
+    const float bodyWorldScale = readFloat(
+        bodyBase + NiAvObjectWorldScaleOffset,
+        0.0f);
+    const Vec3 firstPersonRigRootWorld = readVec3(
+        rigBase + NiAvObjectWorldTranslationOffset);
+    if (!finiteMatrix33(bodyWorldRotation)
+        || !finiteVec3(bodyWorldPosition)
+        || !finiteVec3(firstPersonRigRootWorld)
+        || !std::isfinite(bodyWorldScale)
+        || std::fabs(bodyWorldScale) < 0.0001f)
+    {
+        return false;
+    }
+
+    // Latch the first-person rig's engine-authored place in the body frame
+    // once.  Later controller targets are derived from that body anchor, not
+    // from the current camera/HMD transform, so head movement cannot drag the
+    // weapon along after this point.
+    g_retailRigOriginHmdRot = normalizeQuat(pose.hmdRot);
+    g_retailRigOriginHmdPos = pose.hmdPos;
+    g_retailRigReferenceSpaceGeneration = pose.referenceSpaceGeneration;
+    g_retailRigProducerEpoch = pose.producerEpoch;
+    g_retailRigOriginPoseSequence = static_cast<UInt32>(pose.sequence);
+    g_retailRigOriginAuthoritySequence = pose.sequence;
+    g_retailRigOriginBodyRoot = bodyRoot;
+    g_retailRigOriginSource = RetailRigOriginSource::TrackedPropAssist;
+    g_retailRigBodyAnchorLocal = transformVec3(
+        transposeMatrix33(bodyWorldRotation),
+        subtractVec3(firstPersonRigRootWorld, bodyWorldPosition));
+    g_retailRigBodyAnchorLocal = scaleVec3(
+        g_retailRigBodyAnchorLocal,
+        1.0f / bodyWorldScale);
+    if (!finiteVec3(g_retailRigBodyAnchorLocal))
+        return false;
+
+    g_haveRetailRigOrigin = true;
+    logTelemetry(
+        "trackedPropAssist origin latched seq=%ld frame=%llu referenceGeneration=%lu hmdPos=(%.4f %.4f %.4f) bodyRoot=%p firstPersonRigRoot=%p bodyAnchorLocal=(%.3f %.3f %.3f) anchorSource=first-person-rig-root-at-latch originSource=tracked-prop-assist-body projectile=0 input=0 renderer=0 openxr=0\n",
+        pose.sequence,
+        static_cast<unsigned long long>(pose.frame),
+        static_cast<unsigned long>(pose.referenceSpaceGeneration),
+        g_retailRigOriginHmdPos.x,
+        g_retailRigOriginHmdPos.y,
+        g_retailRigOriginHmdPos.z,
+        bodyRoot,
+        firstPersonRigRoot,
         g_retailRigBodyAnchorLocal.x,
         g_retailRigBodyAnchorLocal.y,
         g_retailRigBodyAnchorLocal.z);
@@ -5648,7 +6495,7 @@ bool installProjectileNodeConsumeHook(void* process)
 {
     if (g_projectileNodeHookInstalled)
         return true;
-    if (!process || !envEnabled("FNVXR_RETAIL_PROJECTILE_NODE_HOOK", true))
+    if (!process || !envEnabled("FNVXR_RETAIL_PROJECTILE_NODE_HOOK", false))
         return false;
     __try
     {
@@ -5735,6 +6582,7 @@ void resetRetailRigOrigin(const char* reason)
     g_retailRigProducerEpoch = 0;
     g_retailRigOriginPoseSequence = 0;
     g_retailRigOriginAuthoritySequence = 0;
+    g_retailRigOriginSource = RetailRigOriginSource::None;
     g_lastRetailRigPoseSequence = 0;
     g_haveRetailRigMotionSample = false;
     g_retailRigHeadOnlySamples = 0;
@@ -5765,6 +6613,19 @@ void onRetailPostAnimation(void* animData)
 {
     if (!envEnabled("FNVXR_RETAIL_RIG_ENABLE", false))
         return;
+    const bool trackedPropAssist = trackedPropAssistProfileRequested();
+    if (trackedPropAssist && !trackedPropAssistLeaseCurrent())
+    {
+        static LONG rejectedLease = 0;
+        const LONG count = InterlockedIncrement(&rejectedLease);
+        if (count <= 12 || count % 300 == 0)
+        {
+            logTelemetry(
+                "trackedPropAssist rig skipped count=%ld reason=lease-not-current; no visual rig write performed\n",
+                count);
+        }
+        return;
+    }
     if (!retailRigGameplayAllowed())
     {
         resetRetailRigOrigin("not-gameplay");
@@ -5784,14 +6645,31 @@ void onRetailPostAnimation(void* animData)
     // not configurable: the retail view-model pass is the sole IK owner.
     if (animData == thirdPersonAnimData)
         return;
-    void* playerProcess = player
-        ? readPointer(reinterpret_cast<std::uintptr_t>(player) + MobileObjectBaseProcessOffset)
-        : nullptr;
-    installProjectileNodeConsumeHook(playerProcess);
+    if (!trackedPropAssist)
+    {
+        void* playerProcess = player
+            ? readPointer(reinterpret_cast<std::uintptr_t>(player) + MobileObjectBaseProcessOffset)
+            : nullptr;
+        installProjectileNodeConsumeHook(playerProcess);
+    }
 
     VrRigPoseSnapshot pose {};
     SharedVrOriginState authoritativeOrigin {};
-    if (!readCoherentRetailRigPoseAndOrigin(pose, authoritativeOrigin))
+    if (trackedPropAssist)
+    {
+        if (!readLatestRetailRigPose(pose))
+        {
+            const LONG count = InterlockedIncrement(&g_retailRigPoseOriginUnavailableCount);
+            if (count <= 12 || count % 300 == 0)
+            {
+                logTelemetry(
+                    "trackedPropAssist rig skipped count=%ld reason=pose-unavailable\n",
+                    count);
+            }
+            return;
+        }
+    }
+    else if (!readCoherentRetailRigPoseAndOrigin(pose, authoritativeOrigin))
     {
         const LONG count = InterlockedIncrement(&g_retailRigPoseOriginUnavailableCount);
         if (count <= 12 || count % 300 == 0)
@@ -5811,7 +6689,8 @@ void onRetailPostAnimation(void* animData)
     {
         resetRetailRigOrigin("reference-space-generation-changed");
     }
-    if (g_haveRetailRigOrigin
+    if (!trackedPropAssist
+        && g_haveRetailRigOrigin
         && (authoritativeOrigin.generation != g_retailRigReferenceSpaceGeneration
             || authoritativeOrigin.producerEpoch != g_retailRigProducerEpoch
             || authoritativeOrigin.poseSequence != g_retailRigOriginPoseSequence))
@@ -5833,6 +6712,17 @@ void onRetailPostAnimation(void* animData)
     const bool rightControllerUsable =
         (pose.trackingFlags & fnvxr::shared::VrPoseTrackingRightGripActive) != 0
         && (pose.trackingFlags & fnvxr::shared::VrPoseTrackingRightGripCurrent) != 0;
+    const bool rightAimUsable =
+        (pose.trackingFlags & fnvxr::shared::VrPoseTrackingRightAimActive) != 0
+        && (pose.trackingFlags & fnvxr::shared::VrPoseTrackingRightAimCurrent) != 0;
+    if (trackedPropAssist && (!rightControllerUsable || !rightAimUsable))
+    {
+        logRetailRigGateSkip(
+            g_retailRigNoCurrentControllerCount,
+            "right-grip-or-aim-not-current",
+            pose);
+        return;
+    }
     if (!leftControllerUsable && !rightControllerUsable)
     {
         logRetailRigGateSkip(
@@ -5849,6 +6739,14 @@ void onRetailPostAnimation(void* animData)
     {
         logRetailRigGateSkip(g_retailRigNoRootCount, "first-person-root-unavailable", pose);
         return;
+    }
+    if (trackedPropAssist
+        && g_haveRetailRigOrigin
+        && g_retailRigOriginSource == RetailRigOriginSource::TrackedPropAssist
+        && g_retailRigNodes.root
+        && root != g_retailRigNodes.root)
+    {
+        resetRetailRigOrigin("first-person-rig-root-changed");
     }
     if (root != g_retailRigNodes.root || !retailRigNodesComplete(g_retailRigNodes))
     {
@@ -5890,17 +6788,23 @@ void onRetailPostAnimation(void* animData)
     const float bodyWorldScale = readFloat(
         reinterpret_cast<std::uintptr_t>(bodyRoot) + NiAvObjectWorldScaleOffset,
         0.0f);
-    const Vec3 stableCameraWorld {
-        authoritativeOrigin.renderCameraWorldPos[0],
-        authoritativeOrigin.renderCameraWorldPos[1],
-        authoritativeOrigin.renderCameraWorldPos[2]
-    };
+    const Vec3 stableCameraWorld = trackedPropAssist
+        ? readVec3(
+            reinterpret_cast<std::uintptr_t>(root)
+                + NiAvObjectWorldTranslationOffset)
+        : Vec3 {
+            authoritativeOrigin.renderCameraWorldPos[0],
+            authoritativeOrigin.renderCameraWorldPos[1],
+            authoritativeOrigin.renderCameraWorldPos[2]
+        };
     if (!finiteMatrix33(bodyWorldRotation)
         || !finiteVec3(bodyWorldPosition)
         || !finiteVec3(stableCameraWorld)
         || !std::isfinite(bodyWorldScale)
         || std::fabs(bodyWorldScale) < 0.0001f
-        || reinterpret_cast<std::uintptr_t>(bodyRoot) != authoritativeOrigin.bodyRootAddress)
+        || (!trackedPropAssist
+            && reinterpret_cast<std::uintptr_t>(bodyRoot)
+                != authoritativeOrigin.bodyRootAddress))
     {
         static LONG loggedAnchorUnavailable = 0;
         const LONG count = InterlockedIncrement(&loggedAnchorUnavailable);
@@ -5910,21 +6814,25 @@ void onRetailPostAnimation(void* animData)
                 "retailRig skipped count=%ld reason=stable-body-anchor-unavailable bodyRoot=%p renderCamera=0x%08lx renderCameraWorldValid=%lu\n",
                 count,
                 bodyRoot,
-                static_cast<unsigned long>(authoritativeOrigin.renderCameraAddress),
-                static_cast<unsigned long>(authoritativeOrigin.renderCameraWorldValid));
+                trackedPropAssist
+                    ? static_cast<unsigned long>(reinterpret_cast<std::uintptr_t>(root))
+                    : static_cast<unsigned long>(authoritativeOrigin.renderCameraAddress),
+                trackedPropAssist
+                    ? 1ul
+                    : static_cast<unsigned long>(authoritativeOrigin.renderCameraWorldValid));
         }
         return;
     }
 
     if (g_haveRetailRigOrigin && g_retailRigOriginBodyRoot != bodyRoot)
         resetRetailRigOrigin("body-root-changed");
-    if (!g_haveRetailRigOrigin
-        && !captureRetailRigOrigin(
-            pose,
-            authoritativeOrigin,
-            bodyRoot))
+    if (!g_haveRetailRigOrigin)
     {
-        return;
+        const bool originCaptured = trackedPropAssist
+            ? captureTrackedPropAssistRigOrigin(pose, bodyRoot, root)
+            : captureRetailRigOrigin(pose, authoritativeOrigin, bodyRoot);
+        if (!originCaptured)
+            return;
     }
 
     // The hand/controller origin follows only the engine-authored body frame.
@@ -6118,8 +7026,8 @@ void onRetailPostAnimation(void* animData)
                 "{\"event\":\"fnvxrRigIndependence\",\"solve\":%llu,\"poseFrame\":%llu,\"poseSeq\":%ld,"
                 "\"referenceGeneration\":%lu,\"originPoseSeq\":%lu,\"originAuthoritySeq\":%ld,"
                 "\"renderPoseSeq\":%lu,\"gravityAlignedOrigin\":true,\"originUpDotWorldUp\":%.8f,"
-                "\"originSource\":\"d3d9-native-camera\","
-                "\"anchorSource\":\"exact-d3d9-render-camera\","
+                "\"originSource\":\"%s\","
+                "\"anchorSource\":\"%s\","
                 "\"cameraInput\":\"hmd-only\",\"rigInput\":\"controller-only\","
                 "\"apply\":%s,\"rightSolved\":%s,\"weaponAligned\":%s,"
                 "\"weaponWriteRequested\":%s,\"weaponWriteAttempted\":%s,\"weaponWriteApplied\":%s,"
@@ -6155,10 +7063,14 @@ void onRetailPostAnimation(void* animData)
                 static_cast<unsigned long>(g_retailRigReferenceSpaceGeneration),
                 static_cast<unsigned long>(g_retailRigOriginPoseSequence),
                 g_retailRigOriginAuthoritySequence,
-                static_cast<unsigned long>(authoritativeOrigin.renderPoseSequence),
+                trackedPropAssist
+                    ? static_cast<unsigned long>(pose.sequence)
+                    : static_cast<unsigned long>(authoritativeOrigin.renderPoseSequence),
                 1.0f - 2.0f * (
                     g_retailRigOriginHmdRot.x * g_retailRigOriginHmdRot.x
                     + g_retailRigOriginHmdRot.z * g_retailRigOriginHmdRot.z),
+                retailRigOriginSourceName(),
+                retailRigAnchorSourceName(),
                 applyWrites ? "true" : "false",
                 rightSolved ? "true" : "false",
                 weaponAligned ? "true" : "false",
@@ -6325,6 +7237,12 @@ __declspec(naked) void hookedRetailAnimationApply()
 
 bool installRetailRigHook()
 {
+    if (stereoVisualTrialProfileSelected())
+    {
+        logTelemetry(
+            "retailRig hook hard-blocked: stereo visual trial is publication-only in the plugin\n");
+        return false;
+    }
     if (g_retailRigHookInstalled)
         return true;
     const bool requested = envEnabled("FNVXR_RETAIL_RIG_ENABLE", false);
@@ -6333,7 +7251,17 @@ bool installRetailRigHook()
         logTelemetry("retailRig hook install disabled\n");
         return true;
     }
-    if (!retailMutationAllowedForCurrentProcess(requested))
+    const bool trackedPropAssist = trackedPropAssistProfileRequested();
+    if (trackedPropAssist)
+    {
+        if (!trackedPropAssistMutationAllowedAtDecision())
+        {
+            logTelemetry(
+                "retailRig hook hard-blocked: tracked-prop visual-only compatibility/configuration proof incomplete\n");
+            return true;
+        }
+    }
+    else if (!retailMutationAllowedForCurrentProcess(requested))
     {
         logTelemetry("retailRig hook hard-blocked: retail mutation source/evidence proof incomplete\n");
         return true;
@@ -6375,11 +7303,12 @@ bool installRetailRigHook()
     }
     g_retailRigHookInstalled = true;
     logTelemetry(
-        "retailRig hook installed site=%p hook=%p original=%p apply=%d\n",
+        "retailRig hook installed site=%p hook=%p original=%p apply=%d authority=%s projectile=0-for-tracked-prop\n",
         pointerFromAddress32<void*>(PlayerAnimationApplyCallSiteAddress),
         reinterpret_cast<void*>(hookedRetailAnimationApply),
         pointerFromAddress32<void*>(ApplyActorAnimDataAddress),
-        envEnabled("FNVXR_RETAIL_RIG_APPLY", false) ? 1 : 0);
+        envEnabled("FNVXR_RETAIL_RIG_APPLY", false) ? 1 : 0,
+        trackedPropAssist ? "tracked-prop-assist" : "full-retail");
     return true;
 #endif
 }
@@ -6542,6 +7471,311 @@ void* visibleMenuForInput(void** outTileMenu = nullptr, UInt32* outMenuType = nu
     if (outMenuType)
         *outMenuType = 0;
     return nullptr;
+}
+
+// This path is deliberately observational.  It runs only for a visible
+// MessageMenu, copies a small printable snapshot of existing TileValue text,
+// and never invokes a menu handler or writes a tile trait.  In particular, it
+// cannot acknowledge, dismiss, or otherwise progress a load-time popup.
+bool copyPrintableTileValueStringReadOnly(
+    const TileValue* value,
+    char* output,
+    size_t outputCapacity)
+{
+    if (!value || !output || outputCapacity < 2)
+        return false;
+
+    output[0] = '\0';
+    size_t written = 0;
+    __try
+    {
+        char* source = value->str;
+        if (!source)
+            return false;
+        for (size_t index = 0; index + 1 < outputCapacity; ++index)
+        {
+            const unsigned char character =
+                static_cast<unsigned char>(source[index]);
+            if (character == 0)
+                break;
+
+            if (character == '\r' || character == '\n' || character == '\t')
+            {
+                output[written++] = ' ';
+                continue;
+            }
+            if (character < 0x20 || character > 0x7e)
+            {
+                output[0] = '\0';
+                return false;
+            }
+            output[written++] = static_cast<char>(character);
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        output[0] = '\0';
+        return false;
+    }
+
+    while (written != 0 && output[written - 1] == ' ')
+        --written;
+    output[written] = '\0';
+    return written != 0;
+}
+
+struct ReadOnlyMessageMenuTrace
+{
+    UInt32 tileCount = 0;
+    UInt32 textCount = 0;
+    UInt32 faultCount = 0;
+    std::vector<void*> visitedTiles;
+};
+
+void collectReadOnlyMessageMenuText(
+    void* tile,
+    UInt32 depth,
+    ReadOnlyMessageMenuTrace& trace)
+{
+    if (!tile || depth > 20 || trace.tileCount >= 256 || trace.textCount >= 64)
+        return;
+    if (std::find(trace.visitedTiles.begin(), trace.visitedTiles.end(), tile)
+        != trace.visitedTiles.end())
+    {
+        return;
+    }
+
+    trace.visitedTiles.push_back(tile);
+    ++trace.tileCount;
+    __try
+    {
+        auto* values = *reinterpret_cast<TileValue***>(
+            reinterpret_cast<std::uintptr_t>(tile) + 0x14);
+        const UInt32 valueCount = *reinterpret_cast<UInt32*>(
+            reinterpret_cast<std::uintptr_t>(tile) + 0x18);
+        const UInt32 buttonId = getTileButtonId(tile);
+        if (values && valueCount <= 512)
+        {
+            for (UInt32 index = 0; index < valueCount && trace.textCount < 64; ++index)
+            {
+                TileValue* value = values[index];
+                char text[384] {};
+                if (!copyPrintableTileValueStringReadOnly(value, text, sizeof(text)))
+                    continue;
+
+                ++trace.textCount;
+                logTelemetry(
+                    "messageMenu readOnlyText[%lu] depth=%lu tile=%p buttonId=%lu trait=0x%04lx text=\"%s\"\n",
+                    static_cast<unsigned long>(trace.textCount),
+                    static_cast<unsigned long>(depth),
+                    tile,
+                    static_cast<unsigned long>(buttonId),
+                    static_cast<unsigned long>(value->id),
+                    text);
+            }
+        }
+
+        auto* node = reinterpret_cast<TileListNode*>(
+            reinterpret_cast<std::uintptr_t>(tile) + 0x04);
+        for (UInt32 count = 0; node && count < 512 && trace.tileCount < 256; ++count)
+        {
+            auto* childNode = static_cast<TileChildNode*>(node->data);
+            void* child = childNode ? childNode->child : nullptr;
+            if (child)
+                collectReadOnlyMessageMenuText(child, depth + 1, trace);
+            node = node->next;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        ++trace.faultCount;
+    }
+}
+
+void logReadOnlyMessageMenuDiagnostic(UInt64 generation)
+{
+    void* menu = nullptr;
+    void* tileMenu = nullptr;
+    if (!validatedVisibleMenu(kMenuTypeMessage, nullptr, &menu, &tileMenu))
+    {
+        logTelemetry(
+            "messageMenu readOnlyDiagnostic generation=%llu unavailable\n",
+            static_cast<unsigned long long>(generation));
+        return;
+    }
+
+    void* root = tileRootFromMenu(menu, tileMenu);
+    ReadOnlyMessageMenuTrace trace {};
+    logTelemetry(
+        "messageMenu readOnlyDiagnostic generation=%llu menu=%p tileMenu=%p root=%p action=inspect-only\n",
+        static_cast<unsigned long long>(generation),
+        menu,
+        tileMenu,
+        root);
+    collectReadOnlyMessageMenuText(root, 0, trace);
+    logTelemetry(
+        "messageMenu readOnlyDiagnostic complete generation=%llu tiles=%lu readableText=%lu faults=%lu action=none\n",
+        static_cast<unsigned long long>(generation),
+        static_cast<unsigned long>(trace.tileCount),
+        static_cast<unsigned long>(trace.textCount),
+        static_cast<unsigned long>(trace.faultCount));
+}
+
+struct ExactOfficialPackMessageMenuMatch
+{
+    UInt32 observedTitleMask = 0u;
+    UInt32 observedBodyMask = 0u;
+    void* firstButtonOkTile = nullptr;
+    UInt32 firstButtonOkTileCount = 0u;
+    UInt32 tileCount = 0u;
+    UInt32 faultCount = 0u;
+    std::vector<void*> visitedTiles;
+};
+
+void collectExactOfficialPackMessageMenuMatch(
+    void* tile,
+    UInt32 depth,
+    ExactOfficialPackMessageMenuMatch& match)
+{
+    if (!tile || depth > 20u || match.tileCount >= 256u)
+        return;
+    if (std::find(match.visitedTiles.begin(), match.visitedTiles.end(), tile)
+        != match.visitedTiles.end())
+    {
+        return;
+    }
+
+    match.visitedTiles.push_back(tile);
+    ++match.tileCount;
+    __try
+    {
+        auto* values = *reinterpret_cast<TileValue***>(
+            reinterpret_cast<std::uintptr_t>(tile) + 0x14);
+        const UInt32 valueCount = *reinterpret_cast<UInt32*>(
+            reinterpret_cast<std::uintptr_t>(tile) + 0x18);
+        bool exactOkOnVisibleTile = false;
+        if (values && valueCount <= 512u)
+        {
+            for (UInt32 index = 0u; index < valueCount; ++index)
+            {
+                char text[384] {};
+                if (!copyPrintableTileValueStringReadOnly(
+                        values[index], text, sizeof(text)))
+                {
+                    continue;
+                }
+
+                const std::string_view valueText { text };
+                constexpr UInt32 notificationCount = static_cast<UInt32>(
+                    sizeof(fnvxr::engine::stereo_visual_trial_automation::
+                        OfficialPackNotifications)
+                    / sizeof(fnvxr::engine::stereo_visual_trial_automation::
+                        OfficialPackNotifications[0]));
+                static_assert(notificationCount <= 32u,
+                    "official-pack acknowledgement mask no longer fits");
+                for (UInt32 notificationIndex = 0u;
+                     notificationIndex < notificationCount;
+                     ++notificationIndex)
+                {
+                    const auto& notification =
+                        fnvxr::engine::stereo_visual_trial_automation::
+                            OfficialPackNotifications[notificationIndex];
+                    if (valueText == notification.title)
+                        match.observedTitleMask |= 1u << notificationIndex;
+                    if (valueText == notification.body)
+                        match.observedBodyMask |= 1u << notificationIndex;
+                }
+                if (valueText
+                    == fnvxr::engine::stereo_visual_trial_automation::
+                        MessageMenuOkText)
+                {
+                    exactOkOnVisibleTile = true;
+                }
+            }
+        }
+
+        if (exactOkOnVisibleTile
+            && getTileFloatByName(
+                    tile,
+                    "visible",
+                    TileValueVisible,
+                    1.0f) != 0.0f
+            // The MessageMenu contains a duplicate text descendant labeled
+            // OK.  The native actionable tile is uniquely the first button
+            // (button index zero), as observed in the retail trace.
+            && getTileButtonId(tile) == 0u)
+        {
+            ++match.firstButtonOkTileCount;
+            match.firstButtonOkTile = match.firstButtonOkTileCount == 1u
+                ? tile
+                : nullptr;
+        }
+
+        auto* node = reinterpret_cast<TileListNode*>(
+            reinterpret_cast<std::uintptr_t>(tile) + 0x04);
+        for (UInt32 count = 0u;
+             node && count < 512u && match.tileCount < 256u;
+             ++count)
+        {
+            auto* childNode = static_cast<TileChildNode*>(node->data);
+            void* child = childNode ? childNode->child : nullptr;
+            if (child)
+                collectExactOfficialPackMessageMenuMatch(
+                    child, depth + 1u, match);
+            node = node->next;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        ++match.faultCount;
+    }
+}
+
+bool findExactOfficialPackMessageMenuTarget(
+    void** outMenu,
+    void** outOkTile,
+    UInt32* outOfficialPackNotificationMask = nullptr,
+    bool* outExactlyOneFirstButtonOk = nullptr)
+{
+    if (outMenu)
+        *outMenu = nullptr;
+    if (outOkTile)
+        *outOkTile = nullptr;
+    if (outOfficialPackNotificationMask)
+        *outOfficialPackNotificationMask = 0u;
+    if (outExactlyOneFirstButtonOk)
+        *outExactlyOneFirstButtonOk = false;
+
+    void* menu = nullptr;
+    void* tileMenu = nullptr;
+    if (!validatedVisibleMenu(kMenuTypeMessage, nullptr, &menu, &tileMenu))
+        return false;
+
+    ExactOfficialPackMessageMenuMatch match {};
+    collectExactOfficialPackMessageMenuMatch(
+        tileRootFromMenu(menu, tileMenu), 0u, match);
+    const UInt32 officialPackNotificationMask =
+        match.observedTitleMask & match.observedBodyMask;
+    const bool exactlyOneOfficialPackNotification =
+        officialPackNotificationMask != 0u
+        && (officialPackNotificationMask
+            & (officialPackNotificationMask - 1u)) == 0u;
+    const bool exactlyOneFirstButtonOk = match.firstButtonOkTileCount == 1u
+        && match.firstButtonOkTile != nullptr;
+    if (outOfficialPackNotificationMask)
+        *outOfficialPackNotificationMask = officialPackNotificationMask;
+    if (outExactlyOneFirstButtonOk)
+        *outExactlyOneFirstButtonOk = exactlyOneFirstButtonOk;
+    const bool exact = exactlyOneOfficialPackNotification
+        && exactlyOneFirstButtonOk;
+    if (!exact)
+        return false;
+
+    if (outMenu)
+        *outMenu = menu;
+    if (outOkTile)
+        *outOkTile = match.firstButtonOkTile;
+    return true;
 }
 
 void collectMenuButtons(
@@ -8319,8 +9553,21 @@ void recoverFocusLossPause(UInt64 frame, UInt32 menuBits, RuntimePhase phase)
     static UInt32 previousMenuBits = fnvxr::shared::RuntimeBlockingMenuBits;
     static bool focusLossArmed = false;
     static UInt64 lastCloseAttemptFrame = 0;
+    static UInt32 ownedFixtureCloseAttempts = 0u;
 
-    if (!retailSidecarProfile() || !envEnabled("FNVXR_CLOSE_FOCUS_LOSS_PAUSE", true))
+    // The general visual trial is publication-only. The one exception is an
+    // already-completed, owned headset-demo fixture: retail itself creates a
+    // StartMenu pause as soon as its hidden process loses foreground after a
+    // verified load. This path never repairs focus or sends input; it can
+    // issue one fixed in-engine CloseAllMenus command only after the exact
+    // gameplay-to-StartMenu transition has been observed.
+    const bool ownedHeadsetFixtureRecovery =
+        headsetDemoFixtureProfileSelected()
+        && retailFixtureAutomationRequested()
+        && g_headsetDemoFixtureReady;
+    if ((stereoVisualTrialProfileSelected() && !ownedHeadsetFixtureRecovery)
+        || (!retailSidecarProfile() && !ownedHeadsetFixtureRecovery)
+        || !envEnabled("FNVXR_CLOSE_FOCUS_LOSS_PAUSE", true))
         return;
 
     const bool foreground = currentProcessHasForegroundWindow();
@@ -8338,36 +9585,47 @@ void recoverFocusLossPause(UInt64 frame, UInt32 menuBits, RuntimePhase phase)
     const bool cleanPreviousGameplay =
         previousPhase == RuntimePhase::Gameplay
         && (previousMenuBits & fnvxr::shared::RuntimeBlockingMenuBits) == 0u;
-    if (previousInteractive && !interactive && cleanPreviousGameplay)
-    {
-        focusLossArmed = true;
-        lastCloseAttemptFrame = 0;
-        logTelemetry(
-            "focusLossPause armed frame=%llu previousBits=0x%02lx\n",
-            static_cast<unsigned long long>(frame),
-            static_cast<unsigned long>(previousMenuBits));
-    }
-
     constexpr UInt32 nonStartBlockingBits =
         fnvxr::shared::RuntimeBlockingMenuBits
         & ~fnvxr::shared::RuntimeStartMenuBit;
     const bool focusPauseVisible =
         (menuBits & fnvxr::shared::RuntimeStartMenuBit) != 0u
         && (menuBits & nonStartBlockingBits) == 0u;
+    const bool observedForegroundLoss =
+        previousInteractive && !interactive && cleanPreviousGameplay;
+    const bool observedOwnedFixturePause =
+        ownedHeadsetFixtureRecovery
+        && cleanPreviousGameplay
+        && focusPauseVisible;
+    if (observedForegroundLoss || observedOwnedFixturePause)
+    {
+        focusLossArmed = true;
+        lastCloseAttemptFrame = 0;
+        logTelemetry(
+            "focusLossPause armed frame=%llu previousBits=0x%02lx ownedFixture=%d\n",
+            static_cast<unsigned long long>(frame),
+            static_cast<unsigned long>(previousMenuBits),
+            static_cast<int>(ownedHeadsetFixtureRecovery));
+    }
+
     if (focusLossArmed
         && focusPauseVisible
+        && (!ownedHeadsetFixtureRecovery || ownedFixtureCloseAttempts == 0u)
         && (lastCloseAttemptFrame == 0 || frame >= lastCloseAttemptFrame + 30))
     {
         lastCloseAttemptFrame = frame;
+        if (ownedHeadsetFixtureRecovery)
+            ++ownedFixtureCloseAttempts;
         const bool closed = runPluginConsoleCommand(
             "fnvxrFocusLossPauseRecovery",
             "CloseAllMenus");
         logTelemetry(
-            "focusLossPause close frame=%llu bits=0x%02lx foreground=%d active=%d ok=%d\n",
+            "focusLossPause close frame=%llu bits=0x%02lx foreground=%d active=%d ownedFixture=%d ok=%d\n",
             static_cast<unsigned long long>(frame),
             static_cast<unsigned long>(menuBits),
             static_cast<int>(foreground),
             static_cast<int>(active),
+            static_cast<int>(ownedHeadsetFixtureRecovery),
             static_cast<int>(closed));
         if (closed)
             focusLossArmed = false;
@@ -8614,6 +9872,104 @@ void consumeSharedCommand(UInt64 frame)
         ok ? "true" : "false",
         static_cast<unsigned long>(ok ? 0u : 2u),
         built ? command : "",
+        static_cast<unsigned long long>(frame));
+}
+
+bool desktopAssistRecoveryLoadCommandIsExact(const SharedCommandState& request)
+{
+    return request.command == fnvxr::shared::CommandTypeConsole
+        // The mailbox is cross-process storage.  Bound this comparison by its
+        // fixed field size so a malformed, unterminated request cannot make
+        // the in-game consumer read beyond the snapshot while deciding
+        // whether it is the sole permitted automation action.
+        && std::strncmp(
+            request.saveName,
+            DesktopAssistRecoveryLoadCommand,
+            sizeof(request.saveName)) == 0;
+}
+
+void consumeDesktopAssistRecoveryLoad(
+    UInt64 frame,
+    RuntimePhase phase,
+    UInt32 menuBits,
+    bool uiInputAllowed)
+{
+    if (!desktopAssistAutomationRequested())
+        return;
+
+    // One game process gets one recovery-load attempt.  A later mailbox
+    // request, even if it repeats the exact text, cannot reload the save or
+    // become a general desktop-assist command channel.
+    static bool recoveryLoadAlreadySubmitted = false;
+
+    SharedCommandState request {};
+    if (!readSharedCommandSnapshot(request))
+        return;
+    if (request.requestId == 0 || request.requestId == g_lastCommandRequestId)
+        return;
+    if (request.status != fnvxr::shared::CommandStatusPending)
+    {
+        logTelemetry(
+            "{\"event\":\"fnvxrDesktopAssistAutomationSkip\",\"requestId\":%lu,\"status\":\"%s\",\"frame\":%llu}\n",
+            static_cast<unsigned long>(request.requestId),
+            sharedCommandStatusName(request.status),
+            static_cast<unsigned long long>(frame));
+        g_lastCommandRequestId = request.requestId;
+        return;
+    }
+
+    const bool exactRecoveryLoad = desktopAssistRecoveryLoadCommandIsExact(request);
+    const bool startMenu = phase == RuntimePhase::Menu
+        && (menuBits & fnvxr::shared::RuntimeStartMenuBit) != 0u
+        && uiInputAllowed;
+    const bool authorized = exactRecoveryLoad
+        && startMenu
+        && !recoveryLoadAlreadySubmitted
+        && fnvxr::engine::desktopAssistAutomationAuthorized(
+            desktopAssistCameraRequest(),
+            desktopAssistAutomationRequested(),
+            fnvxr::engine::DesktopAssistAutomationAction::LoadFixedRecoverySave);
+    logTelemetry(
+        "{\"event\":\"fnvxrDesktopAssistAutomationRequest\",\"requestId\":%lu,\"exactRecoveryLoad\":%s,\"startMenu\":%s,\"authorized\":%s,\"frame\":%llu}\n",
+        static_cast<unsigned long>(request.requestId),
+        exactRecoveryLoad ? "true" : "false",
+        startMenu ? "true" : "false",
+        authorized ? "true" : "false",
+        static_cast<unsigned long long>(frame));
+    if (!publishSharedCommandStatus(
+            request.requestId,
+            fnvxr::shared::CommandStatusRunning,
+            frame,
+            authorized ? 0u : ERROR_ACCESS_DENIED,
+            authorized ? DesktopAssistRecoveryLoadCommand : ""))
+    {
+        logTelemetry(
+            "desktopAssist recovery load lost ownership before running request=%lu\n",
+            static_cast<unsigned long>(request.requestId));
+        return;
+    }
+
+    const bool ok = authorized && runPluginConsoleCommand(
+        "fnvxrDesktopAssistRecoveryLoad",
+        DesktopAssistRecoveryLoadCommand);
+    if (authorized)
+        recoveryLoadAlreadySubmitted = true;
+    g_lastCommandRequestId = request.requestId;
+    const bool completionPublished = publishSharedCommandStatus(
+        request.requestId,
+        ok ? fnvxr::shared::CommandStatusSucceeded : fnvxr::shared::CommandStatusFailed,
+        frame,
+        ok ? 0u : ERROR_ACCESS_DENIED,
+        authorized ? DesktopAssistRecoveryLoadCommand : "");
+    if (!completionPublished)
+        logTelemetry(
+            "desktopAssist recovery load completion ownership lost request=%lu\n",
+            static_cast<unsigned long>(request.requestId));
+    logTelemetry(
+        "{\"event\":\"fnvxrDesktopAssistAutomationComplete\",\"requestId\":%lu,\"ok\":%s,\"resultCode\":%lu,\"frame\":%llu}\n",
+        static_cast<unsigned long>(request.requestId),
+        ok ? "true" : "false",
+        static_cast<unsigned long>(ok ? 0u : ERROR_ACCESS_DENIED),
         static_cast<unsigned long long>(frame));
 }
 
@@ -9930,14 +11286,20 @@ struct RuntimeObservation
     UInt32 menuBits = 0u;
     RuntimePhase phase = RuntimePhase::Unknown;
     bool uiInputAllowed = false;
+    bool cameraActive = false;
 };
 
 bool ensureAuthorizedRuntimeObservationStarted()
 {
+    const bool fixedCommandAutomationRequested =
+        desktopAssistAutomationRequested()
+        || stereoVisualTrialAutomationRequested()
+        || retailFixtureAutomationRequested();
     if (g_authorizedRuntimeObservationStarted)
     {
         return gamePluginProducerLeaseHeldByCurrentThread()
-            && g_runtimeState;
+            && g_runtimeState
+            && (!fixedCommandAutomationRequested || g_commandState);
     }
 
     ++g_retailObservationAuthorityAttempts;
@@ -9949,7 +11311,7 @@ bool ensureAuthorizedRuntimeObservationStarted()
             || (g_retailObservationAuthorityAttempts % 300u) == 0u)
         {
             logTelemetry(
-                "runtime observation authority deferred attempt=%lu failure=%u compatible=%d evidence=%d%d%d%d%d%d%d%d%d%d; no game state read performed\n",
+                "runtime observation authority deferred attempt=%lu failure=%u compatible=%d evidence=%d%d%d%d%d%d%d%d%d%d%d; no game state read performed\n",
                 static_cast<unsigned long>(
                     g_retailObservationAuthorityAttempts),
                 static_cast<unsigned>(proof.failure),
@@ -9957,6 +11319,7 @@ bool ensureAuthorizedRuntimeObservationStarted()
                 static_cast<int>(proof.evidence.retailExecutableIdentityMatched),
                 static_cast<int>(proof.evidence.moduleSnapshotStable),
                 static_cast<int>(proof.evidence.jip5730ExactOrAbsent),
+                static_cast<int>(proof.evidence.johnnyGuitar528ExactOrAbsent),
                 static_cast<int>(proof.evidence.showOff184ExactOrAbsent),
                 static_cast<int>(proof.evidence.renderFirstPersonStockOrJipNormalized),
                 static_cast<int>(proof.evidence.protectedCoreBodiesMatched),
@@ -9970,7 +11333,16 @@ bool ensureAuthorizedRuntimeObservationStarted()
     if (!acquireGamePluginProducerLease())
         return false;
     initSharedRuntime();
+    // Mapping this mailbox is not general command authority.  Its only
+    // consumers are the separately opted-in, fixed-command automation gates.
+    // The publication-only visual-trial consumer is reached later with the
+    // just-published runtime observation and never starts the full bridge.
+    if (fixedCommandAutomationRequested)
+        initSharedCommand();
     g_authorizedRuntimeObservationStarted = g_runtimeState != nullptr;
+    if (fixedCommandAutomationRequested)
+        g_authorizedRuntimeObservationStarted = g_authorizedRuntimeObservationStarted
+            && g_commandState != nullptr;
     if (g_authorizedRuntimeObservationStarted)
     {
         logTelemetry(
@@ -9988,11 +11360,31 @@ RuntimeObservation observeAndPublishRuntime()
     observation.phase = runtimePhaseFromMenuBits(observation.menuBits);
     observation.uiInputAllowed =
         uiInputAllowedFromMenuBits(observation.menuBits);
+    const bool visualTrialPublicationOnly =
+        stereoVisualTrialMainLoopDisposition()
+        == fnvxr::engine::RetailPluginMainLoopDisposition::
+            PublishRuntimeOnly;
+    // The owned fixture has the same read-only runtime-publication boundary as
+    // the visual trial, but is independently enabled and never starts a
+    // bridge. Its lifecycle needs a real current camera observation to prove
+    // it reached a scene before mutating its owned save.
+    const bool readOnlyCameraPublicationAuthorized =
+        visualTrialPublicationOnly || retailFixtureAutomationRequested();
+    const bool currentCameraObjectObserved =
+        readOnlyCameraPublicationAuthorized
+        && cameraAllowedForMenuBits(observation.menuBits)
+        && activeGameCameraObject() != nullptr;
+    observation.cameraActive =
+        fnvxr::engine::retailRuntimeCameraActive(
+            g_cameraState && g_cameraState->active != 0u,
+            readOnlyCameraPublicationAuthorized,
+            currentCameraObjectObserved);
     publishRuntimeState(
         observation.frame,
         observation.menuBits,
         observation.phase,
-        observation.uiInputAllowed);
+        observation.uiInputAllowed,
+        observation.cameraActive);
 
     static UInt32 previousMenuBits = 0xffffffffu;
     if (observation.menuBits != previousMenuBits
@@ -10001,17 +11393,1204 @@ RuntimeObservation observeAndPublishRuntime()
     {
         previousMenuBits = observation.menuBits;
         logTelemetry(
-            "runtime observation frame=%llu bits=0x%02X phase=%lu ui=%d source=compatibility-authorized-mainloop\n",
+            "runtime observation frame=%llu bits=0x%02X phase=%lu ui=%d camera=%d source=compatibility-authorized-mainloop\n",
             static_cast<unsigned long long>(observation.frame),
             observation.menuBits,
             static_cast<unsigned long>(observation.phase),
-            static_cast<int>(observation.uiInputAllowed));
+            static_cast<int>(observation.uiInputAllowed),
+            static_cast<int>(observation.cameraActive));
     }
     return observation;
 }
 
+bool stereoVisualTrialRecoveryLoadCommandIsExact(
+    const SharedCommandState& request,
+    const fnvxr::engine::stereo_visual_trial_automation::
+        ApprovedRetailSave& selectedRetailSave)
+{
+    namespace automation =
+        fnvxr::engine::stereo_visual_trial_automation;
+    static_assert(
+        automation::FreshCharacterLoadCommand.size() + 1u
+            <= sizeof(request.saveName),
+        "verified Goodsprings visual-trial load command no longer fits the mailbox");
+    const std::string_view fixedCommand = selectedRetailSave.loadCommand;
+    return request.command == fnvxr::shared::CommandTypeConsole
+        && std::memcmp(
+            request.saveName,
+            fixedCommand.data(),
+            fixedCommand.size()) == 0
+        && request.saveName[fixedCommand.size()] == '\0';
+}
+
+bool stereoVisualTrialFreshCharacterCommandIsExact(
+    const SharedCommandState& request)
+{
+    namespace automation =
+        fnvxr::engine::stereo_visual_trial_automation;
+    static_assert(
+        automation::FreshCharacterStartCommand.size() + 1u
+            <= sizeof(request.saveName),
+        "fresh-character visual-trial COC command no longer fits the mailbox");
+    return request.command == fnvxr::shared::CommandTypeConsole
+        && std::memcmp(
+            request.saveName,
+            automation::FreshCharacterStartCommand.data(),
+            automation::FreshCharacterStartCommand.size()) == 0
+        && request.saveName[
+            automation::FreshCharacterStartCommand.size()] == '\0';
+}
+
+bool realStereoVisualTrialStartMenuState(
+    const RuntimeObservation& observation)
+{
+    return observation.frame != 0u
+        && observation.phase == RuntimePhase::Menu
+        && observation.uiInputAllowed
+        && !g_showroomActive
+        && (observation.menuBits
+                & fnvxr::shared::RuntimeBlockingMenuBits)
+            == fnvxr::shared::RuntimeStartMenuBit;
+}
+
+bool realStereoVisualTrialFreshGameplayState(
+    const RuntimeObservation& observation)
+{
+    // Retail can retain MenuMode alone for a frame after a load. It is not an
+    // actionable or blocking menu (and uiInputAllowed remains false), so it
+    // must not invalidate an otherwise verified gameplay camera observation.
+    return observation.frame != 0u
+        && observation.phase == RuntimePhase::Gameplay
+        && !observation.uiInputAllowed
+        && observation.cameraActive
+        && !g_showroomActive
+        && (observation.menuBits
+                & fnvxr::shared::RuntimeBlockingMenuBits)
+            == 0u;
+}
+
+// The fixture uses the same concrete proof as the isolated runtime
+// publication path: no UI, gameplay phase, and a currently observed retail
+// camera. It does not activate or steer that camera.
+bool realRetailFixtureFreshGameplayState(
+    const RuntimeObservation& observation)
+{
+    return observation.frame != 0u
+        && observation.phase == RuntimePhase::Gameplay
+        && !observation.uiInputAllowed
+        && observation.cameraActive
+        && !g_showroomActive
+        && (observation.menuBits
+                & fnvxr::shared::RuntimeBlockingMenuBits)
+            == 0u;
+}
+
+// The retail GUI normally assigns these two fields before dispatching a menu
+// click. In the headless visual-trial run there is deliberately no desktop
+// cursor, keyboard, controller, or simulator input to make that assignment.
+// Arm only the exact, already-verified first button of one official DLC notice
+// so the stock MessageMenu handler receives the same in-game selection state.
+bool armExactOfficialPackMessageMenuSelection(void* menu, void* okTile)
+{
+    if (!menu || !okTile)
+        return false;
+
+    void* interfaceManager = readPointer(InterfaceManagerAddress);
+    if (!interfaceManager)
+        return false;
+
+    bool armed = false;
+    __try
+    {
+        auto** activeTile = reinterpret_cast<void**>(
+            reinterpret_cast<std::uintptr_t>(interfaceManager)
+            + InterfaceManagerActiveTileOffset);
+        auto** activeMenu = reinterpret_cast<void**>(
+            reinterpret_cast<std::uintptr_t>(interfaceManager)
+            + InterfaceManagerActiveMenuOffset);
+        if (!activeTile || !activeMenu)
+            return false;
+
+        // Do not synthesize a device event. These are the stock in-game
+        // selection fields that identify the exact native tile and its menu.
+        *activeTile = okTile;
+        *activeMenu = menu;
+        armed = true;
+        logTelemetry(
+            "fnvxrStereoVisualTrialOfficialPackNativeSelection menu=%p tile=%p\n",
+            menu,
+            okTile);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        armed = false;
+    }
+    return armed;
+}
+
+void acknowledgeExactOfficialPackMessageMenu(
+    const RuntimeObservation& observation)
+{
+    namespace automation = fnvxr::engine::stereo_visual_trial_automation;
+    static UInt32 acknowledgedOfficialPackNotificationMask = 0u;
+    const bool explicitlyOptedIn =
+        exactOfficialPackAcknowledgementRequested();
+    if (!explicitlyOptedIn)
+        return;
+
+    void* menu = nullptr;
+    void* okTile = nullptr;
+    UInt32 officialPackNotificationMask = 0u;
+    bool exactlyOneFirstButtonOk = false;
+    const bool expectedMessageMenuState = observation.frame != 0u
+        && observation.phase == RuntimePhase::Menu
+        && observation.uiInputAllowed
+        && !g_showroomActive
+        && (observation.menuBits
+                & fnvxr::shared::RuntimeGenericMenuBit) != 0u;
+    if (expectedMessageMenuState)
+    {
+        findExactOfficialPackMessageMenuTarget(
+            &menu,
+            &okTile,
+            &officialPackNotificationMask,
+            &exactlyOneFirstButtonOk);
+    }
+    const bool visibleMessageMenu = expectedMessageMenuState && menu != nullptr;
+    const bool alreadyAttempted = officialPackNotificationMask != 0u
+        && (acknowledgedOfficialPackNotificationMask
+            & officialPackNotificationMask) != 0u;
+    const bool authorized = automation::exactOfficialPackAcknowledgementAuthorized(
+        explicitlyOptedIn,
+        visibleMessageMenu,
+        officialPackNotificationMask != 0u,
+        exactlyOneFirstButtonOk,
+        alreadyAttempted);
+    if (!authorized)
+        return;
+
+    // Mark before the native game call: a bad or changed retail vtable must
+    // fail closed rather than repeatedly attempting a menu action.
+    acknowledgedOfficialPackNotificationMask |= officialPackNotificationMask;
+    bool invoked = false;
+    bool nativeSelectionArmed = false;
+    __try
+    {
+        void** vtable = menu ? *reinterpret_cast<void***>(menu) : nullptr;
+        if (vtable && vtable[3] && vtable[4] && okTile)
+        {
+            // This exactly mirrors the game-native tile preparation used by
+            // its regular menu click path, but only after the exact prompt
+            // and unique first-button OK tile have been proven above.  It is
+            // not a desktop, keyboard, mouse, controller, or simulator event.
+            setTileFloatByName(
+                okTile, "mouseover", TileValueMouseover, 1.0f);
+            setTileFloatByName(okTile, "clicked", TileValueClicked, 1.0f);
+
+            nativeSelectionArmed = armExactOfficialPackMessageMenuSelection(
+                menu,
+                okTile);
+            if (nativeSelectionArmed)
+            {
+                // Invoke the same native mouseover-then-click dispatch slots
+                // used by a normal GUI click, but only for the one verified
+                // first-button tile. This is an in-game method call, not a
+                // desktop key press, SendInput, controller event, or simulator
+                // event.
+                using HandleMouseoverFn = void (__thiscall*)(void*, UInt32, void*);
+                reinterpret_cast<HandleMouseoverFn>(vtable[4])(
+                    menu,
+                    0u,
+                    okTile);
+                using HandleClickFn = void (__thiscall*)(void*, UInt32, void*);
+                reinterpret_cast<HandleClickFn>(vtable[3])(
+                    menu,
+                    0u,
+                    okTile);
+                logTelemetry(
+                    "fnvxrStereoVisualTrialOfficialPackNativeMouseoverAndClick menu=%p buttonId=0 tile=%p\n",
+                    menu,
+                    okTile);
+                invoked = true;
+            }
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        invoked = false;
+    }
+    logTelemetry(
+        "{\"event\":\"fnvxrStereoVisualTrialOfficialPackAcknowledgement\",\"attempted\":true,\"officialPackMask\":%lu,\"exactFirstButtonOk\":true,\"nativeTileArmed\":%s,\"buttonIndex\":0,\"invoked\":%s,\"frame\":%llu}\n",
+        static_cast<unsigned long>(officialPackNotificationMask),
+        nativeSelectionArmed ? "true" : "false",
+        invoked ? "true" : "false",
+        static_cast<unsigned long long>(observation.frame));
+}
+
+void completeStereoVisualTrialFreshCharacterRequest(
+    UInt32 requestId,
+    UInt64 frame,
+    bool ok,
+    const char* command,
+    const char* stage)
+{
+    g_lastCommandRequestId = requestId;
+    const bool completionPublished = publishSharedCommandStatus(
+        requestId,
+        ok
+            ? fnvxr::shared::CommandStatusSucceeded
+            : fnvxr::shared::CommandStatusFailed,
+        frame,
+        ok ? 0u : ERROR_ACCESS_DENIED,
+        command);
+    if (!completionPublished)
+    {
+        logTelemetry(
+            "stereo visual-trial fresh-character completion ownership lost request=%lu stage=%s\n",
+            static_cast<unsigned long>(requestId),
+            stage ? stage : "unknown");
+    }
+    logTelemetry(
+        "{\"event\":\"fnvxrStereoVisualTrialFreshCharacterComplete\",\"requestId\":%lu,\"stage\":\"%s\",\"ok\":%s,\"resultCode\":%lu,\"frame\":%llu}\n",
+        static_cast<unsigned long>(requestId),
+        stage ? stage : "unknown",
+        ok ? "true" : "false",
+        static_cast<unsigned long>(ok ? 0u : ERROR_ACCESS_DENIED),
+        static_cast<unsigned long long>(frame));
+}
+
+// The stock MessageMenu handler is invoked above for the exact prompt, but
+// some retail pack notifications retain their tile even after that handler
+// returns. The fixture owns a second, stricter fallback: re-prove the exact
+// notice and submit only FNV's fixed stock menu-close console command. No menu
+// traversal or device event is involved, and no launcher supplied text reaches
+// the console.
+void closeExactRetailFixtureOfficialPackMessageMenu(
+    const RuntimeObservation& observation)
+{
+    namespace automation = fnvxr::engine::stereo_visual_trial_automation;
+    namespace fixture = fnvxr::engine::retail_fixture_automation;
+    static UInt32 closeAttemptCount = 0u;
+    static UInt32 visibleOfficialPackNotificationMask = 0u;
+    static bool exactOfficialPackVisibleLastFrame = false;
+    const bool explicitlyOptedIn =
+        retailFixtureOfficialPackAcknowledgementRequested();
+    if (!explicitlyOptedIn)
+        return;
+
+    void* menu = nullptr;
+    void* okTile = nullptr;
+    UInt32 officialPackNotificationMask = 0u;
+    bool exactlyOneFirstButtonOk = false;
+    const bool expectedMessageMenuState = observation.frame != 0u
+        && observation.phase == RuntimePhase::Menu
+        && observation.uiInputAllowed
+        && !g_showroomActive
+        && (observation.menuBits
+                & fnvxr::shared::RuntimeGenericMenuBit) != 0u;
+    if (expectedMessageMenuState)
+    {
+        findExactOfficialPackMessageMenuTarget(
+            &menu,
+            &okTile,
+            &officialPackNotificationMask,
+            &exactlyOneFirstButtonOk);
+    }
+    const bool visibleMessageMenu = expectedMessageMenuState && menu != nullptr;
+    const bool exactVisible = visibleMessageMenu
+        && officialPackNotificationMask != 0u
+        && exactlyOneFirstButtonOk;
+    if (!exactVisible)
+    {
+        exactOfficialPackVisibleLastFrame = false;
+        visibleOfficialPackNotificationMask = 0u;
+        return;
+    }
+
+    // The retail message queue can show the same exact stock pack notice more
+    // than once after a successful close. Permit one fixed command per new
+    // visible episode, while keeping a hard process-local cap so a changed
+    // retail UI cannot turn this into general menu authority.
+    const bool newVisibleEpisode = !exactOfficialPackVisibleLastFrame
+        || visibleOfficialPackNotificationMask != officialPackNotificationMask;
+    exactOfficialPackVisibleLastFrame = true;
+    visibleOfficialPackNotificationMask = officialPackNotificationMask;
+    const bool alreadyAttempted = !newVisibleEpisode
+        || closeAttemptCount
+            >= fixture::MaxExactOfficialPackCloseAttemptsPerRun;
+    const bool authorized = fixture::exactOfficialPackCloseAuthorized(
+        explicitlyOptedIn,
+        visibleMessageMenu,
+        officialPackNotificationMask != 0u,
+        exactlyOneFirstButtonOk,
+        alreadyAttempted);
+    if (!authorized)
+        return;
+
+    ++closeAttemptCount;
+    const bool submitted = runPluginConsoleCommand(
+        "fnvxrRetailFixtureOfficialPackClose",
+        fixture::CloseExactOfficialPackMessageCommand.data());
+    logTelemetry(
+        "{\"event\":\"fnvxrRetailFixtureOfficialPackClose\",\"submitted\":%s,\"officialPackMask\":%lu,\"exactFirstButtonOk\":true,\"attempt\":%lu,\"frame\":%llu}\n",
+        submitted ? "true" : "false",
+        static_cast<unsigned long>(officialPackNotificationMask),
+        static_cast<unsigned long>(closeAttemptCount),
+        static_cast<unsigned long long>(observation.frame));
+}
+
+enum class RetailFixtureAutomationStage : UInt8
+{
+    AwaitingStartMenu = 0u,
+    AwaitingLoadGameplay,
+    AwaitingGameplayName,
+    AwaitingFirstTrait,
+    AwaitingSecondTrait,
+    AwaitingSave,
+    Complete,
+};
+
+bool buildRetailFixtureNamedCommand(
+    std::string_view prefix,
+    const fnvxr::engine::retail_fixture_automation::Plan& plan,
+    char* output,
+    std::size_t outputSize)
+{
+    namespace fixture = fnvxr::engine::retail_fixture_automation;
+    if (!output || outputSize == 0u || !fixture::authorized(plan)
+        || prefix.size() + plan.saveName.size() + 1u > outputSize)
+    {
+        return false;
+    }
+    std::memcpy(output, prefix.data(), prefix.size());
+    std::memcpy(output + prefix.size(), plan.saveName.data(), plan.saveName.size());
+    output[prefix.size() + plan.saveName.size()] = '\0';
+    return true;
+}
+
+bool copyRetailFixtureStaticCommand(
+    std::string_view command,
+    char* output,
+    std::size_t outputSize)
+{
+    if (!output || outputSize == 0u || command.size() + 1u > outputSize)
+        return false;
+    std::memcpy(output, command.data(), command.size());
+    output[command.size()] = '\0';
+    return true;
+}
+
+bool retailFixtureCommandIsExact(
+    const SharedCommandState& request,
+    const char* expected)
+{
+    if (!expected || request.command != fnvxr::shared::CommandTypeConsole)
+        return false;
+    const std::size_t expectedSize = std::strlen(expected);
+    return expectedSize + 1u <= sizeof(request.saveName)
+        && std::memcmp(request.saveName, expected, expectedSize) == 0
+        && request.saveName[expectedSize] == '\0';
+}
+
+bool completeRetailFixtureAutomationRequest(
+    UInt32 requestId,
+    UInt64 frame,
+    bool ok,
+    const char* command,
+    const char* stage)
+{
+    const bool completionPublished = publishSharedCommandStatus(
+        requestId,
+        ok
+            ? fnvxr::shared::CommandStatusSucceeded
+            : fnvxr::shared::CommandStatusFailed,
+        frame,
+        ok ? 0u : ERROR_ACCESS_DENIED,
+        command);
+    if (completionPublished)
+        g_lastCommandRequestId = requestId;
+    if (!completionPublished)
+    {
+        logTelemetry(
+            "retail fixture completion ownership lost request=%lu stage=%s\n",
+            static_cast<unsigned long>(requestId),
+            stage ? stage : "unknown");
+    }
+    logTelemetry(
+        "{\"event\":\"fnvxrRetailFixtureComplete\",\"requestId\":%lu,\"stage\":\"%s\",\"ok\":%s,\"published\":%s,\"resultCode\":%lu,\"frame\":%llu}\n",
+        static_cast<unsigned long>(requestId),
+        stage ? stage : "unknown",
+        ok ? "true" : "false",
+        completionPublished ? "true" : "false",
+        static_cast<unsigned long>(ok ? 0u : ERROR_ACCESS_DENIED),
+        static_cast<unsigned long long>(frame));
+    return completionPublished;
+}
+
+void processRetailFixtureAutomation(const RuntimeObservation& observation)
+{
+    namespace fixture = fnvxr::engine::retail_fixture_automation;
+    if (!retailFixtureAutomationRequested())
+        return;
+
+    // Retail can present a known official pre-order-pack inventory notice
+    // after COC even when the temporary profile contains only FalloutNV.esm.
+    // This invokes the separately gated exact native click-handler path and,
+    // only if the stock modal remains, one exact stock-console fallback. It
+    // never emits desktop, controller, keyboard, mouse, or simulator input.
+    // Retail can enqueue a duplicate known official-pack notice after the
+    // owned fixture has reached gameplay. Keep this exact matcher alive for
+    // the bounded demo so that one of those modals cannot cover the Pip-Boy.
+    // Neither helper accepts arbitrary UI: each revalidates the known title,
+    // body, unique first-button OK tile, and per-pack/attempt limits.
+    acknowledgeExactOfficialPackMessageMenu(observation);
+    closeExactRetailFixtureOfficialPackMessageMenu(observation);
+
+    // This owned fixture path intentionally contains no menu traversal or
+    // device input. It accepts a single start-menu command, then uses only the
+    // static Goodsprings/name/trait commands and a validated owned fixture
+    // save name. A player's historical saves cannot pass the gate.
+    static RetailFixtureAutomationStage stage =
+        RetailFixtureAutomationStage::AwaitingStartMenu;
+    static RetailFixtureAutomationPlan fixturePlan {};
+    static UInt32 requestId = 0u;
+    static UInt64 lastMutationFrame = 0u;
+    // A load is only acknowledged from a later main-loop observation, after
+    // the native console call has unwound. That observation already proves a
+    // real, menu-free gameplay camera, so additional frame delay is neither a
+    // safety condition nor a useful popup-handling window.
+    constexpr UInt64 FixtureLoadGameplaySettlingFrames = 1u;
+    constexpr UInt64 FixtureMutationSettlingFrames = 20u;
+    // Exact official-pack handling runs before this state-machine's terminal
+    // check, so it remains live after a fixture request has completed. Do not
+    // keep the command pending just to extend that independently bounded
+    // handler: acknowledge once a later gameplay observation proves that the
+    // owned load has settled.
+
+    if (stage == RetailFixtureAutomationStage::Complete)
+        return;
+
+    if (stage == RetailFixtureAutomationStage::AwaitingStartMenu)
+    {
+        SharedCommandState request {};
+        if (!readSharedCommandSnapshot(request))
+            return;
+        if (request.requestId == 0u || request.requestId == g_lastCommandRequestId)
+            return;
+        if (request.status != fnvxr::shared::CommandStatusPending)
+        {
+            g_lastCommandRequestId = request.requestId;
+            logTelemetry(
+                "{\"event\":\"fnvxrRetailFixtureSkip\",\"requestId\":%lu,\"status\":\"%s\",\"frame\":%llu}\n",
+                static_cast<unsigned long>(request.requestId),
+                sharedCommandStatusName(request.status),
+                static_cast<unsigned long long>(observation.frame));
+            return;
+        }
+
+        const bool planValid = readRetailFixtureAutomationPlan(fixturePlan);
+        char expectedCommand[64] {};
+        bool commandBuilt = false;
+        if (planValid)
+        {
+            commandBuilt = fixturePlan.plan.action == fixture::Action::Create
+                ? copyRetailFixtureStaticCommand(
+                    fixture::CreateStartCommand,
+                    expectedCommand,
+                    sizeof(expectedCommand))
+                : buildRetailFixtureNamedCommand(
+                    fixture::LoadCommandPrefix,
+                    fixturePlan.plan,
+                    expectedCommand,
+                    sizeof(expectedCommand));
+        }
+        const bool startMenu = realStereoVisualTrialStartMenuState(observation);
+        const bool exactCommand = commandBuilt
+            && retailFixtureCommandIsExact(request, expectedCommand);
+        const bool authorized = planValid && startMenu && exactCommand;
+        logTelemetry(
+            "{\"event\":\"fnvxrRetailFixtureStartRequest\",\"requestId\":%lu,\"planValid\":%s,\"startMenu\":%s,\"exactCommand\":%s,\"authorized\":%s,\"action\":\"%s\",\"saveName\":\"%s\",\"frame\":%llu}\n",
+            static_cast<unsigned long>(request.requestId),
+            planValid ? "true" : "false",
+            startMenu ? "true" : "false",
+            exactCommand ? "true" : "false",
+            authorized ? "true" : "false",
+            planValid && fixturePlan.plan.action == fixture::Action::Create
+                ? "create"
+                : (planValid && fixturePlan.plan.action == fixture::Action::Load
+                    ? "load" : "invalid"),
+            planValid ? fixturePlan.saveName : "",
+            static_cast<unsigned long long>(observation.frame));
+        if (!publishSharedCommandStatus(
+                request.requestId,
+                fnvxr::shared::CommandStatusRunning,
+                observation.frame,
+                authorized ? 0u : ERROR_ACCESS_DENIED,
+                authorized ? expectedCommand : ""))
+        {
+            return;
+        }
+        if (!authorized)
+        {
+            stage = RetailFixtureAutomationStage::Complete;
+            completeRetailFixtureAutomationRequest(
+                request.requestId,
+                observation.frame,
+                false,
+                "",
+                "start-gate");
+            return;
+        }
+
+        requestId = request.requestId;
+        const bool ok = runPluginConsoleCommand(
+            fixturePlan.plan.action == fixture::Action::Create
+                ? "fnvxrRetailFixtureCreateStart"
+                : "fnvxrRetailFixtureLoad",
+            expectedCommand);
+        if (fixturePlan.plan.action == fixture::Action::Load)
+        {
+            if (!ok)
+            {
+                stage = RetailFixtureAutomationStage::Complete;
+                completeRetailFixtureAutomationRequest(
+                    requestId,
+                    observation.frame,
+                    false,
+                    expectedCommand,
+                    "load-dispatch");
+                return;
+            }
+            // A retail load can re-enter its engine work while RunScriptLine2
+            // is still on this stack. Wait for a subsequent, settled real
+            // gameplay observation before acknowledging the exact request.
+            lastMutationFrame = observation.frame;
+            stage = RetailFixtureAutomationStage::AwaitingLoadGameplay;
+            logTelemetry(
+                "{\"event\":\"fnvxrRetailFixtureLoadDispatched\",\"requestId\":%lu,\"frame\":%llu}\n",
+                static_cast<unsigned long>(requestId),
+                static_cast<unsigned long long>(observation.frame));
+            return;
+        }
+        if (!ok)
+        {
+            stage = RetailFixtureAutomationStage::Complete;
+            completeRetailFixtureAutomationRequest(
+                requestId,
+                observation.frame,
+                false,
+                expectedCommand,
+                "coc");
+            return;
+        }
+        lastMutationFrame = observation.frame;
+        stage = RetailFixtureAutomationStage::AwaitingGameplayName;
+        return;
+    }
+
+    if (!realRetailFixtureFreshGameplayState(observation) || requestId == 0u)
+        return;
+
+    if (stage == RetailFixtureAutomationStage::AwaitingLoadGameplay)
+    {
+        if (observation.frame
+            < lastMutationFrame + FixtureLoadGameplaySettlingFrames)
+            return;
+        char loadCommand[64] {};
+        const bool commandBuilt = buildRetailFixtureNamedCommand(
+            fixture::LoadCommandPrefix,
+            fixturePlan.plan,
+            loadCommand,
+            sizeof(loadCommand));
+        const bool published = completeRetailFixtureAutomationRequest(
+            requestId,
+            observation.frame,
+            commandBuilt,
+            commandBuilt ? loadCommand : "",
+            "load-gameplay");
+        logTelemetry(
+            "{\"event\":\"fnvxrRetailFixtureLoadGameplay\",\"requestId\":%lu,\"commandBuilt\":%s,\"published\":%s,\"frame\":%llu}\n",
+            static_cast<unsigned long>(requestId),
+            commandBuilt ? "true" : "false",
+            published ? "true" : "false",
+            static_cast<unsigned long long>(observation.frame));
+        if (published)
+        {
+            stage = RetailFixtureAutomationStage::Complete;
+            g_headsetDemoFixtureReady = headsetDemoFixtureProfileSelected()
+                && commandBuilt;
+        }
+        return;
+    }
+
+    if (stage == RetailFixtureAutomationStage::AwaitingGameplayName)
+    {
+        const bool ok = runPluginConsoleCommand(
+            "fnvxrRetailFixtureSetName",
+            fixture::SetFixturePlayerNameCommand.data());
+        logTelemetry(
+            "{\"event\":\"fnvxrRetailFixtureSetName\",\"requestId\":%lu,\"ok\":%s,\"frame\":%llu}\n",
+            static_cast<unsigned long>(requestId),
+            ok ? "true" : "false",
+            static_cast<unsigned long long>(observation.frame));
+        if (!ok)
+        {
+            stage = RetailFixtureAutomationStage::Complete;
+            completeRetailFixtureAutomationRequest(
+                requestId,
+                observation.frame,
+                false,
+                fixture::SetFixturePlayerNameCommand.data(),
+                "name");
+            return;
+        }
+        lastMutationFrame = observation.frame;
+        stage = RetailFixtureAutomationStage::AwaitingFirstTrait;
+        return;
+    }
+
+    if (observation.frame
+        < lastMutationFrame + FixtureMutationSettlingFrames)
+        return;
+
+    fixture::Trait trait = fixture::Trait::None;
+    const char* stageName = nullptr;
+    RetailFixtureAutomationStage nextStage =
+        RetailFixtureAutomationStage::Complete;
+    if (stage == RetailFixtureAutomationStage::AwaitingFirstTrait)
+    {
+        trait = fixturePlan.plan.firstTrait;
+        stageName = "trait-one";
+        nextStage = RetailFixtureAutomationStage::AwaitingSecondTrait;
+    }
+    else if (stage == RetailFixtureAutomationStage::AwaitingSecondTrait)
+    {
+        trait = fixturePlan.plan.secondTrait;
+        stageName = "trait-two";
+        nextStage = RetailFixtureAutomationStage::AwaitingSave;
+    }
+    else if (stage == RetailFixtureAutomationStage::AwaitingSave)
+    {
+        char saveCommand[64] {};
+        const bool commandBuilt = buildRetailFixtureNamedCommand(
+            fixture::SaveCommandPrefix,
+            fixturePlan.plan,
+            saveCommand,
+            sizeof(saveCommand));
+        const bool ok = commandBuilt && runPluginConsoleCommand(
+            "fnvxrRetailFixtureSave",
+            saveCommand);
+        stage = RetailFixtureAutomationStage::Complete;
+        const bool completed = completeRetailFixtureAutomationRequest(
+            requestId,
+            observation.frame,
+            ok,
+            commandBuilt ? saveCommand : "",
+            "save");
+        g_headsetDemoFixtureReady = headsetDemoFixtureProfileSelected()
+            && ok
+            && completed;
+        return;
+    }
+    else
+    {
+        return;
+    }
+
+    const std::string_view traitCommand = fixture::addPerkCommand(trait);
+    const bool ok = trait == fixture::Trait::None || (!traitCommand.empty()
+        && runPluginConsoleCommand("fnvxrRetailFixtureAddTrait", traitCommand.data()));
+    logTelemetry(
+        "{\"event\":\"fnvxrRetailFixtureTrait\",\"requestId\":%lu,\"stage\":\"%s\",\"trait\":\"%s\",\"ok\":%s,\"frame\":%llu}\n",
+        static_cast<unsigned long>(requestId),
+        stageName,
+        fixture::findTrait(trait) ? fixture::findTrait(trait)->token.data() : "invalid",
+        ok ? "true" : "false",
+        static_cast<unsigned long long>(observation.frame));
+    if (!ok)
+    {
+        stage = RetailFixtureAutomationStage::Complete;
+        completeRetailFixtureAutomationRequest(
+            requestId,
+            observation.frame,
+            false,
+            traitCommand.empty() ? "" : traitCommand.data(),
+            stageName);
+        return;
+    }
+    lastMutationFrame = observation.frame;
+    stage = nextStage;
+}
+
+void processHeadsetDemoFixtureUi(const RuntimeObservation& observation)
+{
+    if (!headsetDemoFixtureProfileSelected())
+        return;
+
+    // Apart from the separately bounded exact official-pack acknowledgement
+    // above, the headset demo has exactly two in-game events, both Tab: one
+    // after a loaded owned fixture reaches stable gameplay and one after
+    // Pip-Boy has remained visibly open for a bounded interval. The event is
+    // published to the staged in-process DirectInput queue; it is never an
+    // OS key, desktop/window operation, controller signal, or simulator
+    // command.
+    namespace demo = fnvxr::engine::headset_demo;
+    static demo::State state {};
+    if (g_headsetDemoFixtureReady && !g_inputEvents)
+        initSharedInputEvents();
+
+    const std::uint64_t gameplayWarmupFrames = static_cast<std::uint64_t>(
+        std::clamp(getIntFromEnv("FNVXR_HEADSET_DEMO_GAMEPLAY_WARMUP_FRAMES", 90), 1, 1200));
+    const std::uint64_t pipBoyHoldFrames = static_cast<std::uint64_t>(
+        std::clamp(getIntFromEnv("FNVXR_HEADSET_DEMO_PIPBOY_HOLD_FRAMES", 240), 30, 3600));
+    const bool pipBoyVisible = pipBoyVisibleFromMenuBits(observation.menuBits);
+    const demo::Input input {
+        true,
+        g_headsetDemoFixtureReady,
+        realRetailFixtureFreshGameplayState(observation),
+        pipBoyVisible,
+        g_inputEvents != nullptr && g_inputEventWriterMutex != nullptr,
+        observation.frame,
+        gameplayWarmupFrames,
+        pipBoyHoldFrames,
+    };
+    const demo::Decision decision = demo::advance(state, input);
+    if (decision.action != demo::Action::None)
+    {
+        const bool tapped = tapDirectInputKey(DIK_TAB);
+        logTelemetry(
+            "{\"event\":\"fnvxrHeadsetDemoPipBoyTap\",\"action\":\"%s\",\"tapped\":%s,\"fixtureReady\":%s,\"gameplay\":%s,\"pipBoyVisible\":%s,\"frame\":%llu}\n",
+            decision.action == demo::Action::OpenPipBoy ? "open" : "close",
+            tapped ? "true" : "false",
+            g_headsetDemoFixtureReady ? "true" : "false",
+            input.gameplay ? "true" : "false",
+            pipBoyVisible ? "true" : "false",
+            static_cast<unsigned long long>(observation.frame));
+        if (!tapped)
+            return;
+    }
+    if (state.stage != decision.next.stage
+        || state.stageFrame != decision.next.stageFrame)
+    {
+        logTelemetry(
+            "{\"event\":\"fnvxrHeadsetDemoPipBoyStage\",\"stage\":%u,\"fixtureReady\":%s,\"gameplay\":%s,\"pipBoyVisible\":%s,\"frame\":%llu}\n",
+            static_cast<unsigned>(decision.next.stage),
+            g_headsetDemoFixtureReady ? "true" : "false",
+            input.gameplay ? "true" : "false",
+            pipBoyVisible ? "true" : "false",
+            static_cast<unsigned long long>(observation.frame));
+    }
+    state = decision.next;
+}
+
+void processStereoVisualTrialFixedSaveAutomation(
+    const RuntimeObservation& observation)
+{
+    namespace automation =
+        fnvxr::engine::stereo_visual_trial_automation;
+    if (!stereoVisualTrialAutomationRequested())
+        return;
+
+    // The state is process-local. Every transition is fixed in the authority
+    // gate. A recovery load is one exact command. A fresh character can only
+    // use the fixed no-save COC, fixed name, and fixed save sequence.  The
+    // only menu exception is the separately opted-in, once-per-known-pack
+    // native acknowledgement of an exact official-pack notification; neither
+    // route gains input, camera, rig, or weapon control.
+    acknowledgeExactOfficialPackMessageMenu(observation);
+    static automation::State authorityState {};
+    static const automation::ApprovedRetailSave* const selectedRetailSave =
+        stereoVisualTrialRecoveryLoadRequested()
+            ? stereoVisualTrialSelectedRetailSave()
+            : nullptr;
+    static UInt32 freshCharacterRequestId = 0u;
+    static UInt64 freshCharacterNameFrame = 0u;
+
+    if (authorityState.stage
+        == automation::Stage::AwaitingStartMenuCommand)
+    {
+        SharedCommandState request {};
+        if (!readSharedCommandSnapshot(request))
+            return;
+        if (request.requestId == 0u
+            || request.requestId == g_lastCommandRequestId)
+        {
+            return;
+        }
+        if (request.status != fnvxr::shared::CommandStatusPending)
+        {
+            logTelemetry(
+                "{\"event\":\"fnvxrStereoVisualTrialAutomationSkip\",\"requestId\":%lu,\"status\":\"%s\",\"frame\":%llu}\n",
+                static_cast<unsigned long>(request.requestId),
+                sharedCommandStatusName(request.status),
+                static_cast<unsigned long long>(observation.frame));
+            g_lastCommandRequestId = request.requestId;
+            return;
+        }
+
+        const bool recoveryWorkflow =
+            stereoVisualTrialRecoveryLoadRequested();
+        const bool freshCharacterWorkflow =
+            stereoVisualTrialFreshCharacterRequested();
+        const bool exactRecoveryLoad = recoveryWorkflow
+            && selectedRetailSave != nullptr
+            && stereoVisualTrialRecoveryLoadCommandIsExact(
+                request,
+                *selectedRetailSave);
+        const bool exactFreshCharacterStart = freshCharacterWorkflow
+            && stereoVisualTrialFreshCharacterCommandIsExact(request);
+        const bool realStartMenu =
+            realStereoVisualTrialStartMenuState(observation);
+        automation::Request authorityRequest {};
+        authorityRequest.explicitlyOptedIn =
+            stereoVisualTrialAutomationRequested();
+        authorityRequest.action = exactRecoveryLoad
+            ? automation::Action::LoadFixedRecoverySave
+            : (exactFreshCharacterStart
+                ? automation::Action::StartFreshCharacter
+                : automation::Action::None);
+        authorityRequest.argument = exactRecoveryLoad
+            ? selectedRetailSave->name
+            : (exactFreshCharacterStart
+                ? automation::FreshCharacterStartCommand
+                : std::string_view {});
+        const automation::Decision decision =
+            automation::decide(authorityState, authorityRequest);
+        const bool authorized = (exactRecoveryLoad || exactFreshCharacterStart)
+            && realStartMenu
+            && decision.authorized
+            && (exactRecoveryLoad
+                ? decision.command == selectedRetailSave->loadCommand
+                : decision.command == automation::FreshCharacterStartCommand);
+        logTelemetry(
+            "{\"event\":\"fnvxrStereoVisualTrialAutomationStartRequest\",\"requestId\":%lu,\"exactRecoveryLoad\":%s,\"exactFreshCharacterStart\":%s,\"realStartMenu\":%s,\"authorized\":%s,\"gateFailure\":%u,\"frame\":%llu}\n",
+            static_cast<unsigned long>(request.requestId),
+            exactRecoveryLoad ? "true" : "false",
+            exactFreshCharacterStart ? "true" : "false",
+            realStartMenu ? "true" : "false",
+            authorized ? "true" : "false",
+            static_cast<unsigned>(decision.failure),
+            static_cast<unsigned long long>(observation.frame));
+        if (!publishSharedCommandStatus(
+                request.requestId,
+                fnvxr::shared::CommandStatusRunning,
+                observation.frame,
+                authorized ? 0u : ERROR_ACCESS_DENIED,
+                authorized ? decision.command.data() : ""))
+        {
+            logTelemetry(
+                "stereo visual-trial automation lost ownership before running request=%lu\n",
+                static_cast<unsigned long>(request.requestId));
+            return;
+        }
+
+        if (!authorized)
+        {
+            g_lastCommandRequestId = request.requestId;
+            const bool completionPublished = publishSharedCommandStatus(
+                request.requestId,
+                fnvxr::shared::CommandStatusFailed,
+                observation.frame,
+                ERROR_ACCESS_DENIED,
+                "");
+            if (!completionPublished)
+            {
+                logTelemetry(
+                    "stereo visual-trial automation rejection completion ownership lost request=%lu\n",
+                    static_cast<unsigned long>(request.requestId));
+            }
+            return;
+        }
+
+        authorityState = decision.nextState;
+        if (exactRecoveryLoad)
+        {
+            const bool ok = runPluginConsoleCommand(
+                "fnvxrStereoVisualTrialRecoveryLoad",
+                decision.command.data());
+            g_lastCommandRequestId = request.requestId;
+            const bool completionPublished = publishSharedCommandStatus(
+                request.requestId,
+                ok
+                    ? fnvxr::shared::CommandStatusSucceeded
+                    : fnvxr::shared::CommandStatusFailed,
+                observation.frame,
+                ok ? 0u : ERROR_ACCESS_DENIED,
+                decision.command.data());
+            if (!completionPublished)
+            {
+                logTelemetry(
+                    "stereo visual-trial recovery load completion ownership lost request=%lu\n",
+                    static_cast<unsigned long>(request.requestId));
+            }
+            logTelemetry(
+                "{\"event\":\"fnvxrStereoVisualTrialAutomationLoadComplete\",\"requestId\":%lu,\"ok\":%s,\"resultCode\":%lu,\"frame\":%llu}\n",
+                static_cast<unsigned long>(request.requestId),
+                ok ? "true" : "false",
+                static_cast<unsigned long>(
+                    ok ? 0u : ERROR_ACCESS_DENIED),
+                static_cast<unsigned long long>(observation.frame));
+            return;
+        }
+
+        freshCharacterRequestId = request.requestId;
+        const bool ok = runPluginConsoleCommand(
+            "fnvxrStereoVisualTrialFreshCharacterStart",
+            decision.command.data());
+        if (!ok)
+        {
+            authorityState.stage = automation::Stage::Complete;
+            completeStereoVisualTrialFreshCharacterRequest(
+                freshCharacterRequestId,
+                observation.frame,
+                false,
+                decision.command.data(),
+                "coc");
+        }
+        else
+        {
+            logTelemetry(
+                "{\"event\":\"fnvxrStereoVisualTrialFreshCharacterStart\",\"requestId\":%lu,\"ok\":true,\"frame\":%llu}\n",
+                static_cast<unsigned long>(freshCharacterRequestId),
+                static_cast<unsigned long long>(observation.frame));
+        }
+        return;
+    }
+
+    if (authorityState.stage
+        == automation::Stage::AwaitingFreshGameplayName)
+    {
+        if (!realStereoVisualTrialFreshGameplayState(observation)
+            || freshCharacterRequestId == 0u)
+        {
+            return;
+        }
+
+        const automation::Decision decision = automation::decide(
+            authorityState,
+            { true, automation::Action::NameFreshCharacter, {} });
+        const bool authorized = decision.authorized
+            && decision.command == automation::FreshCharacterSetNameCommand;
+        logTelemetry(
+            "{\"event\":\"fnvxrStereoVisualTrialFreshCharacterName\",\"requestId\":%lu,\"authorized\":%s,\"gateFailure\":%u,\"frame\":%llu}\n",
+            static_cast<unsigned long>(freshCharacterRequestId),
+            authorized ? "true" : "false",
+            static_cast<unsigned>(decision.failure),
+            static_cast<unsigned long long>(observation.frame));
+        authorityState = authorized
+            ? decision.nextState
+            : automation::State { automation::Stage::Complete };
+        const bool ok = authorized && runPluginConsoleCommand(
+            "fnvxrStereoVisualTrialFreshCharacterName",
+            decision.command.data());
+        if (!ok)
+        {
+            completeStereoVisualTrialFreshCharacterRequest(
+                freshCharacterRequestId,
+                observation.frame,
+                false,
+                authorized ? decision.command.data() : "",
+                "name");
+            freshCharacterRequestId = 0u;
+            return;
+        }
+        freshCharacterNameFrame = observation.frame;
+        return;
+    }
+
+    if (authorityState.stage
+        == automation::Stage::AwaitingFreshGameplaySave)
+    {
+        constexpr UInt64 FreshCharacterNameSettlingFrames = 30u;
+        if (!realStereoVisualTrialFreshGameplayState(observation)
+            || freshCharacterRequestId == 0u
+            || observation.frame
+                < freshCharacterNameFrame + FreshCharacterNameSettlingFrames)
+        {
+            return;
+        }
+
+        const automation::Decision decision = automation::decide(
+            authorityState,
+            { true, automation::Action::SaveFreshCharacter, {} });
+        const bool authorized = decision.authorized
+            && decision.command == automation::FreshCharacterSaveCommand;
+        logTelemetry(
+            "{\"event\":\"fnvxrStereoVisualTrialFreshCharacterSave\",\"requestId\":%lu,\"authorized\":%s,\"gateFailure\":%u,\"frame\":%llu}\n",
+            static_cast<unsigned long>(freshCharacterRequestId),
+            authorized ? "true" : "false",
+            static_cast<unsigned>(decision.failure),
+            static_cast<unsigned long long>(observation.frame));
+        authorityState = authorized
+            ? decision.nextState
+            : automation::State { automation::Stage::Complete };
+        const bool ok = authorized && runPluginConsoleCommand(
+            "fnvxrStereoVisualTrialFreshCharacterSave",
+            decision.command.data());
+        completeStereoVisualTrialFreshCharacterRequest(
+            freshCharacterRequestId,
+            observation.frame,
+            ok,
+            authorized ? decision.command.data() : "",
+            "save");
+        freshCharacterRequestId = 0u;
+        return;
+    }
+}
+
+bool ensureAuthorizedDesktopAssistBridgeStarted()
+{
+    if (!desktopAssistProfileRequested())
+        return false;
+
+    if (g_desktopAssistBridgeStarted)
+    {
+        return gamePluginProducerLeaseHeldByCurrentThread()
+            && g_vrPoseState
+            && g_cameraState
+            && g_runtimeState
+            && g_playerState
+            && g_desktopAssistState
+            && g_cameraHookInstalled
+            && g_cameraHookAuthorization == CameraHookAuthorization::DesktopAssist
+            && (!desktopAssistAutomationRequested() || g_commandState)
+            && desktopAssistCameraLeaseCurrent();
+    }
+
+    ++g_desktopAssistAuthorityAttempts;
+    const fnvxr::engine::compatibility::RetailCompatibilityProof proof =
+        fnvxr::engine::compatibility::proveCurrentRetailCompatibilityAtDecisionPoint();
+    const fnvxr::engine::DesktopAssistCameraRequest request =
+        desktopAssistCameraRequest();
+    if (!fnvxr::engine::desktopAssistCameraAuthorized(proof, request))
+    {
+        if (g_desktopAssistAuthorityAttempts <= 12u
+            || (g_desktopAssistAuthorityAttempts % 300u) == 0u)
+        {
+            logTelemetry(
+                "desktopAssist bridge deferred attempt=%lu compatible=%d failure=%u; no input, renderer, weapon, or body mutation performed\n",
+                static_cast<unsigned long>(g_desktopAssistAuthorityAttempts),
+                static_cast<int>(proof.compatible),
+                static_cast<unsigned>(proof.failure));
+        }
+        return false;
+    }
+    if (!acquireGamePluginProducerLease())
+        return false;
+
+    // Desktop assist normally maps only the external HMD pose and the
+    // read-only evidence required by fnvxr_assist.  Its separately requested
+    // unattended recovery path may map the command mailbox, but accepts only
+    // one fixed load command below; it never enables a general command or
+    // input bridge.
+    initSharedVrPose();
+    initSharedCamera();
+    initSharedPlayer();
+    initSharedDesktopAssist();
+    if (!g_vrPoseState || !g_cameraState || !g_runtimeState || !g_playerState
+        || !g_desktopAssistState
+        || (desktopAssistAutomationRequested() && !g_commandState))
+    {
+        logTelemetry("desktopAssist bridge initialization deferred: required mapping unavailable\n");
+        return false;
+    }
+
+    if (!installCameraHook()
+        || !g_cameraHookInstalled
+        || g_cameraHookAuthorization != CameraHookAuthorization::DesktopAssist)
+    {
+        logTelemetry("desktopAssist bridge deferred: camera hook was not authorized/installed\n");
+        return false;
+    }
+
+    g_desktopAssistBridgeStarted = true;
+    logTelemetry(
+        "desktopAssist bridge ready attempt=%lu mode=rotation-only input=0 commandRecovery=%d renderer=0 weapon=0 rig=0 openxr=0\n",
+        static_cast<unsigned long>(g_desktopAssistAuthorityAttempts),
+        static_cast<int>(desktopAssistAutomationRequested()));
+    return true;
+}
+
+bool ensureAuthorizedTrackedPropAssistBridgeStarted()
+{
+    if (!trackedPropAssistProfileRequested())
+        return false;
+
+    if (g_trackedPropAssistBridgeStarted)
+    {
+        return gamePluginProducerLeaseHeldByCurrentThread()
+            && g_vrPoseState
+            && g_cameraState
+            && g_runtimeState
+            && g_playerState
+            && g_cameraHookInstalled
+            && g_cameraHookAuthorization == CameraHookAuthorization::TrackedPropAssist
+            && g_retailRigHookInstalled
+            && trackedPropAssistLeaseCurrent();
+    }
+
+    ++g_trackedPropAssistAuthorityAttempts;
+    const fnvxr::engine::compatibility::RetailCompatibilityProof proof =
+        fnvxr::engine::compatibility::proveCurrentRetailCompatibilityAtDecisionPoint();
+    const fnvxr::engine::TrackedPropAssistRequest request =
+        trackedPropAssistRequest();
+    if (!fnvxr::engine::trackedPropAssistAuthorized(proof, request))
+    {
+        if (g_trackedPropAssistAuthorityAttempts <= 12u
+            || (g_trackedPropAssistAuthorityAttempts % 300u) == 0u)
+        {
+            logTelemetry(
+                "trackedPropAssist bridge deferred attempt=%lu compatible=%d failure=%u; no input, projectile, hit, renderer, replay, or OpenXR transaction performed\n",
+                static_cast<unsigned long>(g_trackedPropAssistAuthorityAttempts),
+                static_cast<int>(proof.compatible),
+                static_cast<unsigned>(proof.failure));
+        }
+        return false;
+    }
+    if (!acquireGamePluginProducerLease())
+        return false;
+
+    // This profile maps only the host/fixture pose and read-only game
+    // observations required to place the first-person visual rig.  It does
+    // not map controller input, commands, input events, renderer state, or a
+    // D3D/OpenXR origin transaction.
+    initSharedVrPose();
+    initSharedCamera();
+    initSharedPlayer();
+    if (!g_vrPoseState || !g_cameraState || !g_runtimeState || !g_playerState)
+    {
+        logTelemetry("trackedPropAssist bridge initialization deferred: required mapping unavailable\n");
+        return false;
+    }
+
+    if (!installCameraHook()
+        || !g_cameraHookInstalled
+        || g_cameraHookAuthorization != CameraHookAuthorization::TrackedPropAssist
+        || !installRetailRigHook()
+        || !g_retailRigHookInstalled
+        || !trackedPropAssistLeaseCurrent())
+    {
+        logTelemetry("trackedPropAssist bridge deferred: camera/rig hook was not authorized or installed\n");
+        return false;
+    }
+
+    g_trackedPropAssistBridgeStarted = true;
+    logTelemetry(
+        "trackedPropAssist bridge ready attempt=%lu mode=body-anchored-visual-rig input=0 projectile=0 hit=0 renderer=0 replay=0 openxr=0\n",
+        static_cast<unsigned long>(g_trackedPropAssistAuthorityAttempts));
+    return true;
+}
+
 bool ensureAuthorizedSharedBridgeStarted()
 {
+    // Assist profiles have deliberately smaller authority paths. Do not let a
+    // missing opt-in fall through to mapping input, command, rig, or render
+    // state via the full bridge.
+    if (desktopAssistProfileSelected()
+        || trackedPropAssistProfileSelected()
+        || stereoVisualTrialProfileSelected())
+        return false;
+
     if (g_authorizedSharedBridgeStarted)
     {
         return g_retailRuntimeAuthority.complete()
@@ -10146,6 +12725,37 @@ void processMainGameLoop(const RuntimeObservation& observation)
         executeAcceptClickOnGameThread();
 }
 
+void processDesktopAssistMainLoop(const RuntimeObservation& observation)
+{
+    // Keep the game entirely responsible for simulation, movement, menus,
+    // and body heading.  This path observes only the camera/player results of
+    // the camera-local pose transaction; it never consumes external input.
+    updateSharedCamera(observation.frame, observation.menuBits);
+    updateSharedPlayer(observation.frame, observation.phase);
+    updateSharedDesktopAssist(observation.frame);
+    logCameraTelemetry(observation.frame, observation.menuBits);
+    // This function is intentionally the only desktop-assist command path.
+    // It accepts the fixed recovery save only after the real Start Menu is
+    // observed; all UI navigation during acceptance remains external and is
+    // limited by the supervisor to two verified Escape taps.
+    if (desktopAssistAutomationRequested())
+        consumeDesktopAssistRecoveryLoad(
+            observation.frame,
+            observation.phase,
+            observation.menuBits,
+            observation.uiInputAllowed);
+}
+
+void processTrackedPropAssistMainLoop(const RuntimeObservation& observation)
+{
+    // Camera/player records are observational.  The only visual writes happen
+    // later at the already-authorized post-animation rig hook; this main-loop
+    // path does not consume external input, commands, or renderer state.
+    updateSharedCamera(observation.frame, observation.menuBits);
+    updateSharedPlayer(observation.frame, observation.phase);
+    logCameraTelemetry(observation.frame, observation.menuBits);
+}
+
 void handleNvseMessage(NVSEMessagingInterface::Message* message)
 {
     if (!message)
@@ -10153,9 +12763,156 @@ void handleNvseMessage(NVSEMessagingInterface::Message* message)
 
     if (message->type == MessageMainGameLoop)
     {
+        const fnvxr::engine::RetailPluginMainLoopDisposition
+            visualTrialDisposition =
+                stereoVisualTrialMainLoopDisposition();
+        if (visualTrialDisposition
+            == fnvxr::engine::RetailPluginMainLoopDisposition::
+                RejectVisualTrial)
+        {
+            static bool loggedVisualTrialOptInMissing = false;
+            if (!loggedVisualTrialOptInMissing)
+            {
+                loggedVisualTrialOptInMissing = true;
+                logTelemetry(
+                    "stereo visual-trial profile selected but FNVXR_ENABLE_ENGINE_CENTER_STEREO is not enabled; no bridge or hook will start\n");
+            }
+            return;
+        }
+        if (retailFixtureProfileSelected()
+            && !retailFixtureAutomationRequested())
+        {
+            static bool loggedRetailFixtureOptInMissing = false;
+            if (!loggedRetailFixtureOptInMissing)
+            {
+                loggedRetailFixtureOptInMissing = true;
+                logTelemetry(
+                    "retail fixture profile selected without FNVXR_RETAIL_FIXTURE_AUTOMATION; no fixture, OpenXR, input, bridge, camera, or rig authority will start\n");
+            }
+            return;
+        }
+        if (headsetDemoFixtureProfileSelected()
+            && !retailFixtureAutomationRequested())
+        {
+            static bool loggedHeadsetDemoFixtureOptInMissing = false;
+            if (!loggedHeadsetDemoFixtureOptInMissing)
+            {
+                loggedHeadsetDemoFixtureOptInMissing = true;
+                logTelemetry(
+                    "headset demo fixture profile selected without FNVXR_RETAIL_FIXTURE_AUTOMATION; no fixture, OpenXR, input, bridge, camera, or rig authority will start\n");
+            }
+            return;
+        }
+        if (desktopAssistProfileSelected() && !desktopAssistProfileRequested())
+        {
+            static bool loggedDesktopAssistOptInMissing = false;
+            if (!loggedDesktopAssistOptInMissing)
+            {
+                loggedDesktopAssistOptInMissing = true;
+                logTelemetry(
+                    "desktopAssist profile selected but FNVXR_DESKTOP_ASSIST_CAMERA_ONLY is not enabled; no bridge or hook will start\n");
+            }
+            return;
+        }
+        if (trackedPropAssistProfileSelected() && !trackedPropAssistProfileRequested())
+        {
+            static bool loggedTrackedPropAssistOptInMissing = false;
+            if (!loggedTrackedPropAssistOptInMissing)
+            {
+                loggedTrackedPropAssistOptInMissing = true;
+                logTelemetry(
+                    "trackedPropAssist profile selected but FNVXR_TRACKED_PROP_ASSIST_VISUAL_ONLY is not enabled; no bridge or hook will start\n");
+            }
+            return;
+        }
         if (!ensureAuthorizedRuntimeObservationStarted())
             return;
         const RuntimeObservation observation = observeAndPublishRuntime();
+        if (ttwBaselineProfileSelected())
+        {
+            static bool loggedTtwBaselinePublicationOnly = false;
+            if (!loggedTtwBaselinePublicationOnly)
+            {
+                loggedTtwBaselinePublicationOnly = true;
+                logTelemetry(
+                    "TTW baseline runtime publication ready; menu observation only and no save, console, bridge, OpenXR, simulator, input, camera, rig, renderer, or weapon authority is active\n");
+            }
+            return;
+        }
+        if (retailFixtureProfileSelected())
+        {
+            processRetailFixtureAutomation(observation);
+            static bool loggedRetailFixturePublicationOnly = false;
+            if (!loggedRetailFixturePublicationOnly)
+            {
+                loggedRetailFixturePublicationOnly = true;
+                logTelemetry(
+                    "retail fixture runtime publication ready; no OpenXR, simulator, bridge, input, camera, rig, renderer, or weapon authority is active\n");
+            }
+            return;
+        }
+        if (headsetDemoFixtureProfileSelected())
+        {
+            processRetailFixtureAutomation(observation);
+            recoverFocusLossPause(
+                observation.frame,
+                observation.menuBits,
+                observation.phase);
+            processHeadsetDemoFixtureUi(observation);
+            static bool loggedHeadsetDemoFixturePublicationOnly = false;
+            if (!loggedHeadsetDemoFixturePublicationOnly)
+            {
+                loggedHeadsetDemoFixturePublicationOnly = true;
+                logTelemetry(
+                    "headset demo fixture runtime publication ready; OpenXR display remains host-owned and the only in-game events are the fixed Pip-Boy open/close taps\n");
+            }
+            return;
+        }
+        if (visualTrialDisposition
+            == fnvxr::engine::RetailPluginMainLoopDisposition::
+                PublishRuntimeOnly)
+        {
+            if (stereoVisualTrialAutomationRequested())
+                processStereoVisualTrialFixedSaveAutomation(observation);
+            static bool loggedVisualTrialPublicationOnly = false;
+            if (!loggedVisualTrialPublicationOnly)
+            {
+                loggedVisualTrialPublicationOnly = true;
+                logTelemetry(
+                    "stereo visual trial runtime publication ready; plugin full bridge, input, camera, and rig hooks remain disabled for D3D world authority\n");
+            }
+            return;
+        }
+        if (desktopAssistProfileRequested())
+        {
+            if (!ensureAuthorizedDesktopAssistBridgeStarted())
+            {
+                static bool loggedDesktopAssist = false;
+                if (!loggedDesktopAssist)
+                {
+                    loggedDesktopAssist = true;
+                    logTelemetry("desktopAssist bridge deferred until exact compatibility proof and rotation-only camera lease are ready\n");
+                }
+                return;
+            }
+            processDesktopAssistMainLoop(observation);
+            return;
+        }
+        if (trackedPropAssistProfileRequested())
+        {
+            if (!ensureAuthorizedTrackedPropAssistBridgeStarted())
+            {
+                static bool loggedTrackedPropAssist = false;
+                if (!loggedTrackedPropAssist)
+                {
+                    loggedTrackedPropAssist = true;
+                    logTelemetry("trackedPropAssist bridge deferred until exact compatibility proof and visual-rig lease are ready\n");
+                }
+                return;
+            }
+            processTrackedPropAssistMainLoop(observation);
+            return;
+        }
         if (!ensureAuthorizedSharedBridgeStarted())
         {
             static bool logged = false;
@@ -10642,11 +13399,40 @@ extern "C" __declspec(dllexport) bool NVSEPlugin_Load(const NVSEInterface* nvse)
         g_console,
         g_playerControls);
     logInputConfig();
-    // Plugin enumeration can occur before every required compatibility module
-    // has finished loading. Attempt synchronously now, then let the registered
-    // main-loop callback retry. No mapping or game-state access occurs until
-    // the exact current-process authority succeeds.
-    static_cast<void>(ensureAuthorizedSharedBridgeStarted());
+    // Never acquire full retail authority from NVSEPlugin_Load. The D3D
+    // Present bootstrap may already exist, so the first authenticated
+    // main-loop observation must run and advance the plugin-owned runtime
+    // mapping from neutral before either side can install a world hook.
+    if (desktopAssistProfileSelected())
+    {
+        logTelemetry(
+            "desktopAssist profile selected: deferring to camera-only main-loop authority; full bridge is disabled\n");
+    }
+    else if (trackedPropAssistProfileSelected())
+    {
+        logTelemetry(
+            "trackedPropAssist profile selected: deferring to visual-rig main-loop authority; full bridge, input, projectile, renderer, replay, and OpenXR are disabled\n");
+    }
+    else if (retailFixtureProfileSelected())
+    {
+        logTelemetry(
+            "retail fixture profile selected: xNVSE fixture lifecycle only; OpenXR, simulator, D3D bridge, input, camera, rig, renderer, and weapon authority are disabled\n");
+    }
+    else if (ttwBaselineProfileSelected())
+    {
+        logTelemetry(
+            "TTW baseline profile selected: Start Menu observation only; save, console, OpenXR, simulator, D3D bridge, input, camera, rig, renderer, and weapon authority are disabled\n");
+    }
+    else if (stereoVisualTrialProfileSelected())
+    {
+        logTelemetry(
+            "stereo visual-trial profile selected: deferring to publication-only main-loop authority; plugin full bridge, input, camera, and rig hooks are disabled\n");
+    }
+    else
+    {
+        logTelemetry(
+            "full bridge authority deferred until a plugin-owned runtime publication advances from neutral on the main loop\n");
+    }
     return g_pluginHandle != InvalidPluginHandle;
 }
 

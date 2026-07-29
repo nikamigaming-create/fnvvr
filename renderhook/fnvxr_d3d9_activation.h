@@ -25,8 +25,9 @@ constexpr bool productionRendererAuthorized(const ProductionRendererProof& proof
         && proof.retainedD3D9HookSetAudited;
 }
 
-// Checked-in builds are forwarding shims only.  Changing environment values
-// cannot alter this compile-time result.
+// The checked-in legacy interposer remains forwarding-only. Changing
+// environment values cannot alter this compile-time result; the independently
+// bounded visual-trial bridge below does not grant any of these capabilities.
 inline constexpr ProductionRendererProof CompiledProductionRendererProof {};
 inline constexpr bool ProductionRendererAuthorized =
     productionRendererAuthorized(CompiledProductionRendererProof);
@@ -85,6 +86,45 @@ inline constexpr RetailVrBridgePolicy CompiledRetailVrBridgePolicy {
     true,
     false,
 };
+
+// Runtime configuration can request only the bounded CPU visual trial.  It
+// cannot widen the compiled bridge policy or authorize the retained D3D9
+// replay interposer.
+struct RetailVrVisualTrialRequest
+{
+    bool exactProfileMatched = false;
+    bool engineCenterStereoRequested = false;
+    bool stereoWorldDisabled = false;
+    bool legacyImageDiagnosticsRequested = false;
+    bool retainedStereoGameTexturesRequested = false;
+    bool unprovenColorOnlyStereoDiagnosticRequested = false;
+    bool allowStereoWorld2dFallback = false;
+    bool showGamePlaneOnStereoLoss = false;
+    bool stereoFallbackMonoFullscreen = false;
+};
+
+constexpr bool retailVrVisualTrialAuthorized(
+    const RetailVrBridgePolicy& policy,
+    const RetailVrVisualTrialRequest& request) noexcept
+{
+    return policy.compiled
+        && policy.exactCurrentProcessAuthorityRequired
+        && !policy.exBackedGameDevice
+        && policy.retailWorldHookOnly
+        && !policy.replaceD3D9DeviceVtablePointer
+        && policy.leaseNativePresentSlot
+        && policy.cpuImageTransfer
+        && !policy.legacyDrawReplay
+        && request.exactProfileMatched
+        && request.engineCenterStereoRequested
+        && !request.stereoWorldDisabled
+        && !request.legacyImageDiagnosticsRequested
+        && !request.retainedStereoGameTexturesRequested
+        && !request.unprovenColorOnlyStereoDiagnosticRequested
+        && !request.allowStereoWorld2dFallback
+        && !request.showGamePlaneOnStereoLoss
+        && !request.stereoFallbackMonoFullscreen;
+}
 
 static_assert(CompiledInterpositionPolicy.forwardSystemExports);
 static_assert(!CompiledInterpositionPolicy.wrapDirect3D9);

@@ -23,6 +23,7 @@ enum class RetailCenterRuntimeFailure : std::uint8_t
     InvalidFrame,
     StaleFrameGeneration,
     CameraPointerMismatch,
+    CullingProcessPointerMismatch,
     TrackedFrameRejected,
     StalePoseFrame,
     EyeCameraDerivationRejected,
@@ -45,6 +46,9 @@ struct RetailCenterRuntimeFrame
     RetailTrackedFrame tracked {};
     float gameUnitsPerMeter = 0.0f;
     std::uint64_t generation = 0u;
+    // The actual third cdecl argument at the audited AccumulateScene call.
+    // The global SceneGraph must name this exact already-prepared culler.
+    abi::RetailBSCullingProcessLayout* stockCullingProcess = nullptr;
 };
 
 struct RetailCenterRuntimeFrameResult
@@ -56,10 +60,13 @@ struct RetailCenterRuntimeFrameResult
     CenterRendererResult renderer {};
 };
 
-// Owns the private camera/culler/accumulators and turns a proven retail world
-// hook invocation into one conservative cull plus two engine renders. Gameplay
-// failures never fall back to a flat world. The original function is admitted
-// only for the explicitly allowed menu/dialogue/Pip-Boy scene-graph mode.
+// Owns the private cameras and accumulators and turns a proven retail world
+// hook invocation into one conservative cull plus two engine renders. The
+// cull itself deliberately uses the already-prepared stock SceneGraph culler:
+// a constructor-fresh culler lacks the retail renderer's per-frame setup.
+// Gameplay failures never fall back to a flat world. UI routing is decided by
+// the authenticated tracked runtime state before this world-only runtime is
+// called.
 template <std::size_t CollectorCapacity>
 class RetailCenterStereoRuntime final
 {
@@ -108,6 +115,7 @@ public:
                 resolution.calls,
                 *mResources.collectorBinding(),
                 *mResources.leftAccumulator(),
+                verifiedCullerVtable,
                 targets))
         {
             mResources = {};
@@ -142,11 +150,7 @@ public:
     {
         if (!mInitialized || !mResources.valid())
             return fail(RetailCenterRuntimeFailure::RuntimeNotReady);
-        if (!mRendererContext.initialize(
-                calls,
-                *mResources.collectorBinding(),
-                *mResources.leftAccumulator(),
-                targets))
+        if (!mRendererContext.rebind(calls, targets))
         {
             return fail(RetailCenterRuntimeFailure::RendererOperationsRejected);
         }
@@ -180,9 +184,33 @@ public:
         return mEyeCameraFailure;
     }
 
+    const RetailCenterVisibilityDiagnostics& visibilityDiagnostics() const
+        noexcept
+    {
+        return mRendererContext.visibilityDiagnostics();
+    }
+
+    const RetailCenterAccumulatorSnapshotDiagnostics&
+    accumulatorSnapshotDiagnostics() const noexcept
+    {
+        return mRendererContext.accumulatorSnapshotDiagnostics();
+    }
+
     const Resources& resources() const noexcept
     {
         return mResources;
+    }
+
+    bool beginStockCullerCapture(
+        abi::RetailBSCullingProcessLayout* culler) noexcept
+    {
+        return ready() && mRendererContext.beginStockCullerCapture(culler);
+    }
+
+    bool finishStockCullerCapture(
+        abi::RetailBSCullingProcessLayout* culler) noexcept
+    {
+        return ready() && mRendererContext.finishStockCullerCapture(culler);
     }
 
     RetailCenterRuntimeFrameResult renderWorld(
@@ -199,15 +227,6 @@ public:
             || frame.generation == 0u)
         {
             return reject(RetailCenterRuntimeFailure::InvalidFrame);
-        }
-        if (frame.sceneGraph->isMenuSceneGraph != 0u)
-        {
-            mFailure = RetailCenterRuntimeFailure::None;
-            return {
-                RetailWorldHookDisposition::CallOriginalForUi,
-                RetailCenterRuntimeFailure::None,
-                {},
-            };
         }
         if (frame.generation <= mLastFrameGeneration)
         {
@@ -234,6 +253,23 @@ public:
                 && frame.tracked.poseSequence == mLastPoseSequence))
         {
             return reject(RetailCenterRuntimeFailure::StalePoseFrame);
+        }
+
+        const std::uintptr_t stockCullerAddress =
+            reinterpret_cast<std::uintptr_t>(frame.stockCullingProcess);
+        if (!frame.stockCullingProcess
+            || stockCullerAddress
+                > (std::numeric_limits<abi::RetailPointer32>::max)()
+            || frame.sceneGraph->cullingProcess
+                != static_cast<abi::RetailPointer32>(stockCullerAddress))
+        {
+            return reject(
+                RetailCenterRuntimeFailure::CullingProcessPointerMismatch);
+        }
+        if (frame.stockCullingProcess == mResources.cullingProcess())
+        {
+            return reject(
+                RetailCenterRuntimeFailure::CullingProcessPointerMismatch);
         }
 
         const RetailVrOriginCandidate originCandidate =
@@ -277,7 +313,7 @@ public:
             cameras.center,
             cameras.left,
             cameras.right,
-            mResources.cullingProcess(),
+            frame.stockCullingProcess,
             mResources.leftAccumulator(),
             mResources.rightAccumulator(),
             frame.generation,

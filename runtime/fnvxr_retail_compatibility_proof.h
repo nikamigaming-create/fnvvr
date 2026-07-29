@@ -2,6 +2,7 @@
 
 #include "fnvxr_retail_engine_abi.h"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 
@@ -27,6 +28,9 @@ enum class RetailCompatibilityFailure : std::uint8_t
     ProtectedVtableSlotMismatch,
     ProtectedVtableBlockMismatch,
     ProtectedMemoryUnstable,
+    DuplicateJohnnyGuitarModule,
+    JohnnyGuitar528IdentityMismatch,
+    JohnnyGuitarProtectedRewriteMismatch,
 };
 
 struct RetailCompatibilityEvidence
@@ -34,6 +38,7 @@ struct RetailCompatibilityEvidence
     bool retailExecutableIdentityMatched = false;
     bool moduleSnapshotStable = false;
     bool jip5730ExactOrAbsent = false;
+    bool johnnyGuitar528ExactOrAbsent = false;
     bool showOff184ExactOrAbsent = false;
     bool renderFirstPersonStockOrJipNormalized = false;
     bool protectedCoreBodiesMatched = false;
@@ -55,6 +60,8 @@ struct RetailCompatibilityDiagnostics
     std::size_t protectedVtableBytesHashed = 0;
     bool jipPresent = false;
     bool jipNormalizationApplied = false;
+    bool johnnyGuitarPresent = false;
+    bool johnnyGuitarNormalizationApplied = false;
     bool showOffPresent = false;
 };
 
@@ -140,14 +147,39 @@ struct SyntheticJipRewriteSeal
     std::size_t stubBytes = 0;
 };
 
+// Exact JohnnyGuitar 5.28 rewrites observed in the protected game bodies.
+// Every listed target is module-relative so the verifier can normalize only
+// the proven ASLR-dependent layout back to its stock engine bytes.
+struct SyntheticJohnnyGuitarRewriteSeal
+{
+    std::uintptr_t renderFirstPersonPreferredAddress = 0;
+    std::size_t renderFirstPersonBytes = 0;
+    std::size_t renderFirstPersonCallOffset = 0;
+    std::uintptr_t renderFirstPersonStockTargetPreferredAddress = 0;
+    std::uintptr_t updateCameraPreferredAddress = 0;
+    std::size_t updateCameraBytes = 0;
+    std::size_t updateCameraOverwriteOffset = 0;
+    std::array<std::uint8_t, 5> updateCameraOriginalBytes {};
+    std::size_t updateCameraFirstCallOffset = 0;
+    std::uintptr_t updateCameraFirstStockTargetPreferredAddress = 0;
+    std::size_t updateCameraSecondCallOffset = 0;
+    std::uintptr_t updateCameraSecondStockTargetPreferredAddress = 0;
+    std::uint32_t renderFirstPersonHookRva = 0;
+    std::uint32_t updateCameraOverwriteHookRva = 0;
+    std::uint32_t updateCameraFirstCallHookRva = 0;
+    std::uint32_t updateCameraSecondCallHookRva = 0;
+};
+
 struct SyntheticRetailCompatibilityContract
 {
     std::uintptr_t preferredImageBase = 0;
     LoadedExecutableIdentity loadedIdentity {};
     std::uint32_t sizeOfImage = 0;
     SyntheticExactModuleSeal jip {};
+    SyntheticExactModuleSeal johnnyGuitar {};
     SyntheticExactModuleSeal showOff {};
     SyntheticJipRewriteSeal jipRewrite {};
+    SyntheticJohnnyGuitarRewriteSeal johnnyGuitarRewrite {};
     const LoadedFunctionManifestEntry* coreManifest = nullptr;
     std::size_t coreManifestCount = 0;
     const abi::RetailFunctionAbiDescriptor* functionInventory = nullptr;

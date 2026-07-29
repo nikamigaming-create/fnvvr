@@ -21,6 +21,14 @@ inline constexpr std::uint32_t RetailWorldStackArgumentBytes = 0x10u;
 inline constexpr std::uint32_t RetailWorldHookIndependentProcessSamples = 2u;
 inline constexpr bool RetailWorldHookContractHeaderContainsIssuer = false;
 
+// RenderWorldSceneGraph calls this stock cdecl wrapper while its renderer and
+// culling setup is still live.  A private stereo pass must run at one of the
+// three exact call instructions below; calling ProcessAlt after the whole
+// world function returns loses that setup and is not a valid equivalent.
+inline constexpr std::uintptr_t RetailWorldAccumulateSceneAddress =
+    0x00B6BEE0u;
+inline constexpr std::size_t RetailWorldAccumulationCallPatchByteCount = 5u;
+
 // The five stolen bytes are three complete instructions:
 //   push ebp; mov ebp, esp; push -1
 // Copying six bytes, as the retired DoRenderFrame detour did, would split the
@@ -178,6 +186,45 @@ inline constexpr std::array<RetailWorldCallSiteContract, 2>
         },
     }};
 
+struct RetailWorldAccumulationCallSiteContract
+{
+    const char* name = nullptr;
+    std::uintptr_t preferredCallAddress = 0u;
+    std::array<std::uint8_t, RetailWorldAccumulationCallPatchByteCount>
+        bytes {};
+    std::uintptr_t preferredTargetAddress = 0u;
+    std::uint32_t independentLoadedProcessSamples = 0u;
+};
+
+// Each entry is an exact `call AccumulateScene` instruction inside the same
+// 4698-byte retail RenderWorldSceneGraph body.  The three paths preserve the
+// identical cdecl `(camera, scene, culler)` stack contract.  Do not replace a
+// broader helper: these local calls retain the stock function's live state.
+inline constexpr std::array<RetailWorldAccumulationCallSiteContract, 3>
+    RetailWorldAccumulationCallSiteContractInventory {{
+        {
+            "primary accumulation call",
+            0x0087415Bu,
+            {{ 0xE8u, 0x80u, 0x7Du, 0x2Fu, 0x00u }},
+            RetailWorldAccumulateSceneAddress,
+            2u,
+        },
+        {
+            "alternate accumulation call",
+            0x008742B7u,
+            {{ 0xE8u, 0x24u, 0x7Cu, 0x2Fu, 0x00u }},
+            RetailWorldAccumulateSceneAddress,
+            2u,
+        },
+        {
+            "third accumulation call",
+            0x0087436Du,
+            {{ 0xE8u, 0x6Eu, 0x7Bu, 0x2Fu, 0x00u }},
+            RetailWorldAccumulateSceneAddress,
+            2u,
+        },
+    }};
+
 constexpr bool retailWorldBytesEqual(
     const std::uint8_t* bytes,
     std::size_t byteCount,
@@ -328,6 +375,66 @@ inline RetailWorldCallSiteObservation observeRetailWorldCallSite(
     return result;
 }
 
+struct RetailWorldAccumulationCallSiteObservation
+{
+    bool bytesReadable = false;
+    bool exactInstructionMatches = false;
+    bool callAddressMatches = false;
+    bool targetDecoded = false;
+    std::uintptr_t targetAddress = 0u;
+    bool targetMatches = false;
+
+    bool complete() const noexcept
+    {
+        return bytesReadable
+            && exactInstructionMatches
+            && callAddressMatches
+            && targetDecoded
+            && targetMatches;
+    }
+};
+
+inline RetailWorldAccumulationCallSiteObservation
+observeRetailWorldAccumulationCallSite(
+    const std::uint8_t* bytes,
+    std::size_t byteCount,
+    std::uintptr_t runtimeCallAddress,
+    std::uintptr_t runtimeWorldAddress,
+    const RetailWorldAccumulationCallSiteContract& contract) noexcept
+{
+    RetailWorldAccumulationCallSiteObservation result {};
+    result.bytesReadable = bytes && byteCount >= contract.bytes.size();
+    if (!result.bytesReadable)
+        return result;
+
+    result.exactInstructionMatches = retailWorldBytesEqual(
+        bytes,
+        byteCount,
+        contract.bytes.data(),
+        contract.bytes.size());
+
+    std::uintptr_t expectedRuntimeCallAddress = 0u;
+    result.callAddressMatches = relocateRetailWorldPreferredAddress(
+            runtimeWorldAddress,
+            contract.preferredCallAddress,
+            expectedRuntimeCallAddress)
+        && runtimeCallAddress == expectedRuntimeCallAddress;
+
+    result.targetDecoded = decodeRetailWorldRel32Target(
+        bytes,
+        byteCount,
+        runtimeCallAddress,
+        result.targetAddress);
+    std::uintptr_t expectedRuntimeTarget = 0u;
+    result.targetMatches = result.targetDecoded
+        && relocateRetailWorldPreferredAddress(
+            runtimeWorldAddress,
+            contract.preferredTargetAddress,
+            expectedRuntimeTarget)
+        && result.targetAddress == expectedRuntimeTarget;
+    return result;
+}
+
 struct RetailWorldHookSeamObservation
 {
     bool bodyReadable = false;
@@ -388,6 +495,34 @@ inline RetailWorldRelativeJump encodeRetailWorldX86Jump(
     const std::uint32_t displacement = target - (source + 5u);
     result.bytes = {{
         0xE9u,
+        static_cast<std::uint8_t>(displacement & 0xFFu),
+        static_cast<std::uint8_t>((displacement >> 8u) & 0xFFu),
+        static_cast<std::uint8_t>((displacement >> 16u) & 0xFFu),
+        static_cast<std::uint8_t>((displacement >> 24u) & 0xFFu),
+    }};
+    result.valid = true;
+    return result;
+}
+
+struct RetailWorldRelativeCall
+{
+    bool valid = false;
+    std::array<std::uint8_t, 5> bytes {};
+};
+
+inline RetailWorldRelativeCall encodeRetailWorldX86Call(
+    std::uintptr_t instructionAddress,
+    std::uintptr_t targetAddress) noexcept
+{
+    RetailWorldRelativeCall result {};
+    if (instructionAddress > 0xFFFFFFFFu || targetAddress > 0xFFFFFFFFu)
+        return result;
+
+    const std::uint32_t source = static_cast<std::uint32_t>(instructionAddress);
+    const std::uint32_t target = static_cast<std::uint32_t>(targetAddress);
+    const std::uint32_t displacement = target - (source + 5u);
+    result.bytes = {{
+        0xE8u,
         static_cast<std::uint8_t>(displacement & 0xFFu),
         static_cast<std::uint8_t>((displacement >> 8u) & 0xFFu),
         static_cast<std::uint8_t>((displacement >> 16u) & 0xFFu),

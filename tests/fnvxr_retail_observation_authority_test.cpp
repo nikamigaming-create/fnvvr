@@ -13,7 +13,7 @@ RetailCompatibilityProof completeProof()
     RetailCompatibilityProof proof {};
     proof.evidence = {
         true, true, true, true, true, true,
-        true, true, true, true,
+        true, true, true, true, true,
     };
     proof.diagnostics.runtimeImageBase = 0x400000u;
     proof.diagnostics.processId = 42u;
@@ -40,13 +40,14 @@ int main()
     require(retailObservationAuthorized(proof),
         "complete same-process compatibility proof rejected observation");
 
-    for (int missing = 0; missing < 10; ++missing)
+    for (int missing = 0; missing < 11; ++missing)
     {
         proof = completeProof();
         bool* fields[] = {
             &proof.evidence.retailExecutableIdentityMatched,
             &proof.evidence.moduleSnapshotStable,
             &proof.evidence.jip5730ExactOrAbsent,
+            &proof.evidence.johnnyGuitar528ExactOrAbsent,
             &proof.evidence.showOff184ExactOrAbsent,
             &proof.evidence.renderFirstPersonStockOrJipNormalized,
             &proof.evidence.protectedCoreBodiesMatched,

@@ -36,12 +36,19 @@ void rollbackEyeTarget(
 bool restoreEyeTargets(void*) noexcept { return false; }
 bool prepareCameraFrame(
     void*,
-    const fnvxr::engine::RetailWorldHookDispatchFrame&,
+    const fnvxr::engine::RetailWorldAccumulationCallFrame&,
     const fnvxr::engine::RetailTrackedFrame&,
     std::uint64_t,
     fnvxr::engine::RetailCenterRuntimeFrame&) noexcept
 {
     return false;
+}
+bool armAccumulationCallRelay(void*, std::uintptr_t) noexcept
+{
+    return true;
+}
+void disarmAccumulationCallRelay(void*) noexcept
+{
 }
 bool publishCpuPair(
     void*,
@@ -49,6 +56,23 @@ bool publishCpuPair(
     std::uint64_t) noexcept
 {
     return false;
+}
+bool publishCpuMonoUiQuad(
+    void*,
+    const fnvxr::engine::RetailTrackedFrame&,
+    std::uint64_t) noexcept
+{
+    return false;
+}
+bool prepareColorProducer(void*, std::uint64_t) noexcept
+{
+    return false;
+}
+fnvxr::d3d9::color_transport::ProducerPublication produceColorPair(
+    void*,
+    const fnvxr::d3d9::color_transport::ProducerFrameIdentity&) noexcept
+{
+    return {};
 }
 }
 
@@ -90,21 +114,69 @@ int main()
         &rollbackEyeTarget,
         &restoreEyeTargets,
     };
+    cpuOperations.armAccumulationCallRelay = &armAccumulationCallRelay;
+    cpuOperations.disarmAccumulationCallRelay = &disarmAccumulationCallRelay;
     cpuOperations.prepareDistinctCameraFrame = &prepareCameraFrame;
+    cpuOperations.publicationTransport =
+        fnvxr::d3d9::RetailVrPublicationTransport::CpuReadback;
     cpuOperations.publishCpuPair = &publishCpuPair;
+    cpuOperations.publishCpuMonoUiQuad = &publishCpuMonoUiQuad;
     require(
         fnvxr::d3d9::retailVrBridgeOperationsComplete(cpuOperations),
         "complete ordinary-D3D9 CPU publication operations were rejected");
+    cpuOperations.publishCpuMonoUiQuad = nullptr;
+    require(
+        !fnvxr::d3d9::retailVrBridgeOperationsComplete(cpuOperations),
+        "CPU bridge accepted a world publisher without its mono UI publisher");
+    cpuOperations.publishCpuMonoUiQuad = &publishCpuMonoUiQuad;
     cpuOperations.publishCpuPair = nullptr;
     require(
         !fnvxr::d3d9::retailVrBridgeOperationsComplete(cpuOperations),
         "bridge accepted neither a CPU publisher nor a complete GPU publisher");
 
+    fnvxr::d3d9::RetailVrBridgeOperations gpuOperations {};
+    gpuOperations.context = &gpuOperations;
+    gpuOperations.eyeTargets = {
+        &gpuOperations,
+        &snapshotEyeTargets,
+        &bindEyeTarget,
+        &endEyeTarget,
+        &rollbackEyeTarget,
+        &restoreEyeTargets,
+    };
+    gpuOperations.armAccumulationCallRelay = &armAccumulationCallRelay;
+    gpuOperations.disarmAccumulationCallRelay = &disarmAccumulationCallRelay;
+    gpuOperations.prepareDistinctCameraFrame = &prepareCameraFrame;
+    gpuOperations.publicationTransport =
+        fnvxr::d3d9::RetailVrPublicationTransport::GpuSharedTextures;
+    gpuOperations.prepareColorProducer = &prepareColorProducer;
+    gpuOperations.produceColorPair = &produceColorPair;
+    require(
+        fnvxr::d3d9::retailVrBridgeOperationsComplete(gpuOperations),
+        "complete GPU-shared-texture publication operations were rejected");
+
+    gpuOperations.publishCpuPair = &publishCpuPair;
+    require(
+        !fnvxr::d3d9::retailVrBridgeOperationsComplete(gpuOperations),
+        "GPU bridge accepted a hidden CPU fallback");
+    gpuOperations.publishCpuPair = nullptr;
+    gpuOperations.publishCpuMonoUiQuad = &publishCpuMonoUiQuad;
+    require(
+        !fnvxr::d3d9::retailVrBridgeOperationsComplete(gpuOperations),
+        "GPU bridge accepted a hidden CPU UI fallback");
+    gpuOperations.publishCpuMonoUiQuad = nullptr;
+    gpuOperations.publicationTransport =
+        fnvxr::d3d9::RetailVrPublicationTransport::CpuReadback;
+    require(
+        !fnvxr::d3d9::retailVrBridgeOperationsComplete(gpuOperations),
+        "CPU bridge accepted GPU callbacks instead of an explicit CPU route");
+
     fnvxr::d3d9::RetailVrBridgeWin32<4096u> bridge;
     const auto initialDiagnostics = bridge.frameDiagnostics();
     require(
         initialDiagnostics.dispatchCount == 0u
-            && initialDiagnostics.stereoCompleteCount == 0u,
+            && initialDiagnostics.stereoCompleteCount == 0u
+            && !initialDiagnostics.eyeCamera.captured,
         "bridge diagnostics did not start empty");
     require(
         !bridge.initialize({}, 0u),

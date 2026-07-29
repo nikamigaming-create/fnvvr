@@ -368,7 +368,7 @@ $manifest = [ordered]@{
         applied = [bool]$activationReachApplied
     }
     mapping = "Local\FNVXR_D3D9_Frame_v1"
-    stereoMapping = "Local\FNVXR_D3D9_StereoFrame_v7"
+    stereoMapping = "Local\FNVXR_D3D9_StereoFrame_v8"
     openXrHostLaunched = $false
     forcedMenuAction = $false
     uiGrid = "${UiWidth}x${UiHeight}"

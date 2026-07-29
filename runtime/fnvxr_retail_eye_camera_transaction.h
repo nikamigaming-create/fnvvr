@@ -37,7 +37,8 @@ struct RetailNiCameraSpatialEvidenceLayout
     std::uint8_t opaque1C[0x18] {};
     RetailNiTransformLayout local {};
     RetailNiTransformLayout world {};
-    float worldToCamera[16] {};
+    std::uint8_t opaqueWorldBound[0x10] {};
+    float worldToCamera[12] {};
     abi::RetailNiFrustumLayout frustum {};
     float minimumNearPlane = 0.0f;
     float maximumFarNearRatio = 0.0f;
@@ -51,7 +52,7 @@ static_assert(offsetof(RetailNiCameraSpatialEvidenceLayout, parent) == 0x18u);
 static_assert(offsetof(RetailNiCameraSpatialEvidenceLayout, local) == 0x34u);
 static_assert(offsetof(RetailNiCameraSpatialEvidenceLayout, world) == 0x68u);
 static_assert(
-    offsetof(RetailNiCameraSpatialEvidenceLayout, worldToCamera) == 0x9Cu);
+    offsetof(RetailNiCameraSpatialEvidenceLayout, worldToCamera) == 0xACu);
 static_assert(offsetof(RetailNiCameraSpatialEvidenceLayout, frustum) == 0xDCu);
 static_assert(
     sizeof(RetailNiCameraSpatialEvidenceLayout)
@@ -103,7 +104,7 @@ struct RetailCameraMutableState
 {
     RetailNiTransformLayout local {};
     RetailNiTransformLayout world {};
-    float worldToCamera[16] {};
+    float worldToCamera[12] {};
     abi::RetailNiFrustumLayout frustum {};
     float minimumNearPlane = 0.0f;
     float maximumFarNearRatio = 0.0f;
@@ -282,12 +283,9 @@ inline RetailNiTransformLayout retailTransform(
 
 inline bool buildRetailWorldToCamera(
     const RetailNiTransformLayout& world,
-    const abi::RetailNiFrustumLayout& frustum,
-    float output[16]) noexcept
+    float output[12]) noexcept
 {
-    if (!output
-        || !retailTransformUsable(world)
-        || !retailFrustumUsable(frustum))
+    if (!output || !retailTransformUsable(world))
     {
         return false;
     }
@@ -312,6 +310,35 @@ inline bool buildRetailWorldToCamera(
             + view[axis][2] * static_cast<double>(world.translation[2]));
     }
 
+    for (std::size_t row = 0u; row < 3u; ++row)
+    {
+        for (std::size_t column = 0u; column < 4u; ++column)
+        {
+            const double value = view[row][column];
+            if (!std::isfinite(value)
+                || value > (std::numeric_limits<float>::max)()
+                || value < -(std::numeric_limits<float>::max)())
+            {
+                return false;
+            }
+            output[row * 4u + column] = static_cast<float>(value);
+        }
+    }
+    return retailCameraFinite(output, 12u);
+}
+
+inline bool buildRetailWorldToClip(
+    const RetailNiTransformLayout& world,
+    const abi::RetailNiFrustumLayout& frustum,
+    float output[16]) noexcept
+{
+    if (!output || !retailFrustumUsable(frustum))
+        return false;
+
+    float worldToCamera[12] {};
+    if (!buildRetailWorldToCamera(world, worldToCamera))
+        return false;
+
     const double left = frustum.left;
     const double right = frustum.right;
     const double top = frustum.top;
@@ -329,12 +356,15 @@ inline bool buildRetailWorldToCamera(
     double matrix[4][4] {};
     for (std::size_t component = 0u; component < 4u; ++component)
     {
-        matrix[0][component] = horizontalScale * view[0][component]
-            + horizontalOffset * view[2][component];
-        matrix[1][component] = verticalScale * view[1][component]
-            + verticalOffset * view[2][component];
-        matrix[2][component] = depthScale * view[2][component];
-        matrix[3][component] = view[2][component];
+        const double view0 = worldToCamera[component];
+        const double view1 = worldToCamera[4u + component];
+        const double view2 = worldToCamera[8u + component];
+        matrix[0][component] = horizontalScale * view0
+            + horizontalOffset * view2;
+        matrix[1][component] = verticalScale * view1
+            + verticalOffset * view2;
+        matrix[2][component] = depthScale * view2;
+        matrix[3][component] = view2;
     }
     matrix[2][3] += depthOffset;
 
@@ -518,7 +548,6 @@ inline bool configureDerivedCamera(
         && retailFrustumUsable(destination.frustum)
         && buildRetailWorldToCamera(
             destination.world,
-            destination.frustum,
             destination.worldToCamera);
 }
 }

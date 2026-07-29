@@ -119,6 +119,81 @@ require_text(
     "${bridge_text}"
     "mPublicationSequence.claim("
     "World and UI publications must share one monotonic transaction domain")
+require_text(
+    "${bridge_text}"
+    "controllerOperations.claimWorldTransaction = &claimWorldTransaction;"
+    "The world controller must claim from the bridge's UI/world transaction domain before rendering")
+require_text(
+    "${bridge_text}"
+    "publishCpuMonoUiQuad"
+    "The ordinary-D3D9 bridge must publish a verified flat UI record as well as a world pair")
+require_text(
+    "${bridge_text}"
+    "operations.publishCpuPair\n        && operations.publishCpuMonoUiQuad"
+    "CPU transport setup must require both the world and UI publishers")
+require_text(
+    "${bridge_text}"
+    "mOperations.publishCpuMonoUiQuad("
+    "A confirmed UI Present must route through the CPU mono-quad publisher")
+require_text(
+    "${proxy_text}"
+    "operations.publishCpuMonoUiQuad = &publishRetailVrCpuMonoUiQuad;"
+    "The retail proxy must bind its CPU mono-quad publisher into the bridge")
+require_text(
+    "${proxy_text}"
+    "bool publishRetailVrCpuMonoUiQuad("
+    "The ordinary-D3D9 proxy must implement the CPU mono-quad publication seam")
+require_text(
+    "${proxy_text}"
+    "header->producerMode = fnvxr::shared::StereoProducerMonoUiQuad;"
+    "CPU UI pixels must be labelled as a flat UI producer, never as world stereo")
+require_text(
+    "${proxy_text}"
+    "header->separated = 0;\n    header->worldCandidate = 0;\n    header->uiActive = 1;"
+    "CPU UI records must be exclusively flat, non-world presentation records")
+require_text(
+    "${proxy_text}"
+    "header->transactionId = transactionId;\n    header->sourceFrame = transactionId;\n    header->runtimeStateSample = tracked.runtime.frame;"
+    "CPU UI records must carry the exact shared transition identity and runtime sample")
+
+string(FIND "${bridge_text}" "static bool claimWorldTransaction(" world_claim_start)
+string(FIND "${bridge_text}" "static engine::RetailCenterRuntimeFrameResult renderStereo(" world_claim_end)
+if(world_claim_start EQUAL -1
+    OR world_claim_end EQUAL -1
+    OR world_claim_end LESS world_claim_start)
+    message(FATAL_ERROR
+        "Could not isolate the bridge world-transaction claim callback")
+endif()
+math(EXPR world_claim_length "${world_claim_end} - ${world_claim_start}")
+string(SUBSTRING "${bridge_text}" ${world_claim_start} ${world_claim_length} world_claim_body)
+require_text(
+    "${world_claim_body}"
+    "mPublicationSequence.claim("
+    "World rendering must reserve its identity from the shared UI/world sequence")
+require_text(
+    "${world_claim_body}"
+    "PresentationMode::BinocularWorld"
+    "A claimed world identity must be explicitly labelled as binocular world content")
+
+string(FIND "${bridge_text}" "static bool publishGpuPair(" world_publish_start)
+string(FIND "${bridge_text}" "bool produceAndPublish(" world_publish_end)
+if(world_publish_start EQUAL -1
+    OR world_publish_end EQUAL -1
+    OR world_publish_end LESS world_publish_start)
+    message(FATAL_ERROR
+        "Could not isolate GPU world publication")
+endif()
+math(EXPR world_publish_length "${world_publish_end} - ${world_publish_start}")
+string(SUBSTRING "${bridge_text}" ${world_publish_start} ${world_publish_length} world_publish_body)
+require_text(
+    "${world_publish_body}"
+    "identity.transactionId = transactionId;"
+    "GPU world publication must preserve the identity claimed before eye rendering")
+string(FIND "${world_publish_body}" "mPublicationSequence.claim(" world_publish_reclaim)
+if(NOT world_publish_reclaim EQUAL -1)
+    message(FATAL_ERROR
+        "GPU world publication must not allocate a second transaction ID after eye rendering")
+endif()
 forbid_text(
     "${bridge_text}"
     "mNextUiTransactionId"

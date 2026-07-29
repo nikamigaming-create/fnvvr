@@ -1,6 +1,10 @@
 param(
     [ValidateSet("Release")][string]$Configuration = "Release",
     [string]$OpenXrLoaderPath = "",
+    # The product build compiles both architectures and numerous standalone
+    # verifier targets. Two workers avoid intermittent compiler/linker
+    # corruption on this machine while retaining bounded parallelism.
+    [ValidateRange(1, 4)][int]$Parallelism = 2,
     [switch]$ReuseAttestation
 )
 
@@ -44,15 +48,16 @@ $nonce = [Guid]::NewGuid().ToString("N")
 if ($LASTEXITCODE -ne 0) { throw "Product Win32 configure failed with exit code $LASTEXITCODE." }
 # Bound compiler fan-out: unbounded MSBuild parallelism can start dozens of
 # multi-gigabyte CL processes and turn a clean build into an out-of-memory
-# compiler exit. Four keeps both architectures deterministic on this machine.
-& cmake --build $win32Build --config $Configuration --clean-first --parallel 4
+# compiler exit. The default is deliberately conservative and can be raised
+# only through the explicit bounded parameter.
+& cmake --build $win32Build --config $Configuration --clean-first --parallel $Parallelism
 if ($LASTEXITCODE -ne 0) { throw "Product Win32 clean build failed with exit code $LASTEXITCODE." }
 & ctest --test-dir $win32Build -C $Configuration --no-tests=error --output-on-failure
 if ($LASTEXITCODE -ne 0) { throw "Product Win32 CTest failed with exit code $LASTEXITCODE." }
 
 & cmake -S $root -B $x64Build -A x64
 if ($LASTEXITCODE -ne 0) { throw "Product x64 configure failed with exit code $LASTEXITCODE." }
-& cmake --build $x64Build --config $Configuration --clean-first --parallel 4
+& cmake --build $x64Build --config $Configuration --clean-first --parallel $Parallelism
 if ($LASTEXITCODE -ne 0) { throw "Product x64 clean build failed with exit code $LASTEXITCODE." }
 & ctest --test-dir $x64Build -C $Configuration --no-tests=error --output-on-failure
 if ($LASTEXITCODE -ne 0) { throw "Product x64 CTest failed with exit code $LASTEXITCODE." }

@@ -21,12 +21,21 @@ inline constexpr std::array<std::uint32_t, 3u>
     };
 
 // CPU publication uses the canonical BGRA8 byte layout consumed by the
-// protocol-v7 OpenXR host. These formats are ordinary-D3D9 render targets and
+// protocol-v8 OpenXR host. These formats are ordinary-D3D9 render targets and
 // do not require D3D9Ex shared handles.
 inline constexpr std::array<std::uint32_t, 2u>
     RetailCpuEyeTargetColorFormats {
         21u, // D3DFMT_A8R8G8B8
         22u, // D3DFMT_X8R8G8B8
+    };
+
+// When the engine has no depth surface bound at Present, the ordinary-D3D9
+// bootstrap may create a private depth surface only with a conservative
+// eight-bit-stencil format. D24S8 is the sole fail-closed fallback; an exact
+// observed engine format always takes priority.
+inline constexpr std::array<std::uint32_t, 1u>
+    RetailFallbackEyeTargetDepthFormats {
+        75u, // D3DFMT_D24S8
     };
 
 constexpr bool retailCpuEyeTargetColorFormatAccepted(
@@ -51,6 +60,18 @@ constexpr bool retailSharedEyeTargetColorFormatAccepted(
     return false;
 }
 
+constexpr bool retailFallbackEyeTargetDepthFormatAccepted(
+    std::uint32_t format) noexcept
+{
+    for (const std::uint32_t candidate :
+        RetailFallbackEyeTargetDepthFormats)
+    {
+        if (candidate == format)
+            return true;
+    }
+    return false;
+}
+
 enum class EyeTargetSurfaceIdentity : std::uint8_t
 {
     Failure,
@@ -68,6 +89,84 @@ struct EyeTargetSurfaceDescription
     bool renderTarget = false;
     bool depthStencil = false;
 };
+
+enum class RetailEyeDepthDescriptionSource : std::uint8_t
+{
+    Unavailable,
+    Current,
+    Cached,
+    StencilFallback,
+};
+
+struct RetailEyeDepthSelection
+{
+    RetailEyeDepthDescriptionSource source =
+        RetailEyeDepthDescriptionSource::Unavailable;
+    std::uint32_t format = 0u;
+
+    constexpr bool available() const noexcept
+    {
+        return source != RetailEyeDepthDescriptionSource::Unavailable
+            && format != 0u;
+    }
+};
+
+constexpr bool retailEyeDepthDescriptionMatchesColor(
+    const EyeTargetSurfaceDescription& color,
+    const EyeTargetSurfaceDescription& depth) noexcept
+{
+    return color.width != 0u
+        && color.height != 0u
+        && color.format != 0u
+        && color.renderTarget
+        && !color.depthStencil
+        && depth.width == color.width
+        && depth.height == color.height
+        && depth.format != 0u
+        && !depth.renderTarget
+        && depth.depthStencil;
+}
+
+constexpr RetailEyeDepthSelection selectRetailEyeDepthDescription(
+    const EyeTargetSurfaceDescription& color,
+    bool currentAvailable,
+    const EyeTargetSurfaceDescription& current,
+    bool cachedAvailable,
+    const EyeTargetSurfaceDescription& cached) noexcept
+{
+    if (color.width == 0u
+        || color.height == 0u
+        || color.format == 0u
+        || !color.renderTarget
+        || color.depthStencil)
+    {
+        return {};
+    }
+    if (currentAvailable
+        && retailEyeDepthDescriptionMatchesColor(color, current))
+    {
+        return {
+            RetailEyeDepthDescriptionSource::Current,
+            current.format,
+        };
+    }
+    if (cachedAvailable
+        && retailEyeDepthDescriptionMatchesColor(color, cached))
+    {
+        return {
+            RetailEyeDepthDescriptionSource::Cached,
+            cached.format,
+        };
+    }
+    if (!RetailFallbackEyeTargetDepthFormats.empty())
+    {
+        return {
+            RetailEyeDepthDescriptionSource::StencilFallback,
+            RetailFallbackEyeTargetDepthFormats.front(),
+        };
+    }
+    return {};
+}
 
 struct EyeTargetViewport
 {
@@ -134,6 +233,7 @@ struct EyeTargetDeviceApi
     bool (*setViewport)(void*, void*, const EyeTargetViewport&) noexcept = nullptr;
     bool (*setScissorRect)(void*, void*, const EyeTargetRect&) noexcept = nullptr;
     bool (*setScissorEnabled)(void*, void*, bool) noexcept = nullptr;
+    bool (*clearBoundEyeTargets)(void*, void*) noexcept = nullptr;
     void (*releaseSurface)(void*, void*) noexcept = nullptr;
 };
 
@@ -152,6 +252,7 @@ constexpr bool eyeTargetDeviceApiComplete(
         && api.setViewport
         && api.setScissorRect
         && api.setScissorEnabled
+        && api.clearBoundEyeTargets
         && api.releaseSurface;
 }
 
@@ -522,7 +623,12 @@ private:
             mApi.context,
             mResources.device,
             false);
-        if (!scissorDisabled)
+        const bool targetsCleared =
+            scissorDisabled
+            && mApi.clearBoundEyeTargets(
+                mApi.context,
+                mResources.device);
+        if (!targetsCleared)
             return false;
 
         mEyeActive = true;

@@ -7,7 +7,10 @@
 
 #include "fnvxr_protocol.h"
 #include "fnvxr_gpu_color_route.h"
+#include "fnvxr_cpu_engine_presentation.h"
+#include "fnvxr_game_plane_surface.h"
 #include "fnvxr_host_ui_capture_gate.h"
+#include "fnvxr_headset_mirror_capture.h"
 #include "fnvxr_openxr_live_authority.h"
 #include "fnvxr_shared_state.h"
 #include "fnvxr_stereo_visual_trial.h"
@@ -284,6 +287,9 @@ struct Renderer
     bool resetSharedStereoReaderClaim = false;
     LONG lastSharedStereoSequence = 0;
     LONG64 lastSharedStereoPublicationGeneration = 0;
+    LONG lastSharedStereoUiSequence = 0;
+    LONG64 lastSharedStereoUiPublicationGeneration = 0;
+    std::uint64_t lastSharedStereoUiRendererEpoch = 0u;
     HANDLE sharedRuntimeMapping = nullptr;
     fnvxr::shared::SharedRuntimeState* sharedRuntimeState = nullptr;
     LONG lastSharedRuntimeSequence = 0;
@@ -303,6 +309,12 @@ struct Renderer
     std::uint64_t retainedUiRuntimeStateSample = 0u;
     float retainedUiTextureAspect = 16.0f / 9.0f;
     bool retainedUiHostWindowCaptured = false;
+    // The last structurally valid CPU menu boundary remains separate from the
+    // retained texture.  Even a rejected/black menu copy must prevent an old
+    // world pair from being revived on the following gameplay transition.
+    std::uint64_t cpuUiBoundaryTransactionId = 0u;
+    std::uint64_t cpuUiBoundarySourceFrame = 0u;
+    std::uint64_t cpuUiBoundaryRuntimeStateSample = 0u;
     uint64_t gameTextureUpdates = 0;
     uint64_t gameTextureMisses = 0;
     bool hasWorldTextureFrame = false;
@@ -313,7 +325,11 @@ struct Renderer
     bool stereoGameFrameSeparated = false;
     bool stereoGameFrameWorldCandidate = false;
     LONG stereoGameFrameSequence = 0;
+    std::uint64_t stereoGamePublicationGeneration = 0u;
     LONG stereoGameRenderPairSequence = 0;
+    std::uint64_t stereoGameTransactionId = 0u;
+    std::uint64_t stereoGameSourceFrame = 0u;
+    std::uint64_t stereoGameRuntimeStateSample = 0u;
     LONG stereoProducerMode = 0;
     LONG stereoGamePoseSequence = 0;
     XrTime stereoGameRenderedDisplayTime = 0;
@@ -364,6 +380,15 @@ struct StereoPixelStats
     std::uint32_t rightHash = 2166136261u;
 };
 
+struct CpuMonoUiFrame
+{
+    std::vector<std::uint32_t> pixels;
+    int width = 0;
+    int height = 0;
+    float aspect = 16.0f / 9.0f;
+    fnvxr::host::cpu_engine_presentation::FrameIdentity identity {};
+};
+
 struct HostSharedBridge
 {
     HANDLE inputProducerMutex = nullptr;
@@ -396,6 +421,23 @@ struct EyeRenderProof
     std::uint32_t samples = 0;
     std::uint32_t nonBlackSamples = 0;
     std::uint32_t variedSamples = 0;
+};
+
+struct HeadsetMirrorCapture
+{
+    bool enabled = false;
+    std::wstring directory;
+    std::uint32_t everyFrames = 1u;
+    std::uint32_t maximumPairs = 0u;
+    fnvxr::host::headset_mirror::ScheduleState schedule {};
+
+    fnvxr::host::headset_mirror::ScheduleDecision request(
+        std::uint64_t frame) noexcept
+    {
+        return fnvxr::host::headset_mirror::schedule(
+            schedule,
+            { enabled, frame, everyFrames, maximumPairs });
+    }
 };
 
 struct SourceViewPublication
@@ -1097,6 +1139,169 @@ std::wstring joinPath(const std::wstring& left, const std::wstring& right)
     if (left.back() == L'\\' || left.back() == L'/')
         return left + right;
     return left + L"\\" + right;
+}
+
+enum class HeadsetMirrorPixelLayout
+{
+    Unsupported,
+    Rgba,
+    Bgra,
+};
+
+HeadsetMirrorPixelLayout headsetMirrorPixelLayout(DXGI_FORMAT format) noexcept
+{
+    switch (format)
+    {
+    // Some OpenXR runtimes expose an R8G8B8A8 resource as typeless while
+    // requiring an R8G8B8A8_UNORM render-target view.  The mapped bytes have
+    // the same RGBA layout, so retain the view's intended interpretation for
+    // the offline PNG mirror instead of silently dropping a valid eye image.
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+    case DXGI_FORMAT_R8G8B8A8_UNORM:
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+        return HeadsetMirrorPixelLayout::Rgba;
+    case DXGI_FORMAT_B8G8R8A8_UNORM:
+    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+        return HeadsetMirrorPixelLayout::Bgra;
+    default:
+        return HeadsetMirrorPixelLayout::Unsupported;
+    }
+}
+
+HRESULT writeHeadsetMirrorPng(
+    const std::wstring& path,
+    const D3D11_TEXTURE2D_DESC& desc,
+    const D3D11_MAPPED_SUBRESOURCE& mapped)
+{
+    if (path.empty()
+        || !mapped.pData
+        || desc.Width == 0u
+        || desc.Height == 0u
+        || mapped.RowPitch == 0u
+        || mapped.RowPitch < static_cast<size_t>(desc.Width) * 4u
+        || desc.Height > (std::numeric_limits<UINT>::max)() / mapped.RowPitch)
+    {
+        return E_INVALIDARG;
+    }
+
+    const HeadsetMirrorPixelLayout sourceLayout = headsetMirrorPixelLayout(desc.Format);
+    if (sourceLayout == HeadsetMirrorPixelLayout::Unsupported)
+        return WINCODEC_ERR_UNSUPPORTEDPIXELFORMAT;
+
+    constexpr size_t BytesPerPixel = 4u;
+    const size_t tightRowPitch = static_cast<size_t>(desc.Width) * BytesPerPixel;
+    if (tightRowPitch > (std::numeric_limits<UINT>::max)()
+        || desc.Height > (std::numeric_limits<UINT>::max)() / tightRowPitch)
+    {
+        return E_INVALIDARG;
+    }
+
+    BYTE* encodedPixels = static_cast<BYTE*>(mapped.pData);
+    UINT encodedRowPitch = mapped.RowPitch;
+    UINT encodedImageBytes = mapped.RowPitch * desc.Height;
+    std::vector<BYTE> convertedPixels;
+    if (sourceLayout == HeadsetMirrorPixelLayout::Rgba)
+    {
+        try
+        {
+            convertedPixels.resize(tightRowPitch * desc.Height);
+        }
+        catch (...)
+        {
+            return E_OUTOFMEMORY;
+        }
+
+        for (UINT y = 0u; y < desc.Height; ++y)
+        {
+            const BYTE* const source = static_cast<const BYTE*>(mapped.pData)
+                + static_cast<size_t>(y) * mapped.RowPitch;
+            BYTE* const destination = convertedPixels.data()
+                + static_cast<size_t>(y) * tightRowPitch;
+            for (UINT x = 0u; x < desc.Width; ++x)
+            {
+                const size_t offset = static_cast<size_t>(x) * BytesPerPixel;
+                destination[offset + 0u] = source[offset + 2u];
+                destination[offset + 1u] = source[offset + 1u];
+                destination[offset + 2u] = source[offset + 0u];
+                destination[offset + 3u] = source[offset + 3u];
+            }
+        }
+
+        encodedPixels = convertedPixels.data();
+        encodedRowPitch = static_cast<UINT>(tightRowPitch);
+        encodedImageBytes = static_cast<UINT>(convertedPixels.size());
+    }
+
+    ComPtr<IWICImagingFactory> factory;
+    HRESULT result = CoCreateInstance(
+            CLSID_WICImagingFactory,
+            nullptr,
+            CLSCTX_INPROC_SERVER,
+            IID_PPV_ARGS(&factory));
+    if (FAILED(result))
+    {
+        return result;
+    }
+    if (!factory)
+        return E_NOINTERFACE;
+
+    ComPtr<IWICStream> stream;
+    ComPtr<IWICBitmapEncoder> encoder;
+    ComPtr<IWICBitmapFrameEncode> frame;
+    ComPtr<IPropertyBag2> properties;
+    result = factory->CreateStream(&stream);
+    if (SUCCEEDED(result))
+        result = stream->InitializeFromFilename(path.c_str(), GENERIC_WRITE);
+    if (SUCCEEDED(result))
+        result = factory->CreateEncoder(GUID_ContainerFormatPng, nullptr, &encoder);
+    if (SUCCEEDED(result))
+        result = encoder->Initialize(stream.Get(), WICBitmapEncoderNoCache);
+    if (SUCCEEDED(result))
+        result = encoder->CreateNewFrame(&frame, &properties);
+    if (SUCCEEDED(result))
+        result = frame->Initialize(properties.Get());
+    if (SUCCEEDED(result))
+        result = frame->SetSize(desc.Width, desc.Height);
+    WICPixelFormatGUID requestedPixelFormat = GUID_WICPixelFormat32bppBGRA;
+    if (SUCCEEDED(result))
+        result = frame->SetPixelFormat(&requestedPixelFormat);
+    if (SUCCEEDED(result)
+        && !IsEqualGUID(requestedPixelFormat, GUID_WICPixelFormat32bppBGRA))
+    {
+        return WINCODEC_ERR_UNSUPPORTEDPIXELFORMAT;
+    }
+    if (SUCCEEDED(result))
+    {
+        result = frame->WritePixels(
+            desc.Height,
+            encodedRowPitch,
+            encodedImageBytes,
+            encodedPixels);
+    }
+    if (SUCCEEDED(result))
+        result = frame->Commit();
+    if (SUCCEEDED(result))
+        result = encoder->Commit();
+    return result;
+}
+
+std::wstring headsetMirrorFramePath(
+    const HeadsetMirrorCapture& capture,
+    std::uint32_t ordinal,
+    std::uint32_t eyeIndex)
+{
+    if (capture.directory.empty() || ordinal == 0u || eyeIndex > 1u)
+        return {};
+    wchar_t fileName[64] {};
+    if (swprintf_s(
+            fileName,
+            L"pair_%06u_%s.png",
+            ordinal,
+            eyeIndex == 0u ? L"left" : L"right") < 0)
+    {
+        return {};
+    }
+    return joinPath(capture.directory, fileName);
 }
 
 std::vector<std::wstring> sceneCacheManifestPaths()
@@ -2301,7 +2506,7 @@ bool readSharedD3D9StereoFrame(
         HANDLE lease = CreateMutexA(
             nullptr,
             FALSE,
-            "Local\\FNVXR_D3D9_Stereo_HostReader_v7");
+            fnvxr::shared::D3D9StereoFrameHostReaderMutexName);
         if (!lease)
             return false;
         const DWORD waitResult = WaitForSingleObject(lease, 0);
@@ -2380,7 +2585,11 @@ bool readSharedD3D9StereoFrame(
         renderer.lastSharedStereoSequence = 0;
         renderer.lastSharedStereoPublicationGeneration = 0;
         renderer.stereoGameFrameSequence = 0;
+        renderer.stereoGamePublicationGeneration = 0u;
         renderer.stereoGameRenderPairSequence = 0;
+        renderer.stereoGameTransactionId = 0u;
+        renderer.stereoGameSourceFrame = 0u;
+        renderer.stereoGameRuntimeStateSample = 0u;
         renderer.hasStereoGameFrame = false;
         renderer.stereoStableFrameCount = 0;
         renderer.stereoProducerProcessId = sourceProcessId;
@@ -2401,6 +2610,16 @@ bool readSharedD3D9StereoFrame(
     const bool requireNativeStereo = envEnabled("FNVXR_REQUIRE_NATIVE_STEREO", true);
     const LONG sourceRenderPairSequence = header->renderPairSequence;
     const LONG sourceProducerMode = header->producerMode;
+    const std::uint64_t sourceTransactionId = header->transactionId;
+    const std::uint64_t sourceFrameId = header->sourceFrame;
+    const std::uint64_t sourceRuntimeStateSample =
+        header->runtimeStateSample;
+    if (sourceTransactionId == 0u
+        || sourceFrameId == 0u
+        || sourceRuntimeStateSample == 0u)
+    {
+        return false;
+    }
     const bool coherentSameTickProducer =
         fnvxr::shared::stereoProducerCarriesSameTransactionEyes(
             static_cast<std::uint32_t>(sourceProducerMode))
@@ -2545,7 +2764,12 @@ bool readSharedD3D9StereoFrame(
 
     renderer.lastSharedStereoSequence = sequenceBefore;
     renderer.lastSharedStereoPublicationGeneration = publicationGenerationBefore;
+    renderer.stereoGamePublicationGeneration =
+        static_cast<std::uint64_t>(publicationGenerationBefore);
     renderer.stereoGameRenderPairSequence = sourceRenderPairSequence;
+    renderer.stereoGameTransactionId = sourceTransactionId;
+    renderer.stereoGameSourceFrame = sourceFrameId;
+    renderer.stereoGameRuntimeStateSample = sourceRuntimeStateSample;
     renderer.stereoProducerMode = sourceProducerMode;
     renderer.stereoReferenceSpaceGeneration = sourceReferenceGeneration;
     renderer.stereoProducerEpoch = sourceProducerEpoch;
@@ -2555,6 +2779,235 @@ bool readSharedD3D9StereoFrame(
     renderedDisplayTimeOut = renderedDisplayTime;
     sequenceOut = sequenceBefore;
     sourceAspect = static_cast<float>(sourceWidth) / static_cast<float>(sourceHeight);
+    return true;
+}
+
+bool readSharedD3D9MonoUiFrame(
+    Renderer& renderer,
+    CpuMonoUiFrame& output)
+{
+    output = {};
+    if (renderer.ownsSharedStereoReaderLease
+        && renderer.sharedStereoReaderLeaseThreadId != GetCurrentThreadId())
+    {
+        return false;
+    }
+    if (!renderer.ownsSharedStereoReaderLease)
+    {
+        HANDLE lease = CreateMutexA(
+            nullptr,
+            FALSE,
+            fnvxr::shared::D3D9StereoFrameHostReaderMutexName);
+        if (!lease)
+            return false;
+        const DWORD waitResult = WaitForSingleObject(lease, 0);
+        if (waitResult != WAIT_OBJECT_0 && waitResult != WAIT_ABANDONED)
+        {
+            CloseHandle(lease);
+            return false;
+        }
+        renderer.sharedStereoReaderLease = lease;
+        renderer.ownsSharedStereoReaderLease = true;
+        renderer.sharedStereoReaderLeaseThreadId = GetCurrentThreadId();
+        renderer.resetSharedStereoReaderClaim = true;
+    }
+    if (!renderer.sharedStereoView)
+    {
+        renderer.sharedStereoMapping = OpenFileMappingA(
+            FILE_MAP_READ | FILE_MAP_WRITE,
+            FALSE,
+            fnvxr::shared::D3D9StereoFrameSharedMappingName);
+        if (!renderer.sharedStereoMapping)
+            return false;
+
+        constexpr SIZE_T mappingSize =
+            sizeof(SharedStereoHeader) + SharedVideoMaxWidth * SharedVideoMaxHeight * 4 * 2
+                * fnvxr::shared::D3D9StereoFrameSlotCount;
+        renderer.sharedStereoView =
+            static_cast<std::uint8_t*>(MapViewOfFile(
+                renderer.sharedStereoMapping,
+                FILE_MAP_READ | FILE_MAP_WRITE,
+                0,
+                0,
+                mappingSize));
+        if (!renderer.sharedStereoView)
+        {
+            CloseHandle(renderer.sharedStereoMapping);
+            renderer.sharedStereoMapping = nullptr;
+            return false;
+        }
+    }
+
+    const auto* header =
+        reinterpret_cast<const SharedStereoHeader*>(renderer.sharedStereoView);
+    constexpr std::uint32_t mappingSize =
+        sizeof(SharedStereoHeader) + SharedVideoMaxWidth * SharedVideoMaxHeight * 4 * 2
+            * fnvxr::shared::D3D9StereoFrameSlotCount;
+    if (header->magic != SharedStereoMagic
+        || header->version != fnvxr::shared::D3D9StereoFrameSharedVersion
+        || header->headerBytes != sizeof(SharedStereoHeader)
+        || header->totalMappingBytes != mappingSize
+        || header->producerProcessId == 0u
+        || header->rendererProducerEpoch == 0u
+        || header->writing)
+    {
+        return false;
+    }
+    const LONG64 publicationGenerationBefore = InterlockedCompareExchange64(
+        &const_cast<SharedStereoHeader*>(header)->publicationGeneration,
+        0,
+        0);
+    if (publicationGenerationBefore == 0)
+        return false;
+
+    if (renderer.resetSharedStereoReaderClaim)
+    {
+        InterlockedExchange(
+            &const_cast<SharedStereoHeader*>(header)->readerSlots[
+                fnvxr::shared::D3D9StereoHostReaderLane],
+            -1);
+        renderer.resetSharedStereoReaderClaim = false;
+    }
+
+    const std::uint32_t sourceProcessId = header->producerProcessId;
+    if (renderer.stereoProducerProcessId != 0u
+        && renderer.stereoProducerProcessId != sourceProcessId)
+    {
+        renderer.lastSharedStereoSequence = 0;
+        renderer.lastSharedStereoPublicationGeneration = 0;
+        renderer.lastSharedStereoUiSequence = 0;
+        renderer.lastSharedStereoUiPublicationGeneration = 0;
+        renderer.lastSharedStereoUiRendererEpoch = 0u;
+        renderer.cpuUiBoundaryTransactionId = 0u;
+        renderer.cpuUiBoundarySourceFrame = 0u;
+        renderer.cpuUiBoundaryRuntimeStateSample = 0u;
+        renderer.hasStereoGameFrame = false;
+        renderer.stereoStableFrameCount = 0u;
+        renderer.stereoProducerProcessId = sourceProcessId;
+        return false;
+    }
+    renderer.stereoProducerProcessId = sourceProcessId;
+
+    const LONG sequenceBefore = header->sequence;
+    MemoryBarrier();
+    const LONG publishedSlot = header->publishedSlot;
+    const std::uint64_t sourceRendererEpoch = header->rendererProducerEpoch;
+    if (publishedSlot < 0
+        || publishedSlot >= static_cast<LONG>(fnvxr::shared::D3D9StereoFrameSlotCount)
+        || (sequenceBefore == renderer.lastSharedStereoUiSequence
+            && publicationGenerationBefore
+                == renderer.lastSharedStereoUiPublicationGeneration
+            && sourceRendererEpoch
+                == renderer.lastSharedStereoUiRendererEpoch))
+    {
+        return false;
+    }
+
+    const LONG sourceProducerMode = header->producerMode;
+    const LONG sourceRenderPairSequence = header->renderPairSequence;
+    const int sourceWidth = header->width;
+    const int sourceHeight = header->height;
+    const int sourcePitch = header->pitchBytes;
+    const std::uint32_t leftPayloadOffset = header->leftPayloadOffset;
+    const std::uint32_t rightPayloadOffset = header->rightPayloadOffset;
+    output.identity = {
+        header->transactionId,
+        header->sourceFrame,
+        header->runtimeStateSample,
+        static_cast<std::uint32_t>(sourceProducerMode),
+        header->separated != 0,
+        header->worldCandidate != 0,
+        header->uiActive != 0,
+        false,
+    };
+    if (!fnvxr::host::cpu_engine_presentation::flatUiBoundaryValid(
+            output.identity)
+        || !header->poseValid
+        || !fnvxr::shared::sequencedValueIsPublished(header->poseSequence)
+        || header->renderedDisplayTime <= 0)
+    {
+        return false;
+    }
+    std::uint32_t expectedTransactionBits =
+        static_cast<std::uint32_t>(output.identity.transactionId);
+    if (expectedTransactionBits == 0u)
+        expectedTransactionBits = 1u;
+    if (fnvxr::shared::sequencedValueBits(sourceRenderPairSequence)
+        != expectedTransactionBits)
+    {
+        return false;
+    }
+    if (sourceWidth <= 0
+        || sourceHeight <= 0
+        || sourceWidth > static_cast<int>(SharedVideoMaxWidth)
+        || sourceHeight > static_cast<int>(SharedVideoMaxHeight)
+        || sourcePitch != sourceWidth * 4)
+    {
+        return false;
+    }
+
+    constexpr std::uint64_t slotBytes =
+        static_cast<std::uint64_t>(SharedVideoMaxWidth)
+        * SharedVideoMaxHeight * 4u * 2u;
+    const std::uint64_t requiredLeftOffset = sizeof(SharedStereoHeader)
+        + static_cast<std::uint64_t>(publishedSlot) * slotBytes;
+    const std::uint64_t requiredRightOffset = requiredLeftOffset
+        + static_cast<std::uint64_t>(sourcePitch) * sourceHeight;
+    const std::uint64_t payloadEnd = static_cast<std::uint64_t>(rightPayloadOffset)
+        + static_cast<std::uint64_t>(sourcePitch) * sourceHeight;
+    if (leftPayloadOffset != requiredLeftOffset
+        || rightPayloadOffset != requiredRightOffset
+        || payloadEnd > requiredLeftOffset + slotBytes
+        || payloadEnd > header->totalMappingBytes)
+    {
+        return false;
+    }
+
+    if (InterlockedCompareExchange(
+            &const_cast<SharedStereoHeader*>(header)->readerSlots[
+                fnvxr::shared::D3D9StereoHostReaderLane],
+            publishedSlot,
+            -1) != -1)
+    {
+        return false;
+    }
+    SharedStereoSlotClaim slotClaim {
+        &const_cast<SharedStereoHeader*>(header)->readerSlots[
+            fnvxr::shared::D3D9StereoHostReaderLane],
+        publishedSlot
+    };
+    MemoryBarrier();
+    if (header->writing
+        || header->sequence != sequenceBefore
+        || header->publishedSlot != publishedSlot
+        || InterlockedCompareExchange64(
+            &const_cast<SharedStereoHeader*>(header)->publicationGeneration,
+            0,
+            0) != publicationGenerationBefore)
+    {
+        return false;
+    }
+
+    const size_t planeBytes = static_cast<size_t>(sourcePitch)
+        * static_cast<size_t>(sourceHeight);
+    const auto* leftPixels = renderer.sharedStereoView + requiredLeftOffset;
+    const auto* rightPixels = renderer.sharedStereoView + requiredRightOffset;
+    output.pixels.resize(
+        static_cast<size_t>(sourceWidth) * static_cast<size_t>(sourceHeight));
+    std::memcpy(output.pixels.data(), leftPixels, planeBytes);
+    const bool monoPixels = std::memcmp(leftPixels, rightPixels, planeBytes) == 0;
+    MemoryBarrier();
+    slotClaim.release();
+
+    output.width = sourceWidth;
+    output.height = sourceHeight;
+    output.aspect = static_cast<float>(sourceWidth)
+        / static_cast<float>(sourceHeight);
+    output.identity.pixelsComplete = monoPixels
+        && !isMostlyBlackFrame(output.pixels);
+    renderer.lastSharedStereoUiSequence = sequenceBefore;
+    renderer.lastSharedStereoUiPublicationGeneration = publicationGenerationBefore;
+    renderer.lastSharedStereoUiRendererEpoch = sourceRendererEpoch;
     return true;
 }
 
@@ -2584,7 +3037,7 @@ bool readSharedStereoState(
         HANDLE lease = CreateMutexA(
             nullptr,
             FALSE,
-            "Local\\FNVXR_D3D9_Stereo_HostReader_v7");
+            fnvxr::shared::D3D9StereoFrameHostReaderMutexName);
         if (!lease)
             return false;
         const DWORD waitResult = WaitForSingleObject(lease, 0);
@@ -2669,6 +3122,13 @@ bool readSharedStereoState(
     const bool stereoUiActive = header->uiActive != 0;
     const bool poseValid = header->poseValid != 0;
     const bool poseTimed = header->renderedDisplayTime > 0;
+    const std::uint64_t sourceTransactionId = header->transactionId;
+    const std::uint64_t sourceFrameId = header->sourceFrame;
+    const std::uint64_t sourceRuntimeStateSample =
+        header->runtimeStateSample;
+    const bool presentationIdentityComplete = sourceTransactionId != 0u
+        && sourceFrameId != 0u
+        && sourceRuntimeStateSample != 0u;
     const bool coherentSameTickProducer =
         fnvxr::shared::stereoProducerCarriesSameTransactionEyes(
             static_cast<std::uint32_t>(header->producerMode))
@@ -2696,7 +3156,9 @@ bool readSharedStereoState(
     {
         if (sourceRendererEpoch == renderer.lastSharedStereoStateRendererEpoch
             && renderer.lastSharedStereoStateGeneration != 0
-            && publicationGenerationBefore <= renderer.lastSharedStereoStateGeneration)
+            && !fnvxr::shared::nonzeroSharedGenerationAdvanced(
+                publicationGenerationBefore,
+                renderer.lastSharedStereoStateGeneration))
         {
             return false;
         }
@@ -2728,7 +3190,17 @@ bool readSharedStereoState(
     {
         renderer.hasStereoGameFrame = false;
         renderer.stereoGameFrameSequence = 0;
+        renderer.stereoGamePublicationGeneration = 0u;
         renderer.stereoGameRenderPairSequence = 0;
+        renderer.stereoGameTransactionId = 0u;
+        renderer.stereoGameSourceFrame = 0u;
+        renderer.stereoGameRuntimeStateSample = 0u;
+        renderer.lastSharedStereoUiSequence = 0;
+        renderer.lastSharedStereoUiPublicationGeneration = 0;
+        renderer.lastSharedStereoUiRendererEpoch = 0u;
+        renderer.cpuUiBoundaryTransactionId = 0u;
+        renderer.cpuUiBoundarySourceFrame = 0u;
+        renderer.cpuUiBoundaryRuntimeStateSample = 0u;
         renderer.stereoStableFrameCount = 0;
         renderer.stereoProducerProcessId = sourceProcessId;
         return false;
@@ -2753,6 +3225,7 @@ bool readSharedStereoState(
         && worldCandidate
         && poseValid
         && poseTimed
+        && presentationIdentityComplete
         && acceptedProducer
         && width > 0
         && height > 0
@@ -3966,7 +4439,11 @@ bool updateStereoGameTextures(ID3D11Device* device, Renderer& renderer)
         renderer.stereoGameFrameSeparated = false;
         renderer.stereoGameFrameWorldCandidate = false;
         renderer.stereoGameFrameSequence = 0;
+        renderer.stereoGamePublicationGeneration = 0u;
         renderer.stereoGameRenderPairSequence = 0;
+        renderer.stereoGameTransactionId = 0u;
+        renderer.stereoGameSourceFrame = 0u;
+        renderer.stereoGameRuntimeStateSample = 0u;
         renderer.stereoGamePoseSequence = 0;
         renderer.stereoGameRenderedDisplayTime = 0;
         renderer.stereoStableFrameCount = 0;
@@ -4129,7 +4606,11 @@ bool updateStereoGameTextures(ID3D11Device* device, Renderer& renderer)
         renderer.stereoGameFrameSeparated = separated;
         renderer.stereoGameFrameWorldCandidate = worldCandidate;
         renderer.stereoGameFrameSequence = sourceSequence;
+        renderer.stereoGamePublicationGeneration = 0u;
         renderer.stereoGameRenderPairSequence = 0;
+        renderer.stereoGameTransactionId = 0u;
+        renderer.stereoGameSourceFrame = 0u;
+        renderer.stereoGameRuntimeStateSample = 0u;
         renderer.stereoGamePoseSequence = poseSequence;
         renderer.stereoGameRenderedDisplayTime = renderedDisplayTime;
         renderer.stereoStableFrameCount = 0;
@@ -4305,6 +4786,11 @@ bool loadSceneCacheIntoStereoTextures(ID3D11Device* device, Renderer& renderer)
     renderer.stereoGameFrameSeparated = true;
     renderer.stereoGameFrameWorldCandidate = true;
     renderer.stereoGameFrameSequence = static_cast<LONG>(header.sequence);
+    renderer.stereoGamePublicationGeneration = 0u;
+    renderer.stereoGameRenderPairSequence = 0;
+    renderer.stereoGameTransactionId = 0u;
+    renderer.stereoGameSourceFrame = 0u;
+    renderer.stereoGameRuntimeStateSample = 0u;
     renderer.stereoGamePoseSequence = static_cast<LONG>(header.sequence);
     renderer.stereoGameRenderedDisplayTime = 0;
     renderer.stereoStableFrameCount =
@@ -4842,7 +5328,8 @@ void drawGamePlane(
     const XMMATRIX& viewProjection,
     const GamePlane& gamePlane,
     ID3D11ShaderResourceView* gameTextureView,
-    bool allowSourceSurround)
+    bool allowSourceSurround,
+    fnvxr::host::game_plane_surface::Kind surfaceKind)
 {
     const GamePlaneMode mode = gamePlaneMode();
     const GamePlaneModeSettings modeSettings = gamePlaneModeSettings(mode);
@@ -4932,7 +5419,12 @@ void drawGamePlane(
         return;
     }
 
-    if (envEnabled("FNVXR_GAME_PLANE_CURVE_ENABLE", true)
+    // A confirmed retail menu is a UI quad, not an environment surface.
+    // The independently tested selection policy never returns
+    // CurvedGameplay for a menu, keeping pointer coordinates on the same
+    // literal plane used for hit testing.
+    if (surfaceKind
+            == fnvxr::host::game_plane_surface::Kind::CurvedGameplay
         && renderer.curvedTexturedVertexBuffer
         && renderer.curvedTexturedVertexCount > 0)
     {
@@ -5167,6 +5659,110 @@ void clearRetainedUiTexture(Renderer& renderer) noexcept
     renderer.retainedUiRuntimeStateSample = 0u;
     renderer.retainedUiTextureAspect = 16.0f / 9.0f;
     renderer.retainedUiHostWindowCaptured = false;
+    renderer.cpuUiBoundaryTransactionId = 0u;
+    renderer.cpuUiBoundarySourceFrame = 0u;
+    renderer.cpuUiBoundaryRuntimeStateSample = 0u;
+}
+
+bool uploadCpuEngineUiTexture(
+    ID3D11Device* device,
+    Renderer& renderer,
+    const CpuMonoUiFrame& frame) noexcept
+{
+    namespace cpu_presentation = fnvxr::host::cpu_engine_presentation;
+    if (!device
+        || !cpu_presentation::flatUiBoundaryValid(frame.identity)
+        || !frame.identity.pixelsComplete
+        || frame.width <= 0
+        || frame.height <= 0
+        || frame.width > static_cast<int>((std::numeric_limits<UINT>::max)() / 4u)
+        || frame.pixels.size()
+            != static_cast<size_t>(frame.width) * static_cast<size_t>(frame.height)
+        || !std::isfinite(frame.aspect)
+        || frame.aspect <= 0.0f)
+    {
+        return false;
+    }
+
+    const UINT width = static_cast<UINT>(frame.width);
+    const UINT height = static_cast<UINT>(frame.height);
+    bool reusable = !renderer.retainedUiHostWindowCaptured
+        && renderer.retainedUiTexture
+        && renderer.retainedUiTextureView;
+    if (reusable)
+    {
+        D3D11_TEXTURE2D_DESC existing {};
+        renderer.retainedUiTexture->GetDesc(&existing);
+        reusable = existing.Width == width
+            && existing.Height == height
+            && existing.MipLevels == 1u
+            && existing.ArraySize == 1u
+            && existing.Format == DXGI_FORMAT_B8G8R8A8_TYPELESS
+            && existing.SampleDesc.Count == 1u
+            && existing.Usage == D3D11_USAGE_DEFAULT
+            && (existing.BindFlags & D3D11_BIND_SHADER_RESOURCE) != 0u;
+    }
+
+    if (reusable)
+    {
+        ComPtr<ID3D11DeviceContext> context;
+        device->GetImmediateContext(&context);
+        if (!context)
+            return false;
+        context->UpdateSubresource(
+            renderer.retainedUiTexture.Get(),
+            0u,
+            nullptr,
+            frame.pixels.data(),
+            width * 4u,
+            0u);
+    }
+    else
+    {
+        D3D11_TEXTURE2D_DESC description {};
+        description.Width = width;
+        description.Height = height;
+        description.MipLevels = 1u;
+        description.ArraySize = 1u;
+        description.Format = DXGI_FORMAT_B8G8R8A8_TYPELESS;
+        description.SampleDesc.Count = 1u;
+        description.Usage = D3D11_USAGE_DEFAULT;
+        description.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        D3D11_SUBRESOURCE_DATA initial {};
+        initial.pSysMem = frame.pixels.data();
+        initial.SysMemPitch = width * 4u;
+
+        ComPtr<ID3D11Texture2D> texture;
+        if (FAILED(device->CreateTexture2D(
+                &description,
+                &initial,
+                &texture))
+            || !texture)
+        {
+            return false;
+        }
+        D3D11_SHADER_RESOURCE_VIEW_DESC viewDescription {};
+        viewDescription.Format = DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+        viewDescription.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        viewDescription.Texture2D.MipLevels = 1u;
+        ComPtr<ID3D11ShaderResourceView> view;
+        if (FAILED(device->CreateShaderResourceView(
+                texture.Get(),
+                &viewDescription,
+                &view))
+            || !view)
+        {
+            return false;
+        }
+        renderer.retainedUiTexture = std::move(texture);
+        renderer.retainedUiTextureView = std::move(view);
+    }
+
+    renderer.retainedUiSourceFrame = frame.identity.sourceFrame;
+    renderer.retainedUiRuntimeStateSample = frame.identity.runtimeStateSample;
+    renderer.retainedUiTextureAspect = frame.aspect;
+    renderer.retainedUiHostWindowCaptured = false;
+    return true;
 }
 
 bool uploadProductUiWindowTexture(
@@ -5927,7 +6523,10 @@ void drawAimRay(ID3D11DeviceContext* context, Renderer& renderer, const XMMATRIX
 bool captureSwapchainRenderProof(
     ID3D11Device* device,
     ID3D11Texture2D* texture,
-    EyeRenderProof& proof)
+    EyeRenderProof& proof,
+    HeadsetMirrorCapture* headsetMirrorCapture = nullptr,
+    std::uint64_t hostFrame = 0u,
+    std::uint32_t eyeIndex = 0u)
 {
     proof = {};
     if (!device || !texture || !envEnabled("FNVXR_RENDER_OUTPUT_PROOF", true))
@@ -5994,11 +6593,41 @@ bool captureSwapchainRenderProof(
             ++proof.samples;
         }
     }
-    context->Unmap(staging.Get(), 0);
     proof.hash = hash == 0 ? 1u : hash;
     proof.valid = proof.samples >= 64
         && proof.nonBlackSamples >= 16
         && proof.variedSamples >= 16;
+    if (proof.valid && headsetMirrorCapture)
+    {
+        const fnvxr::host::headset_mirror::ScheduleDecision decision =
+            headsetMirrorCapture->request(hostFrame);
+        if (decision.capture)
+        {
+            const std::wstring outputPath = headsetMirrorFramePath(
+                *headsetMirrorCapture,
+                decision.ordinal,
+                eyeIndex);
+            const HRESULT writeResult = writeHeadsetMirrorPng(
+                outputPath,
+                desc,
+                mapped);
+            const bool saved = SUCCEEDED(writeResult);
+            std::cout
+                << "{\"event\":\"fnvxrHeadsetMirrorCapture\",\"frame\":"
+                << hostFrame
+                << ",\"ordinal\":" << decision.ordinal
+                << ",\"eye\":\"" << (eyeIndex == 0u ? "left" : "right")
+                << "\",\"saved\":" << (saved ? "true" : "false")
+                << ",\"width\":" << desc.Width
+                << ",\"height\":" << desc.Height
+                << ",\"format\":" << static_cast<unsigned int>(desc.Format)
+                << ",\"writeHr\":\"0x" << std::hex
+                << static_cast<std::uint32_t>(writeResult) << std::dec << "\""
+                << ",\"outputHash\":\"0x" << std::hex << proof.hash << std::dec
+                << "\"}\n";
+        }
+    }
+    context->Unmap(staging.Get(), 0);
     return proof.valid;
 }
 
@@ -6024,7 +6653,9 @@ bool renderEye(
     ID3D11ShaderResourceView* productionWorldTextureView,
     ID3D11ShaderResourceView* productionUiTextureView,
     const float clearColor[4],
-    EyeRenderProof& renderProof)
+    EyeRenderProof& renderProof,
+    HeadsetMirrorCapture* headsetMirrorCapture,
+    std::uint64_t hostFrame)
 {
     renderProof = {};
     uint32_t imageIndex = 0;
@@ -6062,7 +6693,10 @@ bool renderEye(
         const bool outputProven = captureSwapchainRenderProof(
             device,
             swapchain.images[imageIndex].texture,
-            renderProof);
+            renderProof,
+            headsetMirrorCapture,
+            hostFrame,
+            static_cast<std::uint32_t>(eyeIndex));
         const bool released = releaseSwapchainImage(xr, swapchain);
         if (!outputProven)
             swapchain.fatalWaitFailure = true;
@@ -6114,10 +6748,25 @@ bool renderEye(
     {
         context->OMSetDepthStencilState(renderer.depthState.Get(), 0);
         const GamePlaneModeSettings modeSettings = gamePlaneModeSettings(gamePlaneMode());
+        const fnvxr::host::game_plane_surface::Kind surfaceKind =
+            fnvxr::host::game_plane_surface::select(
+                gameUiMode,
+                productionUiTextureView != nullptr,
+                envEnabled("FNVXR_GAME_PLANE_CURVE_ENABLE", true),
+                renderer.curvedTexturedVertexBuffer
+                    && renderer.curvedTexturedVertexCount > 0);
         const bool allowSourceSurround =
-            !gameUiMode
-            && modeSettings.surroundInGameplay;
-        drawGamePlane(context.Get(), renderer, viewProjection, gamePlane, uiTextureView, allowSourceSurround);
+            fnvxr::host::game_plane_surface::permitsSourceSurround(
+                surfaceKind,
+                modeSettings.surroundInGameplay);
+        drawGamePlane(
+            context.Get(),
+            renderer,
+            viewProjection,
+            gamePlane,
+            uiTextureView,
+            allowSourceSurround,
+            surfaceKind);
         context->OMSetDepthStencilState(renderer.depthState.Get(), 0);
     }
 
@@ -6169,7 +6818,10 @@ bool renderEye(
     const bool outputProven = captureSwapchainRenderProof(
         device,
         swapchain.images[imageIndex].texture,
-        renderProof);
+        renderProof,
+        headsetMirrorCapture,
+        hostFrame,
+        static_cast<std::uint32_t>(eyeIndex));
     const bool released = releaseSwapchainImage(xr, swapchain);
     if (!outputProven)
         swapchain.fatalWaitFailure = true;
@@ -7890,6 +8542,37 @@ int main(int argc, char** argv)
     }
     const uint64_t targetFrames = static_cast<uint64_t>(parsed);
 
+    HeadsetMirrorCapture headsetMirrorCapture {};
+    if (const char* captureDirectoryText = std::getenv("FNVXR_HMD_MIRROR_CAPTURE_DIR");
+        captureDirectoryText && *captureDirectoryText)
+    {
+        headsetMirrorCapture.directory = widenPath(captureDirectoryText);
+        const DWORD captureDirectoryAttributes =
+            GetFileAttributesW(headsetMirrorCapture.directory.c_str());
+        if (!headsetMirrorCapture.directory.empty()
+            && captureDirectoryAttributes != INVALID_FILE_ATTRIBUTES
+            && (captureDirectoryAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0u)
+        {
+            headsetMirrorCapture.enabled = true;
+            headsetMirrorCapture.everyFrames = static_cast<std::uint32_t>(
+                std::clamp(envInt("FNVXR_HMD_MIRROR_CAPTURE_EVERY_N_FRAMES", 6), 1, 600));
+            headsetMirrorCapture.maximumPairs = static_cast<std::uint32_t>(
+                std::clamp(envInt("FNVXR_HMD_MIRROR_CAPTURE_MAX_PAIRS", 180), 1, 3600));
+            std::wcout
+                << L"fnvxrHeadsetMirrorCaptureReady directory="
+                << headsetMirrorCapture.directory
+                << L" everyFrames=" << headsetMirrorCapture.everyFrames
+                << L" maximumPairs=" << headsetMirrorCapture.maximumPairs
+                << L"\n";
+        }
+        else
+        {
+            std::wcerr
+                << L"fnvxrHeadsetMirrorCaptureDisabled missing-directory="
+                << headsetMirrorCapture.directory << L"\n";
+        }
+    }
+
     constexpr auto openXrInitializationAuthorization =
         fnvxr::host::CompiledProductOpenXrInitializationAuthorization;
     if (!openXrInitializationAuthorization.authorized())
@@ -7968,24 +8651,34 @@ int main(int argc, char** argv)
         return 8;
     }
 
+    // These assets belong to the historical image-replay harness. They may be
+    // loaded for explicit diagnostics, but are absent from the default v5
+    // product route and can never become a gameplay fallback there.
+    const bool legacyImageDiagnostics =
+        envEnabled("FNVXR_ENABLE_LEGACY_IMAGE_DIAGNOSTICS", false);
+    const bool productionCpuEngineStereo =
+        !legacyImageDiagnostics
+        && envEnabled("FNVXR_ENABLE_ENGINE_CENTER_STEREO", false);
+    // The ordinary-D3D9 engine-center route and ABI-v5 shared textures are
+    // exclusive presentation transports. A CPU menu must not quietly fall
+    // back to an unrelated host-window/GPU capture path.
+    const bool productionGpuColorV5 = !legacyImageDiagnostics
+        && !productionCpuEngineStereo;
     fnvxr::host::gpu_color::Win32Consumer gpuColorConsumer;
-    if (!gpuColorConsumer.initialize(device.Get()))
+    const bool gpuColorConsumerReady = gpuColorConsumer.initialize(device.Get());
+    if (productionGpuColorV5 && !gpuColorConsumerReady)
     {
         std::cerr << "ABI-v5 GPU color consumer initialization failed backend="
                   << static_cast<unsigned>(gpuColorConsumer.backendFailure())
                   << "; production presentation remains closed\n";
         return 28;
     }
-
-    // These assets belong to the historical image-replay harness. They may be
-    // loaded for explicit diagnostics, but are absent from the default v5
-    // product route and can never become a gameplay fallback there.
-    const bool legacyImageDiagnostics =
-        envEnabled("FNVXR_ENABLE_LEGACY_IMAGE_DIAGNOSTICS", false);
-    const bool productionGpuColorV5 = !legacyImageDiagnostics;
-    const bool productionCpuEngineStereo =
-        !legacyImageDiagnostics
-        && envEnabled("FNVXR_ENABLE_ENGINE_CENTER_STEREO", false);
+    if (!gpuColorConsumerReady)
+    {
+        std::cerr << "ABI-v5 GPU color consumer unavailable backend="
+                  << static_cast<unsigned>(gpuColorConsumer.backendFailure())
+                  << "; selected CPU/diagnostic transport remains isolated\n";
+    }
     if (legacyImageDiagnostics)
     {
         initPauseSceneTexture(device.Get(), renderer);
@@ -7995,6 +8688,8 @@ int main(int argc, char** argv)
               << static_cast<int>(productionGpuColorV5)
               << " cpuEngineStereoProduction="
               << static_cast<int>(productionCpuEngineStereo)
+              << " gpuColorConsumerReady="
+              << static_cast<int>(gpuColorConsumerReady)
               << " legacyImageDiagnostics="
               << static_cast<int>(legacyImageDiagnostics) << "\n";
 
@@ -8507,17 +9202,20 @@ int main(int argc, char** argv)
         }
         const bool shouldRender = runtimeShouldRender || renderWhenNotRequested;
 
-        // Exactly one ABI-v5 consume is issued for each begun OpenXR frame.
-        // The route below is derived only from this result: Rejected cannot
-        // expose an earlier private texture, while NoNewFrame can retain only
-        // the exact ConsumerFrame returned by Consumer::consume this call.
+        // The GPU ABI-v5 consumer is exclusive with the ordinary-D3D9 CPU
+        // transport. In CPU mode, do not even consume an unrelated v5 record:
+        // it must not clear or substitute the CPU menu/world lineage.
         const fnvxr::host::gpu_color::ConsumeResult gpuColorConsume =
-            gpuColorConsumer.consume();
+            productionGpuColorV5 && gpuColorConsumerReady
+                ? gpuColorConsumer.consume()
+                : fnvxr::host::gpu_color::ConsumeResult {};
         const fnvxr::host::gpu_color::RoutedFrame gpuColorFrame =
-            fnvxr::host::gpu_color::routeConsumedFrame(
-                gpuColorConsume,
-                gpuColorConsumer.eyeView(0u) != nullptr,
-                gpuColorConsumer.eyeView(1u) != nullptr);
+            productionGpuColorV5 && gpuColorConsumerReady
+                ? fnvxr::host::gpu_color::routeConsumedFrame(
+                    gpuColorConsume,
+                    gpuColorConsumer.eyeView(0u) != nullptr,
+                    gpuColorConsumer.eyeView(1u) != nullptr)
+                : fnvxr::host::gpu_color::RoutedFrame {};
         if (gpuColorFrame.frame.producerEpoch != 0u
             && (gpuColorFrame.frame.producerEpoch
                     != activeGpuColorProducerEpoch
@@ -8961,7 +9659,11 @@ int main(int argc, char** argv)
             renderer.stereoGameFrameSeparated = false;
             renderer.stereoGameFrameWorldCandidate = false;
             renderer.stereoGameFrameSequence = 0;
+            renderer.stereoGamePublicationGeneration = 0u;
             renderer.stereoGameRenderPairSequence = 0;
+            renderer.stereoGameTransactionId = 0u;
+            renderer.stereoGameSourceFrame = 0u;
+            renderer.stereoGameRuntimeStateSample = 0u;
             renderer.stereoGamePoseSequence = 0;
             renderer.stereoGameRenderedDisplayTime = 0;
             renderer.stereoStableFrameCount = 0;
@@ -9122,7 +9824,11 @@ int main(int argc, char** argv)
             renderer.stereoGameFrameSeparated = false;
             renderer.stereoGameFrameWorldCandidate = false;
             renderer.stereoGameFrameSequence = 0;
+            renderer.stereoGamePublicationGeneration = 0u;
             renderer.stereoGameRenderPairSequence = 0;
+            renderer.stereoGameTransactionId = 0u;
+            renderer.stereoGameSourceFrame = 0u;
+            renderer.stereoGameRuntimeStateSample = 0u;
             renderer.stereoGamePoseSequence = 0;
             renderer.stereoGameRenderedDisplayTime = 0;
             renderer.stereoStableFrameCount = 0;
@@ -9192,6 +9898,78 @@ int main(int argc, char** argv)
             && !gameUiMode
             && haveRuntimeUiState
             && runtimeGameplayActive;
+        namespace cpu_presentation = fnvxr::host::cpu_engine_presentation;
+        const cpu_presentation::RuntimeSample cpuRuntime {
+            runtimeStateSample,
+            runtimePhase,
+            runtimeMenuBits,
+            runtimeShowroomActive,
+            runtimeCameraActive,
+            haveRuntimeUiState,
+        };
+        CpuMonoUiFrame incomingCpuUi {};
+        const bool cpuUiRecordRead = productionCpuEngineStereo
+            && haveSharedStereoUiState
+            && sharedStereoUiActive
+            && readSharedD3D9MonoUiFrame(renderer, incomingCpuUi);
+        if (productionCpuEngineStereo
+            && haveSharedStereoUiState
+            && sharedStereoUiActive
+            && sharedStereoStateAdvanced
+            && !cpuUiRecordRead)
+        {
+            // The source just advanced to a menu record that could not be
+            // copied as a verified CPU UI frame. Do not retain an earlier
+            // menu texture across that boundary.
+            clearRetainedUiTexture(renderer);
+            renderer.cpuUiBoundaryTransactionId = 0u;
+            renderer.cpuUiBoundarySourceFrame = 0u;
+            renderer.cpuUiBoundaryRuntimeStateSample = 0u;
+        }
+        if (cpuUiRecordRead
+            && cpu_presentation::flatUiBoundaryValid(incomingCpuUi.identity))
+        {
+            // Record the boundary even when texture upload fails: gameplay
+            // must wait for a later world transaction rather than reviving a
+            // pair captured before this menu.
+            renderer.cpuUiBoundaryTransactionId =
+                incomingCpuUi.identity.transactionId;
+            renderer.cpuUiBoundarySourceFrame =
+                incomingCpuUi.identity.sourceFrame;
+            renderer.cpuUiBoundaryRuntimeStateSample =
+                incomingCpuUi.identity.runtimeStateSample;
+            if (cpu_presentation::flatUiFrameEligible(
+                    incomingCpuUi.identity,
+                    cpuRuntime))
+            {
+                static_cast<void>(uploadCpuEngineUiTexture(
+                    device.Get(),
+                    renderer,
+                    incomingCpuUi));
+            }
+        }
+        const cpu_presentation::FrameIdentity retainedCpuUiIdentity {
+            renderer.cpuUiBoundaryTransactionId,
+            renderer.cpuUiBoundarySourceFrame,
+            renderer.cpuUiBoundaryRuntimeStateSample,
+            fnvxr::shared::StereoProducerMonoUiQuad,
+            false,
+            false,
+            true,
+            renderer.retainedUiTexture
+                && renderer.retainedUiTextureView
+                && !renderer.retainedUiHostWindowCaptured
+                && renderer.retainedUiSourceFrame
+                    == renderer.cpuUiBoundarySourceFrame
+                && renderer.retainedUiRuntimeStateSample
+                    == renderer.cpuUiBoundaryRuntimeStateSample,
+        };
+        const bool cpuEngineUiQuadActive = productionCpuEngineStereo
+            && haveSharedStereoUiState
+            && sharedStereoUiActive
+            && cpu_presentation::flatUiFrameEligible(
+                retainedCpuUiIdentity,
+                cpuRuntime);
         int64_t cpuSourcePoseAgeNanoseconds = 0;
         bool cpuSourcePoseAgeValid = false;
         bool cpuEngineStereoActive = false;
@@ -9241,7 +10019,7 @@ int main(int argc, char** argv)
         fnvxr::host::ui_capture::RuntimeSample hostUiValidatedRuntime {};
         fnvxr::product::UiFrameProof hostUiProof {};
         bool hostUiResourceReady = false;
-        if (!incomingUiResourceReady)
+        if (productionGpuColorV5 && !incomingUiResourceReady)
         {
             hostUiResourceReady = prepareProductUiWindowFallback(
                 device.Get(),
@@ -9373,12 +10151,13 @@ int main(int argc, char** argv)
             && stereoVisualTrialDecision.bindsStereoVisuals();
         const bool presentedBinocularWorld = productionBinocularWorld
             || stereoVisualTrialActive;
-        if (productionUiQuadActive)
+        if (productionUiQuadActive || cpuEngineUiQuadActive)
         {
             gamePlane.height = gamePlane.width
                 / renderer.retainedUiTextureAspect;
         }
         const bool showGamePlane = productionUiQuadActive
+            || cpuEngineUiQuadActive
             || (!cacheOnlyMode
                 && legacyImageDiagnostics
                 && (gameUiMode || showGameplayPlane)
@@ -9402,7 +10181,8 @@ int main(int argc, char** argv)
             && (legacyImageDiagnostics
                 ? (haveRuntimeUiState ? runtimeUiActive : gameUiMode)
                 : (productionUiQuadActive
-                    && productComposition.pointerEnabled));
+                    && productComposition.pointerEnabled)
+                    || cpuEngineUiQuadActive);
         const bool gameplayControlsActive =
             shouldReadInput
             && (haveRuntimeUiState ? (!runtimeUiActive || runtimeGameplayActive) : !gameUiMode);
@@ -9607,6 +10387,7 @@ int main(int argc, char** argv)
         bool submitProjectionLayer = false;
         bool submittedStereoFullscreen = false;
         bool presentedGameTexture = false;
+        bool uiQuadVisible = false;
         EyeRenderProof leftRenderProof {};
         EyeRenderProof rightRenderProof {};
 
@@ -9748,7 +10529,11 @@ int main(int argc, char** argv)
                 renderer.stereoGameFrameSeparated = false;
                 renderer.stereoGameFrameWorldCandidate = false;
                 renderer.stereoGameFrameSequence = 0;
+                renderer.stereoGamePublicationGeneration = 0u;
                 renderer.stereoGameRenderPairSequence = 0;
+                renderer.stereoGameTransactionId = 0u;
+                renderer.stereoGameSourceFrame = 0u;
+                renderer.stereoGameRuntimeStateSample = 0u;
                 renderer.stereoGamePoseSequence = 0;
                 renderer.stereoGameRenderedDisplayTime = 0;
                 renderer.stereoStableFrameCount = 0;
@@ -9761,7 +10546,11 @@ int main(int argc, char** argv)
                 renderer.stereoGameFrameSeparated = false;
                 renderer.stereoGameFrameWorldCandidate = false;
                 renderer.stereoGameFrameSequence = 0;
+                renderer.stereoGamePublicationGeneration = 0u;
                 renderer.stereoGameRenderPairSequence = 0;
+                renderer.stereoGameTransactionId = 0u;
+                renderer.stereoGameSourceFrame = 0u;
+                renderer.stereoGameRuntimeStateSample = 0u;
                 renderer.stereoGamePoseSequence = 0;
                 renderer.stereoGameRenderedDisplayTime = 0;
                 renderer.stereoStableFrameCount = 0;
@@ -9781,6 +10570,20 @@ int main(int argc, char** argv)
                     maximumCpuSourcePoseAgeNanoseconds,
                     sourcePoseFutureToleranceNanoseconds,
                     &cpuSourcePoseAgeNanoseconds);
+            const cpu_presentation::UiBoundary cpuUiBoundary {
+                renderer.cpuUiBoundaryTransactionId,
+                renderer.cpuUiBoundarySourceFrame,
+            };
+            const cpu_presentation::FrameIdentity cpuWorldIdentity {
+                renderer.stereoGameTransactionId,
+                renderer.stereoGameSourceFrame,
+                renderer.stereoGameRuntimeStateSample,
+                static_cast<std::uint32_t>(renderer.stereoProducerMode),
+                renderer.stereoGameFrameSeparated,
+                renderer.stereoGameFrameWorldCandidate,
+                false,
+                renderer.hasStereoGameFrame,
+            };
             cpuEngineStereoActive =
                 allowCpuEngineStereo
                 && renderer.hasStereoGameFrame
@@ -9796,6 +10599,10 @@ int main(int argc, char** argv)
                     == referenceSpaceGeneration
                 && renderer.stereoProducerEpoch
                     == sharedBridge.producerEpoch
+                && cpu_presentation::binocularWorldFrameEligible(
+                    cpuWorldIdentity,
+                    cpuRuntime,
+                    cpuUiBoundary)
                 && cpuSourcePoseAgeValid;
             const bool legacyStereoFullscreenActive =
                 allowStereoFullscreen
@@ -10036,9 +10843,16 @@ int main(int argc, char** argv)
             }
             bool leftRendered = false;
             bool rightRendered = false;
-            const bool uiQuadVisible = productionUiQuadActive
+            uiQuadVisible = (productionUiQuadActive
+                    || cpuEngineUiQuadActive)
                 && displayGamePlane
                 && renderer.retainedUiTextureView;
+            const bool headsetMirrorCaptureEligible =
+                presentedBinocularWorld || cpuEngineStereoActive || uiQuadVisible;
+            HeadsetMirrorCapture* const activeHeadsetMirrorCapture =
+                headsetMirrorCapture.enabled && headsetMirrorCaptureEligible
+                ? &headsetMirrorCapture
+                : nullptr;
             const bool legacyDiagnosticVisible = legacyImageDiagnostics
                 && (displayGamePlane
                     || legacyStereoFullscreenActive
@@ -10091,7 +10905,9 @@ int main(int argc, char** argv)
                     leftProductionView,
                     productionUiView,
                     leftEyeColor,
-                    leftRenderProof);
+                    leftRenderProof,
+                    activeHeadsetMirrorCapture,
+                    frameIndex);
                 rightRendered = renderEye(
                     xr,
                     device.Get(),
@@ -10114,7 +10930,9 @@ int main(int argc, char** argv)
                     rightProductionView,
                     productionUiView,
                     rightEyeColor,
-                    rightRenderProof);
+                    rightRenderProof,
+                    activeHeadsetMirrorCapture,
+                    frameIndex);
             }
 
             submitProjectionLayer = leftRendered && rightRendered;
@@ -10187,6 +11005,8 @@ int main(int argc, char** argv)
         if (envEnabled("FNVXR_TELEMETRY_HAMMER", false)
             || frameIndex <= 12
             || frameIndex % 60 == 0
+            || (headsetMirrorCapture.enabled
+                && headsetMirrorCapture.schedule.activeFrame == frameIndex)
             || !submitProjectionLayer
             || endResult != XR_SUCCESS)
         {
@@ -10244,6 +11064,8 @@ int main(int argc, char** argv)
                 << ",\"gpuV5ExactSourceView\":"
                 << (productSourceViewFound ? "true" : "false")
                 << ",\"sourceStereoSequence\":" << renderer.stereoGameFrameSequence
+                << ",\"sourceStereoPublicationGeneration\":\""
+                << renderer.stereoGamePublicationGeneration << "\""
                 << ",\"sourceRenderPairSequence\":" << renderer.stereoGameRenderPairSequence
                 << ",\"sourcePoseSequence\":" << renderer.stereoGamePoseSequence
                 << ",\"sourceReferenceSpaceGeneration\":" << renderer.stereoReferenceSpaceGeneration
@@ -10293,6 +11115,14 @@ int main(int argc, char** argv)
                 << ",\"rightOutputNonBlackSamples\":" << rightRenderProof.nonBlackSamples
                 << ",\"rightOutputVariedSamples\":" << rightRenderProof.variedSamples
                 << ",\"runtimeGameplay\":" << (runtimeGameplayActive ? "true" : "false")
+                << ",\"runtimeUi\":" << (runtimeUiActive ? "true" : "false")
+                << ",\"runtimePhase\":" << runtimePhase
+                << ",\"runtimeMenuBits\":" << runtimeMenuBits
+                << ",\"uiQuadVisible\":" << (uiQuadVisible ? "true" : "false")
+                << ",\"productionUiQuadActive\":"
+                << (productionUiQuadActive ? "true" : "false")
+                << ",\"cpuEngineUiQuadActive\":"
+                << (cpuEngineUiQuadActive ? "true" : "false")
                 << ",\"projectionLayerSubmitted\":" << (submitProjectionLayer ? "true" : "false")
                 << ",\"layerCount\":" << endInfo.layerCount
                 << ",\"xrEndFrame\":\"" << resultName(endResult) << "\"}"

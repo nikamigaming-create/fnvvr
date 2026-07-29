@@ -26,6 +26,7 @@ enum class SetCall : std::uint8_t
     Viewport,
     Scissor,
     ScissorEnable,
+    Clear,
 };
 
 struct FakeState
@@ -49,6 +50,7 @@ struct FakeState
     int retainedReferences = 0;
     bool failGetDepth = false;
     bool failNextDepthSet = false;
+    bool failNextClear = false;
     bool failIdentity = false;
     bool incompatibleRightDepth = false;
 };
@@ -191,6 +193,18 @@ bool setScissorEnable(void* opaque, void*, bool enabled) noexcept
     return true;
 }
 
+bool clearBoundEyeTargets(void* opaque, void*) noexcept
+{
+    auto* state = static_cast<FakeState*>(opaque);
+    state->sets.push_back(SetCall::Clear);
+    if (state->failNextClear)
+    {
+        state->failNextClear = false;
+        return false;
+    }
+    return true;
+}
+
 void release(void* opaque, void* surface) noexcept
 {
     auto* state = static_cast<FakeState*>(opaque);
@@ -214,6 +228,7 @@ EyeTargetDeviceApi api(FakeState& state)
         &setViewport,
         &setScissor,
         &setScissorEnable,
+        &clearBoundEyeTargets,
         &release,
     };
 }
@@ -274,6 +289,123 @@ int main()
     }
     require(!retailCpuEyeTargetColorFormatAccepted(32u),
         "non-BGRA CPU eye target format was accepted");
+    require(RetailFallbackEyeTargetDepthFormats.size() == 1u
+            && RetailFallbackEyeTargetDepthFormats[0] == 75u,
+        "the fail-closed depth fallback must remain D24S8");
+    require(retailFallbackEyeTargetDepthFormatAccepted(75u)
+            && !retailFallbackEyeTargetDepthFormatAccepted(77u),
+        "the depth fallback admitted a format without eight-bit stencil");
+
+    {
+        EyeTargetSurfaceDescription color {};
+        color.width = 2048u;
+        color.height = 1280u;
+        color.format = 21u;
+        color.renderTarget = true;
+
+        EyeTargetSurfaceDescription current {};
+        current.width = color.width;
+        current.height = color.height;
+        current.format = 77u;
+        current.depthStencil = true;
+
+        EyeTargetSurfaceDescription cached = current;
+        cached.format = 75u;
+
+        const RetailEyeDepthSelection live =
+            selectRetailEyeDepthDescription(
+                color,
+                true,
+                current,
+                true,
+                cached);
+        require(live.available()
+                && live.source
+                    == RetailEyeDepthDescriptionSource::Current
+                && live.format == current.format,
+            "a valid currently bound engine depth must win selection");
+
+        const RetailEyeDepthSelection retained =
+            selectRetailEyeDepthDescription(
+                color,
+                false,
+                {},
+                true,
+                cached);
+        require(retained.available()
+                && retained.source
+                    == RetailEyeDepthDescriptionSource::Cached
+                && retained.format == cached.format,
+            "Present without a bound depth did not retain the observed engine format");
+
+        current.width /= 2u;
+        const RetailEyeDepthSelection staleCurrent =
+            selectRetailEyeDepthDescription(
+                color,
+                true,
+                current,
+                true,
+                cached);
+        require(staleCurrent.source
+                    == RetailEyeDepthDescriptionSource::Cached
+                && staleCurrent.format == cached.format,
+            "a size-mismatched current depth displaced the matching cache");
+
+        cached.height /= 2u;
+        const RetailEyeDepthSelection fallback =
+            selectRetailEyeDepthDescription(
+                color,
+                false,
+                {},
+                true,
+                cached);
+        require(fallback.available()
+                && fallback.source
+                    == RetailEyeDepthDescriptionSource::StencilFallback
+                && fallback.format == 75u,
+            "an unavailable or stale engine depth did not fail closed to D24S8");
+
+        const RetailEyeDepthSelection otherDeviceCache =
+            selectRetailEyeDepthDescription(
+                color,
+                false,
+                {},
+                false,
+                cached);
+        require(otherDeviceCache.source
+                    == RetailEyeDepthDescriptionSource::StencilFallback
+                && otherDeviceCache.format == 75u,
+            "a cache from another device escaped the D24S8 fallback");
+
+        EyeTargetSurfaceDescription invalidDepth = cached;
+        invalidDepth.width = color.width;
+        invalidDepth.height = color.height;
+        invalidDepth.format = 0u;
+        invalidDepth.depthStencil = false;
+        const RetailEyeDepthSelection invalidDepthFallback =
+            selectRetailEyeDepthDescription(
+                color,
+                true,
+                invalidDepth,
+                false,
+                {});
+        require(invalidDepthFallback.source
+                    == RetailEyeDepthDescriptionSource::StencilFallback
+                && invalidDepthFallback.format == 75u,
+            "an invalid depth description escaped the D24S8 fallback");
+
+        const RetailEyeDepthSelection invalidColor =
+            selectRetailEyeDepthDescription(
+                {},
+                false,
+                {},
+                false,
+                {});
+        require(!invalidColor.available()
+                && invalidColor.source
+                    == RetailEyeDepthDescriptionSource::Unavailable,
+            "an invalid backbuffer description selected a fallback depth");
+    }
 
     {
         FakeState state;
@@ -335,17 +467,30 @@ int main()
         require(state.retainedReferences == 0,
             "successful restore leaked retained D3D9 surfaces");
 
-        const std::vector<SetCall> perBinding {
+        const std::vector<SetCall> perEyeBinding {
             SetCall::Color,
             SetCall::Depth,
             SetCall::Viewport,
             SetCall::Scissor,
             SetCall::ScissorEnable,
+            SetCall::Clear,
         };
         std::vector<SetCall> expected;
-        expected.insert(expected.end(), perBinding.begin(), perBinding.end());
-        expected.insert(expected.end(), perBinding.begin(), perBinding.end());
-        expected.insert(expected.end(), perBinding.begin(), perBinding.end());
+        expected.insert(
+            expected.end(),
+            perEyeBinding.begin(),
+            perEyeBinding.end());
+        expected.insert(
+            expected.end(),
+            perEyeBinding.begin(),
+            perEyeBinding.end());
+        expected.insert(expected.end(), {
+            SetCall::Color,
+            SetCall::Depth,
+            SetCall::Viewport,
+            SetCall::Scissor,
+            SetCall::ScissorEnable,
+        });
         require(state.sets == expected,
             "left, right, and restore did not use the exact target-state order");
     }
@@ -396,6 +541,29 @@ int main()
         requireOriginalState(state);
         require(state.retainedReferences == 0,
             "partial bind restoration leaked snapshot references");
+    }
+
+    {
+        FakeState state;
+        RetailEyeTargetContext context;
+        require(context.initialize(api(state), resources(state)),
+            "clear-failure context did not initialize");
+        auto operations = makeRetailEyeTargetOperations(context);
+        require(operations.snapshot(operations.context),
+            "clear-failure snapshot failed");
+        state.failNextClear = true;
+        CenterRendererEyeIsolation isolation {};
+        require(!operations.bind(
+                operations.context,
+                CenterRendererEye::Left,
+                isolation)
+                && !isolation.active(),
+            "an uncleared eye target must not receive an isolation token");
+        require(operations.restore(operations.context),
+            "clear failure did not restore the authoritative state");
+        requireOriginalState(state);
+        require(state.retainedReferences == 0,
+            "clear-failure restoration leaked snapshot references");
     }
 
     {

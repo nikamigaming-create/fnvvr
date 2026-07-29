@@ -26,6 +26,11 @@ struct RetailEngineCalls
     abi::NiRefObjectFreeFunction niRefObjectFree = nullptr;
     abi::AccumulatorSetCameraFunction accumulatorSetCamera = nullptr;
     abi::CullingProcessAltFunction cullingProcessAlt = nullptr;
+    // The stock wrapper establishes renderer/global accumulator state before
+    // it invokes ProcessAlt. Stereo collection must enter through this exact
+    // verified retail sequence rather than hand-assembling its lower-level
+    // culling call.
+    abi::AccumulateSceneFunction accumulateScene = nullptr;
     abi::AccumulatorAddVisibleArrayFunction accumulatorAddVisibleArray = nullptr;
     abi::RendererSetAccumulatorFunction rendererSetAccumulator = nullptr;
     abi::SetCurrentAccumulatorFunction setAccumulatingAccumulator = nullptr;
@@ -49,6 +54,7 @@ struct RetailEngineCalls
             && !niRefObjectFree
             && !accumulatorSetCamera
             && !cullingProcessAlt
+            && !accumulateScene
             && !accumulatorAddVisibleArray
             && !rendererSetAccumulator
             && !setAccumulatingAccumulator
@@ -73,6 +79,7 @@ struct RetailEngineCalls
             && niRefObjectFree
             && accumulatorSetCamera
             && cullingProcessAlt
+            && accumulateScene
             && accumulatorAddVisibleArray
             && renderAccumulatorWithoutFinalize
             && finalizeAccumulator;
@@ -107,6 +114,7 @@ struct RetailEngineCallAddressTable
     std::uintptr_t niRefObjectFree = 0u;
     std::uintptr_t accumulatorSetCamera = 0u;
     std::uintptr_t cullingProcessAlt = 0u;
+    std::uintptr_t accumulateScene = 0u;
     std::uintptr_t accumulatorAddVisibleArray = 0u;
     std::uintptr_t rendererSetAccumulator = 0u;
     std::uintptr_t setAccumulatingAccumulator = 0u;
@@ -193,6 +201,7 @@ inline constexpr RetailEngineCallAddressTable RetailEngineCallPreferredAddresses
     detail::uniqueRetailFunctionPreferredAddress("NiRefObject::Free thunk"),
     detail::uniqueRetailFunctionPreferredAddress("NiAccumulator::SetCamera"),
     detail::uniqueRetailFunctionPreferredAddress("BSCullingProcess::ProcessAlt"),
+    detail::uniqueRetailFunctionPreferredAddress("AccumulateScene"),
     detail::uniqueRetailFunctionPreferredAddress(
         "NiAccumulator::AddVisibleArray"),
     detail::uniqueRetailFunctionPreferredAddress(
@@ -246,6 +255,9 @@ constexpr bool retailEngineCallInventoryComplete() noexcept
                "BSCullingProcess::ProcessAlt",
                RetailEngineCallPreferredAddresses.cullingProcessAlt)
         && detail::uniqueProductionFunctionMatches(
+               "AccumulateScene",
+               RetailEngineCallPreferredAddresses.accumulateScene)
+        && detail::uniqueProductionFunctionMatches(
                "NiAccumulator::AddVisibleArray",
                RetailEngineCallPreferredAddresses.accumulatorAddVisibleArray)
         && detail::uniqueProductionFunctionMatches(
@@ -288,6 +300,8 @@ static_assert(
     RetailEngineCallPreferredAddresses.accumulatorSetCamera == 0x00D47A40u);
 static_assert(
     RetailEngineCallPreferredAddresses.cullingProcessAlt == 0x00C4F070u);
+static_assert(
+    RetailEngineCallPreferredAddresses.accumulateScene == 0x00B6BEE0u);
 static_assert(
     RetailEngineCallPreferredAddresses.accumulatorAddVisibleArray
     == 0x00A9B790u);
@@ -457,7 +471,7 @@ struct RetailEngineCallAuthorizationAccess
     }
 };
 
-inline constexpr std::array<std::uintptr_t, 20>
+inline constexpr std::array<std::uintptr_t, 21>
 retailEngineCallAddressesAsArray(
     const RetailEngineCallAddressTable& addresses) noexcept
 {
@@ -473,6 +487,7 @@ retailEngineCallAddressesAsArray(
         addresses.niRefObjectFree,
         addresses.accumulatorSetCamera,
         addresses.cullingProcessAlt,
+        addresses.accumulateScene,
         addresses.accumulatorAddVisibleArray,
         addresses.rendererSetAccumulator,
         addresses.setAccumulatingAccumulator,
@@ -486,7 +501,7 @@ retailEngineCallAddressesAsArray(
 }
 
 inline constexpr RetailEngineCallAddressTable retailEngineCallAddressesFromArray(
-    const std::array<std::uintptr_t, 20>& addresses) noexcept
+    const std::array<std::uintptr_t, 21>& addresses) noexcept
 {
     return {
         addresses[0],
@@ -509,6 +524,7 @@ inline constexpr RetailEngineCallAddressTable retailEngineCallAddressesFromArray
         addresses[17],
         addresses[18],
         addresses[19],
+        addresses[20],
     };
 }
 
@@ -516,9 +532,9 @@ inline RetailEngineAddressRelocationFailure relocateRetailEngineCallTable(
     std::uintptr_t loadedImageBase,
     RetailEngineCallAddressTable& relocated) noexcept
 {
-    const std::array<std::uintptr_t, 20> preferred =
+    const std::array<std::uintptr_t, 21> preferred =
         retailEngineCallAddressesAsArray(RetailEngineCallPreferredAddresses);
-    std::array<std::uintptr_t, 20> candidate {};
+    std::array<std::uintptr_t, 21> candidate {};
     for (std::size_t index = 0u; index < preferred.size(); ++index)
     {
         const RetailEngineAddressRelocation result =
@@ -642,6 +658,9 @@ inline RetailEngineCallResolution resolveRetailEngineCalls(
         calls.cullingProcessAlt =
             reinterpret_cast<abi::CullingProcessAltFunction>(
                 addresses.cullingProcessAlt);
+        calls.accumulateScene =
+            reinterpret_cast<abi::AccumulateSceneFunction>(
+                addresses.accumulateScene);
         calls.accumulatorAddVisibleArray =
             reinterpret_cast<abi::AccumulatorAddVisibleArrayFunction>(
                 addresses.accumulatorAddVisibleArray);

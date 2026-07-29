@@ -51,8 +51,15 @@ struct RetailNiAccumulatorLayout
 
 struct RetailNiCameraLayout
 {
-    std::uint8_t opaqueBase[0x9C];
-    float worldToCamera[16];
+    // NiCamera retains the NiAVObject spatial state through 0x9B, followed
+    // by the 0x10-byte world-bound block.  The world-to-camera affine matrix
+    // starts after that block at 0xAC and occupies three rows of four floats.
+    // The authenticated NiCamera::SetViewFrustum body writes the frustum at
+    // 0xDC..0xF4, while the authenticated factory pushes a 0x114-byte object
+    // allocation.  Treating this affine matrix as a 4x4 matrix consumes the
+    // frustum and is unsafe for an in-process renderer.
+    std::uint8_t opaqueBase[0xAC];
+    float worldToCamera[12];
     RetailNiFrustumLayout frustum;
     float minimumNearPlane;
     float maximumFarNearRatio;
@@ -62,12 +69,17 @@ struct RetailNiCameraLayout
 
 struct RetailSceneGraphLayout
 {
+    // A live retail World SceneGraph snapshot establishes these fields at the
+    // 0xAC NiNode boundary: camera, transient visible array, culler, opaque
+    // word, and FOV.  The older disabled xNVSE declaration that placed them
+    // at 0xDC does not describe the loaded FalloutNV.exe 1.4.0.525 object.
     std::uint8_t opaqueNode[0xAC];
     RetailPointer32 camera;
     RetailPointer32 visibleArray;
     RetailPointer32 cullingProcess;
-    std::uint8_t isMenuSceneGraph;
-    std::uint8_t reservedB9[3];
+    // This is an undocumented word at 0xB8. It is not a
+    // menu-state flag and must not influence world-versus-UI routing.
+    std::uint32_t opaqueUnknownB8;
     float cameraFov;
 };
 
@@ -140,7 +152,7 @@ static_assert(offsetof(RetailNiAccumulatorLayout, vtable) == 0x00u);
 static_assert(offsetof(RetailNiAccumulatorLayout, referenceCount) == 0x04u);
 static_assert(offsetof(RetailNiAccumulatorLayout, camera) == 0x08u);
 
-static_assert(offsetof(RetailNiCameraLayout, worldToCamera) == 0x9Cu);
+static_assert(offsetof(RetailNiCameraLayout, worldToCamera) == 0xACu);
 static_assert(offsetof(RetailNiCameraLayout, frustum) == 0xDCu);
 static_assert(offsetof(RetailNiCameraLayout, minimumNearPlane) == 0xF8u);
 static_assert(offsetof(RetailNiCameraLayout, maximumFarNearRatio) == 0xFCu);
@@ -150,7 +162,7 @@ static_assert(offsetof(RetailNiCameraLayout, lodAdjust) == 0x110u);
 static_assert(offsetof(RetailSceneGraphLayout, camera) == 0xACu);
 static_assert(offsetof(RetailSceneGraphLayout, visibleArray) == 0xB0u);
 static_assert(offsetof(RetailSceneGraphLayout, cullingProcess) == 0xB4u);
-static_assert(offsetof(RetailSceneGraphLayout, isMenuSceneGraph) == 0xB8u);
+static_assert(offsetof(RetailSceneGraphLayout, opaqueUnknownB8) == 0xB8u);
 static_assert(offsetof(RetailSceneGraphLayout, cameraFov) == 0xBCu);
 static_assert(
     offsetof(RetailRendererAccumulatorOwnerLayout, accumulator) == 0x08u);

@@ -31,6 +31,18 @@ std::uint32_t decodeJumpTarget(
         | (static_cast<std::uint32_t>(jump[4]) << 24u);
     return instructionAddress + 5u + displacement;
 }
+
+std::uint32_t decodeCallTarget(
+    const std::uint8_t* call,
+    std::uint32_t instructionAddress)
+{
+    require(call && call[0] == 0xE8u, "test fixture must contain an x86 call");
+    const std::uint32_t displacement = static_cast<std::uint32_t>(call[1])
+        | (static_cast<std::uint32_t>(call[2]) << 8u)
+        | (static_cast<std::uint32_t>(call[3]) << 16u)
+        | (static_cast<std::uint32_t>(call[4]) << 24u);
+    return instructionAddress + 5u + displacement;
+}
 }
 
 int main()
@@ -257,8 +269,77 @@ int main()
             "a changed selector literal must fail the exact callsite contract");
     }
 
+    require(
+        RetailWorldAccumulationCallSiteContractInventory.size() == 3u,
+        "all stock AccumulateScene callsites must be represented");
+    require(
+        RetailWorldAccumulationCallSiteContractInventory[0]
+                .preferredCallAddress == 0x0087415Bu
+            && RetailWorldAccumulationCallSiteContractInventory[1]
+                    .preferredCallAddress == 0x008742B7u
+            && RetailWorldAccumulationCallSiteContractInventory[2]
+                    .preferredCallAddress == 0x0087436Du
+            && RetailWorldAccumulateSceneAddress == 0x00B6BEE0u,
+        "the accumulation inventory must pin the audited stock call addresses");
+    for (const RetailWorldAccumulationCallSiteContract& callSite
+         : RetailWorldAccumulationCallSiteContractInventory)
+    {
+        require(
+            callSite.independentLoadedProcessSamples == 2u
+                && callSite.preferredTargetAddress
+                    == RetailWorldAccumulateSceneAddress,
+            "each accumulation hook must target only stock AccumulateScene");
+        const RetailWorldAccumulationCallSiteObservation preferred =
+            observeRetailWorldAccumulationCallSite(
+                callSite.bytes.data(),
+                callSite.bytes.size(),
+                callSite.preferredCallAddress,
+                WorldRenderAddress,
+                callSite);
+        require(
+            preferred.complete(),
+            "an audited accumulation call must validate at the preferred base");
+
+        constexpr std::uintptr_t RelocationDelta = 0x00100000u;
+        const RetailWorldAccumulationCallSiteObservation relocated =
+            observeRetailWorldAccumulationCallSite(
+                callSite.bytes.data(),
+                callSite.bytes.size(),
+                callSite.preferredCallAddress + RelocationDelta,
+                WorldRenderAddress + RelocationDelta,
+                callSite);
+        require(
+            relocated.complete(),
+            "same-module relocation must preserve the accumulation target");
+
+        std::array<std::uint8_t, RetailWorldAccumulationCallPatchByteCount>
+            changed = callSite.bytes;
+        changed[1] ^= 0x01u;
+        require(
+            !observeRetailWorldAccumulationCallSite(
+                 changed.data(),
+                 changed.size(),
+                 callSite.preferredCallAddress,
+                 WorldRenderAddress,
+                 callSite)
+                 .complete(),
+            "a redirected accumulation call must fail closed");
+
+        const RetailWorldRelativeCall replacement = encodeRetailWorldX86Call(
+            callSite.preferredCallAddress,
+            0x60001000u);
+        require(
+            replacement.valid
+                && decodeCallTarget(
+                    replacement.bytes.data(),
+                    static_cast<std::uint32_t>(
+                        callSite.preferredCallAddress))
+                    == 0x60001000u,
+            "a callsite patch must preserve x86 E8 rel32 semantics");
+    }
+
     std::cout
-        << "retail world hook contract tests passed; inert entry/trampoline "
-           "plan covers both stock callers\n";
+        << "retail world hook contract tests passed; entry and audited "
+           "AccumulateScene callsite plans are exact\n";
     return EXIT_SUCCESS;
 }

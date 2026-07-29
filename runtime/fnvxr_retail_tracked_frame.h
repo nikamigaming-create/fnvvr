@@ -41,6 +41,17 @@ struct RetailTrackedFrameValidation
     }
 };
 
+// A presentation decision must have one owner. In particular, menu
+// transitions must never leave a frame eligible for both the flat UI quad and
+// the binocular world renderer. Any stable frame that is neither confirmed
+// UI nor confirmed gameplay is withheld rather than guessed at.
+enum class RetailTrackedPresentationRoute : std::uint8_t
+{
+    Withhold = 0u,
+    MonoUiQuad,
+    BinocularWorld,
+};
+
 inline bool retailTrackedFinite(const float* values, std::size_t count) noexcept
 {
     if (!values)
@@ -160,6 +171,33 @@ inline bool retailTrackedRuntimeUiConfirmed(
             != 0u;
 }
 
+// Call only after validateRetailTrackedPublishedFrame() succeeds. Keeping the
+// classification separate lets both the world hook and the UI-present path
+// consume the same mutually-exclusive runtime decision.
+inline RetailTrackedPresentationRoute retailTrackedPublishedPresentationRoute(
+    const RetailTrackedFrame& frame) noexcept
+{
+    if (retailTrackedRuntimeUiConfirmed(frame.runtime))
+        return RetailTrackedPresentationRoute::MonoUiQuad;
+    if (shared::runtimeGameplayPhase(
+            frame.runtime.phase,
+            frame.runtime.menuBits,
+            frame.runtime.showroomActive)
+        && frame.runtime.cameraActive != 0u)
+    {
+        return RetailTrackedPresentationRoute::BinocularWorld;
+    }
+    return RetailTrackedPresentationRoute::Withhold;
+}
+
+inline RetailTrackedPresentationRoute retailTrackedPresentationRoute(
+    const RetailTrackedFrame& frame) noexcept
+{
+    if (!validateRetailTrackedPublishedFrame(frame).complete())
+        return RetailTrackedPresentationRoute::Withhold;
+    return retailTrackedPublishedPresentationRoute(frame);
+}
+
 inline RetailTrackedFrameValidation validateRetailTrackedUiFrame(
     const RetailTrackedFrame& frame) noexcept
 {
@@ -167,7 +205,8 @@ inline RetailTrackedFrameValidation validateRetailTrackedUiFrame(
         validateRetailTrackedPublishedFrame(frame);
     if (!published.complete())
         return published;
-    if (!retailTrackedRuntimeUiConfirmed(frame.runtime))
+    if (retailTrackedPublishedPresentationRoute(frame)
+        != RetailTrackedPresentationRoute::MonoUiQuad)
         return { RetailTrackedFrameFailure::RuntimeNotUi };
     return { RetailTrackedFrameFailure::None };
 }
@@ -179,11 +218,8 @@ inline RetailTrackedFrameValidation validateRetailTrackedGameplayFrame(
         validateRetailTrackedPublishedFrame(frame);
     if (!published.complete())
         return published;
-    if (!shared::runtimeGameplayPhase(
-            frame.runtime.phase,
-            frame.runtime.menuBits,
-            frame.runtime.showroomActive)
-        || frame.runtime.cameraActive == 0u)
+    if (retailTrackedPublishedPresentationRoute(frame)
+        != RetailTrackedPresentationRoute::BinocularWorld)
     {
         return { RetailTrackedFrameFailure::RuntimeNotGameplay };
     }

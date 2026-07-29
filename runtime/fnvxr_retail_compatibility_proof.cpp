@@ -65,14 +65,36 @@ struct JipRewriteSeal
     std::size_t stubBytes = 0;
 };
 
+struct JohnnyGuitarRewriteSeal
+{
+    std::uintptr_t renderFirstPersonPreferredAddress = 0;
+    std::size_t renderFirstPersonBytes = 0;
+    std::size_t renderFirstPersonCallOffset = 0;
+    std::uintptr_t renderFirstPersonStockTargetPreferredAddress = 0;
+    std::uintptr_t updateCameraPreferredAddress = 0;
+    std::size_t updateCameraBytes = 0;
+    std::size_t updateCameraOverwriteOffset = 0;
+    std::array<std::uint8_t, 5> updateCameraOriginalBytes {};
+    std::size_t updateCameraFirstCallOffset = 0;
+    std::uintptr_t updateCameraFirstStockTargetPreferredAddress = 0;
+    std::size_t updateCameraSecondCallOffset = 0;
+    std::uintptr_t updateCameraSecondStockTargetPreferredAddress = 0;
+    std::uint32_t renderFirstPersonHookRva = 0;
+    std::uint32_t updateCameraOverwriteHookRva = 0;
+    std::uint32_t updateCameraFirstCallHookRva = 0;
+    std::uint32_t updateCameraSecondCallHookRva = 0;
+};
+
 struct CompatibilityContract
 {
     std::uintptr_t preferredImageBase = 0;
     LoadedExecutableIdentity loadedIdentity {};
     std::uint32_t sizeOfImage = 0;
     ExactModuleSeal jip {};
+    ExactModuleSeal johnnyGuitar {};
     ExactModuleSeal showOff {};
     JipRewriteSeal jipRewrite {};
+    JohnnyGuitarRewriteSeal johnnyGuitarRewrite {};
     const LoadedFunctionManifestEntry* coreManifest = nullptr;
     std::size_t coreManifestCount = 0;
     const abi::RetailFunctionAbiDescriptor* functionInventory = nullptr;
@@ -636,22 +658,65 @@ bool readRel32Target(
     return true;
 }
 
+bool restoreExactRel32Call(
+    std::vector<std::uint8_t>& function,
+    std::uintptr_t functionAddress,
+    std::size_t callOffset,
+    std::uintptr_t expectedHookTarget,
+    std::uintptr_t stockTarget) noexcept
+{
+    std::uintptr_t actualTarget = 0u;
+    std::uintptr_t instructionEnd = 0u;
+    std::array<std::uint8_t, 4> stockDisplacement {};
+    if (!readRel32Target(
+            function,
+            functionAddress,
+            callOffset,
+            actualTarget)
+        || actualTarget != expectedHookTarget
+        || !checkedAdd(
+            functionAddress,
+            callOffset + 5u,
+            instructionEnd)
+        || !encodeRel32(instructionEnd, stockTarget, stockDisplacement))
+    {
+        return false;
+    }
+    std::copy(
+        stockDisplacement.begin(),
+        stockDisplacement.end(),
+        function.begin() + callOffset + 1u);
+    return true;
+}
+
 bool verifyRenderFirstPerson(
     const EvidenceReader& reader,
     const ModuleRecord& mainModule,
     const ModuleRecord* jipModule,
     bool jipExact,
+    const ModuleRecord* johnnyGuitarModule,
+    bool johnnyGuitarExact,
     const CompatibilityContract& contract,
     const LoadedFunctionManifestEntry& manifest,
-    bool& normalizationApplied) noexcept
+    bool& jipNormalizationApplied,
+    bool& johnnyGuitarNormalizationObserved) noexcept
 {
-    normalizationApplied = false;
+    jipNormalizationApplied = false;
+    johnnyGuitarNormalizationObserved = false;
     const JipRewriteSeal& rewrite = contract.jipRewrite;
+    const JohnnyGuitarRewriteSeal& johnnyRewrite =
+        contract.johnnyGuitarRewrite;
     std::uintptr_t functionAddress = 0u;
     if (manifest.preferredAddress != rewrite.functionPreferredAddress
         || manifest.byteCount != rewrite.functionBytes
         || rewrite.callOffset > rewrite.functionBytes
         || rewrite.functionBytes - rewrite.callOffset < 5u
+        || johnnyRewrite.renderFirstPersonPreferredAddress
+            != rewrite.functionPreferredAddress
+        || johnnyRewrite.renderFirstPersonBytes != rewrite.functionBytes
+        || johnnyRewrite.renderFirstPersonCallOffset > rewrite.functionBytes
+        || rewrite.functionBytes
+            - johnnyRewrite.renderFirstPersonCallOffset < 5u
         || !relocate(
             contract,
             mainModule.runtimeBase,
@@ -686,81 +751,251 @@ bool verifyRenderFirstPerson(
         }
         if (digestEqual(rawDigest, manifest.sha256))
             return true;
-        if (!jipModule || !jipExact)
-            return false;
-
-        std::uintptr_t expectedStubAddress = 0u;
-        std::uintptr_t actualTarget = 0u;
-        if (!checkedAdd(
-                jipModule->runtimeBase,
-                rewrite.stubRva,
-                expectedStubAddress)
-            || !rangeWithin(
-                jipModule->runtimeBase,
-                jipModule->runtimeBytes,
-                expectedStubAddress,
-                rewrite.stubBytes)
-            || !rangeHasAccess(
-                reader,
-                expectedStubAddress,
-                rewrite.stubBytes,
-                true,
-                true)
-            || !readRel32Target(
-                function,
-                functionAddress,
-                rewrite.callOffset,
-                actualTarget)
-            || actualTarget != expectedStubAddress)
-        {
-            return false;
-        }
-
-        std::array<std::uint8_t, 19> expectedStub {};
-        std::array<std::uint8_t, 19> actualStub {};
-        if (!makeExpectedJipStub(
-                jipModule->runtimeBase,
-                rewrite,
-                expectedStub)
-            || !reader.read(
-                expectedStubAddress,
-                actualStub.data(),
-                actualStub.size())
-            || actualStub != expectedStub)
-        {
-            return false;
-        }
 
         std::uintptr_t stockTarget = 0u;
-        std::uintptr_t instructionEnd = 0u;
-        std::array<std::uint8_t, 4> stockDisplacement {};
+        std::uintptr_t actualTarget = 0u;
         if (!relocate(
                 contract,
                 mainModule.runtimeBase,
                 rewrite.stockTargetPreferredAddress,
                 stockTarget)
-            || !checkedAdd(
+            || !readRel32Target(
+                function,
                 functionAddress,
-                rewrite.callOffset + 5u,
-                instructionEnd)
-            || !encodeRel32(
-                instructionEnd,
-                stockTarget,
-                stockDisplacement))
+                rewrite.callOffset,
+                actualTarget))
+        {
+            return false;
+        }
+
+        bool jipRewriteObserved = false;
+        if (actualTarget != stockTarget)
+        {
+            std::uintptr_t expectedStubAddress = 0u;
+            if (!jipModule
+                || !jipExact
+                || !checkedAdd(
+                    jipModule->runtimeBase,
+                    rewrite.stubRva,
+                    expectedStubAddress)
+                || !rangeWithin(
+                    jipModule->runtimeBase,
+                    jipModule->runtimeBytes,
+                    expectedStubAddress,
+                    rewrite.stubBytes)
+                || !rangeHasAccess(
+                    reader,
+                    expectedStubAddress,
+                    rewrite.stubBytes,
+                    true,
+                    true)
+                || actualTarget != expectedStubAddress)
+            {
+                return false;
+            }
+
+            std::array<std::uint8_t, 19> expectedStub {};
+            std::array<std::uint8_t, 19> actualStub {};
+            if (!makeExpectedJipStub(
+                    jipModule->runtimeBase,
+                    rewrite,
+                    expectedStub)
+                || !reader.read(
+                    expectedStubAddress,
+                    actualStub.data(),
+                    actualStub.size())
+                || actualStub != expectedStub
+                || !restoreExactRel32Call(
+                    function,
+                    functionAddress,
+                    rewrite.callOffset,
+                    expectedStubAddress,
+                    stockTarget))
+            {
+                return false;
+            }
+            jipRewriteObserved = true;
+        }
+
+        Sha256Digest normalizedDigest {};
+        if (!sha256Bytes(
+                function.data(),
+                function.size(),
+                normalizedDigest))
+        {
+            return false;
+        }
+        if (digestEqual(normalizedDigest, manifest.sha256))
+        {
+            jipNormalizationApplied = jipRewriteObserved;
+            return true;
+        }
+
+        if (!johnnyGuitarModule || !johnnyGuitarExact)
+            return false;
+        std::uintptr_t expectedJohnnyTarget = 0u;
+        std::uintptr_t johnnyStockTarget = 0u;
+        if (!checkedAdd(
+                johnnyGuitarModule->runtimeBase,
+                johnnyRewrite.renderFirstPersonHookRva,
+                expectedJohnnyTarget)
+            || !relocate(
+                contract,
+                mainModule.runtimeBase,
+                johnnyRewrite.renderFirstPersonStockTargetPreferredAddress,
+                johnnyStockTarget)
+            || !restoreExactRel32Call(
+                function,
+                functionAddress,
+                johnnyRewrite.renderFirstPersonCallOffset,
+                expectedJohnnyTarget,
+                johnnyStockTarget)
+            || !sha256Bytes(
+                function.data(),
+                function.size(),
+                normalizedDigest)
+            || !digestEqual(normalizedDigest, manifest.sha256))
+        {
+            return false;
+        }
+        jipNormalizationApplied = jipRewriteObserved;
+        johnnyGuitarNormalizationObserved = true;
+        return true;
+    }
+    catch (...)
+    {
+        return false;
+    }
+}
+
+bool verifyJohnnyGuitarUpdateCamera(
+    const EvidenceReader& reader,
+    const ModuleRecord& mainModule,
+    const ModuleRecord* johnnyGuitarModule,
+    bool johnnyGuitarExact,
+    const CompatibilityContract& contract,
+    const LoadedFunctionManifestEntry& manifest,
+    bool johnnyGuitarRenderNormalizationObserved,
+    bool& johnnyGuitarNormalizationApplied) noexcept
+{
+    johnnyGuitarNormalizationApplied = false;
+    const JohnnyGuitarRewriteSeal& rewrite =
+        contract.johnnyGuitarRewrite;
+    if (manifest.preferredAddress != rewrite.updateCameraPreferredAddress
+        || manifest.byteCount != rewrite.updateCameraBytes
+        || rewrite.updateCameraOverwriteOffset > rewrite.updateCameraBytes
+        || rewrite.updateCameraBytes - rewrite.updateCameraOverwriteOffset
+            < rewrite.updateCameraOriginalBytes.size()
+        || rewrite.updateCameraFirstCallOffset > rewrite.updateCameraBytes
+        || rewrite.updateCameraBytes - rewrite.updateCameraFirstCallOffset < 5u
+        || rewrite.updateCameraSecondCallOffset > rewrite.updateCameraBytes
+        || rewrite.updateCameraBytes - rewrite.updateCameraSecondCallOffset < 5u)
+    {
+        return false;
+    }
+
+    std::uintptr_t functionAddress = 0u;
+    if (!relocate(
+            contract,
+            mainModule.runtimeBase,
+            rewrite.updateCameraPreferredAddress,
+            functionAddress)
+        || !rangeWithin(
+            mainModule.runtimeBase,
+            mainModule.runtimeBytes,
+            functionAddress,
+            rewrite.updateCameraBytes)
+        || !rangeHasAccess(
+            reader,
+            functionAddress,
+            rewrite.updateCameraBytes,
+            true,
+            true))
+    {
+        return false;
+    }
+
+    try
+    {
+        std::vector<std::uint8_t> function(rewrite.updateCameraBytes);
+        Sha256Digest digest {};
+        if (!reader.read(
+                functionAddress,
+                function.data(),
+                function.size())
+            || !sha256Bytes(function.data(), function.size(), digest))
+        {
+            return false;
+        }
+        if (digestEqual(digest, manifest.sha256))
+            return !johnnyGuitarRenderNormalizationObserved;
+        if (!johnnyGuitarRenderNormalizationObserved
+            || !johnnyGuitarModule
+            || !johnnyGuitarExact)
+        {
+            return false;
+        }
+
+        std::uintptr_t overwriteTarget = 0u;
+        std::uintptr_t firstCallTarget = 0u;
+        std::uintptr_t secondCallTarget = 0u;
+        std::uintptr_t actualTarget = 0u;
+        if (!checkedAdd(
+                johnnyGuitarModule->runtimeBase,
+                rewrite.updateCameraOverwriteHookRva,
+                overwriteTarget)
+            || !checkedAdd(
+                johnnyGuitarModule->runtimeBase,
+                rewrite.updateCameraFirstCallHookRva,
+                firstCallTarget)
+            || !checkedAdd(
+                johnnyGuitarModule->runtimeBase,
+                rewrite.updateCameraSecondCallHookRva,
+                secondCallTarget)
+            || !readRel32Target(
+                function,
+                functionAddress,
+                rewrite.updateCameraOverwriteOffset,
+                actualTarget)
+            || actualTarget != overwriteTarget)
         {
             return false;
         }
         std::copy(
-            stockDisplacement.begin(),
-            stockDisplacement.end(),
-            function.begin() + rewrite.callOffset + 1u);
-        Sha256Digest normalizedDigest {};
-        normalizationApplied = sha256Bytes(
-                                   function.data(),
-                                   function.size(),
-                                   normalizedDigest)
-            && digestEqual(normalizedDigest, manifest.sha256);
-        return normalizationApplied;
+            rewrite.updateCameraOriginalBytes.begin(),
+            rewrite.updateCameraOriginalBytes.end(),
+            function.begin() + rewrite.updateCameraOverwriteOffset);
+
+        std::uintptr_t firstStockTarget = 0u;
+        std::uintptr_t secondStockTarget = 0u;
+        if (!relocate(
+                contract,
+                mainModule.runtimeBase,
+                rewrite.updateCameraFirstStockTargetPreferredAddress,
+                firstStockTarget)
+            || !relocate(
+                contract,
+                mainModule.runtimeBase,
+                rewrite.updateCameraSecondStockTargetPreferredAddress,
+                secondStockTarget)
+            || !restoreExactRel32Call(
+                function,
+                functionAddress,
+                rewrite.updateCameraFirstCallOffset,
+                firstCallTarget,
+                firstStockTarget)
+            || !restoreExactRel32Call(
+                function,
+                functionAddress,
+                rewrite.updateCameraSecondCallOffset,
+                secondCallTarget,
+                secondStockTarget)
+            || !sha256Bytes(function.data(), function.size(), digest))
+        {
+            return false;
+        }
+        johnnyGuitarNormalizationApplied = digestEqual(digest, manifest.sha256);
+        return johnnyGuitarNormalizationApplied;
     }
     catch (...)
     {
@@ -836,6 +1071,31 @@ PassResult evaluatePass(
         return result;
     }
 
+    std::size_t johnnyGuitarCount = 0u;
+    const ModuleRecord* johnnyGuitarModule = uniqueModule(
+        modules,
+        lower(contract.johnnyGuitar.baseName
+                ? contract.johnnyGuitar.baseName
+                : L""),
+        johnnyGuitarCount);
+    result.diagnostics.johnnyGuitarPresent = johnnyGuitarCount != 0u;
+    if (johnnyGuitarCount > 1u)
+    {
+        result.failure = RetailCompatibilityFailure::DuplicateJohnnyGuitarModule;
+        return result;
+    }
+    result.evidence.johnnyGuitar528ExactOrAbsent = johnnyGuitarCount == 0u
+        || (johnnyGuitarModule
+            && verifyExactModule(
+                reader,
+                *johnnyGuitarModule,
+                contract.johnnyGuitar));
+    if (!result.evidence.johnnyGuitar528ExactOrAbsent)
+    {
+        result.failure = RetailCompatibilityFailure::JohnnyGuitar528IdentityMismatch;
+        return result;
+    }
+
     std::size_t showOffCount = 0u;
     const ModuleRecord* showOffModule = uniqueModule(
         modules,
@@ -864,6 +1124,8 @@ PassResult evaluatePass(
     }
     bool coreMatched = true;
     bool renderFirstPersonFound = false;
+    bool updateCameraFound = false;
+    bool johnnyGuitarRenderNormalizationObserved = false;
     for (std::size_t index = 0u; index < contract.coreManifestCount; ++index)
     {
         const LoadedFunctionManifestEntry& entry = contract.coreManifest[index];
@@ -876,44 +1138,74 @@ PassResult evaluatePass(
         }
         if (entry.preferredAddress == contract.jipRewrite.functionPreferredAddress)
         {
-            bool normalizationApplied = false;
+            bool jipNormalizationApplied = false;
+            bool johnnyNormalizationObserved = false;
             const bool matched = verifyRenderFirstPerson(
                 reader,
                 *mainModule,
                 jipModule,
-                jipCount == 0u || result.evidence.jip5730ExactOrAbsent,
+                jipModule && result.evidence.jip5730ExactOrAbsent,
+                johnnyGuitarModule,
+                johnnyGuitarModule
+                    && result.evidence.johnnyGuitar528ExactOrAbsent,
                 contract,
                 entry,
-                normalizationApplied);
+                jipNormalizationApplied,
+                johnnyNormalizationObserved);
             result.evidence.renderFirstPersonStockOrJipNormalized = matched;
-            result.diagnostics.jipNormalizationApplied = normalizationApplied;
+            result.diagnostics.jipNormalizationApplied =
+                jipNormalizationApplied;
+            johnnyGuitarRenderNormalizationObserved =
+                johnnyNormalizationObserved;
             renderFirstPersonFound = true;
             coreMatched = coreMatched && matched;
             if (matched)
                 ++result.diagnostics.protectedCoreBodiesHashed;
             continue;
         }
-        std::uintptr_t address = 0u;
-        Sha256Digest digest {};
-        const bool matched = relocate(
-                                 contract,
-                                 mainModule->runtimeBase,
-                                 entry.preferredAddress,
-                                 address)
-            && rangeWithin(
-                mainModule->runtimeBase,
-                mainModule->runtimeBytes,
-                address,
-                entry.byteCount)
-            && rangeHasAccess(reader, address, entry.byteCount, true, true)
-            && hashMemory(reader, address, entry.byteCount, digest)
-            && digestEqual(entry.sha256, digest);
+        bool matched = false;
+        if (entry.preferredAddress
+            == contract.johnnyGuitarRewrite.updateCameraPreferredAddress)
+        {
+            bool johnnyNormalizationApplied = false;
+            matched = verifyJohnnyGuitarUpdateCamera(
+                reader,
+                *mainModule,
+                johnnyGuitarModule,
+                johnnyGuitarModule
+                    && result.evidence.johnnyGuitar528ExactOrAbsent,
+                contract,
+                entry,
+                johnnyGuitarRenderNormalizationObserved,
+                johnnyNormalizationApplied);
+            result.diagnostics.johnnyGuitarNormalizationApplied =
+                johnnyNormalizationApplied;
+            updateCameraFound = true;
+        }
+        else
+        {
+            std::uintptr_t address = 0u;
+            Sha256Digest digest {};
+            matched = relocate(
+                          contract,
+                          mainModule->runtimeBase,
+                          entry.preferredAddress,
+                          address)
+                && rangeWithin(
+                    mainModule->runtimeBase,
+                    mainModule->runtimeBytes,
+                    address,
+                    entry.byteCount)
+                && rangeHasAccess(reader, address, entry.byteCount, true, true)
+                && hashMemory(reader, address, entry.byteCount, digest)
+                && digestEqual(entry.sha256, digest);
+        }
         coreMatched = coreMatched && matched;
         if (matched)
             ++result.diagnostics.protectedCoreBodiesHashed;
     }
     result.evidence.protectedCoreBodiesMatched =
-        coreMatched && renderFirstPersonFound;
+        coreMatched && renderFirstPersonFound && updateCameraFound;
     if (!result.evidence.renderFirstPersonStockOrJipNormalized)
     {
         result.failure =
@@ -922,7 +1214,9 @@ PassResult evaluatePass(
     }
     if (!result.evidence.protectedCoreBodiesMatched)
     {
-        result.failure = RetailCompatibilityFailure::ProtectedCoreBodyMismatch;
+        result.failure = johnnyGuitarRenderNormalizationObserved
+            ? RetailCompatibilityFailure::JohnnyGuitarProtectedRewriteMismatch
+            : RetailCompatibilityFailure::ProtectedCoreBodyMismatch;
         return result;
     }
 
@@ -1087,6 +1381,8 @@ RetailCompatibilityEvidence combineEvidence(
         moduleStable,
         before.evidence.jip5730ExactOrAbsent
             && after.evidence.jip5730ExactOrAbsent,
+        before.evidence.johnnyGuitar528ExactOrAbsent
+            && after.evidence.johnnyGuitar528ExactOrAbsent,
         before.evidence.showOff184ExactOrAbsent
             && after.evidence.showOff184ExactOrAbsent,
         before.evidence.renderFirstPersonStockOrJipNormalized
@@ -1110,6 +1406,7 @@ bool allEvidence(const RetailCompatibilityEvidence& evidence) noexcept
     return evidence.retailExecutableIdentityMatched
         && evidence.moduleSnapshotStable
         && evidence.jip5730ExactOrAbsent
+        && evidence.johnnyGuitar528ExactOrAbsent
         && evidence.showOff184ExactOrAbsent
         && evidence.renderFirstPersonStockOrJipNormalized
         && evidence.protectedCoreBodiesMatched
@@ -1166,6 +1463,16 @@ inline constexpr ExactModuleSeal Jip5730 {
     0x10000000u,
 };
 
+inline constexpr ExactModuleSeal JohnnyGuitar528 {
+    L"johnnyguitar.dll",
+    286720u,
+    sha256FromHex(
+        "456B6CE716B6B18D3DE13E20ECA1692070F7DECF35C39DAA165F6499CC1113D3"),
+    0x6A1A9B80u,
+    0x0004C000u,
+    0x10000000u,
+};
+
 inline constexpr ExactModuleSeal ShowOff184 {
     L"showoffnvse.dll",
     1091584u,
@@ -1186,6 +1493,28 @@ inline constexpr JipRewriteSeal Jip5730RenderFirstPerson {
     19u,
 };
 
+// Read-only A/B snapshots of exact JohnnyGuitar 5.28 prove these four
+// ASLR-dependent rewrites.  Each replacement is normalized to the original
+// stock bytes only after the loaded DLL identity and exact hook target match.
+inline constexpr JohnnyGuitarRewriteSeal JohnnyGuitar528Rewrites {
+    FirstPersonRenderAddress,
+    3361u,
+    0x01E2u,
+    0x00A6FAF0u,
+    0x0094AE40u,
+    5433u,
+    0x0EB6u,
+    { 0xDFu, 0xE0u, 0xF6u, 0xC4u, 0x41u },
+    0x0F82u,
+    0x00440460u,
+    0x0F95u,
+    0x0043FA80u,
+    0x00019C20u,
+    0x00012D80u,
+    0x00012590u,
+    0x000125E0u,
+};
+
 const CompatibilityContract& productionContract() noexcept
 {
     static constexpr CompatibilityContract Contract {
@@ -1197,8 +1526,10 @@ const CompatibilityContract& productionContract() noexcept
         },
         SupportedSizeOfImage,
         Jip5730,
+        JohnnyGuitar528,
         ShowOff184,
         Jip5730RenderFirstPerson,
+        JohnnyGuitar528Rewrites,
         RetailEngineManifest.data(),
         RetailEngineManifest.size(),
         abi::RetailFunctionAbiInventory.data(),
@@ -1682,6 +2013,14 @@ RetailCompatibilityProof proveSyntheticRetailCompatibilityAtDecisionPoint(
                 contract.jip.loadedPePreferredImageBase,
             },
             {
+                contract.johnnyGuitar.baseName,
+                contract.johnnyGuitar.fileBytes,
+                contract.johnnyGuitar.fileSha256,
+                contract.johnnyGuitar.loadedPeTimeDateStamp,
+                contract.johnnyGuitar.loadedPeSizeOfImage,
+                contract.johnnyGuitar.loadedPePreferredImageBase,
+            },
+            {
                 contract.showOff.baseName,
                 contract.showOff.fileBytes,
                 contract.showOff.fileSha256,
@@ -1697,6 +2036,27 @@ RetailCompatibilityProof proveSyntheticRetailCompatibilityAtDecisionPoint(
                 contract.jipRewrite.stubRva,
                 contract.jipRewrite.guardVariableRva,
                 contract.jipRewrite.stubBytes,
+            },
+            {
+                contract.johnnyGuitarRewrite.renderFirstPersonPreferredAddress,
+                contract.johnnyGuitarRewrite.renderFirstPersonBytes,
+                contract.johnnyGuitarRewrite.renderFirstPersonCallOffset,
+                contract.johnnyGuitarRewrite
+                    .renderFirstPersonStockTargetPreferredAddress,
+                contract.johnnyGuitarRewrite.updateCameraPreferredAddress,
+                contract.johnnyGuitarRewrite.updateCameraBytes,
+                contract.johnnyGuitarRewrite.updateCameraOverwriteOffset,
+                contract.johnnyGuitarRewrite.updateCameraOriginalBytes,
+                contract.johnnyGuitarRewrite.updateCameraFirstCallOffset,
+                contract.johnnyGuitarRewrite
+                    .updateCameraFirstStockTargetPreferredAddress,
+                contract.johnnyGuitarRewrite.updateCameraSecondCallOffset,
+                contract.johnnyGuitarRewrite
+                    .updateCameraSecondStockTargetPreferredAddress,
+                contract.johnnyGuitarRewrite.renderFirstPersonHookRva,
+                contract.johnnyGuitarRewrite.updateCameraOverwriteHookRva,
+                contract.johnnyGuitarRewrite.updateCameraFirstCallHookRva,
+                contract.johnnyGuitarRewrite.updateCameraSecondCallHookRva,
             },
             contract.coreManifest,
             contract.coreManifestCount,

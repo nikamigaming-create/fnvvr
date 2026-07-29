@@ -70,6 +70,8 @@ struct FakeEngine
 };
 
 FakeEngine* gFake = nullptr;
+abi::RetailPointer32 gVerifiedCullerVtable = static_cast<abi::RetailPointer32>(
+    abi::BSCullingProcessVtableAddress);
 
 #if defined(_MSC_VER) && defined(_M_IX86)
 #define FNVXR_TEST_CDECL __cdecl
@@ -146,8 +148,7 @@ abi::RetailBSCullingProcessLayout* FNVXR_TEST_THISCALL_IMPL fakeCullerConstruct(
 {
     gFake->calls.push_back(CullerConstruct);
     gFake->cullerArgument = argument;
-    storage->base.vtable = static_cast<abi::RetailPointer32>(
-        abi::BSCullingProcessVtableAddress);
+    storage->base.vtable = gVerifiedCullerVtable;
     return storage;
 }
 
@@ -157,7 +158,7 @@ void FNVXR_TEST_THISCALL_IMPL fakeCullerDestroy(
 {
     gFake->calls.push_back(CullerDestroy);
     gFake->cullerVtableRestoredBeforeDestroy = culler
-        && culler->base.vtable == abi::BSCullingProcessVtableAddress;
+        && culler->base.vtable == gVerifiedCullerVtable;
     require(
         !culler || culler->shaderAccumulator == 0u,
         "the adapter must release a stale culler accumulator reference before culler destruction");
@@ -243,6 +244,13 @@ void FNVXR_TEST_THISCALL_IMPL fakeProcessAlt(
 {
 }
 
+void FNVXR_TEST_CDECL fakeAccumulateScene(
+    abi::RetailNiCameraLayout*,
+    void*,
+    abi::RetailBSCullingProcessLayout*)
+{
+}
+
 void FNVXR_TEST_THISCALL_IMPL fakeAddVisible(
     abi::RetailNiAccumulatorLayout*,
     FNVXR_TEST_EDX_ARGUMENT
@@ -288,6 +296,8 @@ RetailEngineCallResolution fakeResolution()
         abi::AccumulatorSetCameraFunction>(&fakeSetCamera);
     calls.cullingProcessAlt = engineFunction<abi::CullingProcessAltFunction>(
         &fakeProcessAlt);
+    calls.accumulateScene = engineFunction<abi::AccumulateSceneFunction>(
+        &fakeAccumulateScene);
     calls.accumulatorAddVisibleArray = engineFunction<
         abi::AccumulatorAddVisibleArrayFunction>(&fakeAddVisible);
     calls.renderAccumulatorWithoutFinalize = &fakeRender;
@@ -332,9 +342,13 @@ int main()
     using namespace fnvxr::engine;
 
     const RetailEngineCallResolution resolution = fakeResolution();
-    require(resolution.complete(), "the fake call surface must cover all 14 retail calls");
+    require(resolution.complete(), "the fake call surface must cover all 15 retail calls");
 
     auto vtable = stockCullerVtable();
+#if defined(_MSC_VER) && defined(_M_IX86)
+    gVerifiedCullerVtable = static_cast<abi::RetailPointer32>(
+        reinterpret_cast<std::uintptr_t>(vtable.data()));
+#endif
     RetailEngineResourceContext<CollectorCapacity> context;
     require(
         context.initialize(
@@ -358,18 +372,14 @@ int main()
         require(result.resources.viewPlan().left == StereoResourceView::Center
                 && result.resources.viewPlan().right == StereoResourceView::Center,
             "the first executable renderer milestone must remain center/center");
-        require(result.resources.collectorBinding()->ownedVtableCloneInstalled(),
-            "the private culler must own its exact cloned vtable before use");
+        require(!result.resources.collectorBinding()->ownedVtableCloneInstalled(),
+            "direct visible-list collection must leave the retail culler vtable unmodified");
         require(result.resources.collectorBinding()->ownedVtableIntegrityValid(),
-            "the installed private vtable clone must pass its integrity check");
+            "an unmodified private culler binding must pass its integrity check");
         const auto& clone = result.resources.collectorBinding()->ownedVtableCloneForAudit();
         for (std::size_t index = 0u; index < clone.size(); ++index)
-        {
-            if (index == Binding::AppendVtableEntryIndex)
-                require(clone[index] != vtable[index], "only Append must be replaced by the owned callback");
-            else
-                require(clone[index] == vtable[index], "every inherited non-Append vslot must stay stock");
-        }
+            require(clone[index] == 0u,
+                "direct visible-list collection must not retain a private culler vtable clone");
 #if defined(_MSC_VER) && defined(_M_IX86)
         fakeSetCullerAccumulator(
             result.resources.cullingProcess(),
@@ -397,7 +407,7 @@ int main()
             "constructed accumulators must use the retail scalar destructor's deleting path");
     }
     require(fake.cullerVtableRestoredBeforeDestroy,
-        "the owned vtable must restore the stock culler vtable before the engine destructor");
+        "the stock culler vtable must remain intact before the engine destructor");
     require(context.failure() == RetailEngineResourceAdapterFailure::None,
         "a complete lifecycle must leave the concrete adapter healthy");
 
@@ -450,7 +460,7 @@ int main()
                 SupportedImageBase + RetailPeAllocationAlignment,
                 vtable.data(),
                 2u),
-        "the culler clone path must reject an unproven relocated retail image");
+        "the culler path must reject an unproven relocated retail image");
 
     RetailEngineResourceContext<CollectorCapacity> unauthorizedContext;
     require(unauthorizedContext.initialize(

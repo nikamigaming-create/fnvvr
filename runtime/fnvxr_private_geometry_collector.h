@@ -160,7 +160,7 @@ struct PrivateGeometryCollectorX86Abi
     static constexpr bool runtimeActivationAuthorized = false;
     static constexpr bool activatesHook = false;
     static constexpr bool clonesVtable = true;
-    static constexpr bool callsEngine = false;
+    static constexpr bool callsEngine = true;
     static constexpr bool writesProcessMemory = false;
 };
 
@@ -335,6 +335,53 @@ struct alignas(8) PrivateGeometryCollectorStorageLayout
 
 template <std::size_t Capacity>
 class PrivateGeometryCollectorBinding;
+
+// The production callback recovers its owner from the cloned vtable address.
+// Unit tests may replace the final stock Append invocation so they can verify
+// the x86 callback ABI without jumping into the retail executable.
+template <std::size_t Capacity>
+struct PrivateGeometryCollectorBindingTestAuthority;
+
+#if defined(_MSC_VER) && defined(_M_IX86)
+template <std::size_t Capacity>
+void __fastcall privateGeometryCollectorVslotRecord(
+    fnvxr::engine::abi::RetailBSCullingProcessLayout* cullingProcess,
+    void* ignoredEdx,
+    void* geometry) noexcept;
+
+template <std::size_t Capacity>
+void __declspec(naked) __fastcall privateGeometryCollectorVslotCallback(
+    fnvxr::engine::abi::RetailBSCullingProcessLayout* cullingProcess,
+    void* ignoredEdx,
+    void* geometry) noexcept;
+
+// The live culler calls the replacement slot with a thiscall frame.  The
+// naked shim below records that frame under saved registers, then tail-enters
+// the verified stock Append target with its original ECX, EDX, flags, stack,
+// and return address intact.  These are translation-unit-local because a
+// process owns one active stock traversal at a time.
+static std::uintptr_t gPrivateGeometryVslotRecordCallback = 0u;
+static RetailGeometryPointer32 gPrivateGeometryVslotForwardTarget = 0u;
+
+[[maybe_unused]] static void __declspec(naked)
+privateGeometryCollectorVslotReturnShim() noexcept
+{
+    __asm
+    {
+        ret 4
+    }
+}
+
+[[maybe_unused]] static RetailGeometryPointer32 __declspec(naked)
+__cdecl privateGeometryCollectorVslotForwardTarget() noexcept
+{
+    __asm
+    {
+        mov eax, dword ptr [gPrivateGeometryVslotForwardTarget]
+        ret
+    }
+}
+#endif
 
 template <std::size_t Capacity>
 class PrivateGeometryCollectorState
@@ -631,6 +678,8 @@ struct alignas(8) PrivateGeometryCollectorBindingLayout
     RetailGeometryPointer32 callbackAddress = 0u;
     std::uint32_t ownedVtableInstalledTag = 0u;
     std::uint64_t dispatchGeneration = 0u;
+    std::uint32_t forwardOriginalAppend = 0u;
+    std::uintptr_t originalAppendOverrideForTest = 0u;
     PrivateGeometryCollectorState<Capacity> collector {};
     std::uint64_t tailCanary = PrivateGeometryBindingTailCanary;
 };
@@ -753,6 +802,14 @@ public:
         mStorage.cullingProcess.base.vtable = ownedCloneVtableAddress;
         mStorage.ownedVtableInstalledTag =
             PrivateGeometryOwnedVtableInstalledTag;
+#if defined(_MSC_VER) && defined(_M_IX86)
+        gPrivateGeometryVslotRecordCallback = reinterpret_cast<std::uintptr_t>(
+            &privateGeometryCollectorVslotRecord<Capacity>);
+        gPrivateGeometryVslotForwardTarget =
+            static_cast<RetailGeometryPointer32>(
+                reinterpret_cast<std::uintptr_t>(
+                    &privateGeometryCollectorVslotReturnShim));
+#endif
         return GeometryVtableInstallResult::Installed;
     }
 
@@ -766,6 +823,20 @@ public:
     bool ownedVtableIntegrityValid() const noexcept
     {
         return bindingIntegrityValid();
+    }
+
+    RetailGeometryPointer32 ownedVtableAddressForDispatch() const noexcept
+    {
+        return ownedVtableCloneInstalled()
+            ? mStorage.ownedVtableAddress
+            : 0u;
+    }
+
+    bool ownsOwnedVtableAddress(RetailGeometryPointer32 address) const noexcept
+    {
+        return ownedVtableCloneInstalled()
+            && address != 0u
+            && address == mStorage.ownedVtableAddress;
     }
 
     const std::array<RetailGeometryPointer32, OwnedVtableEntryCount>&
@@ -807,6 +878,12 @@ public:
 
     bool reset() noexcept
     {
+#if defined(_MSC_VER) && defined(_M_IX86)
+        gPrivateGeometryVslotForwardTarget =
+            static_cast<RetailGeometryPointer32>(
+                reinterpret_cast<std::uintptr_t>(
+                    &privateGeometryCollectorVslotReturnShim));
+#endif
         if (!bindingIntegrityValid())
         {
             mStorage.collector.invalidateFromBinding();
@@ -829,6 +906,8 @@ public:
         mStorage.callbackAddress = 0u;
         mStorage.ownedVtableInstalledTag = 0u;
         mStorage.dispatchGeneration = 0u;
+        mStorage.forwardOriginalAppend = 0u;
+        mStorage.originalAppendOverrideForTest = 0u;
         return true;
     }
 
@@ -838,6 +917,12 @@ public:
     // while discarding only the sealed geometry and generation.
     bool resetCollectedGeometryPreservingOwnedVtable() noexcept
     {
+#if defined(_MSC_VER) && defined(_M_IX86)
+        gPrivateGeometryVslotForwardTarget =
+            static_cast<RetailGeometryPointer32>(
+                reinterpret_cast<std::uintptr_t>(
+                    &privateGeometryCollectorVslotReturnShim));
+#endif
         if (!bindingIntegrityValid()
             || mStorage.ownedVtableInstalledTag
                 != PrivateGeometryOwnedVtableInstalledTag)
@@ -848,35 +933,100 @@ public:
         if (!mStorage.collector.reset())
             return false;
         mStorage.dispatchGeneration = 0u;
+        mStorage.forwardOriginalAppend = 0u;
         return bindingIntegrityValid();
     }
 
 #if defined(_MSC_VER) && defined(_M_IX86)
     bool beginCollection(std::uint64_t generation) noexcept
     {
+        return beginCollectionFor(
+            &mStorage.cullingProcess,
+            generation,
+            false);
+    }
+
+    bool beginCollectionFor(
+        fnvxr::engine::abi::RetailBSCullingProcessLayout* owner,
+        std::uint64_t generation,
+        bool forwardOriginalAppend) noexcept
+    {
         if (!bindingIntegrityValid())
         {
             mStorage.collector.invalidateFromBinding();
             return false;
         }
+        const std::uintptr_t ownerAddress =
+            reinterpret_cast<std::uintptr_t>(owner);
+        if (!owner || ownerAddress
+                > (std::numeric_limits<RetailGeometryPointer32>::max)())
+        {
+            return false;
+        }
+        const RetailGeometryPointer32 originalAppend =
+            mStorage.sourceVtableSnapshot[AppendVtableEntryIndex];
+        const std::uintptr_t forwardTarget = forwardOriginalAppend
+            ? (mStorage.originalAppendOverrideForTest != 0u
+                ? mStorage.originalAppendOverrideForTest
+                : static_cast<std::uintptr_t>(originalAppend))
+            : reinterpret_cast<std::uintptr_t>(
+                &privateGeometryCollectorVslotReturnShim);
+        if ((forwardOriginalAppend
+                && originalAppend
+                    != PrivateGeometryCollectorX86Abi::preferredTargetAddress)
+            || forwardTarget == 0u
+            || forwardTarget
+                > (std::numeric_limits<RetailGeometryPointer32>::max)())
+        {
+            return false;
+        }
+
         mStorage.dispatchGeneration = generation;
-        return mStorage.collector.begin(
+        mStorage.forwardOriginalAppend = forwardOriginalAppend ? 1u : 0u;
+        const bool begun = mStorage.collector.begin(
             generation,
-            cullingProcessToken(),
+            static_cast<RetailGeometryPointer32>(ownerAddress),
             currentPrivateGeometryThreadToken());
+        if (!begun)
+        {
+            mStorage.dispatchGeneration = 0u;
+            mStorage.forwardOriginalAppend = 0u;
+            return false;
+        }
+        gPrivateGeometryVslotForwardTarget =
+            static_cast<RetailGeometryPointer32>(forwardTarget);
+        return true;
     }
 
     GeometrySealResult sealCollection() noexcept
+    {
+        return sealCollectionFor(&mStorage.cullingProcess);
+    }
+
+    GeometrySealResult sealCollectionFor(
+        fnvxr::engine::abi::RetailBSCullingProcessLayout* owner) noexcept
     {
         if (!bindingIntegrityValid())
         {
             mStorage.collector.invalidateFromBinding();
             return GeometrySealResult::StateCorruptInvalidated;
         }
-        return mStorage.collector.seal(
-            cullingProcessToken(),
+        const std::uintptr_t ownerAddress =
+            reinterpret_cast<std::uintptr_t>(owner);
+        if (!owner || ownerAddress
+                > (std::numeric_limits<RetailGeometryPointer32>::max)())
+        {
+            return GeometrySealResult::OwnerMismatchInvalidated;
+        }
+        const GeometrySealResult result = mStorage.collector.seal(
+            static_cast<RetailGeometryPointer32>(ownerAddress),
             mStorage.dispatchGeneration,
             currentPrivateGeometryThreadToken());
+        gPrivateGeometryVslotForwardTarget =
+            static_cast<RetailGeometryPointer32>(
+                reinterpret_cast<std::uintptr_t>(
+                    &privateGeometryCollectorVslotReturnShim));
+        return result;
     }
 
     void appendFromVslot(
@@ -912,6 +1062,11 @@ private:
             {
                 return false;
             }
+            if (mStorage.dispatchGeneration != 0u
+                || mStorage.forwardOriginalAppend != 0u)
+            {
+                return false;
+            }
             for (std::size_t index = 0u; index < OwnedVtableEntryCount; ++index)
             {
                 if (mStorage.ownedVtableClone[index] != 0u
@@ -930,6 +1085,7 @@ private:
             || mStorage.callbackAddress == 0u
             || mStorage.callbackAddress
                 == PrivateGeometryCollectorX86Abi::preferredTargetAddress
+            || mStorage.forwardOriginalAppend > 1u
             || mStorage.cullingProcess.base.vtable
                 != mStorage.ownedVtableAddress
             || mStorage.sourceVtableSnapshot[AppendVtableEntryIndex]
@@ -960,14 +1116,7 @@ private:
             && ownedVtableStateValid();
     }
 
-#if defined(_MSC_VER) && defined(_M_IX86)
-    RetailGeometryPointer32 cullingProcessToken() const noexcept
-    {
-        return static_cast<RetailGeometryPointer32>(
-            reinterpret_cast<std::uintptr_t>(&mStorage.cullingProcess));
-    }
-#endif
-
+    friend struct PrivateGeometryCollectorBindingTestAuthority<Capacity>;
     Storage mStorage {};
 };
 
@@ -979,7 +1128,7 @@ using PrivateGeometryCollectorVslotCallbackFunction = void(__fastcall*)(
     void*) noexcept;
 
 template <std::size_t Capacity>
-void __fastcall privateGeometryCollectorVslotCallback(
+void __fastcall privateGeometryCollectorVslotRecord(
     fnvxr::engine::abi::RetailBSCullingProcessLayout* cullingProcess,
     void* ignoredEdx,
     void* geometry) noexcept
@@ -988,11 +1137,62 @@ void __fastcall privateGeometryCollectorVslotCallback(
     if (!cullingProcess)
         return;
 
-    auto* cullingBytes = reinterpret_cast<unsigned char*>(cullingProcess);
-    auto* binding = reinterpret_cast<PrivateGeometryCollectorBinding<Capacity>*>(
-        cullingBytes
-        - PrivateGeometryCollectorBinding<Capacity>::CullingProcessByteOffset);
+    using Binding = PrivateGeometryCollectorBinding<Capacity>;
+    Binding* binding = nullptr;
+    const RetailGeometryPointer32 vtableAddress = cullingProcess->base.vtable;
+    if (vtableAddress != 0u)
+    {
+        auto* vtableBytes = reinterpret_cast<unsigned char*>(
+            static_cast<std::uintptr_t>(vtableAddress));
+        auto* candidate = reinterpret_cast<Binding*>(
+            vtableBytes - Binding::OwnedVtableCloneByteOffset);
+        if (candidate->ownsOwnedVtableAddress(vtableAddress))
+            binding = candidate;
+    }
+    // Direct ABI tests invoke the callback before a clone is installed. A
+    // nonzero foreign vtable is never treated as an embedded binding.
+    if (!binding && vtableAddress == 0u)
+    {
+        auto* cullingBytes = reinterpret_cast<unsigned char*>(cullingProcess);
+        auto* candidate = reinterpret_cast<Binding*>(
+            cullingBytes - Binding::CullingProcessByteOffset);
+        if (candidate->ownedVtableIntegrityValid())
+            binding = candidate;
+    }
+    if (!binding)
+        return;
     binding->appendFromVslot(cullingProcess, geometry);
+}
+
+template <std::size_t Capacity>
+void __declspec(naked) __fastcall privateGeometryCollectorVslotCallback(
+    fnvxr::engine::abi::RetailBSCullingProcessLayout*,
+    void*,
+    void*) noexcept
+{
+    __asm
+    {
+        // Entry is the original virtual-thiscall frame:
+        // [return-to-retail][geometry], ECX=culler, EDX=caller volatile.
+        pushfd
+        pushad
+        // The record helper is __fastcall: ECX is still the original culler,
+        // EDX is an explicitly ignored register argument, and geometry is its
+        // one stack argument.  Its callee-clean ret 4 restores this stack.
+        mov eax, dword ptr [esp + 40]
+        push eax
+        xor edx, edx
+        call dword ptr [gPrivateGeometryVslotRecordCallback]
+        popad
+        popfd
+
+        // Preserve EAX and flags while replacing only the instruction pointer
+        // with either the exact stock Append or the guarded test return shim.
+        push eax
+        call privateGeometryCollectorVslotForwardTarget
+        xchg eax, dword ptr [esp]
+        ret
+    }
 }
 #endif
 

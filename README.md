@@ -25,9 +25,10 @@ ignored directories.
 - `d3d9.dll` retains mono retail UI capture and graphics interop. Per-draw D3D
   replay is not the production stereo renderer.
 - The standalone OpenXR host owns headset/controller actions, frame timing,
-  VR composition, the stable retail UI quad, and debug visualization. It opens
-  accepted GPU-shared eye color/depth resources; it does not receive a CPU
-  pixel ring.
+  VR composition, the stable retail UI quad, and debug visualization. The
+  production target opens GPU-shared eye color/depth resources. The separately
+  bounded visual trial currently transfers engine-rendered BGRA8 eye images
+  through the versioned CPU-v8 transport.
 - Same-machine fixed-size shared mappings carry poses, input intent, retail
   state, commands, and versioned transaction/resource metadata. There is no
   second game runtime and no network transport.
@@ -47,13 +48,31 @@ The presentation contract has two modes:
 
 ## Current Status
 
-The retained per-D3D-draw replay and CPU readback/ring work is diagnostic only;
-it is a production NO-GO. **Every live OpenXR presentation path and every
-retail mutation path is currently source-blocked.** The installed plugin is
-inert by default, and config or environment variables cannot bypass the fuse.
-The legacy stereo environment setup now throws before writing activation
-variables, and separate host/D3D integration fuses prevent a one-line proof
-flip from reviving mono gameplay fallback or the persistent-HUD path.
+The retained per-D3D-draw replay remains a production NO-GO. A separate,
+exact-profile `stereo-visual-trial-v5` route is now implemented for bounded
+binocular verification: one native Present lease defers authority until the
+xNVSE plugin has published authenticated main-loop state, then one exact world
+hook renders private left/right cameras, accumulators, color targets, and
+depth/stencil targets from one conservative visible set. The OpenXR host
+submits the resulting two projection views. Each eye target is cleared before
+rendering, outputs must be non-aliased and distinct, and mono gameplay
+fallbacks remain disabled.
+
+This is not full product acceptance. The CPU-v8 image transfer is intentionally
+bounded and too expensive for the production transport; controller mutation,
+tracked weapon/muzzle behavior, encoded depth submission, and the retained D3D
+draw-hook set remain source-fused. The plugin is inert outside explicit
+profiles, and the visual trial keeps its full input/camera/rig bridge disabled
+so it cannot invalidate the D3D engine-authority proof.
+
+The process-local headless OpenXR Simulator is now built and can supply
+deterministic HMD/controller poses and final-eye capture without changing the
+machine-wide OpenXR runtime. The latest TTW simulator run started the host and
+retail process, verified advancing runtime/pose publication and the CPU-v8
+bridge, and published non-black mono Start Menu frames. It did not reach
+gameplay or accepted binocular output. No recorded run has yet authorized
+controller mutation or a tracked weapon, so this tree must not be described as
+a stable playable VR build.
 
 Read-only inspection of the loaded retail `1.4.0.525` executable has verified
 the world-render boundary, explicit visible-array culling, and separate
@@ -63,12 +82,13 @@ it through fresh non-aliased left/right accumulators with each eye's complete
 camera/color/depth/auxiliary state bound before population, restore retail
 state, then publish GPU-native resources atomically.
 
-The remaining implementation is the production engine backend, GPU-native
-color/depth transport and OpenXR submission, authoritative weapon/muzzle
-alignment, and full retail/headset acceptance. The launcher remains blocked
-until those gates pass. See `docs/architecture-v2.md` for the production
-contract, `docs/status.md` for the verified boundary, and `docs/next-steps.md`
-for acceptance gates.
+The remaining production work is GPU-native color/depth transport,
+authoritative weapon/muzzle alignment, complete stock-branch and scene
+coverage, performance, and full retail/headset acceptance. The guarded product
+launcher admits only the bounded stereo visual trial; it never marks the full
+product accepted. See `docs/architecture-v2.md` for the production contract,
+`docs/status.md` for the verified boundary, and `docs/next-steps.md` for
+acceptance gates.
 
 ## Layout
 
@@ -80,6 +100,7 @@ for acceptance gates.
 - `docs/experiment-brief.md` - process split and authority boundary.
 - `docs/architecture-v2.md` - production stereo transaction and GPU transport.
 - `docs/next-steps.md` - practical retail camera, weapon, UI, and stereo plan.
+- `docs/assist-mode.md` - deterministic, headset-free head/body acceptance harness.
 - `docs/status.md` - current proof results and live-test blockers.
 - `docs/prop-layer-plan.md` - retail hands, weapon, pointer, and UI plan.
 
@@ -104,6 +125,29 @@ Build the FNV-compatible 32-bit plugin and retail proxy DLLs:
 .\scripts\build-win32.ps1
 ```
 
+Build and attest both product architectures, then perform the read-only
+game/install validation:
+
+```powershell
+.\scripts\build-fnvxr-product.ps1
+.\scripts\start-fnvxr-product.ps1 -UseAttestedBuild -ValidateOnly
+```
+
+With Quest Link/Air Link active and a loaded gameplay world available, run the
+bounded binocular trial:
+
+```powershell
+.\scripts\start-fnvxr-product.ps1 `
+  -UseAttestedBuild `
+  -MaximumRunSeconds 60 `
+  -RetailReadyTimeoutSeconds 90
+```
+
+The supervisor stages the exact attested Win32 product set, launches the host
+before retail FNV, requires advancing runtime/pose and distinct binocular
+OpenXR output, stops only its owned processes, and restores every prior
+game-root file on success or failure.
+
 OpenXR diagnostic (blocked): `scripts/run-openxr-probe.ps1` intentionally
 refuses before configure, build, loader, or runtime access until its reviewed
 runtime-touch proof and compiled source fuse are complete.
@@ -120,8 +164,36 @@ Write a combined local preflight report:
 .\scripts\preflight-fnvxr.ps1
 ```
 
-Only stage or validate artifacts through the guarded launcher; there is no
-authorized headset launch command in the current tree:
+Review the headset-free desktop-assist configuration without staging or
+launching the game:
+
+```powershell
+.\scripts\validate-desktop-assist.ps1 `
+  -GameRoot 'D:\SteamLibrary\steamapps\common\Fallout New Vegas'
+```
+
+Only stage or validate the separate desktop-assist profile through its guarded
+launcher:
+
+```powershell
+.\scripts\start-desktop-assist.ps1 `
+  -GameRoot 'D:\SteamLibrary\steamapps\common\Fallout New Vegas' `
+  -ValidateOnly
+```
+
+The live desktop-assist supervisor requires its own explicit
+`-ApproveStageAndLaunch` switch, temporarily stages only `d3d9.dll` and
+`nvse_fnvxr.dll`, and restores the prior files when its owned desktop game
+session ends. Adding `-RunAcceptanceTrial` waits for first-person body-root
+readiness, then records a current-pose head/body and menu-source transition
+report without launching OpenXR or enabling world stereo, and automatically
+restores the two staged files immediately after a passing trial. Before any
+approved live staging, it rebuilds the exact Win32 stage artifacts and x64
+evidence tools; `-ValidateOnly` only reports that build plan and leaves all
+artifacts untouched. Adding `-AutomateAcceptance` to `-RunAcceptanceTrial`
+uses the fixed `FNVXR_HostExitRecovery` save and one foreground-verified
+Escape open/close pair, so the head/body and menu-source proof can run without
+headset or manual desktop input.
 
 ```powershell
 .\scripts\start-openxr-retail-sidecar.ps1 -StageOnly

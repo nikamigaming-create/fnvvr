@@ -811,21 +811,6 @@ bool finiteFloat(float value) noexcept
     return std::isfinite(value) != 0;
 }
 
-bool finiteFrustum(const RetailNiFrustumLayout& value) noexcept
-{
-    return finiteFloat(value.left)
-        && finiteFloat(value.right)
-        && finiteFloat(value.top)
-        && finiteFloat(value.bottom)
-        && finiteFloat(value.nearDistance)
-        && finiteFloat(value.farDistance)
-        && value.left < value.right
-        && value.bottom < value.top
-        && value.nearDistance > 0.0f
-        && value.farDistance > value.nearDistance
-        && value.orthographic <= 1u;
-}
-
 bool verifyLiveLayouts(
     const MemoryReader& reader,
     std::uintptr_t imageBase,
@@ -934,8 +919,6 @@ bool verifyLiveLayouts(
         return reject(Failure::VisibleArrayUnreadable);
     }
 
-    if (scene.isMenuSceneGraph > 1u)
-        return reject(Failure::MenuFlagInvalid);
     if (!finiteFloat(scene.cameraFov)
         || scene.cameraFov <= 0.0f
         || scene.cameraFov >= 180.0f)
@@ -952,25 +935,15 @@ bool verifyLiveLayouts(
         return reject(Failure::CullerVisibleArrayMismatch);
     if (culler.cullModeStackSize > 10u)
         return reject(Failure::CullerStackInvalid);
-    if (!finiteFrustum(camera.frustum))
-        return reject(Failure::CameraFrustumInvalid);
-    if (stockCullStateBound && !finiteFrustum(culler.base.frustum))
-        return reject(Failure::CullerFrustumInvalid);
-    if (!finiteFloat(camera.minimumNearPlane)
-        || camera.minimumNearPlane <= 0.0f)
-        return reject(Failure::CameraNearPlaneInvalid);
-    if (!finiteFloat(camera.maximumFarNearRatio)
-        || camera.maximumFarNearRatio <= 0.0f)
-        return reject(Failure::CameraFarNearRatioInvalid);
-    if (!finiteFloat(camera.viewport.left)
-        || !finiteFloat(camera.viewport.right)
-        || !finiteFloat(camera.viewport.top)
-        || !finiteFloat(camera.viewport.bottom)
-        || camera.viewport.left == camera.viewport.right
-        || camera.viewport.top == camera.viewport.bottom)
-        return reject(Failure::CameraViewportInvalid);
-    if (!finiteFloat(camera.lodAdjust) || camera.lodAdjust <= 0.0f)
-        return reject(Failure::CameraLodInvalid);
+
+    // This authority decision runs from early Present, before the game has
+    // necessarily populated a gameplay camera projection. The pointers,
+    // culler vtable, and SceneGraph FOV above are stable layout evidence;
+    // the camera transform, frustum, viewport, and derived matrix are
+    // presentation state and are legitimately transitional here. They are
+    // independently validated by deriveRetailEyeCameraRig in the exact
+    // gameplay world-hook transaction before any eye camera is created,
+    // mutated, or rendered.
     if (stockCullStateBound
         && (visible.itemCount > visible.capacity
             || visible.capacity > 10000000u))
@@ -979,11 +952,6 @@ bool verifyLiveLayouts(
         && visible.itemCount != 0u
         && visible.geometryPointers == 0u)
         return reject(Failure::VisibleArrayStorageMissing);
-    for (float value : camera.worldToCamera)
-    {
-        if (!finiteFloat(value))
-            return reject(Failure::CameraWorldMatrixInvalid);
-    }
     if (stockCullStateBound && visible.itemCount != 0u)
     {
         const std::size_t pointerBytes =
