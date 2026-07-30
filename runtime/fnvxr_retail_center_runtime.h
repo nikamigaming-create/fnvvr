@@ -51,6 +51,14 @@ struct RetailCenterRuntimeFrame
     abi::RetailBSCullingProcessLayout* stockCullingProcess = nullptr;
 };
 
+struct RetailCenterCameraPoseProof
+{
+    RetailNiTransformLayout center {};
+    RetailNiTransformLayout left {};
+    RetailNiTransformLayout right {};
+    bool valid = false;
+};
+
 struct RetailCenterRuntimeFrameResult
 {
     RetailWorldHookDisposition disposition =
@@ -58,6 +66,7 @@ struct RetailCenterRuntimeFrameResult
     RetailCenterRuntimeFailure failure =
         RetailCenterRuntimeFailure::RuntimeNotReady;
     CenterRendererResult renderer {};
+    RetailCenterCameraPoseProof cameraPose {};
 };
 
 // Owns the private cameras and accumulators and turns a proven retail world
@@ -303,6 +312,12 @@ public:
             return reject(
                 RetailCenterRuntimeFailure::EyeCameraDerivationRejected);
         }
+        const RetailCenterCameraPoseProof cameraPose {
+            cameraRig.center.world,
+            cameraRig.left.world,
+            cameraRig.right.world,
+            true,
+        };
 
         const RetailPrivateCameraSet cameras {
             mResources.camera(),
@@ -342,6 +357,7 @@ public:
                 RetailWorldHookDisposition::RejectGameplayFrame,
                 mFailure,
                 renderer,
+                cameraPose,
             };
         }
         mLastFrameGeneration = frame.generation;
@@ -354,6 +370,7 @@ public:
             RetailWorldHookDisposition::StereoWorldComplete,
             RetailCenterRuntimeFailure::None,
             renderer,
+            cameraPose,
         };
     }
 

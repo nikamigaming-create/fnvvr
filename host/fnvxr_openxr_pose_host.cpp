@@ -309,12 +309,23 @@ struct Renderer
     std::uint64_t retainedUiRuntimeStateSample = 0u;
     float retainedUiTextureAspect = 16.0f / 9.0f;
     bool retainedUiHostWindowCaptured = false;
+    std::uint64_t retainedCpuUiTransactionId = 0u;
+    std::uint64_t retainedCpuUiEpoch = 0u;
+    std::uint32_t retainedCpuUiProducerProcessId = 0u;
+    fnvxr::host::cpu_engine_presentation::RuntimeSample
+        retainedCpuUiCapturedRuntime {};
     // The last structurally valid CPU menu boundary remains separate from the
     // retained texture.  Even a rejected/black menu copy must prevent an old
     // world pair from being revived on the following gameplay transition.
     std::uint64_t cpuUiBoundaryTransactionId = 0u;
     std::uint64_t cpuUiBoundarySourceFrame = 0u;
     std::uint64_t cpuUiBoundaryRuntimeStateSample = 0u;
+    std::uint64_t cpuUiEpoch = 0u;
+    std::uint32_t cpuRuntimeReadMissFrames = 0u;
+    fnvxr::host::cpu_engine_presentation::RuntimeMode cpuPresentationMode =
+        fnvxr::host::cpu_engine_presentation::RuntimeMode::Unknown;
+    fnvxr::host::cpu_engine_presentation::RuntimeSample
+        cpuPresentationRuntime {};
     uint64_t gameTextureUpdates = 0;
     uint64_t gameTextureMisses = 0;
     bool hasWorldTextureFrame = false;
@@ -1006,6 +1017,21 @@ bool envEqualsIgnoreCase(const char* name, const char* expected)
 {
     const char* value = std::getenv(name);
     return value && _stricmp(value, expected) == 0;
+}
+
+bool physicalHeadsetPlayRequested()
+{
+    return envEqualsIgnoreCase(
+               "FNVXR_RUN_PROFILE",
+               "retail-vr-play-v1")
+        && envEnabled("FNVXR_PHYSICAL_HEADSET_PLAY", false);
+}
+
+bool interactiveControllerRouteRequested()
+{
+    return physicalHeadsetPlayRequested()
+        || envEqualsIgnoreCase("FNVXR_RUN_PROFILE", "retail-sidecar")
+        || envEqualsIgnoreCase("FNVXR_RUN_PROFILE", "openxr-sidecar");
 }
 
 std::wstring widenPath(const char* text)
@@ -3462,6 +3488,15 @@ bool initHostSharedBridge(HostSharedBridge& bridge)
         bridge.xinputState->connected = 0;
         fnvxr::shared::endSequencedSharedWrite(bridge.xinputState->sequence);
     }
+    // This byte belongs to the retail consumer. A newly leased host clears
+    // the prior lifetime's acknowledgement before the game process starts;
+    // exact xNVSE authority republishes it only after its mode-aware
+    // controller consumer is ready.
+    InterlockedExchange8(
+        reinterpret_cast<volatile char*>(
+            &bridge.xinputState->reserved[
+                fnvxr::shared::XInputReservedRetailConsumed]),
+        0);
     fnvxr::shared::SharedXInputState xinputSnapshot {};
     if (!fnvxr::shared::readSequencedSharedSnapshot(bridge.xinputState, xinputSnapshot, 1024))
         return false;
@@ -3596,6 +3631,17 @@ bool initHostSharedBridge(HostSharedBridge& bridge)
     // leased game-plugin producer publishes its first complete record.
     (void)playerExisted;
     return true;
+}
+
+bool retailControllerConsumerAcknowledged(
+    const HostSharedBridge& bridge) noexcept
+{
+    if (!bridge.xinputState)
+        return false;
+    MemoryBarrier();
+    return *reinterpret_cast<volatile const std::uint8_t*>(
+        &bridge.xinputState->reserved[
+            fnvxr::shared::XInputReservedRetailConsumed]) != 0u;
 }
 
 std::uint32_t sampledPixelHash(const std::vector<std::uint32_t>& pixels)
@@ -3865,6 +3911,7 @@ std::uint64_t publishHostSharedBridge(
     const HeadspaceLook& headspaceLook,
     const HeadspaceLook& gyroAimLook,
     bool hostClick,
+    bool controllerInputAuthorized,
     bool menuInputActive,
     bool gameplayControlsActive,
     bool weaponOut,
@@ -3890,12 +3937,26 @@ std::uint64_t publishHostSharedBridge(
         && envEnabled("FNVXR_PIPBOY_SPLIT_STICK_NAV", true);
     const bool suppressLeftMenuAnalog = suppressMenuAnalog && !pipBoySplitStickNav;
     const bool suppressRightMenuAnalog = suppressMenuAnalog && !(pipBoyRightStickNav || pipBoySplitStickNav);
-    const std::int16_t leftThumbX = suppressLeftMenuAnalog ? 0 : thumbValue(frame.leftThumbstickX);
-    const std::int16_t leftThumbY = suppressLeftMenuAnalog ? 0 : thumbValue(frame.leftThumbstickY);
-    const std::int16_t rightThumbX = suppressRightMenuAnalog ? 0 : thumbValue(frame.rightThumbstickX);
-    const std::int16_t rightThumbY = suppressRightMenuAnalog ? 0 : thumbValue(frame.rightThumbstickY);
+    const std::int16_t leftThumbX =
+        !controllerInputAuthorized || suppressLeftMenuAnalog
+        ? 0
+        : thumbValue(frame.leftThumbstickX);
+    const std::int16_t leftThumbY =
+        !controllerInputAuthorized || suppressLeftMenuAnalog
+        ? 0
+        : thumbValue(frame.leftThumbstickY);
+    const std::int16_t rightThumbX =
+        !controllerInputAuthorized || suppressRightMenuAnalog
+        ? 0
+        : thumbValue(frame.rightThumbstickX);
+    const std::int16_t rightThumbY =
+        !controllerInputAuthorized || suppressRightMenuAnalog
+        ? 0
+        : thumbValue(frame.rightThumbstickY);
     std::uint16_t buttons = 0;
-    if (menuInputActive && envEnabled("FNVXR_XINPUT_MENU_STICK_TO_DPAD", false))
+    if (controllerInputAuthorized
+        && menuInputActive
+        && envEnabled("FNVXR_XINPUT_MENU_STICK_TO_DPAD", false))
     {
         const float dpadDeadzone = std::clamp(envFloat("FNVXR_XINPUT_MENU_DPAD_DEADZONE", 0.45f), 0.05f, 0.95f);
         if (frame.leftThumbstickY > dpadDeadzone)
@@ -3907,24 +3968,31 @@ std::uint64_t publishHostSharedBridge(
         if (frame.leftThumbstickX > dpadDeadzone)
             buttons |= XInputDpadRight;
     }
-    if (frame.buttons & fnvxr::ButtonA)
+    if (controllerInputAuthorized
+        && (frame.buttons & fnvxr::ButtonA))
         buttons |= XInputA;
-    if (frame.buttons & fnvxr::ButtonB)
+    if (controllerInputAuthorized
+        && (frame.buttons & fnvxr::ButtonB))
         buttons |= XInputB;
-    if (frame.buttons & fnvxr::ButtonX)
+    if (controllerInputAuthorized
+        && (frame.buttons & fnvxr::ButtonX))
         buttons |= XInputX;
-    if (frame.buttons & fnvxr::ButtonY)
+    if (controllerInputAuthorized
+        && (frame.buttons & fnvxr::ButtonY))
         buttons |= XInputY;
-    if (envEnabled("FNVXR_XINPUT_PHYSICAL_MENU_BUTTONS_ENABLE", false))
+    if (controllerInputAuthorized
+        && envEnabled("FNVXR_XINPUT_PHYSICAL_MENU_BUTTONS_ENABLE", false))
     {
         if (frame.buttons & fnvxr::LeftMenu)
             buttons |= XInputBack;
         if (frame.buttons & fnvxr::RightMenu)
             buttons |= XInputStart;
     }
-    if (frame.buttons & fnvxr::LeftThumbstick)
+    if (controllerInputAuthorized
+        && (frame.buttons & fnvxr::LeftThumbstick))
         buttons |= XInputLeftThumb;
-    if (frame.buttons & fnvxr::RightThumbstick)
+    if (controllerInputAuthorized
+        && (frame.buttons & fnvxr::RightThumbstick))
         buttons |= XInputRightThumb;
     static bool previousLeftGripPipBoyHeld = false;
     static bool previousRightGripMenuHeld = false;
@@ -3932,10 +4000,12 @@ std::uint64_t publishHostSharedBridge(
     static int rightGripMenuPulseFrames = 0;
     const float gripThreshold = std::clamp(envFloat("FNVXR_XINPUT_GRIP_MENU_THRESHOLD", 0.55f), 0.0f, 1.0f);
     const bool leftGripPipBoyHeld =
-        envEnabled("FNVXR_XINPUT_LEFT_GRIP_PIPBOY_ENABLE", false)
+        controllerInputAuthorized
+        && envEnabled("FNVXR_XINPUT_LEFT_GRIP_PIPBOY_ENABLE", false)
         && frame.leftGrip > gripThreshold;
     const bool rightGripMenuHeld =
-        envEnabled("FNVXR_XINPUT_RIGHT_GRIP_MENU_ENABLE", false)
+        controllerInputAuthorized
+        && envEnabled("FNVXR_XINPUT_RIGHT_GRIP_MENU_ENABLE", false)
         && frame.rightGrip > gripThreshold;
     const int gripPulseFrames = std::max(1, envInt("FNVXR_XINPUT_GRIP_PULSE_FRAMES", 6));
     if (leftGripPipBoyHeld && !previousLeftGripPipBoyHeld)
@@ -3958,11 +4028,16 @@ std::uint64_t publishHostSharedBridge(
     {
         bridge.xinputState->magic = fnvxr::shared::XInputSharedMagic;
         bridge.xinputState->version = fnvxr::shared::XInputSharedVersion;
-        bridge.xinputState->connected = 1;
+        bridge.xinputState->connected =
+            controllerInputAuthorized ? 1u : 0u;
         bridge.xinputState->packet = ++bridge.xinputPacket;
         bridge.xinputState->buttons = buttons;
-        bridge.xinputState->leftTrigger = triggerByte(frame.leftTrigger);
-        bridge.xinputState->rightTrigger = triggerByte(frame.rightTrigger);
+        bridge.xinputState->leftTrigger = controllerInputAuthorized
+            ? triggerByte(frame.leftTrigger)
+            : 0u;
+        bridge.xinputState->rightTrigger = controllerInputAuthorized
+            ? triggerByte(frame.rightTrigger)
+            : 0u;
         bridge.xinputState->leftThumbX = leftThumbX;
         bridge.xinputState->leftThumbY = leftThumbY;
         bridge.xinputState->rightThumbX = rightThumbX;
@@ -4005,22 +4080,47 @@ std::uint64_t publishHostSharedBridge(
         bridge.dinputState->frame = static_cast<std::uint32_t>(frame.frame);
         bridge.dinputState->clientX = clientX;
         bridge.dinputState->clientY = clientY;
-        bridge.dinputState->pointerActive = menuPointer.active ? 1u : 0u;
+        bridge.dinputState->pointerActive =
+            controllerInputAuthorized && menuPointer.active ? 1u : 0u;
         bridge.dinputState->mouseClickPacket = bridge.dinputMouseClickPacket;
-        bridge.dinputState->menuInputActive = menuInputActive ? 1u : 0u;
-        bridge.dinputState->gameplayControlsActive = gameplayControlsActive ? 1u : 0u;
-        bridge.dinputState->leftStickX = static_cast<std::int32_t>(std::lround(std::clamp(frame.leftThumbstickX, -1.0f, 1.0f) * 32767.0f));
-        bridge.dinputState->leftStickY = static_cast<std::int32_t>(std::lround(std::clamp(frame.leftThumbstickY, -1.0f, 1.0f) * 32767.0f));
-        bridge.dinputState->rightStickX = static_cast<std::int32_t>(std::lround(std::clamp(frame.rightThumbstickX, -1.0f, 1.0f) * 32767.0f));
-        bridge.dinputState->rightStickY = static_cast<std::int32_t>(std::lround(std::clamp(frame.rightThumbstickY, -1.0f, 1.0f) * 32767.0f));
+        bridge.dinputState->menuInputActive =
+            controllerInputAuthorized && menuInputActive ? 1u : 0u;
+        bridge.dinputState->gameplayControlsActive =
+            controllerInputAuthorized && gameplayControlsActive ? 1u : 0u;
+        bridge.dinputState->leftStickX = controllerInputAuthorized
+            ? static_cast<std::int32_t>(std::lround(
+                std::clamp(frame.leftThumbstickX, -1.0f, 1.0f)
+                    * 32767.0f))
+            : 0;
+        bridge.dinputState->leftStickY = controllerInputAuthorized
+            ? static_cast<std::int32_t>(std::lround(
+                std::clamp(frame.leftThumbstickY, -1.0f, 1.0f)
+                    * 32767.0f))
+            : 0;
+        bridge.dinputState->rightStickX = controllerInputAuthorized
+            ? static_cast<std::int32_t>(std::lround(
+                std::clamp(frame.rightThumbstickX, -1.0f, 1.0f)
+                    * 32767.0f))
+            : 0;
+        bridge.dinputState->rightStickY = controllerInputAuthorized
+            ? static_cast<std::int32_t>(std::lround(
+                std::clamp(frame.rightThumbstickY, -1.0f, 1.0f)
+                    * 32767.0f))
+            : 0;
         bridge.dinputState->headLookActive = headspaceLook.active ? 1u : 0u;
         bridge.dinputState->headLookX = bridge.dinputHeadLookX;
         bridge.dinputState->headLookY = bridge.dinputHeadLookY;
         bridge.dinputState->gyroLookActive = gyroAimLook.active ? 1u : 0u;
         bridge.dinputState->gyroLookX = bridge.dinputGyroLookX;
         bridge.dinputState->gyroLookY = bridge.dinputGyroLookY;
-        bridge.dinputState->leftGrip = static_cast<std::int32_t>(std::lround(std::clamp(frame.leftGrip, 0.0f, 1.0f) * 32767.0f));
-        bridge.dinputState->rightGrip = static_cast<std::int32_t>(std::lround(std::clamp(frame.rightGrip, 0.0f, 1.0f) * 32767.0f));
+        bridge.dinputState->leftGrip = controllerInputAuthorized
+            ? static_cast<std::int32_t>(std::lround(
+                std::clamp(frame.leftGrip, 0.0f, 1.0f) * 32767.0f))
+            : 0;
+        bridge.dinputState->rightGrip = controllerInputAuthorized
+            ? static_cast<std::int32_t>(std::lround(
+                std::clamp(frame.rightGrip, 0.0f, 1.0f) * 32767.0f))
+            : 0;
         bridge.dinputState->gameplayFlags = gameplayFlags;
         bridge.dinputState->aimTrigger = triggerByte(frame.leftTrigger);
         fnvxr::shared::endSequencedSharedWrite(bridge.dinputState->sequence);
@@ -5648,10 +5748,14 @@ void commitUiTextureCandidate(
     renderer.retainedUiRuntimeStateSample = candidate.runtimeStateSample;
     renderer.retainedUiTextureAspect = candidate.aspect;
     renderer.retainedUiHostWindowCaptured = false;
+    renderer.retainedCpuUiTransactionId = 0u;
+    renderer.retainedCpuUiEpoch = 0u;
+    renderer.retainedCpuUiProducerProcessId = 0u;
+    renderer.retainedCpuUiCapturedRuntime = {};
     candidate = {};
 }
 
-void clearRetainedUiTexture(Renderer& renderer) noexcept
+void clearRetainedUiResource(Renderer& renderer) noexcept
 {
     renderer.retainedUiTexture.Reset();
     renderer.retainedUiTextureView.Reset();
@@ -5659,9 +5763,23 @@ void clearRetainedUiTexture(Renderer& renderer) noexcept
     renderer.retainedUiRuntimeStateSample = 0u;
     renderer.retainedUiTextureAspect = 16.0f / 9.0f;
     renderer.retainedUiHostWindowCaptured = false;
+    renderer.retainedCpuUiTransactionId = 0u;
+    renderer.retainedCpuUiEpoch = 0u;
+    renderer.retainedCpuUiProducerProcessId = 0u;
+    renderer.retainedCpuUiCapturedRuntime = {};
+}
+
+void clearRetainedUiTexture(Renderer& renderer) noexcept
+{
+    clearRetainedUiResource(renderer);
     renderer.cpuUiBoundaryTransactionId = 0u;
     renderer.cpuUiBoundarySourceFrame = 0u;
     renderer.cpuUiBoundaryRuntimeStateSample = 0u;
+    renderer.cpuUiEpoch = 0u;
+    renderer.cpuRuntimeReadMissFrames = 0u;
+    renderer.cpuPresentationMode =
+        fnvxr::host::cpu_engine_presentation::RuntimeMode::Unknown;
+    renderer.cpuPresentationRuntime = {};
 }
 
 bool uploadCpuEngineUiTexture(
@@ -5862,6 +5980,10 @@ bool uploadProductUiWindowTexture(
     renderer.retainedUiRuntimeStateSample = proof.runtimeStateSample;
     renderer.retainedUiTextureAspect = aspect;
     renderer.retainedUiHostWindowCaptured = true;
+    renderer.retainedCpuUiTransactionId = 0u;
+    renderer.retainedCpuUiEpoch = 0u;
+    renderer.retainedCpuUiProducerProcessId = 0u;
+    renderer.retainedCpuUiCapturedRuntime = {};
     return true;
 }
 
@@ -9907,25 +10029,99 @@ int main(int argc, char** argv)
             runtimeCameraActive,
             haveRuntimeUiState,
         };
+        const cpu_presentation::RuntimeMode observedCpuRuntimeMode =
+            cpu_presentation::confirmedRuntimeMode(cpuCurrentRuntime);
+        bool cpuRuntimeModeHeld = false;
+        if (productionCpuEngineStereo)
+        {
+            if (haveRuntimeUiState)
+            {
+                if (observedCpuRuntimeMode
+                    != renderer.cpuPresentationMode)
+                {
+                    if (renderer.cpuPresentationMode
+                            == cpu_presentation::RuntimeMode::Ui
+                        || observedCpuRuntimeMode
+                            == cpu_presentation::RuntimeMode::Ui)
+                    {
+                        // A retained menu image belongs to one continuous UI
+                        // epoch only. Preserve the independent ordering
+                        // boundary so a pre-menu world pair cannot revive.
+                        clearRetainedUiResource(renderer);
+                    }
+                    ++renderer.cpuUiEpoch;
+                    if (renderer.cpuUiEpoch == 0u)
+                        ++renderer.cpuUiEpoch;
+                }
+                renderer.cpuPresentationMode = observedCpuRuntimeMode;
+                renderer.cpuPresentationRuntime =
+                    observedCpuRuntimeMode
+                            == cpu_presentation::RuntimeMode::Unknown
+                        ? cpu_presentation::RuntimeSample {}
+                        : cpuCurrentRuntime;
+                renderer.cpuRuntimeReadMissFrames = 0u;
+            }
+            else
+            {
+                const bool sharedTransportContradictsMode =
+                    haveSharedStereoUiState
+                    && ((renderer.cpuPresentationMode
+                                == cpu_presentation::RuntimeMode::Ui
+                            && !effectiveSharedStereoUiActive)
+                        || (renderer.cpuPresentationMode
+                                == cpu_presentation::RuntimeMode::Gameplay
+                            && effectiveSharedStereoUiActive));
+                constexpr std::uint32_t RuntimeReadGraceFrames = 8u;
+                if (renderer.cpuPresentationMode
+                        != cpu_presentation::RuntimeMode::Unknown
+                    && !sharedTransportContradictsMode
+                    && renderer.cpuRuntimeReadMissFrames
+                        < RuntimeReadGraceFrames)
+                {
+                    ++renderer.cpuRuntimeReadMissFrames;
+                    cpuRuntimeModeHeld = true;
+                }
+                else
+                {
+                    if (renderer.cpuPresentationMode
+                        == cpu_presentation::RuntimeMode::Ui)
+                    {
+                        clearRetainedUiResource(renderer);
+                    }
+                    if (renderer.cpuPresentationMode
+                        != cpu_presentation::RuntimeMode::Unknown)
+                    {
+                        ++renderer.cpuUiEpoch;
+                        if (renderer.cpuUiEpoch == 0u)
+                            ++renderer.cpuUiEpoch;
+                    }
+                    renderer.cpuPresentationMode =
+                        cpu_presentation::RuntimeMode::Unknown;
+                    renderer.cpuPresentationRuntime = {};
+                    renderer.cpuRuntimeReadMissFrames = 0u;
+                }
+            }
+        }
+        const fnvxr::host::gpu_color::RuntimeEvidence
+            cpuCurrentRuntimeEvidence {
+                cpuCurrentRuntime.sample,
+                cpuCurrentRuntime.phase,
+                cpuCurrentRuntime.menuBits,
+                cpuCurrentRuntime.showroomActive,
+                cpuCurrentRuntime.cameraActive,
+                cpuCurrentRuntime.fresh,
+            };
+        runtimeEvidenceHistory.record(cpuCurrentRuntimeEvidence);
+
         CpuMonoUiFrame incomingCpuUi {};
         const bool cpuUiRecordRead = productionCpuEngineStereo
             && haveSharedStereoUiState
             && sharedStereoUiActive
             && readSharedD3D9MonoUiFrame(renderer, incomingCpuUi);
-        if (productionCpuEngineStereo
-            && haveSharedStereoUiState
-            && sharedStereoUiActive
-            && sharedStereoStateAdvanced
-            && !cpuUiRecordRead)
-        {
-            // The source just advanced to a menu record that could not be
-            // copied as a verified CPU UI frame. Do not retain an earlier
-            // menu texture across that boundary.
-            clearRetainedUiTexture(renderer);
-            renderer.cpuUiBoundaryTransactionId = 0u;
-            renderer.cpuUiBoundarySourceFrame = 0u;
-            renderer.cpuUiBoundaryRuntimeStateSample = 0u;
-        }
+        bool cpuUiIncomingRuntimeLineage = false;
+        bool cpuUiIncomingRuntimeLineageBracketed = false;
+        bool cpuUiTextureUploadAttempted = false;
+        bool cpuUiTextureUploadSucceeded = false;
         if (cpuUiRecordRead
             && cpu_presentation::flatUiBoundaryValid(incomingCpuUi.identity))
         {
@@ -9938,20 +10134,50 @@ int main(int argc, char** argv)
                 incomingCpuUi.identity.sourceFrame;
             renderer.cpuUiBoundaryRuntimeStateSample =
                 incomingCpuUi.identity.runtimeStateSample;
-            if (cpu_presentation::flatUiFrameEligible(
+            fnvxr::host::gpu_color::RuntimeEvidence
+                cpuUiSourceRuntimeEvidence {};
+            cpuUiIncomingRuntimeLineage =
+                runtimeEvidenceHistory.findStableSource(
+                    incomingCpuUi.identity.runtimeStateSample,
+                    cpuCurrentRuntimeEvidence,
+                    cpuUiSourceRuntimeEvidence,
+                    &cpuUiIncomingRuntimeLineageBracketed);
+            const cpu_presentation::RuntimeSample cpuUiSourceRuntime {
+                cpuUiSourceRuntimeEvidence.sample,
+                cpuUiSourceRuntimeEvidence.phase,
+                cpuUiSourceRuntimeEvidence.menuBits,
+                cpuUiSourceRuntimeEvidence.showroomActive,
+                cpuUiSourceRuntimeEvidence.cameraActive,
+                cpuUiSourceRuntimeEvidence.fresh,
+            };
+            if (renderer.cpuPresentationMode
+                    == cpu_presentation::RuntimeMode::Ui
+                && cpuUiIncomingRuntimeLineage
+                && cpu_presentation::flatUiFrameEligible(
                     incomingCpuUi.identity,
-                    cpuCurrentRuntime))
+                    cpuUiSourceRuntime))
             {
-                static_cast<void>(uploadCpuEngineUiTexture(
+                cpuUiTextureUploadAttempted = true;
+                cpuUiTextureUploadSucceeded = uploadCpuEngineUiTexture(
                     device.Get(),
                     renderer,
-                    incomingCpuUi));
+                    incomingCpuUi);
+                if (cpuUiTextureUploadSucceeded)
+                {
+                    renderer.retainedCpuUiTransactionId =
+                        incomingCpuUi.identity.transactionId;
+                    renderer.retainedCpuUiEpoch = renderer.cpuUiEpoch;
+                    renderer.retainedCpuUiProducerProcessId =
+                        renderer.stereoProducerProcessId;
+                    renderer.retainedCpuUiCapturedRuntime =
+                        cpuUiSourceRuntime;
+                }
             }
         }
         const cpu_presentation::FrameIdentity retainedCpuUiIdentity {
-            renderer.cpuUiBoundaryTransactionId,
-            renderer.cpuUiBoundarySourceFrame,
-            renderer.cpuUiBoundaryRuntimeStateSample,
+            renderer.retainedCpuUiTransactionId,
+            renderer.retainedUiSourceFrame,
+            renderer.retainedUiRuntimeStateSample,
             fnvxr::shared::StereoProducerMonoUiQuad,
             false,
             false,
@@ -9959,21 +10185,27 @@ int main(int argc, char** argv)
             renderer.retainedUiTexture
                 && renderer.retainedUiTextureView
                 && !renderer.retainedUiHostWindowCaptured
-                && renderer.retainedUiSourceFrame
-                    == renderer.cpuUiBoundarySourceFrame
                 && renderer.retainedUiRuntimeStateSample
-                    == renderer.cpuUiBoundaryRuntimeStateSample,
+                    == renderer.retainedCpuUiCapturedRuntime.sample
+                && renderer.retainedCpuUiProducerProcessId != 0u
+                && renderer.retainedCpuUiProducerProcessId
+                    == renderer.stereoProducerProcessId,
         };
         const bool cpuEngineUiQuadActive = productionCpuEngineStereo
-            && haveSharedStereoUiState
-            && sharedStereoUiActive
-            && cpu_presentation::flatUiFrameEligible(
+            && renderer.cpuPresentationMode
+                == cpu_presentation::RuntimeMode::Ui
+            && cpu_presentation::retainedFlatUiFrameEligible(
                 retainedCpuUiIdentity,
-                cpuCurrentRuntime);
+                renderer.retainedCpuUiCapturedRuntime,
+                renderer.cpuPresentationRuntime,
+                renderer.retainedCpuUiEpoch != 0u
+                    && renderer.retainedCpuUiEpoch
+                        == renderer.cpuUiEpoch);
         int64_t cpuSourcePoseAgeNanoseconds = 0;
         bool cpuSourcePoseAgeValid = false;
         bool cpuEngineStereoActive = false;
         bool cpuEngineRuntimeLineageFound = false;
+        bool cpuEngineRuntimeLineageBracketed = false;
         std::uint64_t cpuEngineSourceRuntimeSample = 0u;
         SourceViewPublication productSourceView {};
         const bool productSourceViewFound = sourceViewHistory.find(
@@ -10051,11 +10283,13 @@ int main(int argc, char** argv)
         };
         runtimeEvidenceHistory.record(runtimeEvidence);
         fnvxr::host::gpu_color::RuntimeEvidence sourceRuntimeEvidence {};
+        bool sourceRuntimeLineageBracketed = false;
         const bool sourceRuntimeLineageFound =
             runtimeEvidenceHistory.findStableSource(
                 controllerRouted.frame.runtimeStateSample,
                 runtimeEvidence,
-                sourceRuntimeEvidence);
+                sourceRuntimeEvidence,
+                &sourceRuntimeLineageBracketed);
         const fnvxr::host::gpu_color::RuntimeEvidence&
             controllerRuntimeEvidence = sourceRuntimeLineageFound
                 ? sourceRuntimeEvidence
@@ -10177,17 +10411,51 @@ int main(int argc, char** argv)
             legacyImageDiagnostics
             && envEnabled("FNVXR_STEREO_FALLBACK_MONO_FULLSCREEN", false)
             && allowStereoWorld2dFallback;
+        const bool cpuMenuModeActive =
+            productionCpuEngineStereo
+            && renderer.cpuPresentationMode
+                == cpu_presentation::RuntimeMode::Ui;
+        const bool cpuGameplayModeActive =
+            productionCpuEngineStereo
+            && renderer.cpuPresentationMode
+                == cpu_presentation::RuntimeMode::Gameplay;
+        const bool controllerConsumerAcknowledged =
+            retailControllerConsumerAcknowledged(sharedBridge);
+        const fnvxr::shared::RuntimeControllerMode controllerMode =
+            fnvxr::shared::runtimeControllerMode(
+                runtimePhase,
+                runtimeMenuBits,
+                runtimeShowroomActive,
+                runtimeCameraActive,
+                haveRuntimeUiState);
+        const bool controllerMutationAuthorized =
+            interactiveControllerRouteRequested()
+            && controllerConsumerAcknowledged
+            && controllerMode
+                != fnvxr::shared::RuntimeControllerMode::Unknown;
         const bool menuPointerInputActive =
             shouldReadInput
+            && controllerMutationAuthorized
+            && controllerMode
+                == fnvxr::shared::RuntimeControllerMode::Ui
             && showGamePlane
-            && (legacyImageDiagnostics
+            && (productionCpuEngineStereo
+                ? (cpuMenuModeActive && cpuEngineUiQuadActive)
+                : legacyImageDiagnostics
                 ? (haveRuntimeUiState ? runtimeUiActive : gameUiMode)
                 : (productionUiQuadActive
                     && productComposition.pointerEnabled)
                     || cpuEngineUiQuadActive);
         const bool gameplayControlsActive =
             shouldReadInput
-            && (haveRuntimeUiState ? (!runtimeUiActive || runtimeGameplayActive) : !gameUiMode);
+            && controllerMutationAuthorized
+            && controllerMode
+                == fnvxr::shared::RuntimeControllerMode::Gameplay
+            && (productionCpuEngineStereo
+                ? cpuGameplayModeActive
+                : (haveRuntimeUiState
+                    ? (!runtimeUiActive || runtimeGameplayActive)
+                    : !gameUiMode));
         const float headspaceAimTrigger = std::clamp(envFloat("FNVXR_HEADSPACE_LOOK_AIM_TRIGGER", 0.35f), 0.0f, 1.0f);
         const bool headspaceAimHeld = gameplayControlsActive && frame.leftTrigger >= headspaceAimTrigger;
         const bool weaponOut = gameplayControlsActive && lastSharedPlayerWeaponOut;
@@ -10418,6 +10686,7 @@ int main(int argc, char** argv)
             headspaceLook,
             publishedHandLook,
             hostClick,
+            controllerMutationAuthorized,
             menuPointerInputActive,
             gameplayControlsActive,
             weaponOut,
@@ -10592,7 +10861,8 @@ int main(int argc, char** argv)
                 runtimeEvidenceHistory.findStableSource(
                     renderer.stereoGameRuntimeStateSample,
                     runtimeEvidence,
-                    cpuWorldRuntimeEvidence);
+                    cpuWorldRuntimeEvidence,
+                    &cpuEngineRuntimeLineageBracketed);
             cpuEngineSourceRuntimeSample =
                 cpuWorldRuntimeEvidence.sample;
             const cpu_presentation::RuntimeSample cpuWorldRuntime {
@@ -11063,7 +11333,16 @@ int main(int argc, char** argv)
                 << ",\"cpuEngineTransaction\":"
                 << fnvxr::shared::sequencedValueBits(
                     renderer.stereoGameRenderPairSequence)
-                << ",\"controllerMutationAuthorized\":false"
+                << ",\"controllerMutationAuthorized\":"
+                << (controllerMutationAuthorized ? "true" : "false")
+                << ",\"controllerConsumerAcknowledged\":"
+                << (controllerConsumerAcknowledged ? "true" : "false")
+                << ",\"controllerMode\":\""
+                << fnvxr::shared::runtimeControllerModeName(
+                    controllerMode)
+                << "\""
+                << ",\"physicalHeadsetPlayRequested\":"
+                << (physicalHeadsetPlayRequested() ? "true" : "false")
                 << ",\"trackedWeaponAuthorized\":false"
                 << ",\"productUiSourceFrame\":"
                 << productDecision.presentedUiSourceFrame
@@ -11077,12 +11356,42 @@ int main(int argc, char** argv)
                 << gpuColorFrame.frame.runtimeStateSample
                 << ",\"gpuV5RuntimeLineage\":"
                 << (sourceRuntimeLineageFound ? "true" : "false")
+                << ",\"gpuV5RuntimeLineageBracketed\":"
+                << (sourceRuntimeLineageBracketed ? "true" : "false")
                 << ",\"controllerRuntimeStateSample\":"
                 << controllerRuntimeEvidence.sample
                 << ",\"cpuEngineRuntimeLineage\":"
                 << (cpuEngineRuntimeLineageFound ? "true" : "false")
+                << ",\"cpuEngineRuntimeLineageBracketed\":"
+                << (cpuEngineRuntimeLineageBracketed ? "true" : "false")
                 << ",\"cpuEngineSourceRuntimeSample\":"
                 << cpuEngineSourceRuntimeSample
+                << ",\"cpuPresentationMode\":\""
+                << cpu_presentation::runtimeModeName(
+                    renderer.cpuPresentationMode)
+                << "\",\"cpuRuntimeModeHeld\":"
+                << (cpuRuntimeModeHeld ? "true" : "false")
+                << ",\"cpuUiEpoch\":" << renderer.cpuUiEpoch
+                << ",\"cpuUiIncomingRead\":"
+                << (cpuUiRecordRead ? "true" : "false")
+                << ",\"cpuUiIncomingRuntimeLineage\":"
+                << (cpuUiIncomingRuntimeLineage ? "true" : "false")
+                << ",\"cpuUiIncomingRuntimeLineageBracketed\":"
+                << (cpuUiIncomingRuntimeLineageBracketed
+                    ? "true"
+                    : "false")
+                << ",\"cpuUiTextureUploadAttempted\":"
+                << (cpuUiTextureUploadAttempted ? "true" : "false")
+                << ",\"cpuUiTextureUploadSucceeded\":"
+                << (cpuUiTextureUploadSucceeded ? "true" : "false")
+                << ",\"cpuUiRetainedEpoch\":"
+                << renderer.retainedCpuUiEpoch
+                << ",\"cpuUiRetainedTransaction\":"
+                << renderer.retainedCpuUiTransactionId
+                << ",\"cpuUiRetainedSourceFrame\":"
+                << renderer.retainedUiSourceFrame
+                << ",\"cpuUiRetainedRuntimeSample\":"
+                << renderer.retainedUiRuntimeStateSample
                 << ",\"gpuV5RenderedDisplayTime\":"
                 << gpuColorFrame.frame.renderedDisplayTime
                 << ",\"gpuV5ExactSourceView\":"

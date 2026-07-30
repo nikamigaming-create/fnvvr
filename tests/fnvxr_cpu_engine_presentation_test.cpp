@@ -74,6 +74,37 @@ int main()
     require(
         presentation::flatUiFrameEligible(ui, menu),
         "an exact, visible menu frame did not select the flat UI route");
+    require(
+        presentation::confirmedRuntimeMode(menu)
+            == presentation::RuntimeMode::Ui,
+        "a confirmed menu runtime did not select UI mode");
+    require(
+        presentation::confirmedRuntimeMode(gameplayRuntime(41u))
+            == presentation::RuntimeMode::Gameplay,
+        "a confirmed gameplay runtime did not select gameplay mode");
+
+    const presentation::RuntimeSample laterMenu = menuRuntime(64u);
+    require(
+        presentation::retainedFlatUiFrameEligible(
+            ui,
+            menu,
+            laterMenu,
+            true),
+        "a verified menu texture did not remain eligible as its UI epoch advanced");
+    require(
+        !presentation::retainedFlatUiFrameEligible(
+            ui,
+            menu,
+            gameplayRuntime(65u),
+            true),
+        "a retained menu texture survived a confirmed gameplay transition");
+    require(
+        !presentation::retainedFlatUiFrameEligible(
+            ui,
+            menu,
+            laterMenu,
+            false),
+        "a retained menu texture crossed a closed UI epoch");
 
     const presentation::UiBoundary uiBoundary =
         presentation::boundaryFromUi(ui);

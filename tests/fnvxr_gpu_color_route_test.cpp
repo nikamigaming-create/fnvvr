@@ -298,6 +298,72 @@ int main()
                 advancedRuntime,
                 historicalRuntime),
         "runtime history reset retained a source sample");
+
+    RuntimeEvidence bracketLower = runtime;
+    bracketLower.sample = 100u;
+    RuntimeEvidence bracketCurrent = bracketLower;
+    bracketCurrent.sample = 104u;
+    RuntimeEvidenceHistory<8u> bracketHistory;
+    bracketHistory.record(bracketLower);
+    bracketHistory.record(bracketCurrent);
+    bool runtimeLineageBracketed = false;
+    require(bracketHistory.findStableSource(
+                102u,
+                bracketCurrent,
+                historicalRuntime,
+                &runtimeLineageBracketed)
+            && runtimeLineageBracketed
+            && historicalRuntime.sample == 102u
+            && sameRuntimePresentationState(
+                historicalRuntime,
+                bracketCurrent),
+        "bounded runtime history did not bridge a skipped stable sample");
+    runtimeLineageBracketed = true;
+    require(!bracketHistory.findStableSource(
+                105u,
+                bracketCurrent,
+                historicalRuntime,
+                &runtimeLineageBracketed)
+            && !runtimeLineageBracketed,
+        "bounded runtime history admitted a future source sample");
+
+    RuntimeEvidenceHistory<8u> transitionBracketHistory;
+    transitionBracketHistory.record(bracketLower);
+    RuntimeEvidence bracketTransition = bracketLower;
+    bracketTransition.sample = 101u;
+    bracketTransition.cameraActive = false;
+    transitionBracketHistory.record(bracketTransition);
+    transitionBracketHistory.record(bracketCurrent);
+    require(!transitionBracketHistory.findStableSource(
+                102u,
+                bracketCurrent,
+                historicalRuntime),
+        "bounded runtime history bridged across a camera transition");
+
+    RuntimeEvidenceHistory<8u> conflictingBracketHistory;
+    conflictingBracketHistory.record(bracketLower);
+    RuntimeEvidence bracketConflict = bracketLower;
+    bracketConflict.sample = 101u;
+    conflictingBracketHistory.record(bracketConflict);
+    bracketConflict.cameraActive = false;
+    conflictingBracketHistory.record(bracketConflict);
+    conflictingBracketHistory.record(bracketCurrent);
+    require(!conflictingBracketHistory.findStableSource(
+                102u,
+                bracketCurrent,
+                historicalRuntime),
+        "bounded runtime history bridged across a conflicted sample");
+
+    RuntimeEvidence wideBracketCurrent = bracketLower;
+    wideBracketCurrent.sample = 133u;
+    RuntimeEvidenceHistory<8u> wideBracketHistory;
+    wideBracketHistory.record(bracketLower);
+    wideBracketHistory.record(wideBracketCurrent);
+    require(!wideBracketHistory.findStableSource(
+                116u,
+                wideBracketCurrent,
+                historicalRuntime),
+        "bounded runtime history bridged an oversized sample gap");
     RuntimeEvidence wrongRuntime = runtime;
     ++wrongRuntime.sample;
     require(!makePresentationInput(

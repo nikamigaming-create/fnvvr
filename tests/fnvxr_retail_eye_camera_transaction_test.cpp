@@ -118,6 +118,80 @@ RetailTrackedFrame validFrame()
     return frame;
 }
 
+stereo::Quaternion axisAngle(
+    float x,
+    float y,
+    float z,
+    float radians)
+{
+    const float half = radians * 0.5f;
+    const float sine = std::sin(half);
+    return stereo::normalized({
+        x * sine,
+        y * sine,
+        z * sine,
+        std::cos(half),
+    });
+}
+
+void setTrackedOrientation(
+    RetailTrackedFrame& frame,
+    const stereo::Quaternion& orientation)
+{
+    const float quaternion[4] {
+        orientation.x,
+        orientation.y,
+        orientation.z,
+        orientation.w,
+    };
+    std::memcpy(frame.pose.hmdRot, quaternion, sizeof(quaternion));
+    std::memcpy(frame.pose.leftEyeRot, quaternion, sizeof(quaternion));
+    std::memcpy(frame.pose.rightEyeRot, quaternion, sizeof(quaternion));
+
+    const stereo::Matrix3 rotation =
+        stereo::columnRotationFromQuaternion(orientation);
+    const stereo::Vector3 left =
+        stereo::transform(rotation, { -0.032f, 0.0f, 0.0f });
+    const stereo::Vector3 right =
+        stereo::transform(rotation, { 0.032f, 0.0f, 0.0f });
+    frame.pose.leftEyePos[0] = left.x;
+    frame.pose.leftEyePos[1] = left.y;
+    frame.pose.leftEyePos[2] = left.z;
+    frame.pose.rightEyePos[0] = right.x;
+    frame.pose.rightEyePos[1] = right.y;
+    frame.pose.rightEyePos[2] = right.z;
+}
+
+stereo::Vector3 cameraRight(
+    const RetailCameraMutableState& camera)
+{
+    return {
+        camera.world.rotation[0],
+        camera.world.rotation[3],
+        camera.world.rotation[6],
+    };
+}
+
+stereo::Vector3 cameraUp(
+    const RetailCameraMutableState& camera)
+{
+    return {
+        camera.world.rotation[1],
+        camera.world.rotation[4],
+        camera.world.rotation[7],
+    };
+}
+
+stereo::Vector3 cameraForward(
+    const RetailCameraMutableState& camera)
+{
+    return {
+        -camera.world.rotation[2],
+        -camera.world.rotation[5],
+        -camera.world.rotation[8],
+    };
+}
+
 #if defined(_MSC_VER) && defined(_M_IX86)
 #define FNVXR_TEST_CDECL __cdecl
 #define FNVXR_TEST_THISCALL_IMPL __fastcall
@@ -399,6 +473,103 @@ void testOriginAndRig()
         "parented private camera was admitted as local-equals-world");
 }
 
+void testTrackedOrientationAxes()
+{
+    constexpr float Pi = 3.14159265358979323846f;
+    constexpr float ThirtyDegrees = Pi / 6.0f;
+    abi::RetailNiCameraLayout stock {};
+    initializeCamera(stock, 100.0f, 200.0f, 300.0f);
+
+    const RetailTrackedFrame baseline = validFrame();
+    const RetailVrOriginCandidate origin =
+        prepareRetailVrOriginCandidate({}, baseline);
+    require(origin.complete(), "orientation test origin did not latch");
+
+    RetailTrackedFrame pitchFrame = baseline;
+    pitchFrame.pose.frame = 11u;
+    pitchFrame.runtime.frame = 11u;
+    pitchFrame.poseSequence = 4u;
+    pitchFrame.runtimeSequence = 4u;
+    setTrackedOrientation(
+        pitchFrame,
+        axisAngle(1.0f, 0.0f, 0.0f, ThirtyDegrees));
+    const RetailDerivedEyeCameraRig pitchRig =
+        deriveRetailEyeCameraRig(
+            &stock,
+            pitchFrame,
+            origin.origin,
+            70.0f);
+    require(
+        pitchRig.complete(),
+        "a valid OpenXR pitch pose did not derive an eye-camera rig");
+    const stereo::Vector3 pitchForward =
+        cameraForward(pitchRig.center);
+    require(
+        nearlyEqual(pitchForward.x, 0.0f, 0.001f)
+            && pitchForward.y > 0.85f
+            && pitchForward.z > 0.49f,
+        "OpenXR pitch did not tilt NiCamera forward toward world up");
+
+    RetailTrackedFrame yawFrame = pitchFrame;
+    yawFrame.pose.frame = 12u;
+    yawFrame.runtime.frame = 12u;
+    yawFrame.poseSequence = 6u;
+    yawFrame.runtimeSequence = 6u;
+    setTrackedOrientation(
+        yawFrame,
+        axisAngle(0.0f, 1.0f, 0.0f, ThirtyDegrees));
+    const RetailDerivedEyeCameraRig yawRig =
+        deriveRetailEyeCameraRig(
+            &stock,
+            yawFrame,
+            origin.origin,
+            70.0f);
+    require(
+        yawRig.complete(),
+        "a valid OpenXR yaw pose did not derive an eye-camera rig");
+    const stereo::Vector3 yawForward = cameraForward(yawRig.center);
+    const stereo::Vector3 yawUp = cameraUp(yawRig.center);
+    require(
+        yawForward.x < -0.49f
+            && yawForward.y > 0.85f
+            && nearlyEqual(yawForward.z, 0.0f, 0.001f)
+            && nearlyEqual(yawUp.x, 0.0f, 0.001f)
+            && nearlyEqual(yawUp.y, 0.0f, 0.001f)
+            && yawUp.z > 0.99f,
+        "OpenXR yaw was swapped with pitch or roll in NiCamera space");
+
+    RetailTrackedFrame rollFrame = pitchFrame;
+    rollFrame.pose.frame = 13u;
+    rollFrame.runtime.frame = 13u;
+    rollFrame.poseSequence = 8u;
+    rollFrame.runtimeSequence = 8u;
+    setTrackedOrientation(
+        rollFrame,
+        axisAngle(0.0f, 0.0f, 1.0f, ThirtyDegrees));
+    const RetailDerivedEyeCameraRig rollRig =
+        deriveRetailEyeCameraRig(
+            &stock,
+            rollFrame,
+            origin.origin,
+            70.0f);
+    require(
+        rollRig.complete(),
+        "a valid OpenXR roll pose did not derive an eye-camera rig");
+    const stereo::Vector3 rollRight = cameraRight(rollRig.center);
+    const stereo::Vector3 rollUp = cameraUp(rollRig.center);
+    const stereo::Vector3 rollForward =
+        cameraForward(rollRig.center);
+    require(
+        rollRight.x > 0.85f
+            && rollRight.z > 0.49f
+            && rollUp.x < -0.49f
+            && rollUp.z > 0.85f
+            && nearlyEqual(rollForward.x, 0.0f, 0.001f)
+            && rollForward.y > 0.99f
+            && nearlyEqual(rollForward.z, 0.0f, 0.001f),
+        "OpenXR roll did not rotate NiCamera right/up about forward");
+}
+
 void testPrivateCameraOwnership()
 {
     abi::RetailNiCameraLayout center {};
@@ -447,6 +618,7 @@ int main()
     testWorldToCameraContract();
     testCapturedRetailWorldMatrices();
     testOriginAndRig();
+    testTrackedOrientationAxes();
     testPrivateCameraOwnership();
     std::cout << "retail distinct-eye camera transaction passed\n";
     return EXIT_SUCCESS;

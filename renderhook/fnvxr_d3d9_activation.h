@@ -126,6 +126,49 @@ constexpr bool retailVrVisualTrialAuthorized(
         && !request.stereoFallbackMonoFullscreen;
 }
 
+// Physical play uses the same exact-retail, ordinary-D3D9 eye renderer as the
+// bounded visual trial. Input remains outside this bridge and is authorized
+// independently by the xNVSE current-process capability. Keeping a distinct
+// request prevents an interactive launcher flag from silently widening the
+// historical visual-trial profile.
+struct RetailVrPhysicalPlayRequest
+{
+    bool exactProfileMatched = false;
+    bool physicalHeadsetPlayRequested = false;
+    bool engineCenterStereoRequested = false;
+    bool stereoWorldDisabled = false;
+    bool legacyImageDiagnosticsRequested = false;
+    bool retainedStereoGameTexturesRequested = false;
+    bool unprovenColorOnlyStereoDiagnosticRequested = false;
+    bool allowStereoWorld2dFallback = false;
+    bool showGamePlaneOnStereoLoss = false;
+    bool stereoFallbackMonoFullscreen = false;
+};
+
+constexpr bool retailVrPhysicalPlayAuthorized(
+    const RetailVrBridgePolicy& policy,
+    const RetailVrPhysicalPlayRequest& request) noexcept
+{
+    return policy.compiled
+        && policy.exactCurrentProcessAuthorityRequired
+        && !policy.exBackedGameDevice
+        && policy.retailWorldHookOnly
+        && !policy.replaceD3D9DeviceVtablePointer
+        && policy.leaseNativePresentSlot
+        && policy.cpuImageTransfer
+        && !policy.legacyDrawReplay
+        && request.exactProfileMatched
+        && request.physicalHeadsetPlayRequested
+        && request.engineCenterStereoRequested
+        && !request.stereoWorldDisabled
+        && !request.legacyImageDiagnosticsRequested
+        && !request.retainedStereoGameTexturesRequested
+        && !request.unprovenColorOnlyStereoDiagnosticRequested
+        && !request.allowStereoWorld2dFallback
+        && !request.showGamePlaneOnStereoLoss
+        && !request.stereoFallbackMonoFullscreen;
+}
+
 static_assert(CompiledInterpositionPolicy.forwardSystemExports);
 static_assert(!CompiledInterpositionPolicy.wrapDirect3D9);
 static_assert(!CompiledInterpositionPolicy.patchDirect3D9Vtable);

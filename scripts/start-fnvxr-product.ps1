@@ -3,6 +3,14 @@ param(
     [string]$GameRoot = "D:\SteamLibrary\steamapps\common\Fallout New Vegas",
     [string]$OpenXrLoaderPath = "",
     [string]$HeadlessSimulatorManifest = "",
+    # Process-local runtime selection for a physical headset. Unlike the
+    # simulator option, this sets only XR_RUNTIME_JSON.
+    [string]$PhysicalRuntimeManifest = "",
+    [switch]$PhysicalHeadsetPlay,
+    # Temporary per-eye retail source resolution for interactive headset play.
+    # The user's Fallout INIs are backed up and restored byte-for-byte.
+    [ValidateRange(1280, 4096)][int]$PhysicalGameWidth = 1920,
+    [ValidateRange(720, 2560)][int]$PhysicalGameHeight = 1200,
     # Optional workspace-staged Meta XR Operator API layer. It is observed
     # only: FNVXR neither starts its MCP proxy nor invokes pose/controller tools.
     [string]$MetaXrOperatorLayerDirectory = "",
@@ -95,6 +103,8 @@ Set-StrictMode -Version 3.0
 
 $headsetFixtureVisualTrial =
     [bool]($HeadsetDemoFixture -or $HeadsetWorldOnlyCapture)
+$headsetFixtureOpenXrRun =
+    [bool]($headsetFixtureVisualTrial -or $PhysicalHeadsetPlay)
 if ($HeadsetDemoFixture -and $HeadsetWorldOnlyCapture) {
     throw "-HeadsetDemoFixture and -HeadsetWorldOnlyCapture are mutually exclusive."
 }
@@ -123,6 +133,37 @@ if ($AcknowledgeTribalPackPopup -and -not $AutomateInGame) {
 if ($CaptureHeadsetMirror -and [string]::IsNullOrWhiteSpace($HeadlessSimulatorManifest)) {
     throw "-CaptureHeadsetMirror requires -HeadlessSimulatorManifest so the recording is from the command-line headless simulator."
 }
+if (-not [string]::IsNullOrWhiteSpace($HeadlessSimulatorManifest) -and
+    -not [string]::IsNullOrWhiteSpace($PhysicalRuntimeManifest)) {
+    throw "-HeadlessSimulatorManifest and -PhysicalRuntimeManifest are mutually exclusive."
+}
+if ($PhysicalHeadsetPlay -and
+    [string]::IsNullOrWhiteSpace($PhysicalRuntimeManifest)) {
+    throw "-PhysicalHeadsetPlay requires -PhysicalRuntimeManifest."
+}
+if (-not $PhysicalHeadsetPlay -and
+    -not [string]::IsNullOrWhiteSpace($PhysicalRuntimeManifest)) {
+    throw "-PhysicalRuntimeManifest is valid only with -PhysicalHeadsetPlay."
+}
+if ($PhysicalHeadsetPlay -and $headsetFixtureVisualTrial) {
+    throw "-PhysicalHeadsetPlay is mutually exclusive with headless headset demo/world-capture modes."
+}
+if ($PhysicalHeadsetPlay -and $CaptureHeadsetMirror) {
+    throw "-PhysicalHeadsetPlay does not permit diagnostic mirror capture; the capture stalls the physical compositor."
+}
+if ($PhysicalHeadsetPlay -and $HeadsetPoseSweep) {
+    throw "-PhysicalHeadsetPlay cannot use the headless simulator pose sweep."
+}
+if ($PhysicalHeadsetPlay -and
+    -not [string]::IsNullOrWhiteSpace($MetaXrOperatorLayerDirectory)) {
+    throw "-PhysicalHeadsetPlay does not load the simulator-only Meta XR Operator layer."
+}
+if ($PhysicalHeadsetPlay -and $RetailFixtureAction -cne "Load") {
+    throw "-PhysicalHeadsetPlay requires -RetailFixtureAction Load for an existing owned fixture."
+}
+$physicalDisplaySize = Assert-FnvxrProductPhysicalDisplaySize `
+    -Width $PhysicalGameWidth `
+    -Height $PhysicalGameHeight
 if (-not [string]::IsNullOrWhiteSpace($MetaXrOperatorLayerDirectory) -and
     [string]::IsNullOrWhiteSpace($HeadlessSimulatorManifest)) {
     throw "-MetaXrOperatorLayerDirectory requires -HeadlessSimulatorManifest; interactive runtime selection is not authorized."
@@ -152,11 +193,12 @@ if ($UseRetailPluginProfile) {
 if (Test-FnvxrProductProcessElevated) {
     throw "Product launcher refuses to run elevated; the game, host, and process-local OpenXR runtime must remain at normal user integrity."
 }
-if ($RetailFixtureAction -ne "Disabled" -and -not $headsetFixtureVisualTrial) {
+if ($RetailFixtureAction -ne "Disabled" -and -not $headsetFixtureOpenXrRun) {
     # Never let the general VR supervisor start a host or runtime for a save
     # fixture. The dedicated runner stages only the xNVSE plugin and has no
     # OpenXR/simulator path at all.
     if (-not [string]::IsNullOrWhiteSpace($HeadlessSimulatorManifest) -or
+        -not [string]::IsNullOrWhiteSpace($PhysicalRuntimeManifest) -or
         -not [string]::IsNullOrWhiteSpace($OpenXrLoaderPath) -or
         -not [string]::IsNullOrWhiteSpace($MetaXrOperatorLayerDirectory)) {
         throw "Retail fixtures do not accept an OpenXR loader or simulator manifest."
@@ -273,12 +315,27 @@ $creatingFreshCharacter = $StartNewCharacter -or $creatingRetailFixture
 $runtimeRegistryBefore = $null
 $headlessRuntimeIdentity = $null
 $headlessRuntimeManifestPath = ""
+$physicalRuntimeIdentity = $null
+$physicalRuntimeManifestPath = ""
 if (-not [string]::IsNullOrWhiteSpace($HeadlessSimulatorManifest)) {
     $runtimeRegistryBefore = Get-FnvxrProductHklmActiveRuntimeSnapshot
     $headlessRuntimeIdentity =
         Resolve-FnvxrProductHeadlessRuntimeManifest `
             -ManifestPath $HeadlessSimulatorManifest
     $headlessRuntimeManifestPath = [string]$headlessRuntimeIdentity.manifest.path
+}
+if (-not [string]::IsNullOrWhiteSpace($PhysicalRuntimeManifest)) {
+    $runtimeRegistryBefore = Get-FnvxrProductHklmActiveRuntimeSnapshot
+    $physicalRuntimeIdentity =
+        Resolve-FnvxrProductPhysicalRuntimeManifest `
+            -ManifestPath $PhysicalRuntimeManifest
+    $physicalRuntimeManifestPath =
+        [string]$physicalRuntimeIdentity.manifest.path
+}
+$selectedRuntimeIdentity = if ($headlessRuntimeIdentity) {
+    $headlessRuntimeIdentity
+} else {
+    $physicalRuntimeIdentity
 }
 $metaXrOperatorIdentity = $null
 if (-not [string]::IsNullOrWhiteSpace($MetaXrOperatorLayerDirectory)) {
@@ -404,6 +461,31 @@ if ($retailFixtureRequested) {
             Get-FnvxrProductFileIdentity -Path $retailFixturePluginProfilePath
     }
 }
+$physicalDisplayProfilePlan = [ordered]@{
+    requested = [bool]$PhysicalHeadsetPlay
+    scope = "temporary 1920x1200-class retail source profile; both Fallout INIs are restored byte-for-byte after owned processes stop"
+    size = $physicalDisplaySize
+    paths = @(Get-FnvxrProductPhysicalDisplayIniPaths)
+    status = if ($PhysicalHeadsetPlay) {
+        "validated-not-staged"
+    } else {
+        "disabled"
+    }
+    before = @()
+    staged = $null
+    outputProof = $null
+    after = $null
+    restored = $false
+}
+if ($PhysicalHeadsetPlay) {
+    foreach ($iniPath in @($physicalDisplayProfilePlan.paths)) {
+        if (-not (Test-Path -LiteralPath $iniPath -PathType Leaf)) {
+            throw "Physical headset play requires an existing Fallout INI: $iniPath"
+        }
+        $physicalDisplayProfilePlan.before +=
+            Get-FnvxrProductFileIdentity -Path $iniPath
+    }
+}
 $stagePlan = Get-FnvxrProductStagePlan `
     -Root $root `
     -Configuration $Configuration `
@@ -414,7 +496,9 @@ $attestationIdentity = Get-FnvxrProductFileIdentity -Path $attestationPath
 $automationKind = if ($StartNewCharacter) {
     "fresh-character"
 } elseif ($retailFixtureRequested) {
-    if ($HeadsetDemoFixture) {
+    if ($PhysicalHeadsetPlay) {
+        "physical-headset-play-$fixtureFamily-fixture-$resolvedRetailFixtureAction"
+    } elseif ($HeadsetDemoFixture) {
         "headset-demo-$fixtureFamily-fixture-$resolvedRetailFixtureAction"
     } elseif ($HeadsetWorldOnlyCapture) {
         "headset-world-$fixtureFamily-fixture-$resolvedRetailFixtureAction"
@@ -449,7 +533,9 @@ $automationPlan = [ordered]@{
     scope = if ($StartNewCharacter) {
         "one fixed no-save COC, fixed name, and new disposable save only; no menu, input, controller, camera, rig, weapon, or general command authority"
     } elseif ($retailFixtureRequested) {
-        if ($HeadsetDemoFixture) {
+        if ($PhysicalHeadsetPlay) {
+            "one existing owned $fixtureFamily fixture load under the process-local physical OpenXR runtime; exact-retail xNVSE consumes authenticated Quest controller state with explicit menu/game routing; no desktop or simulator control, personal-save mutation, tracked weapon, projectile, or unverified camera/rig authority"
+        } elseif ($HeadsetDemoFixture) {
             if ($TtwCore) {
                 "one owned FNVXR_AutoTTW level-one fixture in the isolated TTW workspace sandbox and process-local headless OpenXR visual trial; temporary exact TTW core profile; exact title/body/unique-OK official-pack acknowledgement if presented; exactly two fixed in-game Pip-Boy Tab events after verified gameplay; no personal save, live retail, desktop, keyboard, mouse, controller, camera, rig, weapon, simulator UI, or general command authority"
             } else {
@@ -486,6 +572,7 @@ $automationPlan = [ordered]@{
     }
     acknowledgeOfficialPackPopupsRequested =
         [bool]($AcknowledgeTribalPackPopup -or $retailFixtureRequested)
+    controllerMutationRequested = [bool]$PhysicalHeadsetPlay
     controllerMutationAuthorized = $false
     trackedWeaponAuthorized = $false
     startMenuEvidence = $null
@@ -556,20 +643,21 @@ if ($automationRequested) {
     $automationPlan.commandHelper = $commandIdentity
 }
 $openXrRuntimePlan = [ordered]@{
-    requested = [bool]$headlessRuntimeIdentity
-    status = if ($headlessRuntimeIdentity) {
+    requested = [bool]$selectedRuntimeIdentity
+    status = if ($selectedRuntimeIdentity) {
         "validated-not-started"
     } else {
         "inherited-not-overridden"
     }
-    selection = if ($headlessRuntimeIdentity) {
+    selection = if ($selectedRuntimeIdentity) {
         "process-local-environment-only"
     } else {
         "inherited"
     }
     headless = [bool]$headlessRuntimeIdentity
+    physicalHeadset = [bool]$physicalRuntimeIdentity
     registryMutationAuthorized = $false
-    identity = $headlessRuntimeIdentity
+    identity = $selectedRuntimeIdentity
     hklmActiveRuntimeBefore = $runtimeRegistryBefore
     hklmActiveRuntimeAfter = $null
     hklmActiveRuntimeUnchanged = $null
@@ -615,6 +703,7 @@ if ($ValidateOnly) {
         ttwCoreProfile = $ttwCoreProfilePlan
         retailPluginProfile = $retailPluginProfilePlan
         retailFixturePluginProfile = $retailFixturePluginProfilePlan
+        physicalDisplayProfile = $physicalDisplayProfilePlan
         automation = $automationPlan
         openXrRuntime = $openXrRuntimePlan
         minimalEnvironmentKeys = @(Get-FnvxrProductMinimalEnvironment `
@@ -628,6 +717,9 @@ if ($ValidateOnly) {
             -TtwFixture:$TtwCore `
             -HeadsetDemoFixture:$HeadsetDemoFixture `
             -HeadsetWorldOnlyCapture:$HeadsetWorldOnlyCapture `
+            -PhysicalHeadsetPlay:$PhysicalHeadsetPlay `
+            -PhysicalGameWidth $PhysicalGameWidth `
+            -PhysicalGameHeight $PhysicalGameHeight `
             -HeadsetDemoGameplayWarmupFrames $HeadsetDemoGameplayWarmupFrames `
             -RetailVrAccumulationDiagnosticMode $RetailVrAccumulationDiagnosticMode `
             -RetailFixtureAction $resolvedRetailFixtureAction `
@@ -637,6 +729,7 @@ if ($ValidateOnly) {
             -AcknowledgeTribalPackPopup:$AcknowledgeTribalPackPopup `
             -AutomateRecoverySaveName $RetailSaveName `
             -HeadlessRuntimeManifest $headlessRuntimeManifestPath `
+            -PhysicalRuntimeManifest $physicalRuntimeManifestPath `
             -HeadsetMirrorCaptureDirectory $validateHeadsetMirrorDirectory `
             -HeadsetMirrorCaptureEveryFrames $HeadsetMirrorCaptureEveryFrames `
             -HeadsetMirrorCaptureMaxPairs $HeadsetMirrorCaptureMaxPairs `
@@ -684,7 +777,11 @@ if ($headlessRuntimeIdentity) {
 $manifest = [ordered]@{
     schema = 1
     product = "fnvxr-v5-exact-retail"
-    acceptanceScope = "stereo-visual-trial-only"
+    acceptanceScope = if ($PhysicalHeadsetPlay) {
+        "physical-headset-interactive-play"
+    } else {
+        "stereo-visual-trial-only"
+    }
     runId = $runId
     supervisorProcessId = $PID
     startedAtUtc = [DateTime]::UtcNow.ToString("o")
@@ -692,6 +789,7 @@ $manifest = [ordered]@{
     accepted = $false
     trialReady = $false
     fullProductAccepted = $false
+    controllerMutationRequested = [bool]$PhysicalHeadsetPlay
     controllerMutationAuthorized = $false
     trackedWeaponAuthorized = $false
     completion = $null
@@ -708,6 +806,22 @@ $manifest = [ordered]@{
     environment = $null
     automation = $automationPlan
     openXrRuntime = $openXrRuntimePlan
+    physicalHeadsetPlay = [ordered]@{
+        requested = [bool]$PhysicalHeadsetPlay
+        profile = if ($PhysicalHeadsetPlay) {
+            "retail-vr-play-v1"
+        } else {
+            "disabled"
+        }
+        controllerConsumerAcknowledged = $false
+        controllerMode = "unknown"
+        status = if ($PhysicalHeadsetPlay) {
+            "pending-exact-retail-controller-ack"
+        } else {
+            "disabled"
+        }
+    }
+    physicalDisplayProfile = $physicalDisplayProfilePlan
     headsetMirror = [ordered]@{
         requested = [bool]$CaptureHeadsetMirror
         scope = "bounded final OpenXR eye-swapchain image sequence only; no game, desktop, controller, or simulator UI input"
@@ -808,6 +922,7 @@ $fallout = $null
 $staged = @()
 $retailPluginProfileRecord = $null
 $retailFixturePluginProfileRecord = $null
+$physicalDisplayProfileRecord = $null
 $normalCompletion = $false
 
 function Write-SupervisorLog {
@@ -1378,6 +1493,231 @@ function Get-FnvxrProductStereoOutputProof {
     return $null
 }
 
+function Get-FnvxrProductControllerAuthorizationProof {
+    param([Parameter(Mandatory = $true)][string]$LogPath)
+
+    if (-not (Test-Path -LiteralPath $LogPath -PathType Leaf)) {
+        return $null
+    }
+    $lines = @(Get-Content -LiteralPath $LogPath -Tail 600)
+    [array]::Reverse($lines)
+    foreach ($line in $lines) {
+        if (-not $line.StartsWith('{"event":"fnvxrOpenXrSubmit"')) {
+            continue
+        }
+        try {
+            $frame = $line | ConvertFrom-Json -ErrorAction Stop
+        } catch {
+            continue
+        }
+        if ([bool]$frame.physicalHeadsetPlayRequested -and
+            [bool]$frame.controllerConsumerAcknowledged -and
+            [bool]$frame.controllerMutationAuthorized -and
+            [string]$frame.controllerMode -in @("ui", "gameplay")) {
+            return [ordered]@{
+                frame = [uint64]$frame.frame
+                mode = [string]$frame.controllerMode
+                presentationMode = [string]$frame.cpuPresentationMode
+                runtimeStateSample =
+                    [uint64]$frame.controllerRuntimeStateSample
+                consumerAcknowledged = $true
+                mutationAuthorized = $true
+                observedAtUtc = [DateTime]::UtcNow.ToString("o")
+            }
+        }
+    }
+    return $null
+}
+
+function Get-FnvxrProductPhysicalDisplayOutputProof {
+    param(
+        [Parameter(Mandatory = $true)][string]$LogPath,
+        [Parameter(Mandatory = $true)][int]$ExpectedWidth,
+        [Parameter(Mandatory = $true)][int]$ExpectedHeight
+    )
+
+    if (-not (Test-Path -LiteralPath $LogPath -PathType Leaf)) {
+        return $null
+    }
+    $lines = @(Get-Content -LiteralPath $LogPath -Tail 1200)
+    [array]::Reverse($lines)
+    foreach ($line in $lines) {
+        $jsonStart = $line.IndexOf('{"event":"fnvxrRetailEngineCenterCpu')
+        if ($jsonStart -lt 0) {
+            continue
+        }
+        try {
+            $frame = $line.Substring($jsonStart) |
+                ConvertFrom-Json -ErrorAction Stop
+        } catch {
+            continue
+        }
+        # The world eye targets are created from the actual retail backbuffer.
+        # A fixed-size menu transport is not proof of the gameplay source
+        # resolution, even when it happens to share the same dimensions.
+        if ([string]$frame.event -cne
+            "fnvxrRetailEngineCenterCpuStereo") {
+            continue
+        }
+        $actualWidth = [int]$frame.width
+        $actualHeight = [int]$frame.height
+        return [ordered]@{
+            event = [string]$frame.event
+            transaction = [uint64]$frame.transaction
+            width = $actualWidth
+            height = $actualHeight
+            expectedWidth = $ExpectedWidth
+            expectedHeight = $ExpectedHeight
+            matched = $actualWidth -eq $ExpectedWidth -and
+                $actualHeight -eq $ExpectedHeight
+            observedAtUtc = [DateTime]::UtcNow.ToString("o")
+        }
+    }
+    return $null
+}
+
+function Get-FnvxrProductRetailCameraPoseSweepProof {
+    param([Parameter(Mandatory = $true)][string]$LogPath)
+
+    if (-not (Test-Path -LiteralPath $LogPath -PathType Leaf)) {
+        return $null
+    }
+    $samples = @()
+    foreach ($line in @(Get-Content -LiteralPath $LogPath)) {
+        $jsonStart = $line.IndexOf(
+            '{"event":"fnvxrRetailEngineCenterFrame"')
+        if ($jsonStart -lt 0) {
+            continue
+        }
+        try {
+            $frame = $line.Substring($jsonStart) |
+                ConvertFrom-Json -ErrorAction Stop
+        } catch {
+            continue
+        }
+        if (-not [bool]$frame.delivered -or
+            -not [bool]$frame.cameraPoseValid -or
+            @($frame.hmdPos).Count -ne 3 -or
+            @($frame.centerForward).Count -ne 3 -or
+            @($frame.centerUp).Count -ne 3 -or
+            @($frame.centerOffsetFromStock).Count -ne 3) {
+            continue
+        }
+        $samples += $frame
+    }
+    if ($samples.Count -lt 4) {
+        return $null
+    }
+
+    function Get-Range {
+        param(
+            [Parameter(Mandatory = $true)]$Values,
+            [Parameter(Mandatory = $true)][int]$Index
+        )
+        $axis = @($Values | ForEach-Object {
+            [double]$_[$Index]
+        })
+        $minimum = [double]($axis | Measure-Object -Minimum).Minimum
+        $maximum = [double]($axis | Measure-Object -Maximum).Maximum
+        return [ordered]@{
+            minimum = $minimum
+            maximum = $maximum
+            span = $maximum - $minimum
+        }
+    }
+
+    $hmdPosition = @($samples | ForEach-Object {
+        ,@($_.hmdPos)
+    })
+    $centerForward = @($samples | ForEach-Object {
+        ,@($_.centerForward)
+    })
+    $centerUp = @($samples | ForEach-Object {
+        ,@($_.centerUp)
+    })
+    $centerOffset = @($samples | ForEach-Object {
+        ,@($_.centerOffsetFromStock)
+    })
+    $hmdX = Get-Range -Values $hmdPosition -Index 0
+    $hmdY = Get-Range -Values $hmdPosition -Index 1
+    $hmdZ = Get-Range -Values $hmdPosition -Index 2
+    $forwardX = Get-Range -Values $centerForward -Index 0
+    $forwardY = Get-Range -Values $centerForward -Index 1
+    $forwardZ = Get-Range -Values $centerForward -Index 2
+    $upX = Get-Range -Values $centerUp -Index 0
+    $upY = Get-Range -Values $centerUp -Index 1
+    $offsetX = Get-Range -Values $centerOffset -Index 0
+    $offsetY = Get-Range -Values $centerOffset -Index 1
+    $offsetZ = Get-Range -Values $centerOffset -Index 2
+    $translationResponseMagnitude = [Math]::Sqrt(
+        $offsetX.span * $offsetX.span +
+        $offsetY.span * $offsetY.span +
+        $offsetZ.span * $offsetZ.span)
+    # Fallout's stock camera heading is not pinned to one world-horizontal
+    # component. Measure yaw and roll in the full horizontal plane so a valid
+    # camera facing -X is not rejected merely because yaw appears in Y.
+    $horizontalHeadingResponseMagnitude = [Math]::Sqrt(
+        $forwardX.span * $forwardX.span +
+        $forwardY.span * $forwardY.span)
+    $horizontalUpResponseMagnitude = [Math]::Sqrt(
+        $upX.span * $upX.span +
+        $upY.span * $upY.span)
+    $translationInputProven =
+        $hmdX.span -ge 0.05 -and
+        $hmdY.span -ge 0.03 -and
+        $hmdZ.span -ge 0.04
+    $translationCameraResponseProven =
+        $translationResponseMagnitude -ge 3.0
+    $yawCameraResponseProven =
+        $horizontalHeadingResponseMagnitude -ge 0.12
+    $pitchCameraResponseProven = $forwardZ.span -ge 0.08
+    $rollCameraResponseProven =
+        $horizontalUpResponseMagnitude -ge 0.04
+    return [ordered]@{
+        sampleCount = $samples.Count
+        firstTransaction = [uint64]$samples[0].transaction
+        lastTransaction =
+            [uint64]$samples[$samples.Count - 1].transaction
+        hmdPosition = [ordered]@{
+            x = $hmdX
+            y = $hmdY
+            z = $hmdZ
+        }
+        centerForward = [ordered]@{
+            x = $forwardX
+            y = $forwardY
+            z = $forwardZ
+            horizontalResponseMagnitude =
+                $horizontalHeadingResponseMagnitude
+        }
+        centerUp = [ordered]@{
+            x = $upX
+            y = $upY
+            horizontalResponseMagnitude =
+                $horizontalUpResponseMagnitude
+        }
+        centerOffsetFromStock = [ordered]@{
+            x = $offsetX
+            y = $offsetY
+            z = $offsetZ
+            responseMagnitude = $translationResponseMagnitude
+        }
+        translationInputProven = $translationInputProven
+        translationCameraResponseProven =
+            $translationCameraResponseProven
+        yawCameraResponseProven = $yawCameraResponseProven
+        pitchCameraResponseProven = $pitchCameraResponseProven
+        rollCameraResponseProven = $rollCameraResponseProven
+        sixDofCameraResponseProven =
+            $translationInputProven -and
+            $translationCameraResponseProven -and
+            $yawCameraResponseProven -and
+            $pitchCameraResponseProven -and
+            $rollCameraResponseProven
+        observedAtUtc = [DateTime]::UtcNow.ToString("o")
+    }
+}
+
 function Get-FnvxrProductStereoContinuityProof {
     param(
         [Parameter(Mandatory = $true)][string]$LogPath,
@@ -1577,6 +1917,18 @@ try {
             -Path $openXrSimulatorDataDirectory `
             -Force | Out-Null
     }
+    if ($physicalRuntimeIdentity) {
+        $preLaunchRuntimeIdentity =
+            Resolve-FnvxrProductPhysicalRuntimeManifest `
+                -ManifestPath $physicalRuntimeManifestPath
+        if ($preLaunchRuntimeIdentity.manifest.sha256 -cne
+                $physicalRuntimeIdentity.manifest.sha256 -or
+            $preLaunchRuntimeIdentity.runtimeDll.sha256 -cne
+                $physicalRuntimeIdentity.runtimeDll.sha256) {
+            throw "Physical OpenXR runtime manifest or DLL changed after validation."
+        }
+        $openXrRuntimePlan.preLaunchIdentity = $preLaunchRuntimeIdentity
+    }
     foreach ($name in $processLocalRuntimeEnvironmentNames) {
         Remove-Item -LiteralPath ("Env:{0}" -f $name) -ErrorAction SilentlyContinue
     }
@@ -1591,6 +1943,9 @@ try {
         -TtwFixture:$TtwCore `
         -HeadsetDemoFixture:$HeadsetDemoFixture `
         -HeadsetWorldOnlyCapture:$HeadsetWorldOnlyCapture `
+        -PhysicalHeadsetPlay:$PhysicalHeadsetPlay `
+        -PhysicalGameWidth $PhysicalGameWidth `
+        -PhysicalGameHeight $PhysicalGameHeight `
         -HeadsetDemoGameplayWarmupFrames $HeadsetDemoGameplayWarmupFrames `
         -RetailVrAccumulationDiagnosticMode $RetailVrAccumulationDiagnosticMode `
         -RetailFixtureAction $resolvedRetailFixtureAction `
@@ -1600,6 +1955,7 @@ try {
         -AcknowledgeTribalPackPopup:$AcknowledgeTribalPackPopup `
         -AutomateRecoverySaveName $RetailSaveName `
         -HeadlessRuntimeManifest $headlessRuntimeManifestPath `
+        -PhysicalRuntimeManifest $physicalRuntimeManifestPath `
         -HeadsetMirrorCaptureDirectory $headsetMirrorDirectory `
         -HeadsetMirrorCaptureEveryFrames $HeadsetMirrorCaptureEveryFrames `
         -HeadsetMirrorCaptureMaxPairs $HeadsetMirrorCaptureMaxPairs `
@@ -1607,7 +1963,7 @@ try {
             $metaXrOperatorIdentity.directory
         } else { "" })
     Set-FnvxrProductMinimalEnvironment -Environment $environment
-    if ($headlessRuntimeIdentity) {
+    if ($selectedRuntimeIdentity) {
         $openXrRuntimePlan.status = "process-local-environment-applied"
     }
     $manifest.environment = $environment
@@ -1643,7 +1999,7 @@ try {
         throw "Timed out after $HostReadyTimeoutSeconds seconds waiting for the authoritative OpenXR session/shared-mapping bridge handshake."
     }
     $manifest.readiness.hostBridge = $true
-    if ($headlessRuntimeIdentity) {
+    if ($selectedRuntimeIdentity) {
         $openXrRuntimePlan.status = "host-bridge-ready"
     }
     if ($metaXrOperatorIdentity) {
@@ -1652,6 +2008,27 @@ try {
                 -ExpectedProcessId ([uint32]$hostProcess.Id) `
                 -TimeoutSeconds ([Math]::Min($HostReadyTimeoutSeconds, 15))
         $openXrRuntimePlan.metaXrOperator.status = "host-owned-observation-listener-ready"
+    }
+    if ($PhysicalHeadsetPlay) {
+        $manifest.state = "staging-temporary-physical-display-profile"
+        $physicalDisplayProfilePlan.status = "staging"
+        Write-FnvxrProductJsonAtomic -Value $manifest -Path $manifestPath
+        Write-SupervisorLog (
+            "staging temporary physical-play source resolution {0}x{1}; both Fallout INIs will be restored byte-for-byte" -f
+            $PhysicalGameWidth,
+            $PhysicalGameHeight)
+        $physicalDisplayProfileRecord =
+            Install-FnvxrProductPhysicalDisplayProfile `
+                -BackupRoot $backupRoot `
+                -RunId $runId `
+                -Width $PhysicalGameWidth `
+                -Height $PhysicalGameHeight
+        $physicalDisplayProfilePlan.staged =
+            @($physicalDisplayProfileRecord.records | ForEach-Object {
+                $_.staged
+            })
+        $physicalDisplayProfilePlan.status = "staged-temporary"
+        Write-FnvxrProductJsonAtomic -Value $manifest -Path $manifestPath
     }
     if ($UseRetailPluginProfile) {
         $manifest.state = "staging-temporary-retail-plugin-profile"
@@ -1965,20 +2342,35 @@ try {
             [int]$headsetPoseSweepEvidence.commandCount -lt 2) {
             throw "The headless-runtime HMD pose sweep did not prove bounded motion and center restoration."
         }
-        $manifest.headsetPoseSweep.status = "complete-centered"
+        $headsetPoseSweepRenderedProof =
+            Get-FnvxrProductRetailCameraPoseSweepProof `
+                -LogPath $retailVrLog
+        if (-not $headsetPoseSweepRenderedProof -or
+            -not [bool]$headsetPoseSweepRenderedProof.sixDofCameraResponseProven) {
+            throw "The commanded headless HMD sweep did not prove yaw, pitch, roll, and translation in the actual retail NiCamera transactions."
+        }
+        $manifest.headsetPoseSweep.status =
+            "rendered-six-dof-proven-centered"
         $manifest.headsetPoseSweep.evidence = $headsetPoseSweepEvidence
+        $manifest.headsetPoseSweep.renderedCameraProof =
+            $headsetPoseSweepRenderedProof
         Write-FnvxrProductJsonAtomic -Value $manifest -Path $manifestPath
         Write-SupervisorLog (
-            "completed six-axis HMD pose sweep commands={0} x=[{1:N3},{2:N3}] y=[{3:N3},{4:N3}] z=[{5:N3},{6:N3}]; simulator center restored" -f
+            "completed six-axis HMD pose sweep commands={0} x=[{1:N3},{2:N3}] y=[{3:N3},{4:N3}] z=[{5:N3},{6:N3}] renderedSamples={7} yawSpan={8:N3} pitchSpan={9:N3} rollSpan={10:N3} translationResponse={11:N3}; simulator center restored" -f
             $headsetPoseSweepEvidence.commandCount,
             $headsetPoseSweepEvidence.commandedMinimum.x,
             $headsetPoseSweepEvidence.commandedMaximum.x,
             $headsetPoseSweepEvidence.commandedMinimum.y,
             $headsetPoseSweepEvidence.commandedMaximum.y,
             $headsetPoseSweepEvidence.commandedMinimum.z,
-            $headsetPoseSweepEvidence.commandedMaximum.z)
+            $headsetPoseSweepEvidence.commandedMaximum.z,
+            $headsetPoseSweepRenderedProof.sampleCount,
+            $headsetPoseSweepRenderedProof.centerForward.horizontalResponseMagnitude,
+            $headsetPoseSweepRenderedProof.centerForward.z.span,
+            $headsetPoseSweepRenderedProof.centerUp.x.span,
+            $headsetPoseSweepRenderedProof.centerOffsetFromStock.responseMagnitude)
     }
-    if ($retailFixtureRequested -and -not $headsetFixtureVisualTrial) {
+    if ($retailFixtureRequested -and -not $headsetFixtureOpenXrRun) {
         # Fixture automation is a deterministic game-state harness, not a
         # stereo acceptance run. Stop once the owned save/load and real scene
         # proof succeed so a missing binocular proof cannot hide a successful
@@ -2002,6 +2394,8 @@ try {
     $stereoContinuityProof = $null
     $pipBoyOutputProof = $null
     $headsetDemoInputProof = $null
+    $controllerAuthorizationProof = $null
+    $physicalDisplayOutputProof = $null
     do {
         $hostProcess.Refresh()
         $fallout.Refresh()
@@ -2011,6 +2405,66 @@ try {
             break
         }
         if ([DateTime]::UtcNow -ge $nextHealthCheck) {
+            if ($PhysicalHeadsetPlay -and
+                -not $physicalDisplayOutputProof) {
+                $physicalDisplayObservation =
+                    Get-FnvxrProductPhysicalDisplayOutputProof `
+                        -LogPath $retailVrLog `
+                        -ExpectedWidth $PhysicalGameWidth `
+                        -ExpectedHeight $PhysicalGameHeight
+                if ($physicalDisplayObservation -and
+                    -not [bool]$physicalDisplayObservation.matched) {
+                    throw (
+                        "Retail ignored the staged physical-play source resolution: expected {0}x{1}, observed {2}x{3}." -f
+                            $PhysicalGameWidth,
+                            $PhysicalGameHeight,
+                            $physicalDisplayObservation.width,
+                            $physicalDisplayObservation.height)
+                }
+                if ($physicalDisplayObservation) {
+                    $physicalDisplayOutputProof =
+                        $physicalDisplayObservation
+                    $physicalDisplayProfilePlan.outputProof =
+                        $physicalDisplayOutputProof
+                    $physicalDisplayProfilePlan.status =
+                        "live-source-resolution-proven"
+                    Write-FnvxrProductJsonAtomic `
+                        -Value $manifest `
+                        -Path $manifestPath
+                    Write-SupervisorLog (
+                        "proven physical-play retail source resolution {0}x{1} transaction={2} event={3}" -f
+                            $physicalDisplayOutputProof.width,
+                            $physicalDisplayOutputProof.height,
+                            $physicalDisplayOutputProof.transaction,
+                            $physicalDisplayOutputProof.event)
+                }
+            }
+            if ($PhysicalHeadsetPlay -and
+                -not $controllerAuthorizationProof) {
+                $controllerAuthorizationProof =
+                    Get-FnvxrProductControllerAuthorizationProof `
+                        -LogPath $hostOut
+                if ($controllerAuthorizationProof) {
+                    $manifest.controllerMutationAuthorized = $true
+                    $automationPlan.controllerMutationAuthorized = $true
+                    $manifest.physicalHeadsetPlay.controllerConsumerAcknowledged =
+                        $true
+                    $manifest.physicalHeadsetPlay.controllerMode =
+                        $controllerAuthorizationProof.mode
+                    $manifest.physicalHeadsetPlay.status =
+                        "exact-retail-controller-route-live"
+                    $manifest.physicalHeadsetPlay.authorizationProof =
+                        $controllerAuthorizationProof
+                    Write-FnvxrProductJsonAtomic `
+                        -Value $manifest `
+                        -Path $manifestPath
+                    Write-SupervisorLog (
+                        "physical controller route authorized by exact-retail xNVSE consumer frame={0} mode={1} runtimeSample={2}" -f
+                        $controllerAuthorizationProof.frame,
+                        $controllerAuthorizationProof.mode,
+                        $controllerAuthorizationProof.runtimeStateSample)
+                }
+            }
             if (-not $stereoOutputProof) {
                 if ($HeadsetWorldOnlyCapture) {
                     $stereoContinuityProof =
@@ -2047,11 +2501,12 @@ try {
                             $stereoContinuityProof.last.frame)
                     } else {
                         Write-SupervisorLog (
-                            "proven binocular output transaction={0} frame={1} left={2} right={3}; controller/weapon product gates remain closed" -f
+                            "proven binocular output transaction={0} frame={1} left={2} right={3}; controllerAuthorized={4} trackedWeaponAuthorized=0" -f
                             $stereoOutputProof.transaction,
                             $stereoOutputProof.frame,
                             $stereoOutputProof.leftOutputHash,
-                            $stereoOutputProof.rightOutputHash)
+                            $stereoOutputProof.rightOutputHash,
+                            [bool]$manifest.controllerMutationAuthorized)
                     }
                 }
             }
@@ -2118,6 +2573,12 @@ try {
             throw "No sustained sequence of at least 60 advancing binocular engine-stereo transactions over two seconds reached OpenXR before '$completion'; evidence is in $runDirectory"
         }
         throw "No proven binocular engine-stereo frame reached OpenXR before '$completion'. Enter a loaded gameplay world before the bounded visual trial expires; evidence is in $runDirectory"
+    }
+    if ($PhysicalHeadsetPlay -and -not $controllerAuthorizationProof) {
+        throw "The exact-retail xNVSE controller consumer never acknowledged the physical-play route before '$completion'; controller input remains unauthorized. Evidence is in $runDirectory"
+    }
+    if ($PhysicalHeadsetPlay -and -not $physicalDisplayOutputProof) {
+        throw "No retail frame proved the requested physical-play source resolution ${PhysicalGameWidth}x${PhysicalGameHeight} before '$completion'. Evidence is in $runDirectory"
     }
     if ($HeadsetDemoFixture -and -not $pipBoyOutputProof) {
         throw "No final-headset Pip-Boy UI frame reached OpenXR before '$completion'. The bounded demo does not claim UI proof without an actual projected UI frame; evidence is in $runDirectory"
@@ -2212,6 +2673,31 @@ try {
         }
     }
 
+    if ($physicalDisplayProfileRecord) {
+        try {
+            $physicalDisplayProfilePlan.after =
+                @(Restore-FnvxrProductPhysicalDisplayProfile `
+                    -Record $physicalDisplayProfileRecord)
+            $physicalDisplayProfilePlan.restored = $true
+            $physicalDisplayProfilePlan.status = "restored-exactly"
+        } catch {
+            $physicalDisplayProfilePlan.restoreError =
+                $_.Exception.Message
+            $physicalDisplayProfilePlan.status = "restore-failed"
+            if ($manifest.error) {
+                $manifest.error =
+                    "{0} Physical display-profile restore also failed: {1}" -f
+                        $manifest.error,
+                        $_.Exception.Message
+            } else {
+                $manifest.error =
+                    "Physical display-profile restore failed: $($_.Exception.Message)"
+            }
+            $manifest.state = "failed"
+            Write-SupervisorLog ("ERROR " + $manifest.error)
+        }
+    }
+
     if ($retailPluginProfileRecord) {
         try {
             $retailPluginProfilePlan.after =
@@ -2299,9 +2785,9 @@ try {
             [string]$savedEnvironment[$key],
             [EnvironmentVariableTarget]::Process)
     }
-    if ($headlessRuntimeIdentity -or $metaXrOperatorIdentity) {
+    if ($selectedRuntimeIdentity -or $metaXrOperatorIdentity) {
         $openXrRuntimePlan.processLocalEnvironmentRestored = $true
-        if ($headlessRuntimeIdentity) {
+        if ($selectedRuntimeIdentity) {
             $openXrRuntimePlan.status = "process-local-environment-restored"
         }
         if ($metaXrOperatorIdentity) {

@@ -76,9 +76,9 @@ constexpr bool sameRuntimePresentationState(
         && left.cameraActive == right.cameraActive;
 }
 
-// GPU work naturally arrives after the runtime mapping has advanced. Admit the
-// exact historical source sample only while the latest fresh sample describes
-// the identical presentation state. A menu/camera/phase transition therefore
+// GPU work naturally arrives after the runtime mapping has advanced. Admit a
+// historical source sample only while the latest fresh sample describes the
+// identical presentation state. A menu/camera/phase transition therefore
 // invalidates an in-flight gameplay image instead of relabeling it as current.
 constexpr bool stableRuntimeLineage(
     const RuntimeEvidence& source,
@@ -134,25 +134,88 @@ public:
     bool findStableSource(
         std::uint64_t sourceSample,
         const RuntimeEvidence& current,
-        RuntimeEvidence& found) const noexcept
+        RuntimeEvidence& found,
+        bool* bracketedOut = nullptr) const noexcept
     {
         found = {};
+        if (bracketedOut != nullptr)
+            *bracketedOut = false;
         if (sourceSample == 0u)
             return false;
+
+        // Prefer an exact observation and preserve conflict tombstones. An
+        // ambiguous exact identity must never fall through to interpolation.
         for (const Entry& entry : mEntries)
         {
             if (!entry.occupied
-                || entry.conflicted
                 || entry.evidence.sample != sourceSample)
-            {
                 continue;
-            }
+            if (entry.conflicted)
+                return false;
             if (!stableRuntimeLineage(entry.evidence, current))
                 return false;
             found = entry.evidence;
             return true;
         }
-        return false;
+
+        // The retail plugin can advance its runtime sample multiple times
+        // between two OpenXR host frames. Bridge only a tightly bounded missing
+        // identity that lies after a recorded sample and before the current
+        // sample. Every observation in that interval must agree, so a menu,
+        // showroom, camera, or phase transition still invalidates the image.
+        constexpr std::uint64_t MaxBracketSampleSpan = 32u;
+        if (!current.fresh
+            || current.sample == 0u
+            || sourceSample >= current.sample)
+        {
+            return false;
+        }
+
+        const Entry* lower = nullptr;
+        for (const Entry& entry : mEntries)
+        {
+            if (!entry.occupied
+                || entry.evidence.sample >= sourceSample
+                || (lower != nullptr
+                    && entry.evidence.sample
+                        <= lower->evidence.sample))
+            {
+                continue;
+            }
+            lower = &entry;
+        }
+        if (lower == nullptr
+            || lower->conflicted
+            || !stableRuntimeLineage(lower->evidence, current)
+            || current.sample - lower->evidence.sample
+                > MaxBracketSampleSpan)
+        {
+            return false;
+        }
+
+        for (const Entry& entry : mEntries)
+        {
+            if (!entry.occupied
+                || entry.evidence.sample < lower->evidence.sample
+                || entry.evidence.sample > current.sample)
+            {
+                continue;
+            }
+            if (entry.conflicted
+                || !entry.evidence.fresh
+                || !sameRuntimePresentationState(
+                    entry.evidence,
+                    current))
+            {
+                return false;
+            }
+        }
+
+        found = current;
+        found.sample = sourceSample;
+        if (bracketedOut != nullptr)
+            *bracketedOut = true;
+        return true;
     }
 
 private:

@@ -996,7 +996,7 @@ Require-Text -Path $pluginCode -Text 'mapSharedPointerToWindow(hwnd' -Reason "NV
 Require-Text -Path $pluginCode -Text 'focusProcessWindow' -Reason "NVSE click path must use stronger in-process foreground repair"
 Require-Text -Path $pluginCode -Text 'AttachThreadInput' -Reason "NVSE foreground repair must handle Windows foreground-lock cases"
 Require-Text -Path $pluginCode -Text 'click focus repair' -Reason "NVSE foreground repair must log whether SFX/input focus was actually restored"
-Require-Text -Path $pluginCode -Text 'externalDInput pointer active=1 raw=(%ld,%ld) mapped=(%ld,%ld) frame=%lu hwnd=%p ui=%d menuBits=0x%02lx pipboy=%d' -Reason "Pip-Boy pointer movement must be explicitly proved on the shared pointer line"
+Require-Text -Path $pluginCode -Text 'externalDInput pointer active=1 raw=(%ld,%ld) mapped=(%ld,%ld) frame=%lu hwnd=%p controllerMode=%s menuBits=0x%02lx pipboy=%d' -Reason "Pip-Boy pointer movement must be explicitly proved under the authoritative controller mode"
 Require-Text -Path $pluginCode -Text 'click request pending=%u hasPointer=%d client=(%ld,%ld) menuBits=0x%02lx pipboy=%d' -Reason "Pip-Boy click requests must carry menu-bit proof"
 Require-Text -Path $pluginCode -Text 'buttonUnderPointerInAnySpace' -Reason "NVSE direct menu hits must resolve raw and scaled pointer coordinate spaces"
 Require-Text -Path $pluginCode -Text 'directMenu candidates' -Reason "NVSE pointer misses must log candidate Gamebryo button rects"

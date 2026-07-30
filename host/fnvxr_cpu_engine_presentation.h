@@ -39,6 +39,13 @@ struct UiBoundary
     std::uint64_t sourceFrame = 0u;
 };
 
+enum class RuntimeMode : std::uint8_t
+{
+    Unknown,
+    Ui,
+    Gameplay,
+};
+
 constexpr bool runtimeUiConfirmed(const RuntimeSample& runtime) noexcept
 {
     return runtime.fresh
@@ -59,6 +66,27 @@ constexpr bool runtimeGameplayConfirmed(const RuntimeSample& runtime) noexcept
             runtime.phase,
             runtime.menuBits,
             runtime.showroomActive);
+}
+
+constexpr RuntimeMode confirmedRuntimeMode(
+    const RuntimeSample& runtime) noexcept
+{
+    if (runtimeUiConfirmed(runtime))
+        return RuntimeMode::Ui;
+    if (runtimeGameplayConfirmed(runtime))
+        return RuntimeMode::Gameplay;
+    return RuntimeMode::Unknown;
+}
+
+constexpr const char* runtimeModeName(RuntimeMode mode) noexcept
+{
+    switch (mode)
+    {
+        case RuntimeMode::Unknown: return "unknown";
+        case RuntimeMode::Ui: return "ui";
+        case RuntimeMode::Gameplay: return "gameplay";
+    }
+    return "invalid";
 }
 
 constexpr bool identityComplete(const FrameIdentity& frame) noexcept
@@ -85,6 +113,25 @@ constexpr bool flatUiFrameEligible(
         && frame.pixelsComplete
         && runtimeUiConfirmed(runtime)
         && frame.runtimeStateSample == runtime.sample;
+}
+
+// Once a verified menu texture has been accepted, its producer sample is
+// historical by definition. Keep it visible while the host remains in the
+// same continuous UI epoch instead of demanding equality with every newer
+// runtime sample. The caller owns the epoch boundary and must set
+// sameContinuousUiEpoch=false after any confirmed gameplay/unknown transition.
+constexpr bool retainedFlatUiFrameEligible(
+    const FrameIdentity& frame,
+    const RuntimeSample& capturedRuntime,
+    const RuntimeSample& currentRuntime,
+    bool sameContinuousUiEpoch) noexcept
+{
+    return flatUiBoundaryValid(frame)
+        && frame.pixelsComplete
+        && frame.runtimeStateSample == capturedRuntime.sample
+        && runtimeUiConfirmed(capturedRuntime)
+        && runtimeUiConfirmed(currentRuntime)
+        && sameContinuousUiEpoch;
 }
 
 constexpr UiBoundary boundaryFromUi(

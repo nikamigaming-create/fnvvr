@@ -414,6 +414,57 @@ int main()
     if (!fnvxr::shared::runtimeGameplayPhase(fnvxr::shared::RuntimePhaseGameplay, 0, 0))
         return fail("menu-free retail gameplay must remain stereo eligible");
 
+    if (fnvxr::shared::runtimeControllerMode(
+            fnvxr::shared::RuntimePhaseMenu,
+            fnvxr::shared::RuntimeGenericMenuBit,
+            0u,
+            false,
+            true)
+        != fnvxr::shared::RuntimeControllerMode::Ui)
+    {
+        return fail("an actionable menu did not select controller UI mode");
+    }
+    if (fnvxr::shared::runtimeControllerMode(
+            fnvxr::shared::RuntimePhaseGameplay,
+            0u,
+            0u,
+            true,
+            true)
+        != fnvxr::shared::RuntimeControllerMode::Gameplay)
+    {
+        return fail("a live menu-free camera did not select controller gameplay mode");
+    }
+    if (fnvxr::shared::runtimeControllerMode(
+            fnvxr::shared::RuntimePhaseLoading,
+            fnvxr::shared::RuntimeLoadingMenuBit,
+            0u,
+            false,
+            true)
+        != fnvxr::shared::RuntimeControllerMode::Unknown)
+    {
+        return fail("loading admitted controller mutation");
+    }
+    if (fnvxr::shared::runtimeControllerMode(
+            fnvxr::shared::RuntimePhaseGameplay,
+            0u,
+            0u,
+            false,
+            true)
+        != fnvxr::shared::RuntimeControllerMode::Unknown)
+    {
+        return fail("camera-less startup admitted gameplay controls");
+    }
+    if (fnvxr::shared::runtimeControllerMode(
+            fnvxr::shared::RuntimePhaseMenu,
+            fnvxr::shared::RuntimeGenericMenuBit,
+            0u,
+            false,
+            false)
+        != fnvxr::shared::RuntimeControllerMode::Unknown)
+    {
+        return fail("a stale menu sample admitted UI controls");
+    }
+
     if (offsetof(fnvxr::shared::SharedCommandState, sequence) != 8)
         return fail("SharedCommandState sequence offset mismatch");
 

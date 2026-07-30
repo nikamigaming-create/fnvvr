@@ -462,6 +462,16 @@ enum class RuntimePhase : UInt32
     Gameplay = 3,
 };
 
+struct RuntimeObservation
+{
+    UInt64 frame = 0u;
+    UInt32 menuBits = 0u;
+    RuntimePhase phase = RuntimePhase::Unknown;
+    bool uiInputAllowed = false;
+    bool cameraActive = false;
+    bool showroomActive = false;
+};
+
 enum class CameraHookAuthorization : UInt8
 {
     None = 0,
@@ -924,6 +934,11 @@ bool trackedPropAssistProfileRequested()
 bool stereoVisualTrialProfileSelected()
 {
     return runProfileIs("stereo-visual-trial-v5");
+}
+
+bool physicalHeadsetPlayProfileSelected()
+{
+    return runProfileIs("retail-vr-play-v1");
 }
 
 bool retailFixtureProfileSelected()
@@ -10231,7 +10246,8 @@ void processShowroomCarousel()
     }
 }
 
-void consumeExternalDInputBridge()
+void consumeExternalDInputBridge(
+    const RuntimeObservation& observation)
 {
     SharedDInputState state {};
     if (!readSharedDInputSnapshot(state))
@@ -10245,7 +10261,16 @@ void consumeExternalDInputBridge()
     if (packet == g_lastPublishedDInputMouseClickPacket)
         return;
 
-    const bool active = state.pointerActive != 0;
+    const fnvxr::shared::RuntimeControllerMode controllerMode =
+        fnvxr::shared::runtimeControllerMode(
+            static_cast<UInt32>(observation.phase),
+            observation.menuBits,
+            observation.showroomActive ? 1u : 0u,
+            observation.cameraActive,
+            observation.frame != 0u);
+    const bool active =
+        controllerMode == fnvxr::shared::RuntimeControllerMode::Ui
+        && state.pointerActive != 0;
     g_hasMenuPointer = active;
     g_lastMenuPointerClient.x = state.clientX;
     g_lastMenuPointerClient.y = state.clientY;
@@ -10271,13 +10296,23 @@ void consumeExternalDInputBridge()
         requestAcceptClick();
 }
 
-void syncExternalDInputPointer()
+void syncExternalDInputPointer(
+    const RuntimeObservation& observation)
 {
     SharedDInputState state {};
     if (!readSharedDInputSnapshot(state))
         return;
 
-    const bool active = state.pointerActive != 0;
+    const fnvxr::shared::RuntimeControllerMode controllerMode =
+        fnvxr::shared::runtimeControllerMode(
+            static_cast<UInt32>(observation.phase),
+            observation.menuBits,
+            observation.showroomActive ? 1u : 0u,
+            observation.cameraActive,
+            observation.frame != 0u);
+    const bool active =
+        controllerMode == fnvxr::shared::RuntimeControllerMode::Ui
+        && state.pointerActive != 0;
     const UInt32 frame = state.frame;
     const LONG clientX = state.clientX;
     const LONG clientY = state.clientY;
@@ -10330,18 +10365,19 @@ void syncExternalDInputPointer()
     if (g_loggedExternalDInputPointers < 48 || (frame % 120) == 0)
     {
         ++g_loggedExternalDInputPointers;
-        const UInt32 menuBits = currentMenuBits();
         logTelemetry(
-            "externalDInput pointer active=1 raw=(%ld,%ld) mapped=(%ld,%ld) frame=%lu hwnd=%p ui=%d menuBits=0x%02lx pipboy=%d\n",
+            "externalDInput pointer active=1 raw=(%ld,%ld) mapped=(%ld,%ld) frame=%lu hwnd=%p controllerMode=%s menuBits=0x%02lx pipboy=%d\n",
             clientX,
             clientY,
             windowPointer.x,
             windowPointer.y,
             static_cast<unsigned long>(frame),
             hwnd,
-            static_cast<int>(allowUiInput()),
-            static_cast<unsigned long>(menuBits),
-            static_cast<int>((menuBits & (1u << 6)) != 0));
+            fnvxr::shared::runtimeControllerModeName(controllerMode),
+            static_cast<unsigned long>(observation.menuBits),
+            static_cast<int>(
+                (observation.menuBits
+                    & fnvxr::shared::RuntimePipBoyMenuBit) != 0u));
     }
 }
 
@@ -10453,6 +10489,11 @@ void releaseExternalXInputGameplayHolds()
     holdGameplayGrab(false);
     holdGameplayRunModifier(false);
     holdDirectInputKey(DIK_W, false);
+    holdDirectInputKey(DIK_A, false);
+    holdDirectInputKey(DIK_S, false);
+    holdDirectInputKey(DIK_D, false);
+    holdDirectInputKey(DIK_LEFT, false);
+    holdDirectInputKey(DIK_RIGHT, false);
     cancelThirdPersonL3Control("externalXInput:release", 0);
 }
 
@@ -10819,6 +10860,25 @@ void consumeExternalXInputGameplayControls(
     const bool analogRun = gameplayAnalogRunHeld(state.leftThumbY);
     const bool keyboardMovement = pluginKeyboardMovementEnabled();
     const bool keyboardGameplayFallback = pluginGameplayKeyboardFallbackEnabled();
+    const int movementDeadzone = std::clamp(
+        getIntFromEnv("FNVXR_PLUGIN_MOVEMENT_DEADZONE", 9000),
+        1000,
+        30000);
+    const bool moveLeft =
+        keyboardMovement && state.leftThumbX < -movementDeadzone;
+    const bool moveRight =
+        keyboardMovement && state.leftThumbX > movementDeadzone;
+    const bool moveBackward =
+        keyboardMovement && state.leftThumbY < -movementDeadzone;
+    const bool moveForward =
+        keyboardMovement && state.leftThumbY > movementDeadzone;
+    const bool keyTurnEnabled =
+        keyboardMovement
+        && envEnabled("FNVXR_RIGHT_STICK_KEY_TURN", true);
+    const bool turnLeft =
+        keyTurnEnabled && state.rightThumbX < -movementDeadzone;
+    const bool turnRight =
+        keyTurnEnabled && state.rightThumbX > movementDeadzone;
     const bool thirdPersonChordHeld =
         thirdPersonL3ControlsEnabled()
         && (state.buttons & XInputLeftThumb) != 0;
@@ -10871,7 +10931,15 @@ void consumeExternalXInputGameplayControls(
     holdDirectInputKey(DIK_R, reloadHeld);
     holdGameplayGrab(rightGripGrabHeld);
     holdGameplayRunModifier(runHeld);
-    holdDirectInputKey(DIK_W, keyboardMovement && g_gameplayAutoRunEnabled);
+    holdDirectInputKey(
+        DIK_W,
+        keyboardMovement
+            && (moveForward || g_gameplayAutoRunEnabled));
+    holdDirectInputKey(DIK_A, moveLeft);
+    holdDirectInputKey(DIK_S, moveBackward);
+    holdDirectInputKey(DIK_D, moveRight);
+    holdDirectInputKey(DIK_LEFT, turnLeft);
+    holdDirectInputKey(DIK_RIGHT, turnRight);
 
     if (vatsChordPressed)
         tapVatsKey("externalXInput:LT+RG", frame);
@@ -10958,7 +11026,7 @@ void consumeExternalXInputGameplayControls(
         || waitChordPressed)
     {
         logTelemetry(
-            "externalXInput gameplay buttons=0x%04x pressed=0x%04x rt=%u lt=%u rtMouse=%d ltMouse=%d aimMouseSuppressed=%d vatsChord=%d vatsPressed=%d waitPressed=%d reloadHeld=%d grabHeld=%d grabKey=0x%02lx runHeld=%d runKey=0x%02lx moveMode=%u walk=%d runMode=%d thirdPersonChord=%d combatChord=%d protectedCombatChord=%d combatPressed=0x%04x weaponClass=%s weaponFormId=0x%08lx weaponSlot=%lu analogRun=%d autoRun=%d autoToggle=%d keyboardMovement=%d keyboardFallback=%d bJump=%d ySneak=%d rs=%d\n",
+            "externalXInput gameplay buttons=0x%04x pressed=0x%04x rt=%u lt=%u rtMouse=%d ltMouse=%d aimMouseSuppressed=%d vatsChord=%d vatsPressed=%d waitPressed=%d reloadHeld=%d grabHeld=%d grabKey=0x%02lx runHeld=%d runKey=0x%02lx moveMode=%u walk=%d runMode=%d thirdPersonChord=%d combatChord=%d protectedCombatChord=%d combatPressed=0x%04x weaponClass=%s weaponFormId=0x%08lx weaponSlot=%lu analogRun=%d autoRun=%d autoToggle=%d keyboardMovement=%d keyboardFallback=%d move=%d%d%d%d turn=%d%d bJump=%d ySneak=%d rs=%d\n",
             static_cast<unsigned int>(state.buttons),
             static_cast<unsigned int>(pressed),
             static_cast<unsigned int>(state.rightTrigger),
@@ -10989,6 +11057,12 @@ void consumeExternalXInputGameplayControls(
             static_cast<int>(autoRunPressed),
             static_cast<int>(keyboardMovement),
             static_cast<int>(keyboardGameplayFallback),
+            static_cast<int>(moveForward),
+            static_cast<int>(moveLeft),
+            static_cast<int>(moveBackward),
+            static_cast<int>(moveRight),
+            static_cast<int>(turnLeft),
+            static_cast<int>(turnRight),
             static_cast<int>((pressed & XInputB) != 0),
             static_cast<int>((pressed & XInputY) != 0),
             static_cast<int>(state.rightThumbY));
@@ -11003,7 +11077,8 @@ void consumeExternalXInputGameplayControls(
     previousVatsChordHeld = vatsChordHeld;
 }
 
-void consumeExternalXInputBridge()
+void consumeExternalXInputBridge(
+    const RuntimeObservation& observation)
 {
     static bool previousRightTriggerHeld = false;
     static bool previousLeftTriggerHeld = false;
@@ -11016,6 +11091,8 @@ void consumeExternalXInputBridge()
     static UInt64 lastUiMapZoomMs = 0;
     static bool wasInputAllowed = false;
     static bool releaseBeforePressPending = true;
+    static fnvxr::shared::RuntimeControllerMode previousControllerMode =
+        fnvxr::shared::RuntimeControllerMode::Unknown;
 
     SharedXInputState state {};
     if (!readEffectiveExternalXInputSnapshot(state))
@@ -11033,21 +11110,58 @@ void consumeExternalXInputBridge()
         previousUiFavoriteAssignChordState = 0;
         wasInputAllowed = false;
         releaseBeforePressPending = true;
+        previousControllerMode =
+            fnvxr::shared::RuntimeControllerMode::Unknown;
         return;
     }
 
-    const UInt32 menuBits = currentMenuBits();
-    const RuntimePhase phase = runtimePhaseFromMenuBits(menuBits);
-    const bool uiInputAllowed = uiInputAllowedFromMenuBits(menuBits);
+    const UInt32 menuBits = observation.menuBits;
+    const fnvxr::shared::RuntimeControllerMode controllerMode =
+        fnvxr::shared::runtimeControllerMode(
+            static_cast<UInt32>(observation.phase),
+            observation.menuBits,
+            observation.showroomActive ? 1u : 0u,
+            observation.cameraActive,
+            observation.frame != 0u);
+    const bool uiInputAllowed =
+        controllerMode == fnvxr::shared::RuntimeControllerMode::Ui;
     const bool gameplayInputAllowed =
-        phase == RuntimePhase::Gameplay
-        && cameraAllowedForMenuBits(menuBits);
+        controllerMode == fnvxr::shared::RuntimeControllerMode::Gameplay;
     const bool gripXboxMode = state.leftTrigger > 180;
     const bool leftTriggerModifierHeld = state.leftTrigger > 64;
     const bool inputAllowed = uiInputAllowed || gameplayInputAllowed;
     const bool pipBoyMenuVisible = pipBoyVisibleFromMenuBits(menuBits);
     const bool startMenuVisible = (menuBits & (1u << 1)) != 0;
     const bool menuKeyboardFallback = pluginMenuKeyboardFallbackEnabled();
+    if (controllerMode != previousControllerMode)
+    {
+        updateExternalPipBoyGripMode(false, previousPipBoyGripHeld);
+        updateExternalRightGripMenuMode(
+            false,
+            previousRightGripMenuHeld);
+        g_lastExternalXInputButtons = state.buttons;
+        g_lastExternalXInputNavMask = 0;
+        releaseExternalXInputGameplayHolds();
+        previousRightTriggerHeld = false;
+        previousLeftTriggerHeld = false;
+        previousRunHeld = false;
+        previousReloadHeld = false;
+        previousGrabHeld = false;
+        previousUiFavoriteAssignChordState = 0;
+        wasInputAllowed = false;
+        releaseBeforePressPending = true;
+        logTelemetry(
+            "controller mode transition frame=%llu from=%s to=%s phase=%lu menuBits=0x%02lx camera=%d showroom=%d releaseBeforePress=1\n",
+            static_cast<unsigned long long>(observation.frame),
+            fnvxr::shared::runtimeControllerModeName(
+                previousControllerMode),
+            fnvxr::shared::runtimeControllerModeName(controllerMode),
+            static_cast<unsigned long>(observation.phase),
+            static_cast<unsigned long>(observation.menuBits),
+            static_cast<int>(observation.cameraActive),
+            static_cast<int>(observation.showroomActive));
+        previousControllerMode = controllerMode;
+    }
     if (inputAllowed && !wasInputAllowed)
         releaseBeforePressPending = true;
     if (inputAllowed && releaseBeforePressPending)
@@ -11365,15 +11479,6 @@ void consumeExternalXInputBridge()
 
 bool startBridge();
 
-struct RuntimeObservation
-{
-    UInt64 frame = 0u;
-    UInt32 menuBits = 0u;
-    RuntimePhase phase = RuntimePhase::Unknown;
-    bool uiInputAllowed = false;
-    bool cameraActive = false;
-};
-
 bool ensureAuthorizedRuntimeObservationStarted()
 {
     const bool fixedCommandAutomationRequested =
@@ -11457,6 +11562,7 @@ RuntimeObservation observeAndPublishRuntime()
     observation.phase = runtimePhaseFromMenuBits(observation.menuBits);
     observation.uiInputAllowed =
         uiInputAllowedFromMenuBits(observation.menuBits);
+    observation.showroomActive = g_showroomActive;
     const bool visualTrialPublicationOnly =
         stereoVisualTrialMainLoopDisposition()
         == fnvxr::engine::RetailPluginMainLoopDisposition::
@@ -12944,16 +13050,31 @@ bool ensureAuthorizedSharedBridgeStarted()
 
     g_authorizedSharedBridgeStarted = startBridge();
     if (g_authorizedSharedBridgeStarted)
-        logTelemetry("shared bridge ready under exact current-process authority\n");
+    {
+        // This consumer-owned byte is reset by each newly leased OpenXR host
+        // before retail starts. Publish it only after exact current-process
+        // authority, all controller mappings, and the mode-aware game-thread
+        // consumer are live.
+        InterlockedExchange8(
+            reinterpret_cast<volatile char*>(
+                &g_xinputState->reserved[
+                    fnvxr::shared::XInputReservedRetailConsumed]),
+            1);
+        logTelemetry(
+            "shared bridge ready under exact current-process authority controllerConsumerAcknowledged=1 profile=%s\n",
+            physicalHeadsetPlayProfileSelected()
+                ? "retail-vr-play-v1"
+                : "standard");
+    }
     return g_authorizedSharedBridgeStarted;
 }
 
 void processMainGameLoop(const RuntimeObservation& observation)
 {
     processShowroomCarousel();
-    syncExternalDInputPointer();
-    consumeExternalDInputBridge();
-    consumeExternalXInputBridge();
+    syncExternalDInputPointer(observation);
+    consumeExternalDInputBridge(observation);
+    consumeExternalXInputBridge(observation);
 
     const UInt64 frame = observation.frame;
     const UInt32 menuBits = observation.menuBits;
@@ -13077,6 +13198,18 @@ void handleNvseMessage(NVSEMessagingInterface::Message* message)
                 loggedTrackedPropAssistOptInMissing = true;
                 logTelemetry(
                     "trackedPropAssist profile selected but FNVXR_TRACKED_PROP_ASSIST_VISUAL_ONLY is not enabled; no bridge or hook will start\n");
+            }
+            return;
+        }
+        if (physicalHeadsetPlayProfileSelected()
+            && !envEnabled("FNVXR_PHYSICAL_HEADSET_PLAY", false))
+        {
+            static bool loggedPhysicalPlayOptInMissing = false;
+            if (!loggedPhysicalPlayOptInMissing)
+            {
+                loggedPhysicalPlayOptInMissing = true;
+                logTelemetry(
+                    "physical headset play profile selected without FNVXR_PHYSICAL_HEADSET_PLAY; no bridge, controller, camera, rig, or renderer authority will start\n");
             }
             return;
         }

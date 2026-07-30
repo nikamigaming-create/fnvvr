@@ -324,6 +324,235 @@ function Get-FnvxrProductDocumentsPath {
     return [System.IO.Path]::GetFullPath($fallbackPath)
 }
 
+function Assert-FnvxrProductPhysicalDisplaySize {
+    param(
+        [ValidateRange(1280, 4096)][int]$Width,
+        [ValidateRange(720, 2560)][int]$Height
+    )
+
+    $aspect = [double]$Width / [double]$Height
+    if ($aspect -lt 1.25 -or $aspect -gt 2.0) {
+        throw "Physical-play source aspect must be between 1.25 and 2.0: ${Width}x${Height}"
+    }
+    return [pscustomobject][ordered]@{
+        width = $Width
+        height = $Height
+        aspect = $aspect
+        pixelsPerEye = [uint64]$Width * [uint64]$Height
+        transportMaximum = "4096x2560"
+    }
+}
+
+function Get-FnvxrProductPhysicalDisplayIniPaths {
+    $falloutRoot = Join-Path (
+        Get-FnvxrProductDocumentsPath) "My Games\FalloutNV"
+    return @(
+        (Join-Path $falloutRoot "Fallout.ini"),
+        (Join-Path $falloutRoot "FalloutPrefs.ini"))
+}
+
+function ConvertTo-FnvxrProductPhysicalDisplayIniText {
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Text,
+        [ValidateRange(1280, 4096)][int]$Width,
+        [ValidateRange(720, 2560)][int]$Height
+    )
+
+    Assert-FnvxrProductPhysicalDisplaySize `
+        -Width $Width `
+        -Height $Height | Out-Null
+    $settings = [ordered]@{
+        "bFull Screen" = "0"
+        "bBorderless" = "1"
+        "iPresentInterval" = "0"
+        "iSize W" = [string]$Width
+        "iSize H" = [string]$Height
+        "iMultiSample" = "0"
+        "bTransparencyMultisampling" = "0"
+    }
+    $lines = [System.Collections.Generic.List[string]]::new()
+    foreach ($line in [regex]::Split($Text, "`r`n|`n|`r")) {
+        $remove = $false
+        foreach ($key in $settings.Keys) {
+            if ($line -match ("^\s*{0}\s*=" -f [regex]::Escape($key))) {
+                $remove = $true
+                break
+            }
+        }
+        if (-not $remove) {
+            $lines.Add([string]$line)
+        }
+    }
+
+    $displayStart = -1
+    $displayEnd = $lines.Count
+    for ($index = 0; $index -lt $lines.Count; ++$index) {
+        if ($lines[$index] -match '^\s*\[Display\]\s*$') {
+            $displayStart = $index
+            for ($next = $index + 1; $next -lt $lines.Count; ++$next) {
+                if ($lines[$next] -match '^\s*\[.+\]\s*$') {
+                    $displayEnd = $next
+                    break
+                }
+            }
+            break
+        }
+    }
+    if ($displayStart -lt 0) {
+        if ($lines.Count -gt 0 -and
+            -not [string]::IsNullOrWhiteSpace($lines[$lines.Count - 1])) {
+            $lines.Add("")
+        }
+        $lines.Add("[Display]")
+        $displayEnd = $lines.Count
+    }
+    $offset = 0
+    foreach ($key in $settings.Keys) {
+        $lines.Insert(
+            $displayEnd + $offset,
+            ("{0}={1}" -f $key, $settings[$key]))
+        ++$offset
+    }
+
+    $result = [string]::Join("`r`n", $lines)
+    if (-not $result.EndsWith("`r`n")) {
+        $result += "`r`n"
+    }
+    return $result
+}
+
+function Install-FnvxrProductPhysicalDisplayProfile {
+    param(
+        [Parameter(Mandatory = $true)][string]$BackupRoot,
+        [Parameter(Mandatory = $true)][string]$RunId,
+        [ValidateRange(1280, 4096)][int]$Width,
+        [ValidateRange(720, 2560)][int]$Height
+    )
+
+    $size = Assert-FnvxrProductPhysicalDisplaySize `
+        -Width $Width `
+        -Height $Height
+    $paths = @(Get-FnvxrProductPhysicalDisplayIniPaths)
+    foreach ($path in $paths) {
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            throw "Physical-play display profile requires an existing Fallout INI: $path"
+        }
+    }
+
+    $backupDirectory = Join-Path $BackupRoot "physical-display-profile"
+    New-Item -ItemType Directory -Path $backupDirectory -Force | Out-Null
+    $records = @()
+    foreach ($path in $paths) {
+        $previous = Get-FnvxrProductFileIdentity -Path $path
+        $backup = Join-Path $backupDirectory (
+            Split-Path -Leaf $path)
+        Copy-Item -LiteralPath $path -Destination $backup -Force
+        $backupIdentity = Get-FnvxrProductFileIdentity -Path $backup
+        if ($backupIdentity.sha256 -cne $previous.sha256) {
+            throw "Physical display-profile backup hash mismatch: $path -> $backup"
+        }
+        $records += [pscustomobject][ordered]@{
+            path = [System.IO.Path]::GetFullPath($path)
+            previous = $previous
+            backup = $backup
+            staged = $null
+            changed = $false
+        }
+    }
+
+    try {
+        foreach ($record in $records) {
+            $sourceText = [System.IO.File]::ReadAllText(
+                [string]$record.path)
+            $expectedText =
+                ConvertTo-FnvxrProductPhysicalDisplayIniText `
+                    -Text $sourceText `
+                    -Width $Width `
+                    -Height $Height
+            $expectedSha256 =
+                Get-FnvxrProductStringSha256 -Value $expectedText
+            $temporary = "{0}.fnvxr-display-{1}" -f
+                $record.path,
+                $RunId
+            try {
+                if (Test-Path -LiteralPath $temporary -PathType Leaf) {
+                    Remove-Item -LiteralPath $temporary -Force
+                }
+                [System.IO.File]::WriteAllText(
+                    $temporary,
+                    $expectedText,
+                    [System.Text.ASCIIEncoding]::new())
+                $temporaryIdentity =
+                    Get-FnvxrProductFileIdentity -Path $temporary
+                if ($temporaryIdentity.sha256 -cne $expectedSha256) {
+                    throw "Physical display-profile temporary hash mismatch: $temporary"
+                }
+                Move-Item `
+                    -LiteralPath $temporary `
+                    -Destination ([string]$record.path) `
+                    -Force
+            } finally {
+                if (Test-Path -LiteralPath $temporary -PathType Leaf) {
+                    Remove-Item -LiteralPath $temporary -Force
+                }
+            }
+            $record.staged = Get-FnvxrProductFileIdentity `
+                -Path ([string]$record.path)
+            if ($record.staged.sha256 -cne $expectedSha256) {
+                throw "Physical display-profile staged hash mismatch: $($record.path)"
+            }
+            $record.changed =
+                $record.previous.sha256 -cne $record.staged.sha256
+        }
+    } catch {
+        foreach ($record in $records) {
+            if ($record.backup -and
+                (Test-Path -LiteralPath $record.backup -PathType Leaf)) {
+                Copy-Item `
+                    -LiteralPath $record.backup `
+                    -Destination ([string]$record.path) `
+                    -Force
+            }
+        }
+        throw
+    }
+
+    return [pscustomobject][ordered]@{
+        key = "physical-display-profile"
+        size = $size
+        records = $records
+        stagedAtUtc = [DateTime]::UtcNow.ToString("o")
+    }
+}
+
+function Restore-FnvxrProductPhysicalDisplayProfile {
+    param([Parameter(Mandatory = $true)]$Record)
+
+    $restored = @()
+    foreach ($item in @($Record.records)) {
+        if (-not $item.backup -or
+            -not (Test-Path -LiteralPath ([string]$item.backup) -PathType Leaf)) {
+            throw "Physical display-profile backup is missing: $($item.path)"
+        }
+        $backupIdentity =
+            Get-FnvxrProductFileIdentity -Path ([string]$item.backup)
+        if ($backupIdentity.sha256 -cne $item.previous.sha256) {
+            throw "Physical display-profile backup changed before restore: $($item.backup)"
+        }
+        Copy-Item `
+            -LiteralPath ([string]$item.backup) `
+            -Destination ([string]$item.path) `
+            -Force
+        $identity =
+            Get-FnvxrProductFileIdentity -Path ([string]$item.path)
+        if ($identity.sha256 -cne $item.previous.sha256) {
+            throw "Physical display-profile restore hash mismatch: $($item.path)"
+        }
+        $restored += $identity
+    }
+    return $restored
+}
+
 function Get-FnvxrProductRetailVisualTrialPluginNames {
     # This is the exact official-master order recorded in the approved
     # FNVXR_StereoTest NVSE sidecar.  It intentionally excludes TTW/Fallout 3
@@ -1261,6 +1490,54 @@ function Resolve-FnvxrProductHeadlessRuntimeManifest {
     }
 }
 
+function Resolve-FnvxrProductPhysicalRuntimeManifest {
+    param([Parameter(Mandatory = $true)][string]$ManifestPath)
+
+    if (-not (Test-Path -LiteralPath $ManifestPath -PathType Leaf)) {
+        throw "Physical OpenXR runtime manifest is missing: $ManifestPath"
+    }
+    $resolvedManifestPath = (Resolve-Path -LiteralPath $ManifestPath).Path
+    try {
+        $document = Get-Content -LiteralPath $resolvedManifestPath -Raw |
+            ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        throw "Physical OpenXR runtime manifest is not valid JSON: $resolvedManifestPath"
+    }
+    if (-not ($document.PSObject.Properties.Name -ccontains "file_format_version") -or
+        [string]$document.file_format_version -cne "1.0.0") {
+        throw "Physical OpenXR runtime manifest must use file_format_version 1.0.0: $resolvedManifestPath"
+    }
+    if (-not ($document.PSObject.Properties.Name -ccontains "runtime") -or
+        -not $document.runtime -or
+        -not ($document.runtime.PSObject.Properties.Name -ccontains "library_path") -or
+        [string]::IsNullOrWhiteSpace([string]$document.runtime.library_path)) {
+        throw "Physical OpenXR runtime manifest has no runtime.library_path: $resolvedManifestPath"
+    }
+
+    $declaredLibraryPath = [string]$document.runtime.library_path
+    $libraryPath = if ([System.IO.Path]::IsPathRooted($declaredLibraryPath)) {
+        $declaredLibraryPath
+    } else {
+        Join-Path (Split-Path -Parent $resolvedManifestPath) $declaredLibraryPath
+    }
+    if (-not (Test-Path -LiteralPath $libraryPath -PathType Leaf)) {
+        throw "Physical OpenXR runtime DLL is missing: $libraryPath"
+    }
+    $runtimeIdentity = Get-FnvxrProductFileIdentity -Path $libraryPath -RequirePe
+    if ($runtimeIdentity.peMachine -cne "0x8664") {
+        throw "Physical OpenXR runtime DLL is not x64: $($runtimeIdentity.path)"
+    }
+
+    return [pscustomobject][ordered]@{
+        selection = "process-local-environment-only"
+        headless = $false
+        registryMutationAuthorized = $false
+        manifest = Get-FnvxrProductFileIdentity -Path $resolvedManifestPath
+        declaredLibraryPath = $declaredLibraryPath
+        runtimeDll = $runtimeIdentity
+    }
+}
+
 function Resolve-FnvxrProductMetaXrOperatorLayer {
     param(
         [Parameter(Mandatory = $true)][string]$Root,
@@ -1818,6 +2095,9 @@ function Get-FnvxrProductMinimalEnvironment {
         [switch]$TtwFixture,
         [switch]$HeadsetDemoFixture,
         [switch]$HeadsetWorldOnlyCapture,
+        [switch]$PhysicalHeadsetPlay,
+        [ValidateRange(1280, 4096)][int]$PhysicalGameWidth = 1920,
+        [ValidateRange(720, 2560)][int]$PhysicalGameHeight = 1200,
         [ValidateRange(1, 1200)]
         [int]$HeadsetDemoGameplayWarmupFrames = 90,
         [ValidateSet(
@@ -1844,6 +2124,7 @@ function Get-FnvxrProductMinimalEnvironment {
         [ValidateSet("FNVXR_StereoTest")]
         [string]$AutomateRecoverySaveName = "FNVXR_StereoTest",
         [string]$HeadlessRuntimeManifest = "",
+        [string]$PhysicalRuntimeManifest = "",
         [string]$HeadsetMirrorCaptureDirectory = "",
         [ValidateRange(1, 600)][int]$HeadsetMirrorCaptureEveryFrames = 6,
         [ValidateRange(1, 3600)][int]$HeadsetMirrorCaptureMaxPairs = 180,
@@ -1868,6 +2149,25 @@ function Get-FnvxrProductMinimalEnvironment {
     if ($headsetFixtureVisualTrial -and -not $AutomateRetailFixture) {
         throw "The headset fixture visual trial requires the owned retail-fixture automation."
     }
+    if ($PhysicalHeadsetPlay -and -not $AutomateRetailFixture) {
+        throw "Physical headset play requires an owned retail-fixture load."
+    }
+    if ($PhysicalHeadsetPlay -and $headsetFixtureVisualTrial) {
+        throw "Physical headset play and headless headset visual trials are mutually exclusive."
+    }
+    if ($PhysicalHeadsetPlay -and
+        [string]::IsNullOrWhiteSpace($PhysicalRuntimeManifest)) {
+        throw "Physical headset play requires a process-local physical OpenXR runtime manifest."
+    }
+    if ($PhysicalHeadsetPlay) {
+        Assert-FnvxrProductPhysicalDisplaySize `
+            -Width $PhysicalGameWidth `
+            -Height $PhysicalGameHeight | Out-Null
+    }
+    if (-not [string]::IsNullOrWhiteSpace($HeadlessRuntimeManifest) -and
+        -not [string]::IsNullOrWhiteSpace($PhysicalRuntimeManifest)) {
+        throw "Headless and physical OpenXR runtime manifests are mutually exclusive."
+    }
     if ($RetailVrAccumulationDiagnosticMode -cne "Full" -and
         -not $HeadsetDemoFixture) {
         throw "The retail VR accumulation diagnostic mode requires the bounded headset demo."
@@ -1876,21 +2176,30 @@ function Get-FnvxrProductMinimalEnvironment {
         throw "The TTW fixture family requires the owned fixture automation."
     }
     if ($AutomateRetailFixture -and -not $headsetFixtureVisualTrial -and
+        -not $PhysicalHeadsetPlay -and
         -not [string]::IsNullOrWhiteSpace($HeadsetMirrorCaptureDirectory)) {
         throw "The isolated retail fixture profile cannot capture a headset mirror."
     }
 
-    $runProfile = if ($AutomateRetailFixture -and -not $headsetFixtureVisualTrial) {
+    $runProfile = if ($AutomateRetailFixture -and
+        -not $headsetFixtureVisualTrial -and
+        -not $PhysicalHeadsetPlay) {
         if ($TtwFixture) { "ttw-fixture-v1" } else { "retail-fixture-v1" }
+    } elseif ($PhysicalHeadsetPlay) {
+        "retail-vr-play-v1"
     } else {
         "stereo-visual-trial-v5"
     }
-    $hostMode = if ($AutomateRetailFixture -and -not $headsetFixtureVisualTrial) {
+    $hostMode = if ($AutomateRetailFixture -and
+        -not $headsetFixtureVisualTrial -and
+        -not $PhysicalHeadsetPlay) {
         if ($TtwFixture) { "ttw-fixture" } else { "retail-fixture" }
     } else {
         "vr"
     }
-    $engineCenterStereo = if ($AutomateRetailFixture -and -not $headsetFixtureVisualTrial) {
+    $engineCenterStereo = if ($AutomateRetailFixture -and
+        -not $headsetFixtureVisualTrial -and
+        -not $PhysicalHeadsetPlay) {
         "0"
     } else {
         "1"
@@ -1912,8 +2221,57 @@ function Get-FnvxrProductMinimalEnvironment {
     # The isolated fixture runner has no OpenXR route.  The separately opted-in
     # headset demo still uses the normal visual-trial host, so retain the
     # loader hint for that one bounded recording route.
-    if (-not $AutomateRetailFixture -or $headsetFixtureVisualTrial) {
+    if (-not $AutomateRetailFixture -or
+        $headsetFixtureVisualTrial -or
+        $PhysicalHeadsetPlay) {
         $environment.FNVXR_OPENXR_LOADER_HINT = $OpenXrLoaderPath
+    }
+    if ($PhysicalHeadsetPlay) {
+        # Interactive input is consumed directly by the exact-retail xNVSE
+        # game-thread bridge. The shipping XInput/DirectInput DLL shims remain
+        # transparent and are not granted production mutation authority.
+        $environment.FNVXR_PHYSICAL_HEADSET_PLAY = "1"
+        $environment.FNVXR_EXTERNAL_XINPUT_WRITER = "1"
+        $environment.FNVXR_EXTERNAL_DINPUT_WRITER = "1"
+        $environment.FNVXR_PLUGIN_KEYBOARD_MOVEMENT_ENABLE = "1"
+        $environment.FNVXR_PLUGIN_MOVEMENT_DEADZONE = "9000"
+        $environment.FNVXR_PLUGIN_MENU_KEYBOARD_FALLBACK = "1"
+        $environment.FNVXR_PLUGIN_GAMEPLAY_KEYBOARD_FALLBACK = "1"
+        $environment.FNVXR_PLUGIN_ACCEPT_ON_EXTERNAL_DINPUT_CLICK = "1"
+        $environment.FNVXR_XINPUT_PHYSICAL_MENU_BUTTONS_ENABLE = "1"
+        $environment.FNVXR_L3_MENU_FALLBACK = "1"
+        $environment.FNVXR_RIGHT_STICK_KEY_TURN = "1"
+        $environment.FNVXR_GAMEPLAY_RIGHT_GRIP_GRAB_ENABLE = "1"
+        $environment.FNVXR_DIRECT_UI_CLICK = "0"
+        $environment.FNVXR_UI_SHARED_WIDTH = "1280"
+        $environment.FNVXR_UI_SHARED_HEIGHT = "720"
+        $environment.FNVXR_UI_INPUT_WIDTH =
+            [string]$PhysicalGameWidth
+        $environment.FNVXR_UI_INPUT_HEIGHT =
+            [string]$PhysicalGameHeight
+        $environment.FNVXR_GAME_TEXTURE_WIDTH =
+            [string]$PhysicalGameWidth
+        $environment.FNVXR_GAME_TEXTURE_HEIGHT =
+            [string]$PhysicalGameHeight
+
+        # The engine-center camera transaction owns the complete OpenXR
+        # yaw/pitch/roll plus translation. Disable every 2D mouse-look lane so
+        # pitch cannot be duplicated, filtered away, or applied on another
+        # frame.
+        $environment.FNVXR_D3D9_NATIVE_APPLY_HEAD_ROTATION = "1"
+        $environment.FNVXR_D3D9_NATIVE_HEAD_AXIS_MODE =
+            "openxr-camera-local"
+        $environment.FNVXR_D3D9_USE_SHARED_CAMERA_VIEW = "0"
+        $environment.FNVXR_D3D9_APPLY_HMD_POSE = "0"
+        $environment.FNVXR_HEADSPACE_LOOK_ENABLE = "0"
+        $environment.FNVXR_HANDSPACE_LOOK_ENABLE = "0"
+        $environment.FNVXR_GYRO_AIM_ENABLE = "0"
+        $environment.FNVXR_DINPUT_HEAD_LOOK_ENABLE = "0"
+        $environment.FNVXR_DINPUT_HANDSPACE_LOOK_ENABLE = "0"
+        $environment.FNVXR_DINPUT_GYRO_AIM_ENABLE = "0"
+        $environment.FNVXR_DINPUT_RIGHT_STICK_LOOK_ENABLE = "0"
+        $environment.FNVXR_DINPUT_RIGHT_STICK_PITCH_ENABLE = "0"
+        $environment.FNVXR_XINPUT_RIGHT_STICK_Y_ENABLE = "0"
     }
     if ($AutomateRecoveryLoad) {
         # This opt-in does not enable the general command or input bridge.
@@ -2005,6 +2363,11 @@ function Get-FnvxrProductMinimalEnvironment {
             Join-Path $RunDirectory "openxr-simulator"
         $environment.OPENXR_SIMULATOR_LOG_PATH =
             Join-Path $RunDirectory "openxr-simulator.log"
+    }
+    if (-not [string]::IsNullOrWhiteSpace($PhysicalRuntimeManifest)) {
+        # A physical runtime receives only the standard process-local loader
+        # override. Simulator-only headless/data/log variables are absent.
+        $environment.XR_RUNTIME_JSON = $PhysicalRuntimeManifest
     }
     if (-not [string]::IsNullOrWhiteSpace($HeadsetMirrorCaptureDirectory)) {
         $environment.FNVXR_HMD_MIRROR_CAPTURE_DIR = $HeadsetMirrorCaptureDirectory

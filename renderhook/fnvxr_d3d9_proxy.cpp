@@ -994,9 +994,24 @@ bool retailVrVisualTrialRequested()
         readRawEnvBool("FNVXR_SHOW_GAME_PLANE_ON_STEREO_LOSS", false),
         readRawEnvBool("FNVXR_STEREO_FALLBACK_MONO_FULLSCREEN", false),
     };
+    const fnvxr::d3d9::RetailVrPhysicalPlayRequest playRequest {
+        runProfileIs("retail-vr-play-v1"),
+        readRawEnvBool("FNVXR_PHYSICAL_HEADSET_PLAY", false),
+        request.engineCenterStereoRequested,
+        request.stereoWorldDisabled,
+        request.legacyImageDiagnosticsRequested,
+        request.retainedStereoGameTexturesRequested,
+        request.unprovenColorOnlyStereoDiagnosticRequested,
+        request.allowStereoWorld2dFallback,
+        request.showGamePlaneOnStereoLoss,
+        request.stereoFallbackMonoFullscreen,
+    };
     return fnvxr::d3d9::retailVrVisualTrialAuthorized(
-        fnvxr::d3d9::CompiledRetailVrBridgePolicy,
-        request);
+               fnvxr::d3d9::CompiledRetailVrBridgePolicy,
+               request)
+        || fnvxr::d3d9::retailVrPhysicalPlayAuthorized(
+               fnvxr::d3d9::CompiledRetailVrBridgePolicy,
+               playRequest);
 }
 
 bool rockSolidProfile()
@@ -9392,6 +9407,18 @@ void __cdecl retailVrAfterStockRenderAdapter() noexcept
         const bool firstStereoCompletion =
             diagnostics.stereoCompleteCount != 0u
             && lastLoggedStereoComplete == 0u;
+        // Retain a low-rate sequence of successful camera transactions for
+        // rendered 6DOF verification. Dispatch-periodic samples frequently
+        // land on rejected non-world callbacks, so a single first-success
+        // record cannot prove that pitch, roll, and translation keep moving.
+        constexpr std::uint64_t StereoCompletionProofInterval = 24u;
+        const bool periodicStereoCompletion =
+            diagnostics.stereoCompleteCount != 0u
+            && diagnostics.stereoCompleteCount
+                != lastLoggedStereoComplete
+            && diagnostics.stereoCompleteCount
+                    % StereoCompletionProofInterval
+                == 0u;
         const std::uint32_t controllerFailure = static_cast<std::uint32_t>(
             diagnostics.controller.failure);
         const std::uint32_t controllerFailureBit = controllerFailure < 32u
@@ -9405,6 +9432,7 @@ void __cdecl retailVrAfterStockRenderAdapter() noexcept
         if (diagnostics.dispatchCount <= 3u
             || diagnostics.dispatchCount % 120u == 0u
             || firstStereoCompletion
+            || periodicStereoCompletion
             || firstControllerFailure)
         {
             const bool delivered =
@@ -9471,10 +9499,10 @@ void __cdecl retailVrAfterStockRenderAdapter() noexcept
             // verifier requires that exact order and transaction lineage; a
             // visually separated pair without the completed engine transaction
             // is never evidence of world stereo.
-            char event[1408] {};
+            char event[2048] {};
             sprintf_s(
                 event,
-                "{\"event\":\"fnvxrRetailEngineCenterFrame\",\"dispatch\":%llu,\"dispatchMilliseconds\":%.3f,\"controllerFailure\":%u,\"disposition\":%u,\"transaction\":%llu,\"centerFailure\":%u,\"rendererFailure\":%u,\"visibilityFailure\":%u,\"visibilityCaptured\":%s,\"visibilitySealedItems\":%u,\"visibilityQueueSafeItems\":%u,\"visibilityImmediateRejected\":%u,\"visibilityAccumulatorMode\":%u,\"snapshotFailure\":%u,\"snapshotCaptured\":%s,\"snapshotRendererRefs\":%u,\"snapshotRenderingRefs\":%u,\"snapshotRenderingRetained\":%s,\"eyeCameraFailure\":%u,\"rendererComplete\":%s,\"visible\":%u,\"visibleSetGeneration\":%llu,\"producerMode\":%u,\"delivered\":%s,\"stereoComplete\":%llu}",
+                "{\"event\":\"fnvxrRetailEngineCenterFrame\",\"dispatch\":%llu,\"dispatchMilliseconds\":%.3f,\"controllerFailure\":%u,\"disposition\":%u,\"transaction\":%llu,\"centerFailure\":%u,\"rendererFailure\":%u,\"visibilityFailure\":%u,\"visibilityCaptured\":%s,\"visibilitySealedItems\":%u,\"visibilityQueueSafeItems\":%u,\"visibilityImmediateRejected\":%u,\"visibilityAccumulatorMode\":%u,\"snapshotFailure\":%u,\"snapshotCaptured\":%s,\"snapshotRendererRefs\":%u,\"snapshotRenderingRefs\":%u,\"snapshotRenderingRetained\":%s,\"eyeCameraFailure\":%u,\"rendererComplete\":%s,\"visible\":%u,\"visibleSetGeneration\":%llu,\"producerMode\":%u,\"cameraPoseValid\":%s,\"hmdRot\":[%.9g,%.9g,%.9g,%.9g],\"hmdPos\":[%.9g,%.9g,%.9g],\"centerForward\":[%.9g,%.9g,%.9g],\"centerUp\":[%.9g,%.9g,%.9g],\"centerTranslation\":[%.9g,%.9g,%.9g],\"centerOffsetFromStock\":[%.9g,%.9g,%.9g],\"delivered\":%s,\"stereoComplete\":%llu}",
                 static_cast<unsigned long long>(diagnostics.dispatchCount),
                 dispatchMilliseconds,
                 static_cast<unsigned>(diagnostics.controller.failure),
@@ -9510,6 +9538,31 @@ void __cdecl retailVrAfterStockRenderAdapter() noexcept
                     diagnostics.renderer.renderer.visibleSetGeneration),
                 static_cast<unsigned>(
                     fnvxr::shared::StereoProducerEngineCenter),
+                diagnostics.renderer.cameraPose.valid
+                    ? "true"
+                    : "false",
+                diagnostics.eyeCamera.hmdRot[0],
+                diagnostics.eyeCamera.hmdRot[1],
+                diagnostics.eyeCamera.hmdRot[2],
+                diagnostics.eyeCamera.hmdRot[3],
+                diagnostics.eyeCamera.hmdPos[0],
+                diagnostics.eyeCamera.hmdPos[1],
+                diagnostics.eyeCamera.hmdPos[2],
+                -diagnostics.renderer.cameraPose.center.rotation[2],
+                -diagnostics.renderer.cameraPose.center.rotation[5],
+                -diagnostics.renderer.cameraPose.center.rotation[8],
+                diagnostics.renderer.cameraPose.center.rotation[1],
+                diagnostics.renderer.cameraPose.center.rotation[4],
+                diagnostics.renderer.cameraPose.center.rotation[7],
+                diagnostics.renderer.cameraPose.center.translation[0],
+                diagnostics.renderer.cameraPose.center.translation[1],
+                diagnostics.renderer.cameraPose.center.translation[2],
+                diagnostics.renderer.cameraPose.center.translation[0]
+                    - diagnostics.eyeCamera.stockWorld.translation[0],
+                diagnostics.renderer.cameraPose.center.translation[1]
+                    - diagnostics.eyeCamera.stockWorld.translation[1],
+                diagnostics.renderer.cameraPose.center.translation[2]
+                    - diagnostics.eyeCamera.stockWorld.translation[2],
                 delivered ? "true" : "false",
                 static_cast<unsigned long long>(
                     diagnostics.stereoCompleteCount));

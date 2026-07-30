@@ -168,6 +168,13 @@ constexpr std::uint32_t RuntimeBlockingMenuBits =
     | RuntimePipBoyMenuBit
     | RuntimeGenericMenuBit;
 
+enum class RuntimeControllerMode : std::uint32_t
+{
+    Unknown = 0u,
+    Ui = 1u,
+    Gameplay = 2u,
+};
+
 inline bool runtimeLoadingMenuBlocksInput(bool rawLoadingVisible, bool actionableMenuVisible)
 {
     return rawLoadingVisible && !actionableMenuVisible;
@@ -189,6 +196,46 @@ inline bool runtimeGameplayPhase(std::uint32_t phase, std::uint32_t menuBits, st
 inline bool runtimeUiActive(std::uint32_t phase, std::uint32_t menuBits, std::uint32_t showroomActive)
 {
     return !runtimeGameplayPhase(phase, menuBits, showroomActive);
+}
+
+// Controller mutation has one authoritative tri-state contract shared by the
+// OpenXR publisher and the exact-retail xNVSE consumer. Loading, stale reads,
+// non-actionable MenuMode-only frames, showroom frames, and camera-less
+// startup frames are deliberately Unknown so neither UI nor gameplay actions
+// can leak across a transition.
+inline RuntimeControllerMode runtimeControllerMode(
+    std::uint32_t phase,
+    std::uint32_t menuBits,
+    std::uint32_t showroomActive,
+    bool cameraActive,
+    bool fresh)
+{
+    if (!fresh)
+        return RuntimeControllerMode::Unknown;
+    if (phase == RuntimePhaseMenu
+        && runtimeUiInputAllowed(menuBits)
+        && showroomActive == 0u)
+    {
+        return RuntimeControllerMode::Ui;
+    }
+    if (cameraActive
+        && runtimeGameplayPhase(phase, menuBits, showroomActive))
+    {
+        return RuntimeControllerMode::Gameplay;
+    }
+    return RuntimeControllerMode::Unknown;
+}
+
+inline const char* runtimeControllerModeName(
+    RuntimeControllerMode mode) noexcept
+{
+    switch (mode)
+    {
+        case RuntimeControllerMode::Unknown: return "unknown";
+        case RuntimeControllerMode::Ui: return "ui";
+        case RuntimeControllerMode::Gameplay: return "gameplay";
+    }
+    return "invalid";
 }
 
 constexpr std::uint32_t PlayerSharedFlagPlayerNodeValid = 1u << 0;

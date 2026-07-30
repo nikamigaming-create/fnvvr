@@ -21,9 +21,11 @@ int main()
     using fnvxr::d3d9::ProductionRendererAuthorized;
     using fnvxr::d3d9::ProductionRendererProof;
     using fnvxr::d3d9::RetailVrBridgePolicy;
+    using fnvxr::d3d9::RetailVrPhysicalPlayRequest;
     using fnvxr::d3d9::RetailVrVisualTrialRequest;
     using fnvxr::d3d9::interpositionPolicy;
     using fnvxr::d3d9::productionRendererAuthorized;
+    using fnvxr::d3d9::retailVrPhysicalPlayAuthorized;
     using fnvxr::d3d9::retailVrVisualTrialAuthorized;
 
     if (ProductionRendererAuthorized
@@ -81,6 +83,33 @@ int main()
         || CompiledInterpositionPolicy.patchDeviceVtable)
     {
         return fail("visual-trial authority must not authorize the legacy interposer");
+    }
+
+    const RetailVrPhysicalPlayRequest physicalPlay {
+        true,
+        true,
+        true,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+    };
+    if (!retailVrPhysicalPlayAuthorized(
+            CompiledRetailVrBridgePolicy,
+            physicalPlay))
+    {
+        return fail("the explicit physical-play profile did not authorize the bounded engine-center renderer");
+    }
+    RetailVrPhysicalPlayRequest missingPlayOptIn = physicalPlay;
+    missingPlayOptIn.physicalHeadsetPlayRequested = false;
+    if (retailVrPhysicalPlayAuthorized(
+            CompiledRetailVrBridgePolicy,
+            missingPlayOptIn))
+    {
+        return fail("the physical-play renderer authorized without its independent opt-in");
     }
 
     const std::array<RetailVrVisualTrialRequest, 9> rejectedRequests {{

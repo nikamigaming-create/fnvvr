@@ -28,12 +28,14 @@ $buildPath = Join-Path $SourceRoot "scripts\build-fnvxr-product.ps1"
 $commonPath = Join-Path $SourceRoot "scripts\fnvxr-product-common.ps1"
 $hostSourcePath = Join-Path $SourceRoot "host\fnvxr_openxr_pose_host.cpp"
 $pluginSourcePath = Join-Path $SourceRoot "plugin\fnvxr_nvse_plugin.cpp"
+$d3d9SourcePath = Join-Path $SourceRoot "renderhook\fnvxr_d3d9_proxy.cpp"
 $launcher = Get-Content -LiteralPath $launcherPath -Raw
 $fixtureLauncher = Get-Content -LiteralPath $fixtureLauncherPath -Raw
 $builder = Get-Content -LiteralPath $buildPath -Raw
 $common = Get-Content -LiteralPath $commonPath -Raw
 $hostSource = Get-Content -LiteralPath $hostSourcePath -Raw
 $pluginSource = Get-Content -LiteralPath $pluginSourcePath -Raw
+$d3d9Source = Get-Content -LiteralPath $d3d9SourcePath -Raw
 
 $documentsPath = Get-FnvxrProductDocumentsPath
 if ([string]::IsNullOrWhiteSpace($documentsPath) -or
@@ -770,8 +772,11 @@ if (-not $hostSource.Contains('envInt("FNVXR_SESSION_READY_TIMEOUT_SECONDS", 45)
 
 foreach ($cliOnlyContract in @(
     '[string]$HeadlessSimulatorManifest = ""',
+    '[string]$PhysicalRuntimeManifest = ""',
+    '[switch]$PhysicalHeadsetPlay',
     'if (Test-FnvxrProductProcessElevated)',
     'Resolve-FnvxrProductHeadlessRuntimeManifest',
+    'Resolve-FnvxrProductPhysicalRuntimeManifest',
     'selection = "process-local-environment-only"',
     'registryMutationAuthorized = $false',
     'Assert-FnvxrProductHklmActiveRuntimeUnchanged',
@@ -794,6 +799,7 @@ foreach ($cliOnlyContract in @(
     'hklmActiveRuntimeUnchanged = $true',
     'runtimeLogIdentity',
     'Headless OpenXR runtime manifest or DLL changed after validation.',
+    'Physical OpenXR runtime manifest or DLL changed after validation.',
     'function Wait-FnvxrProductStartMenuForRecoveryLoad',
     'function Wait-FnvxrProductLoadedGameplay',
     'function Invoke-FnvxrProductFreshCharacter',
@@ -854,6 +860,11 @@ if ([regex]::Matches(
         [regex]::Escape('-HeadlessRuntimeManifest $headlessRuntimeManifestPath')).Count -ne 2) {
     throw "Validated process-local runtime manifest must feed validation metadata and the live child environment."
 }
+if ([regex]::Matches(
+        $launcher,
+        [regex]::Escape('-PhysicalRuntimeManifest $physicalRuntimeManifestPath')).Count -ne 2) {
+    throw "Validated physical runtime manifest must feed validation metadata and the live child environment."
+}
 $recoveryAutomationSubmit = $launcher.LastIndexOf('Invoke-FnvxrProductFixedRecoveryLoad `')
 $freshCharacterAutomationSubmit = $launcher.LastIndexOf('Invoke-FnvxrProductFreshCharacter `')
 $automationGameplayGate = $launcher.LastIndexOf('Wait-FnvxrProductLoadedGameplay `')
@@ -883,10 +894,12 @@ foreach ($headsetDemoContract in @(
     'Get-FnvxrProductHeadsetMirrorCaptureProof',
     '$left.Name -replace ''_left\.png$'', ''_right.png''',
     'Get-FnvxrProductStereoContinuityProof',
+    'Get-FnvxrProductRetailCameraPoseSweepProof',
     'invoke-openxr-simulator-head-sweep.ps1',
-    '$manifest.headsetPoseSweep.status = "complete-centered"',
+    '"rendered-six-dof-proven-centered"',
+    'pitchCameraResponseProven',
     'Wait-FnvxrProductRetailFixtureGameplay',
-    'retailFixtureRequested -and -not $headsetFixtureVisualTrial',
+    'retailFixtureRequested -and -not $headsetFixtureOpenXrRun',
     'No final-headset Pip-Boy UI frame reached OpenXR',
     'FNVXR_HEADSET_DEMO_FIXTURE',
     'FNVXR_HEADSET_WORLD_ONLY_CAPTURE')) {
@@ -894,6 +907,101 @@ foreach ($headsetDemoContract in @(
             $common.Contains($headsetDemoContract))) {
         throw "Product launcher lost headset demo/recording contract: $headsetDemoContract"
     }
+}
+foreach ($physicalPlayContract in @(
+    'retail-vr-play-v1',
+    'physical-headset-interactive-play',
+    '[ValidateRange(1280, 4096)][int]$PhysicalGameWidth = 1920',
+    '[ValidateRange(720, 2560)][int]$PhysicalGameHeight = 1200',
+    'FNVXR_PHYSICAL_HEADSET_PLAY = "1"',
+    'FNVXR_PLUGIN_KEYBOARD_MOVEMENT_ENABLE = "1"',
+    'FNVXR_PLUGIN_MENU_KEYBOARD_FALLBACK = "1"',
+    'FNVXR_PLUGIN_GAMEPLAY_KEYBOARD_FALLBACK = "1"',
+    'FNVXR_UI_INPUT_WIDTH',
+    'FNVXR_UI_INPUT_HEIGHT',
+    'FNVXR_D3D9_NATIVE_APPLY_HEAD_ROTATION = "1"',
+    'FNVXR_HEADSPACE_LOOK_ENABLE = "0"',
+    'Install-FnvxrProductPhysicalDisplayProfile',
+    'Restore-FnvxrProductPhysicalDisplayProfile',
+    'Get-FnvxrProductPhysicalDisplayOutputProof',
+    '"fnvxrRetailEngineCenterCpuStereo"',
+    'live-source-resolution-proven',
+    'Get-FnvxrProductControllerAuthorizationProof',
+    'controllerConsumerAcknowledged',
+    'runtimeControllerMode(',
+    'controller mode transition',
+    'releaseBeforePress=1',
+    'StereoCompletionProofInterval = 24u',
+    'periodicStereoCompletion',
+    '$manifest.controllerMutationAuthorized = $true',
+    'The exact-retail xNVSE controller consumer never acknowledged')) {
+    if (-not ($launcher.Contains($physicalPlayContract) -or
+            $common.Contains($physicalPlayContract) -or
+            $pluginSource.Contains($physicalPlayContract) -or
+            $hostSource.Contains($physicalPlayContract) -or
+            $d3d9Source.Contains($physicalPlayContract))) {
+        throw "Product launcher lost physical-headset play contract: $physicalPlayContract"
+    }
+}
+$physicalDisplayIni = @"
+[General]
+iSize W=640
+[Display]
+iSize W=800
+iSize H=600
+[Other]
+iSize H=1
+"@
+$physicalDisplayIni = ConvertTo-FnvxrProductPhysicalDisplayIniText `
+    -Text $physicalDisplayIni `
+    -Width 1920 `
+    -Height 1200
+if (([regex]::Matches(
+        $physicalDisplayIni,
+        '(?im)^\s*iSize W\s*=')).Count -ne 1 -or
+    ([regex]::Matches(
+        $physicalDisplayIni,
+        '(?im)^\s*iSize H\s*=')).Count -ne 1 -or
+    $physicalDisplayIni -notmatch '(?im)^\s*iSize W\s*=\s*1920\s*$' -or
+    $physicalDisplayIni -notmatch '(?im)^\s*iSize H\s*=\s*1200\s*$') {
+    throw "Physical display-profile INI conversion did not produce one exact staged resolution."
+}
+Require-Throws -Fragment "aspect" -Action {
+    Assert-FnvxrProductPhysicalDisplaySize `
+        -Width 1280 `
+        -Height 1100
+}
+$poseProofLog = [System.IO.Path]::GetTempFileName()
+try {
+    $poseProofFunction = [regex]::Match(
+        $launcher,
+        '(?s)function Get-FnvxrProductRetailCameraPoseSweepProof \{.*?(?=function Get-FnvxrProductStereoContinuityProof)').Value
+    if ([string]::IsNullOrWhiteSpace($poseProofFunction)) {
+        throw "Could not isolate the rendered retail camera sweep verifier."
+    }
+    . ([scriptblock]::Create($poseProofFunction))
+    $poseProofLines = @(
+        [ordered]@{ event = "fnvxrRetailEngineCenterFrame"; transaction = 1; delivered = $true; cameraPoseValid = $true; hmdPos = @(-0.10, 1.64, -0.08); centerForward = @(-0.98, -0.20, -0.10); centerUp = @(-0.06, -0.03, 0.99); centerOffsetFromStock = @(-7.0, -5.0, -4.0) },
+        [ordered]@{ event = "fnvxrRetailEngineCenterFrame"; transaction = 2; delivered = $true; cameraPoseValid = $true; hmdPos = @(0.10, 1.76, 0.08); centerForward = @(-0.98, 0.20, 0.10); centerUp = @(0.06, 0.03, 0.99); centerOffsetFromStock = @(7.0, 5.0, 4.0) },
+        [ordered]@{ event = "fnvxrRetailEngineCenterFrame"; transaction = 3; delivered = $true; cameraPoseValid = $true; hmdPos = @(-0.08, 1.65, 0.07); centerForward = @(-0.99, -0.18, 0.09); centerUp = @(0.05, 0.02, 0.99); centerOffsetFromStock = @(-5.0, 4.0, 3.0) },
+        [ordered]@{ event = "fnvxrRetailEngineCenterFrame"; transaction = 4; delivered = $true; cameraPoseValid = $true; hmdPos = @(0.08, 1.75, -0.07); centerForward = @(-0.99, 0.18, -0.09); centerUp = @(-0.05, -0.02, 0.99); centerOffsetFromStock = @(5.0, -4.0, -3.0) }
+    ) | ForEach-Object {
+        $_ | ConvertTo-Json -Compress
+    }
+    [System.IO.File]::WriteAllLines(
+        $poseProofLog,
+        $poseProofLines,
+        [System.Text.UTF8Encoding]::new($false))
+    $poseProof =
+        Get-FnvxrProductRetailCameraPoseSweepProof `
+            -LogPath $poseProofLog
+    if (-not $poseProof -or
+        -not [bool]$poseProof.sixDofCameraResponseProven -or
+        -not [bool]$poseProof.pitchCameraResponseProven) {
+        throw "Rendered retail camera sweep proof did not recognize six-axis motion."
+    }
+} finally {
+    Remove-Item -LiteralPath $poseProofLog -Force -ErrorAction SilentlyContinue
 }
 $headsetDemoFunction = [regex]::Match(
     $pluginSource,
@@ -991,7 +1099,7 @@ if ([regex]::Matches($launcher, [regex]::Escape($sessionTimeoutBinding)).Count -
     throw "Product launcher must bind the validated readiness timeout into both validation metadata and the live host environment."
 }
 foreach ($trialBoundary in @(
-    'acceptanceScope = "stereo-visual-trial-only"',
+    '"stereo-visual-trial-only"',
     'fullProductAccepted = $false',
     'controllerMutationAuthorized = $false',
     'trackedWeaponAuthorized = $false',
