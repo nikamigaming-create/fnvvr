@@ -23,6 +23,7 @@ enum class RetailCenterRuntimeFailure : std::uint8_t
     InvalidFrame,
     StaleFrameGeneration,
     CameraPointerMismatch,
+    CullingProcessPointerMismatch,
     TrackedFrameRejected,
     StalePoseFrame,
     EyeCameraDerivationRejected,
@@ -45,6 +46,27 @@ struct RetailCenterRuntimeFrame
     RetailTrackedFrame tracked {};
     float gameUnitsPerMeter = 0.0f;
     std::uint64_t generation = 0u;
+    // The actual third cdecl argument at the audited AccumulateScene call.
+    // The global SceneGraph must name this exact already-prepared culler.
+    abi::RetailBSCullingProcessLayout* stockCullingProcess = nullptr;
+    // xNVSE's published first-person player root.  Geometry below this root
+    // may use NiAccumulator's immediate-dispatch path, which is one-shot per
+    // retail frame.  The private renderer uses this exact ancestry boundary
+    // to queue only view-model geometry independently for both eyes.
+    abi::RetailPointer32 firstPersonRootNode = 0u;
+};
+
+struct RetailCenterCameraPoseProof
+{
+    RetailNiTransformLayout center {};
+    RetailNiTransformLayout left {};
+    RetailNiTransformLayout right {};
+    // The origin is part of the same accepted tracked frame as the derived
+    // cameras.  Retain it with the transaction proof so post-run evidence can
+    // distinguish a clean relatch from a stale camera result.
+    RetailVrOrigin origin {};
+    bool originRelatched = false;
+    bool valid = false;
 };
 
 struct RetailCenterRuntimeFrameResult
@@ -54,12 +76,20 @@ struct RetailCenterRuntimeFrameResult
     RetailCenterRuntimeFailure failure =
         RetailCenterRuntimeFailure::RuntimeNotReady;
     CenterRendererResult renderer {};
+    RetailCenterCameraPoseProof cameraPose {};
+    // The post-world RenderFirstPerson continuation must reuse this exact
+    // accepted rig. Re-deriving from a later pose would put a weapon in a
+    // different eye frame than the world it is composited into.
+    RetailDerivedEyeCameraRig cameraRig {};
 };
 
-// Owns the private camera/culler/accumulators and turns a proven retail world
-// hook invocation into one conservative cull plus two engine renders. Gameplay
-// failures never fall back to a flat world. The original function is admitted
-// only for the explicitly allowed menu/dialogue/Pip-Boy scene-graph mode.
+// Owns the private cameras and accumulators and turns a proven retail world
+// hook invocation into one conservative cull plus two engine renders. The
+// cull itself deliberately uses the already-prepared stock SceneGraph culler:
+// a constructor-fresh culler lacks the retail renderer's per-frame setup.
+// Gameplay failures never fall back to a flat world. UI routing is decided by
+// the authenticated tracked runtime state before this world-only runtime is
+// called.
 template <std::size_t CollectorCapacity>
 class RetailCenterStereoRuntime final
 {
@@ -107,6 +137,8 @@ public:
         if (!mRendererContext.initialize(
                 resolution.calls,
                 *mResources.collectorBinding(),
+                *mResources.leftAccumulator(),
+                verifiedCullerVtable,
                 targets))
         {
             mResources = {};
@@ -129,6 +161,7 @@ public:
         mLastPoseFrame = 0u;
         mLastPoseSequence = 0;
         mOrigin = {};
+        mEyeCameraFailure = RetailEyeCameraFailure::None;
         mFailure = RetailCenterRuntimeFailure::None;
         mInitialized = true;
         return true;
@@ -140,10 +173,7 @@ public:
     {
         if (!mInitialized || !mResources.valid())
             return fail(RetailCenterRuntimeFailure::RuntimeNotReady);
-        if (!mRendererContext.initialize(
-                calls,
-                *mResources.collectorBinding(),
-                targets))
+        if (!mRendererContext.rebind(calls, targets))
         {
             return fail(RetailCenterRuntimeFailure::RendererOperationsRejected);
         }
@@ -177,9 +207,51 @@ public:
         return mEyeCameraFailure;
     }
 
+    const RetailCenterVisibilityDiagnostics& visibilityDiagnostics() const
+        noexcept
+    {
+        return mRendererContext.visibilityDiagnostics();
+    }
+
+    const RetailCenterAccumulatorSnapshotDiagnostics&
+    accumulatorSnapshotDiagnostics() const noexcept
+    {
+        return mRendererContext.accumulatorSnapshotDiagnostics();
+    }
+
+    const RetailCenterEyeCameraDiagnostics& eyeCameraDiagnostics() const
+        noexcept
+    {
+        return mRendererContext.eyeCameraDiagnostics();
+    }
+
+    const RetailCenterRendererTimingDiagnostics& timingDiagnostics() const
+        noexcept
+    {
+        return mRendererContext.timingDiagnostics();
+    }
+
     const Resources& resources() const noexcept
     {
         return mResources;
+    }
+
+    bool beginStockCullerCapture(
+        abi::RetailBSCullingProcessLayout* culler) noexcept
+    {
+        return ready() && mRendererContext.beginStockCullerCapture(culler);
+    }
+
+    bool finishStockCullerCapture(
+        abi::RetailBSCullingProcessLayout* culler) noexcept
+    {
+        return ready() && mRendererContext.finishStockCullerCapture(culler);
+    }
+
+    bool setRendererDiagnosticStop(
+        RetailCenterRendererDiagnosticStop stop) noexcept
+    {
+        return ready() && mRendererContext.setDiagnosticStop(stop);
     }
 
     RetailCenterRuntimeFrameResult renderWorld(
@@ -196,15 +268,6 @@ public:
             || frame.generation == 0u)
         {
             return reject(RetailCenterRuntimeFailure::InvalidFrame);
-        }
-        if (frame.sceneGraph->isMenuSceneGraph != 0u)
-        {
-            mFailure = RetailCenterRuntimeFailure::None;
-            return {
-                RetailWorldHookDisposition::CallOriginalForUi,
-                RetailCenterRuntimeFailure::None,
-                {},
-            };
         }
         if (frame.generation <= mLastFrameGeneration)
         {
@@ -233,6 +296,23 @@ public:
             return reject(RetailCenterRuntimeFailure::StalePoseFrame);
         }
 
+        const std::uintptr_t stockCullerAddress =
+            reinterpret_cast<std::uintptr_t>(frame.stockCullingProcess);
+        if (!frame.stockCullingProcess
+            || stockCullerAddress
+                > (std::numeric_limits<abi::RetailPointer32>::max)()
+            || frame.sceneGraph->cullingProcess
+                != static_cast<abi::RetailPointer32>(stockCullerAddress))
+        {
+            return reject(
+                RetailCenterRuntimeFailure::CullingProcessPointerMismatch);
+        }
+        if (frame.stockCullingProcess == mResources.cullingProcess())
+        {
+            return reject(
+                RetailCenterRuntimeFailure::CullingProcessPointerMismatch);
+        }
+
         const RetailVrOriginCandidate originCandidate =
             prepareRetailVrOriginCandidate(mOrigin, frame.tracked);
         if (!originCandidate.complete())
@@ -252,6 +332,14 @@ public:
             return reject(
                 RetailCenterRuntimeFailure::EyeCameraDerivationRejected);
         }
+        const RetailCenterCameraPoseProof cameraPose {
+            cameraRig.center.world,
+            cameraRig.left.world,
+            cameraRig.right.world,
+            originCandidate.origin,
+            originCandidate.relatched,
+            true,
+        };
 
         const RetailPrivateCameraSet cameras {
             mResources.camera(),
@@ -274,11 +362,16 @@ public:
             cameras.center,
             cameras.left,
             cameras.right,
-            mResources.cullingProcess(),
+            frame.stockCullingProcess,
             mResources.leftAccumulator(),
             mResources.rightAccumulator(),
             frame.generation,
         };
+        if (!mRendererContext.setFirstPersonRootNode(
+                frame.firstPersonRootNode))
+        {
+            return reject(RetailCenterRuntimeFailure::InvalidFrame);
+        }
         CenterRendererResult renderer = executeCenterRendererFrame(
             mRendererOperations,
             authorization,
@@ -291,6 +384,8 @@ public:
                 RetailWorldHookDisposition::RejectGameplayFrame,
                 mFailure,
                 renderer,
+                cameraPose,
+                cameraRig,
             };
         }
         mLastFrameGeneration = frame.generation;
@@ -303,6 +398,8 @@ public:
             RetailWorldHookDisposition::StereoWorldComplete,
             RetailCenterRuntimeFailure::None,
             renderer,
+            cameraPose,
+            cameraRig,
         };
     }
 

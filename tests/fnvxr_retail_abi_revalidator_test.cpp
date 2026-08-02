@@ -13,6 +13,9 @@
 
 namespace
 {
+static_assert(fnvxr::engine::SupportedTextVirtualBytes == 0x00BDD58Bu);
+static_assert(fnvxr::engine::SupportedTextMappedBytes == 0x00BDD600u);
+static_assert(fnvxr::engine::SupportedTextRawBytes == 0x00BDD600u);
 using namespace fnvxr::engine;
 using namespace fnvxr::engine::abi;
 using namespace fnvxr::engine::abi::revalidation;
@@ -242,8 +245,12 @@ struct SyntheticFixture
     RetailBSCullingProcessLayout culler {};
 
     std::array<ExecutableSectionLayout, 1> executableSections {};
-    std::array<LoadedFunctionManifestEntry, 13> coreManifest {};
-    std::array<RetailFunctionAbiDescriptor, 22> functions {};
+    std::array<
+        LoadedFunctionManifestEntry,
+        RetailEngineManifest.size()> coreManifest {};
+    std::array<
+        RetailFunctionAbiDescriptor,
+        RetailFunctionAbiInventory.size()> functions {};
     std::array<RetailVtableSlotDescriptor, 16> vtableSlots {};
     std::array<RetailVtableBlockDescriptor, 1> vtableBlocks {};
     std::vector<ModuleObservation> modules = completeModuleSet();
@@ -333,7 +340,7 @@ struct SyntheticFixture
 
     void initializeLayouts()
     {
-        for (std::size_t row = 0; row < 4u; ++row)
+        for (std::size_t row = 0; row < 3u; ++row)
             camera.worldToCamera[row * 4u + row] = 1.0f;
         camera.frustum = validFrustum();
         camera.minimumNearPlane = 0.01f;
@@ -352,7 +359,9 @@ struct SyntheticFixture
         scene.camera = static_cast<RetailPointer32>(CameraAddress);
         scene.visibleArray = static_cast<RetailPointer32>(VisibleAddress);
         scene.cullingProcess = static_cast<RetailPointer32>(CullerAddress);
-        scene.isMenuSceneGraph = 0u;
+        // The retail SceneGraph field at 0xB8 is opaque. A non-boolean value
+        // must not invalidate ABI authority or classify a presentation route.
+        scene.opaqueUnknownB8 = 0xDEADBEEFu;
         scene.cameraFov = 75.0f;
 
         culler.base.vtable = static_cast<RetailPointer32>(
@@ -534,9 +543,9 @@ void testCompleteDecisionPointDerivesEveryEvidenceField()
     require(evidence.loadedExecutableSectionLayoutAndProtectionsVerified,
         "the exact executable-section layout and protections were not derived");
     require(evidence.coreManifestMatched,
-        "the 13-entry core manifest was not derived");
+        "the 15-entry core manifest was not derived");
     require(evidence.fullFunctionInventoryMatched,
-        "the 22-entry function inventory was not derived");
+        "the 28-entry function inventory was not derived");
     require(evidence.vtableSlotsMatched,
         "the 16 exact vtable slots were not derived");
     require(evidence.vtableBlocksMatched,
@@ -645,9 +654,10 @@ void testIndependentSealsAndProtectionFailClosed()
     fixture.snapshot.protectionRanges = fixture.protections.data();
     rejected = revalidateSyntheticRetailAbiAtDecisionPoint(
         fixture.snapshot, fixture.contract);
-    require(!rejected.evidence.loadedExecutableSectionLayoutAndProtectionsVerified,
-        "a writable executable retail section was accepted");
-    requireRejected(rejected, "writable executable memory authorized calls");
+    require(rejected.evidence.loadedExecutableSectionLayoutAndProtectionsVerified,
+        "an unrelated runtime-patched executable page invalidated exact PE geometry");
+    requireRejected(rejected,
+        "writable protected engine ranges authorized calls");
 }
 
 void testEveryLiveLayoutAndCensusRemainSynchronous()
@@ -665,9 +675,9 @@ void testEveryLiveLayoutAndCensusRemainSynchronous()
     const float originalNear = fixture.camera.frustum.nearDistance;
     fixture.camera.frustum.nearDistance = -1.0f;
     rejected = fixture.evaluate();
-    require(!rejected.evidence.liveObjectLayoutsVerified,
-        "an invalid camera frustum was accepted");
-    requireRejected(rejected, "an invalid camera layout authorized calls");
+    require(rejected.evidence.liveObjectLayoutsVerified
+            && rejected.assessment.engineCallsAuthorized,
+        "early camera projection state must not block structural startup authority");
     fixture.camera.frustum.nearDistance = originalNear;
 
     const RetailPointer32 originalCullerCamera = fixture.culler.base.camera;
@@ -742,12 +752,12 @@ void testProductionEntryCannotAuthorizeThisTestProcess()
 
 int main()
 {
-    static_assert(RetailEngineManifest.size() == 13u);
-    static_assert(RetailFunctionAbiInventory.size() == 22u);
+    static_assert(RetailEngineManifest.size() == 15u);
+    static_assert(RetailFunctionAbiInventory.size() == 28u);
     static_assert(RetailVtableSlots.size() == 16u);
     static_assert(RetailVtableBlocks.size() == 1u);
     static_assert(sizeof(RetailBSCullingProcessLayout) == 0xC8u);
-    static_assert(AllowedModuleCount == 124u);
+    static_assert(AllowedModuleCount == 126u);
 
     testCompleteDecisionPointDerivesEveryEvidenceField();
     testEveryFunctionAndVtableSlotIsLiveEvidence();

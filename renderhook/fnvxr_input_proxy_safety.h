@@ -1,7 +1,16 @@
 #pragma once
 
+#include "../protocol/fnvxr_product_capabilities.h"
+
 namespace fnvxr::input_proxy
 {
+static_assert(
+    product::SelectedProductInputOwner == product::InputOwner::NvseMainGameLoop,
+    "The current product input owner is the xNVSE main-game-loop consumer");
+static_assert(
+    !product::inputOwnerIsProxy(product::SelectedProductInputOwner),
+    "DirectInput and XInput proxies must remain transparent product-side");
+
 // Input remapping changes retail control semantics and therefore requires the
 // same standard of proof as an engine hook. This is a source fuse, not a
 // configuration default; environment variables and shared memory cannot

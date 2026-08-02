@@ -60,7 +60,7 @@ if ($ValidateOnly -and $StopExisting) {
     throw "-ValidateOnly is read-only with respect to running processes and cannot be combined with -StopExisting."
 }
 if (-not ($StageOnly -or $ValidateOnly)) {
-    throw "All live OpenXR presentation is intentionally blocked. The remaining finite blockers are an authenticated supervisor/completion record, source-correlated asynchronous output proof, isolated color/depth render transactions, conservative stereo visibility, per-eye depth, complete auxiliary-resource twinning, exact VS+PS camera provenance, and a proved retail rig schedule. This launcher can only -StageOnly or -ValidateOnly; it will not launch the game or touch an OpenXR runtime."
+    throw "All live OpenXR presentation is intentionally blocked. The remaining finite blockers are an authenticated supervisor/completion record, source-correlated asynchronous output proof, isolated color plus render-local-depth transactions, conservative stereo visibility, complete auxiliary-resource twinning, exact VS+PS camera provenance, and a proved retail rig schedule. This launcher can only -StageOnly or -ValidateOnly; it will not launch the game or touch an OpenXR runtime."
 }
 
 $Root = Split-Path -Parent $PSScriptRoot
@@ -185,7 +185,7 @@ if ($EnableD3D9ShaderStereo) {
 }
 if (-not ($StageOnly -or $ValidateOnly)) {
     if ($EnableStereoWorld -or $EnableD3D9ShaderStereo -or $StereoProducerProofOnly) {
-        throw "OpenXR stereo launch is intentionally blocked: isolated color/depth transactions, per-eye OpenXR depth submission, conservative stereo visibility/LOD/portal/particle traversal, complete auxiliary resource twinning, and exact VS+PS camera-semantic contracts are not implemented. A rejected center traversal can already have changed retail pixels and camera-dependent engine state, while D3D replay cannot recover geometry omitted before submission. Only flat 2D capture remains launchable; stereo producer execution is blocked off-headset as well."
+        throw "OpenXR stereo launch is intentionally blocked: isolated color plus render-local-depth transactions, conservative stereo visibility/LOD/portal/particle traversal, complete auxiliary resource twinning, and exact VS+PS camera-semantic contracts are not implemented. OpenXR depth submission is not a v1 gate. A rejected center traversal can already have changed retail pixels and camera-dependent engine state, while D3D replay cannot recover geometry omitted before submission. Only flat 2D capture remains launchable; stereo producer execution is blocked off-headset as well."
     }
     if ($ApplyRetailRig) {
         throw "Retail rig application is intentionally blocked: the exact animation/render commit schedule is not yet proved. Read-only rig telemetry remains available."

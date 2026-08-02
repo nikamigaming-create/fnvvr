@@ -561,7 +561,11 @@ bool verifyExecutableSectionLayoutAndProtections(
 
         ++diagnostics.loadedExecutableSectionCount;
         std::uintptr_t address = 0u;
-        Sha256Digest inspectionDigest {};
+        // Section headers establish executable intent and exact geometry.
+        // Runtime patchers may transiently split unrelated pages into RW or
+        // RWX regions, so whole-section coverage requires only committed,
+        // readable, unguarded memory. Exact protected engine ranges below
+        // retain their independent RX/nonwritable and digest requirements.
         const bool observed = checkedAdd(imageBase, section.rva, address)
             && rangeWithinImage(
                 imageBase,
@@ -572,13 +576,8 @@ bool verifyExecutableSectionLayoutAndProtections(
                 reader,
                 address,
                 section.protectionBytes,
-                true,
-                true)
-            && hashMemory(
-                reader,
-                address,
-                section.protectionBytes,
-                inspectionDigest);
+                false,
+                false);
         if (observed)
         {
             diagnostics.executableSectionBytesInspected +=
@@ -595,7 +594,6 @@ bool verifyExecutableSectionLayoutAndProtections(
                 contract.executableSections[executableIndex];
             allMatched = allMatched
                 && observed
-                && inspectionDigest.valid
                 && expected.independentLayoutSamples
                     >= MinimumIndependentLoadedSamples
                 && sameExecutableSectionLayout(section, expected);
@@ -813,26 +811,18 @@ bool finiteFloat(float value) noexcept
     return std::isfinite(value) != 0;
 }
 
-bool finiteFrustum(const RetailNiFrustumLayout& value) noexcept
-{
-    return finiteFloat(value.left)
-        && finiteFloat(value.right)
-        && finiteFloat(value.top)
-        && finiteFloat(value.bottom)
-        && finiteFloat(value.nearDistance)
-        && finiteFloat(value.farDistance)
-        && value.left < value.right
-        && value.bottom < value.top
-        && value.nearDistance > 0.0f
-        && value.farDistance > value.nearDistance
-        && value.orthographic <= 1u;
-}
-
 bool verifyLiveLayouts(
     const MemoryReader& reader,
     std::uintptr_t imageBase,
-    const RevalidationContract& contract) noexcept
+    const RevalidationContract& contract,
+    RetailAbiRevalidationDiagnostics& diagnostics) noexcept
 {
+    using Failure = RetailLiveLayoutFailure;
+    diagnostics.liveLayoutFailure = Failure::None;
+    const auto reject = [&diagnostics](Failure failure) noexcept {
+        diagnostics.liveLayoutFailure = failure;
+        return false;
+    };
     std::uintptr_t singletonAddress = 0u;
     std::uintptr_t expectedCullerVtable = 0u;
     RetailPointer32 sceneAddress32 = 0u;
@@ -845,8 +835,11 @@ bool verifyLiveLayouts(
             contract,
             imageBase,
             contract.bSCullingProcessVtableAddress,
-            expectedCullerVtable)
-        || !rangeHasAccess(
+            expectedCullerVtable))
+    {
+        return reject(Failure::AddressRelocation);
+    }
+    if (!rangeHasAccess(
             reader,
             singletonAddress,
             sizeof(sceneAddress32),
@@ -855,13 +848,15 @@ bool verifyLiveLayouts(
         || !reader.read(
             singletonAddress,
             &sceneAddress32,
-            sizeof(sceneAddress32))
-        || sceneAddress32 == 0u)
+            sizeof(sceneAddress32)))
     {
-        return false;
+        return reject(Failure::SceneGraphSingletonUnreadable);
     }
+    if (sceneAddress32 == 0u)
+        return reject(Failure::SceneGraphPointersMissing);
 
     const std::uintptr_t sceneAddress = sceneAddress32;
+    diagnostics.liveSceneGraphAddress = sceneAddress;
     RetailSceneGraphLayout scene {};
     RetailNiCameraLayout camera {};
     RetailBSCullingProcessLayout culler {};
@@ -872,71 +867,92 @@ bool verifyLiveLayouts(
             sizeof(scene),
             false,
             false)
-        || !reader.read(sceneAddress, &scene, sizeof(scene))
-        || scene.camera == 0u
-        || scene.visibleArray == 0u
-        || scene.cullingProcess == 0u
-        || !rangeHasAccess(
+        || !reader.read(sceneAddress, &scene, sizeof(scene)))
+    {
+        return reject(Failure::SceneGraphUnreadable);
+    }
+    diagnostics.liveSceneCameraAddress = scene.camera;
+    diagnostics.liveSceneVisibleArrayAddress = scene.visibleArray;
+    diagnostics.liveSceneCullerAddress = scene.cullingProcess;
+    if (scene.camera == 0u || scene.cullingProcess == 0u)
+    {
+        return reject(Failure::SceneGraphPointersMissing);
+    }
+    if (!rangeHasAccess(
             reader,
             scene.camera,
             sizeof(camera),
             false,
             false)
-        || !rangeHasAccess(
+        || !reader.read(scene.camera, &camera, sizeof(camera)))
+    {
+        return reject(Failure::CameraUnreadable);
+    }
+    if (!rangeHasAccess(
             reader,
             scene.cullingProcess,
             sizeof(culler),
             false,
             false)
-        || !rangeHasAccess(
-            reader,
-            scene.visibleArray,
-            sizeof(visible),
-            false,
-            false)
-        || !reader.read(scene.camera, &camera, sizeof(camera))
-        || !reader.read(scene.cullingProcess, &culler, sizeof(culler))
-        || !reader.read(scene.visibleArray, &visible, sizeof(visible)))
+        || !reader.read(scene.cullingProcess, &culler, sizeof(culler)))
     {
-        return false;
+        return reject(Failure::CullerUnreadable);
+    }
+    diagnostics.liveCullerCameraAddress = culler.base.camera;
+    diagnostics.liveCullerVisibleArrayAddress = culler.base.visibleArray;
+
+    // SceneGraph::visibleArray and the matching culler bindings describe the
+    // stock cull operation in progress; retail clears them between traversals.
+    // Present-time authority therefore cannot require that transient state.
+    // When the stock traversal is bound, validate it fully. The center renderer
+    // owns independent per-eye visible arrays and never consumes this pointer.
+    const bool stockCullStateBound = scene.visibleArray != 0u;
+    if (stockCullStateBound
+        && (!rangeHasAccess(
+                reader,
+                scene.visibleArray,
+                sizeof(visible),
+                false,
+                false)
+            || !reader.read(scene.visibleArray, &visible, sizeof(visible))))
+    {
+        return reject(Failure::VisibleArrayUnreadable);
     }
 
-    if (scene.isMenuSceneGraph > 1u
-        || !finiteFloat(scene.cameraFov)
+    if (!finiteFloat(scene.cameraFov)
         || scene.cameraFov <= 0.0f
-        || scene.cameraFov >= 180.0f
-        || culler.base.vtable != static_cast<RetailPointer32>(
-            expectedCullerVtable)
-        || culler.base.useAppendFunction > 1u
-        || culler.base.camera != scene.camera
-        || culler.base.visibleArray != scene.visibleArray
-        || culler.cullModeStackSize > 10u
-        || !finiteFrustum(camera.frustum)
-        || !finiteFrustum(culler.base.frustum)
-        || !finiteFloat(camera.minimumNearPlane)
-        || camera.minimumNearPlane <= 0.0f
-        || !finiteFloat(camera.maximumFarNearRatio)
-        || camera.maximumFarNearRatio <= 0.0f
-        || !finiteFloat(camera.viewport.left)
-        || !finiteFloat(camera.viewport.right)
-        || !finiteFloat(camera.viewport.top)
-        || !finiteFloat(camera.viewport.bottom)
-        || camera.viewport.left == camera.viewport.right
-        || camera.viewport.top == camera.viewport.bottom
-        || !finiteFloat(camera.lodAdjust)
-        || camera.lodAdjust <= 0.0f
-        || visible.itemCount > visible.capacity
-        || visible.capacity > 10000000u
-        || (visible.itemCount != 0u && visible.geometryPointers == 0u))
-    {
-        return false;
-    }
-    for (float value : camera.worldToCamera)
-    {
-        if (!finiteFloat(value))
-            return false;
-    }
-    if (visible.itemCount != 0u)
+        || scene.cameraFov >= 180.0f)
+        return reject(Failure::CameraFovInvalid);
+    if (culler.base.vtable
+        != static_cast<RetailPointer32>(expectedCullerVtable))
+        return reject(Failure::CullerVtableMismatch);
+    if (culler.base.useAppendFunction > 1u)
+        return reject(Failure::CullerAppendFlagInvalid);
+    if (stockCullStateBound && culler.base.camera != scene.camera)
+        return reject(Failure::CullerCameraMismatch);
+    if (stockCullStateBound
+        && culler.base.visibleArray != scene.visibleArray)
+        return reject(Failure::CullerVisibleArrayMismatch);
+    if (culler.cullModeStackSize > 10u)
+        return reject(Failure::CullerStackInvalid);
+
+    // This authority decision runs from early Present, before the game has
+    // necessarily populated a gameplay camera projection. The pointers,
+    // culler vtable, and SceneGraph FOV above are stable layout evidence;
+    // the camera transform, frustum, viewport, and derived matrix are
+    // presentation state and are legitimately transitional here. They are
+    // independently validated by deriveRetailEyeCameraRig in the exact
+    // gameplay world-hook transaction before any eye camera is created,
+    // mutated, or rendered.
+    if (stockCullStateBound
+        && (visible.itemCount > visible.capacity
+            || visible.capacity > 10000000u))
+        return reject(Failure::VisibleArrayCountsInvalid);
+    if (stockCullStateBound
+        && visible.itemCount != 0u
+        && visible.geometryPointers == 0u)
+        return reject(Failure::VisibleArrayStorageMissing);
+    if (stockCullStateBound && visible.itemCount != 0u)
     {
         const std::size_t pointerBytes =
             static_cast<std::size_t>(visible.itemCount) * sizeof(RetailPointer32);
@@ -947,7 +963,7 @@ bool verifyLiveLayouts(
                 false,
                 false))
         {
-            return false;
+            return reject(Failure::VisibleArrayStorageMissing);
         }
     }
     return true;
@@ -1007,6 +1023,8 @@ bool sealedBothWorldBranches(const RevalidationContract& contract) noexcept
     constexpr const char* Required[] = {
         "AccumulateScene",
         "AccumulateSecondWorldBranch",
+        "NiAccumulator::FinishAccumulating",
+        "FinishAccumulatingShaderAccumulator",
         "RenderAccumulatorWithoutFinalize",
         "FinalizeAccumulator",
         "RenderAndFinalizeAccumulator",
@@ -1156,7 +1174,8 @@ RetailAbiRevalidationResult revalidateSnapshot(
     result.evidence.liveObjectLayoutsVerified = verifyLiveLayouts(
         reader,
         imageBase,
-        contract);
+        contract,
+        result.diagnostics);
     result.evidence.constructorOwnershipVerified =
         result.evidence.fullFunctionInventoryMatched
         && sealedConstructorOwnership(contract);
@@ -1197,12 +1216,12 @@ inline constexpr std::array<ExecutableSectionLayoutInternal, 2>
     RetailLoadedExecutableSections {{
         {
             { '.', 't', 'e', 'x', 't', 0u, 0u, 0u },
-            0x00001000u,
-            0x00BDD38Bu,
-            0x00BDD400u,
-            0x00BDE000u,
-            0x00BDD400u,
-            0x60000020u,
+            SupportedTextRva,
+            SupportedTextVirtualBytes,
+            SupportedTextMappedBytes,
+            SupportedTextProtectionBytes,
+            SupportedTextRawBytes,
+            SupportedTextCharacteristics,
             2u,
         },
         {
@@ -1217,9 +1236,19 @@ inline constexpr std::array<ExecutableSectionLayoutInternal, 2>
         },
     }};
 static_assert(RetailLoadedExecutableSections.size() == 2u);
-static_assert(RetailLoadedExecutableSections[0].rva == 0x00001000u);
+static_assert(RetailLoadedExecutableSections[0].rva == SupportedTextRva);
 static_assert(
-    RetailLoadedExecutableSections[0].protectionBytes == 0x00BDE000u);
+    RetailLoadedExecutableSections[0].virtualBytes
+        == SupportedTextVirtualBytes);
+static_assert(
+    RetailLoadedExecutableSections[0].mappedBytes
+        == SupportedTextMappedBytes);
+static_assert(
+    RetailLoadedExecutableSections[0].protectionBytes
+        == SupportedTextProtectionBytes);
+static_assert(
+    RetailLoadedExecutableSections[0].rawBytes
+        == SupportedTextRawBytes);
 static_assert(RetailLoadedExecutableSections[1].rva == 0x01009000u);
 static_assert(
     RetailLoadedExecutableSections[1].protectionBytes == 0x00072000u);
@@ -1356,6 +1385,25 @@ RetailAbiRevalidationResult revalidateCurrentRetailEngineAbiAtDecisionPoint()
             RetailAbiRevalidationFailure::CompatibilityProofRejected;
         return result;
     }
+    // The dual-pass compatibility proof is the authoritative current-process
+    // source for protected bytes after exact JIP normalization. Promote only
+    // the ranges it reverified; live object layouts remain independently
+    // observed above and can stay unavailable at the main menu.
+    result.evidence.coreManifestMatched =
+        compatibilityProof.evidence.protectedCoreBodiesMatched;
+    result.evidence.fullFunctionInventoryMatched =
+        compatibilityProof.evidence.protectedFunctionInventoryMatched;
+    result.evidence.vtableSlotsMatched =
+        compatibilityProof.evidence.protectedVtableSlotsMatched;
+    result.evidence.vtableBlocksMatched =
+        compatibilityProof.evidence.protectedVtableBlocksMatched;
+    result.evidence.constructorOwnershipVerified =
+        result.evidence.fullFunctionInventoryMatched
+        && sealedConstructorOwnership(productionContract());
+    result.evidence.bothWorldBranchesVerified =
+        result.evidence.coreManifestMatched
+        && result.evidence.fullFunctionInventoryMatched
+        && sealedBothWorldBranches(productionContract());
     result.evidence.compatibilityModulesVerified = true;
     result.evidence.synchronousRuntimeRevalidation = true;
     result.assessment = assessRetailEngineAbi(result.evidence);

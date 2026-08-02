@@ -25,9 +25,9 @@ static_assert(
     "xNVSE packed version must follow MAKE_NEW_VEGAS_VERSION");
 
 // This is a source fuse, not a configuration default. It remains false until
-// engine stereo, GPU color/depth transport, authoritative weapon, and UI mode
-// transition gates all pass. An environment variable can request a feature
-// but can never override this.
+// engine stereo, GPU color transport, render-local eye depth, authoritative
+// weapon, and UI mode transition gates all pass. An environment variable can
+// request a feature but can never override this.
 inline constexpr bool RetailMutationProofComplete = false;
 
 // This record is intentionally explicit and fail-closed. The production
@@ -47,7 +47,9 @@ struct RetailMutationEvidenceToken
         loadedFunctionDigests {};
     bool engineStereoComplete = false;
     bool gpuColorTransportComplete = false;
-    bool gpuDepthTransportComplete = false;
+    // Product GPU transport v1 exports only color. Per-eye depth/stencil is
+    // still mandatory for the retail render transaction but remains local.
+    bool renderLocalDepthPairComplete = false;
     bool authoritativeWeaponComplete = false;
     bool uiModeTransitionsComplete = false;
 };
@@ -103,7 +105,7 @@ inline bool retailMutationEvidenceComplete(
         && loadedFunctionManifestMatches(evidence)
         && evidence.engineStereoComplete
         && evidence.gpuColorTransportComplete
-        && evidence.gpuDepthTransportComplete
+        && evidence.renderLocalDepthPairComplete
         && evidence.authoritativeWeaponComplete
         && evidence.uiModeTransitionsComplete;
 }

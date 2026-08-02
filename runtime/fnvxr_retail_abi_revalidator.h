@@ -33,6 +33,26 @@ enum class RetailAbiRevalidationFailure : std::uint8_t
     RuntimeEvidenceRejected,
 };
 
+enum class RetailLiveLayoutFailure : std::uint8_t
+{
+    None = 0,
+    AddressRelocation,
+    SceneGraphSingletonUnreadable,
+    SceneGraphUnreadable,
+    SceneGraphPointersMissing,
+    CameraUnreadable,
+    CullerUnreadable,
+    VisibleArrayUnreadable,
+    CameraFovInvalid,
+    CullerVtableMismatch,
+    CullerAppendFlagInvalid,
+    CullerCameraMismatch,
+    CullerVisibleArrayMismatch,
+    CullerStackInvalid,
+    VisibleArrayCountsInvalid,
+    VisibleArrayStorageMissing,
+};
+
 struct RetailAbiRevalidationDiagnostics
 {
     std::uintptr_t runtimeImageBase = 0;
@@ -43,6 +63,14 @@ struct RetailAbiRevalidationDiagnostics
     std::size_t functionBodiesHashed = 0;
     std::size_t vtableSlotsRead = 0;
     std::size_t vtableBlockBytesHashed = 0;
+    std::uintptr_t liveSceneGraphAddress = 0;
+    std::uintptr_t liveSceneCameraAddress = 0;
+    std::uintptr_t liveSceneVisibleArrayAddress = 0;
+    std::uintptr_t liveSceneCullerAddress = 0;
+    std::uintptr_t liveCullerCameraAddress = 0;
+    std::uintptr_t liveCullerVisibleArrayAddress = 0;
+    RetailLiveLayoutFailure liveLayoutFailure =
+        RetailLiveLayoutFailure::None;
 };
 
 struct RetailAbiRevalidationResult

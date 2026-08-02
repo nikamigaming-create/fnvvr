@@ -1,4 +1,5 @@
 #include "fnvxr_retail_tracked_frame_win32.h"
+#include "fnvxr_retail_runtime_publication_win32.h"
 
 #include <cstdlib>
 #include <iostream>
@@ -130,8 +131,60 @@ int main()
     require(
         lateReader.readGameplayFrame(frame) && lateReader.ready(),
         "reader did not acquire mappings published after initialization");
+
+    char readinessName[96] {};
+    sprintf_s(
+        readinessName,
+        "Local\\FNVXR_Test_Runtime_Readiness_%lu",
+        pid);
+    engine::RetailRuntimePublicationWin32Reader readinessReader;
+    require(
+        !readinessReader.initialize(readinessName)
+            && readinessReader.initialized()
+            && !readinessReader.mappingReady(),
+        "runtime readiness reader did not preserve lazy initialization");
+    auto readiness =
+        makeMapping<shared::SharedRuntimeState>(readinessName);
+    require(readiness.state, "runtime readiness mapping unavailable");
+    *readiness.state = {};
+    readiness.state->magic = shared::RuntimeSharedMagic;
+    readiness.state->version = shared::RuntimeSharedVersion;
+    readiness.state->sequence = 2;
+
+    shared::SharedRuntimeState readinessSnapshot {};
+    LONG readinessSequence = 0;
+    require(
+        !readinessReader.readReadyPublication(
+            readinessSnapshot,
+            readinessSequence)
+            && readinessReader.mappingReady()
+            && readinessReader.failure()
+                == engine::RetailRuntimePublicationReadinessFailure::
+                    NeutralPublication,
+        "neutral plugin-owned runtime state admitted bridge startup");
+
+    require(
+        shared::beginSequencedSharedWrite(readiness.state->sequence),
+        "runtime readiness test could not begin a publication");
+    readiness.state->frame = 1u;
+    readiness.state->phase = shared::RuntimePhaseGameplay;
+    readiness.state->menuBits = 0u;
+    readiness.state->uiInputAllowed = 0u;
+    readiness.state->cameraActive = 0u;
+    readiness.state->showroomActive = 0u;
+    shared::endSequencedSharedWrite(readiness.state->sequence);
+    require(
+        readinessReader.readReadyPublication(
+            readinessSnapshot,
+            readinessSequence)
+            && readinessSnapshot.frame == 1u
+            && readinessSnapshot.phase == shared::RuntimePhaseGameplay
+            && readinessSequence == readiness.state->sequence,
+        "advanced stable runtime publication did not release bridge startup");
 #else
     static_assert(!engine::RetailTrackedFrameWin32ReaderAvailable);
+    static_assert(
+        !engine::RetailRuntimePublicationWin32ReaderAvailable);
 #endif
     std::cout << "retail tracked frame Win32 reader passed\n";
     return EXIT_SUCCESS;

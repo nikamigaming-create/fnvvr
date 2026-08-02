@@ -2,11 +2,24 @@
 
 #include "fnvxr_retail_engine_abi.h"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 
 namespace fnvxr::engine::compatibility
 {
+// Exact loaded-image RVAs from the pinned JohnnyGuitar 5.28 module. Keep the
+// production proof and its synthetic rewrite-group test on one source of
+// truth; these are virtual addresses, not raw-file offsets.
+inline constexpr std::uint32_t JohnnyGuitar528RenderFirstPersonHookRva =
+    0x00029C20u;
+inline constexpr std::uint32_t JohnnyGuitar528UpdateCameraOverwriteHookRva =
+    0x00022D80u;
+inline constexpr std::uint32_t JohnnyGuitar528UpdateCameraFirstCallHookRva =
+    0x00022590u;
+inline constexpr std::uint32_t JohnnyGuitar528UpdateCameraSecondCallHookRva =
+    0x000225E0u;
+
 enum class RetailCompatibilityFailure : std::uint8_t
 {
     None = 0,
@@ -17,8 +30,7 @@ enum class RetailCompatibilityFailure : std::uint8_t
     MainModuleUnavailable,
     MainModuleIsNotFallout,
     RetailExecutableIdentityMismatch,
-    ProhibitedOverlayOrCaptureLoaded,
-    DuplicateJipModule,
+    DuplicateJipModule = 9,
     Jip5730IdentityMismatch,
     JipRenderFirstPersonRewriteMismatch,
     DuplicateShowOffModule,
@@ -28,14 +40,35 @@ enum class RetailCompatibilityFailure : std::uint8_t
     ProtectedVtableSlotMismatch,
     ProtectedVtableBlockMismatch,
     ProtectedMemoryUnstable,
+    DuplicateJohnnyGuitarModule,
+    JohnnyGuitar528IdentityMismatch,
+    JohnnyGuitarProtectedRewriteMismatch,
+};
+
+enum class RetailRenderFirstPersonProofStage : std::uint8_t
+{
+    NotEvaluated = 0,
+    ContractRejected,
+    FunctionAccessRejected,
+    FunctionReadRejected,
+    RawStockMatched,
+    JipTargetRejected,
+    JipRewriteRejected,
+    JipNormalized,
+    JipOnlyMatched,
+    JohnnyGuitarUnavailable,
+    JohnnyGuitarTargetRejected,
+    JohnnyGuitarRewriteRejected,
+    JohnnyGuitarDigestRejected,
+    FullyNormalized,
 };
 
 struct RetailCompatibilityEvidence
 {
     bool retailExecutableIdentityMatched = false;
     bool moduleSnapshotStable = false;
-    bool prohibitedModulesAbsent = false;
     bool jip5730ExactOrAbsent = false;
+    bool johnnyGuitar528ExactOrAbsent = false;
     bool showOff184ExactOrAbsent = false;
     bool renderFirstPersonStockOrJipNormalized = false;
     bool protectedCoreBodiesMatched = false;
@@ -57,7 +90,15 @@ struct RetailCompatibilityDiagnostics
     std::size_t protectedVtableBytesHashed = 0;
     bool jipPresent = false;
     bool jipNormalizationApplied = false;
+    bool johnnyGuitarPresent = false;
+    bool johnnyGuitarNormalizationApplied = false;
     bool showOffPresent = false;
+    RetailRenderFirstPersonProofStage renderFirstPersonProofStage =
+        RetailRenderFirstPersonProofStage::NotEvaluated;
+    std::uintptr_t observedJipRenderFirstPersonTarget = 0;
+    std::uintptr_t expectedJipRenderFirstPersonTarget = 0;
+    std::uintptr_t observedJohnnyGuitarRenderFirstPersonTarget = 0;
+    std::uintptr_t expectedJohnnyGuitarRenderFirstPersonTarget = 0;
 };
 
 struct RetailCompatibilityProof
@@ -70,8 +111,11 @@ struct RetailCompatibilityProof
 };
 
 // Enumerates and re-enumerates only the current process. Unknown modules are
-// tolerated unless prohibited by name or they alter a protected engine range.
-// There is no full-image or exact-module-count claim in this proof.
+// tolerated unless they alter a protected engine range. Canonical path,
+// signature, and mapped-code validation for the complete module census is a
+// separate mandatory module-inventory proof; this proof independently demands
+// stable modules and exact protected retail/JIP/ShowOff bytes. There is no
+// full-image or exact-module-count claim in this proof.
 RetailCompatibilityProof proveCurrentRetailCompatibilityAtDecisionPoint()
     noexcept;
 
@@ -139,14 +183,39 @@ struct SyntheticJipRewriteSeal
     std::size_t stubBytes = 0;
 };
 
+// Exact JohnnyGuitar 5.28 rewrites observed in the protected game bodies.
+// Every listed target is module-relative so the verifier can normalize only
+// the proven ASLR-dependent layout back to its stock engine bytes.
+struct SyntheticJohnnyGuitarRewriteSeal
+{
+    std::uintptr_t renderFirstPersonPreferredAddress = 0;
+    std::size_t renderFirstPersonBytes = 0;
+    std::size_t renderFirstPersonCallOffset = 0;
+    std::uintptr_t renderFirstPersonStockTargetPreferredAddress = 0;
+    std::uintptr_t updateCameraPreferredAddress = 0;
+    std::size_t updateCameraBytes = 0;
+    std::size_t updateCameraOverwriteOffset = 0;
+    std::array<std::uint8_t, 5> updateCameraOriginalBytes {};
+    std::size_t updateCameraFirstCallOffset = 0;
+    std::uintptr_t updateCameraFirstStockTargetPreferredAddress = 0;
+    std::size_t updateCameraSecondCallOffset = 0;
+    std::uintptr_t updateCameraSecondStockTargetPreferredAddress = 0;
+    std::uint32_t renderFirstPersonHookRva = 0;
+    std::uint32_t updateCameraOverwriteHookRva = 0;
+    std::uint32_t updateCameraFirstCallHookRva = 0;
+    std::uint32_t updateCameraSecondCallHookRva = 0;
+};
+
 struct SyntheticRetailCompatibilityContract
 {
     std::uintptr_t preferredImageBase = 0;
     LoadedExecutableIdentity loadedIdentity {};
     std::uint32_t sizeOfImage = 0;
     SyntheticExactModuleSeal jip {};
+    SyntheticExactModuleSeal johnnyGuitar {};
     SyntheticExactModuleSeal showOff {};
     SyntheticJipRewriteSeal jipRewrite {};
+    SyntheticJohnnyGuitarRewriteSeal johnnyGuitarRewrite {};
     const LoadedFunctionManifestEntry* coreManifest = nullptr;
     std::size_t coreManifestCount = 0;
     const abi::RetailFunctionAbiDescriptor* functionInventory = nullptr;

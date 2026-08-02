@@ -18,6 +18,15 @@ inline constexpr std::uint32_t SupportedSizeOfImage = 0x0107B000u;
 inline constexpr std::uint64_t SupportedFileBytes = 16549704u;
 inline constexpr char SupportedFileSha256[] =
     "518C87F58A6C4D9826E9EF8FBB7F4213882FA70822675610D45AEA2464502A57";
+// Exact executable-section tuple from that same supported file. Keeping this
+// beside the PE identity prevents a second, stale identity from drifting in
+// the live ABI revalidator.
+inline constexpr std::uint32_t SupportedTextRva = 0x00001000u;
+inline constexpr std::uint32_t SupportedTextVirtualBytes = 0x00BDD58Bu;
+inline constexpr std::uint32_t SupportedTextMappedBytes = 0x00BDD600u;
+inline constexpr std::uint32_t SupportedTextProtectionBytes = 0x00BDE000u;
+inline constexpr std::uint32_t SupportedTextRawBytes = 0x00BDD600u;
+inline constexpr std::uint32_t SupportedTextCharacteristics = 0x60000020u;
 
 struct LoadedExecutableIdentity
 {
@@ -99,7 +108,7 @@ struct LoadedFunctionManifestEntry
 // from two independent loaded-memory dumps. Both dumps produced identical
 // bytes. Do not widen a callable entry to cover adjacent alignment bytes or
 // functions: a matching cluster is not ABI evidence for the named function.
-inline constexpr std::array<LoadedFunctionManifestEntry, 13> RetailEngineManifest {{
+inline constexpr std::array<LoadedFunctionManifestEntry, 15> RetailEngineManifest {{
     {
         "DoRenderFrame",
         WholeFrameRenderAddress,
@@ -137,10 +146,22 @@ inline constexpr std::array<LoadedFunctionManifestEntry, 13> RetailEngineManifes
         sha256FromHex("F41A0EAAC2E0573BC25B8A7A5E3799601B29E5D298D68B1C9E7CA002124D9B2D"),
     },
     {
+        "NiAccumulator::FinishAccumulating",
+        0x00A9B570u,
+        437u,
+        sha256FromHex("192CA9CE2B5C39AC15A0DBFA4F6D2650471A17775AD3950032419C381A3FB20F"),
+    },
+    {
         "NiAccumulator::AddVisibleArray",
         0x00A9B790u,
         189u,
         sha256FromHex("A929F2C8289B45EC15F5A16E88A5052D5E1C3F1348880E07C66E223DCB592843"),
+    },
+    {
+        "FinishAccumulatingShaderAccumulator",
+        0x00B65E80u,
+        51u,
+        sha256FromHex("9D03349FA8780CF4B1898D4B0355D03BD58343E6D514ABE5F44734C63F8E0684"),
     },
     {
         "FinalizeAccumulator",

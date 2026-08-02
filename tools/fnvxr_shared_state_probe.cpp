@@ -1,4 +1,5 @@
 #include "fnvxr_shared_state.h"
+#include "../runtime/fnvxr_desktop_assist_ui_evidence.h"
 
 #include <windows.h>
 
@@ -19,6 +20,8 @@ namespace
         + static_cast<std::size_t>(fnvxr::shared::D3D9SharedFrameMaxWidth)
             * static_cast<std::size_t>(fnvxr::shared::D3D9SharedFrameMaxHeight) * 4u * 2u
             * fnvxr::shared::D3D9StereoFrameSlotCount;
+    constexpr std::size_t SharedDesktopAssistUiQuadMappingBytes =
+        fnvxr::engine::desktopAssistUiQuadMappingBytes();
 
     struct MappingView
     {
@@ -63,10 +66,20 @@ namespace
         bool requireVideo = false;
         bool requireStereo = false;
         bool requireWorldStereo = false;
+        bool requireEngineCenterWorldStereo = false;
+        // Observe one actual shared-protocol transition rather than accepting
+        // a world frame in isolation. This is the headset-free evidence that
+        // a confirmed menu record was retired before a later engine-center
+        // world transaction became eligible.
+        bool requireUiThenEngineCenterWorld = false;
         bool requirePose = false;
         bool requireCamera = false;
+        bool requireDesktopAssistReady = false;
+        bool requireDesktopAssist = false;
+        bool requireDesktopAssistUiQuad = false;
         bool requireAdvancing = false;
         int sampleDelayMs = 250;
+        int transitionTimeoutMs = 5000;
     };
 
     struct PlayerStatus
@@ -80,14 +93,79 @@ namespace
     {
         bool usable = false;
         bool world = false;
+        bool engineCenterWorld = false;
+    };
+
+    struct StereoTransitionStatus
+    {
+        bool uiObserved = false;
+        bool uiPixelsVerified = false;
+        bool worldObservedAfterUi = false;
+        bool worldPixelsVerified = false;
+        bool complete = false;
+        std::uint64_t samples = 0u;
+        std::uint64_t uiTransactionId = 0u;
+        std::uint64_t uiSourceFrame = 0u;
+        std::uint64_t uiRuntimeStateSample = 0u;
+        std::uint64_t uiPublicationGeneration = 0u;
+        std::uint64_t uiRendererProducerEpoch = 0u;
+        std::uint64_t worldTransactionId = 0u;
+        std::uint64_t worldSourceFrame = 0u;
+        std::uint64_t worldRuntimeStateSample = 0u;
+        std::uint64_t worldPublicationGeneration = 0u;
+        std::uint64_t worldRendererProducerEpoch = 0u;
+    };
+
+    struct StereoPayloadEvidence
+    {
+        bool layoutUsable = false;
+        bool stable = false;
+        std::uint64_t leftNonBlackPixels = 0u;
+        std::uint64_t rightNonBlackPixels = 0u;
+        std::uint64_t differentPixels = 0u;
+
+        bool complete() const noexcept
+        {
+            return layoutUsable
+                && stable
+                && leftNonBlackPixels != 0u
+                && rightNonBlackPixels != 0u
+                && differentPixels != 0u;
+        }
+    };
+
+    enum class CounterDomain : std::uint8_t
+    {
+        StrictlyIncreasing,
+        NonzeroModulo32,
+        NonzeroModulo64,
     };
 
     struct CounterStatus
     {
         bool present = false;
         bool usable = false;
-        bool modular32 = false;
+        CounterDomain domain = CounterDomain::StrictlyIncreasing;
         std::uint64_t value = 0;
+    };
+
+    struct DesktopAssistStatus
+    {
+        bool ready = false;
+        bool poseApplied = false;
+    };
+
+    struct DesktopAssistUiQuadStatus
+    {
+        bool present = false;
+        bool stable = false;
+        bool headerComplete = false;
+        bool pixelsHashMatch = false;
+        bool nonBlackCountMatch = false;
+        bool usable = false;
+        fnvxr::shared::SharedDesktopAssistUiQuadHeader header {};
+        LONG sequenceBefore = 0;
+        LONG sequenceAfter = 0;
     };
 
     bool hasArg(const std::vector<std::string>& args, const char* name)
@@ -120,8 +198,14 @@ namespace
             << "usage: fnvxr_shared_state_probe [--require-player] [--require-runtime]\n"
             << "                                [--require-video]\n"
             << "                                [--require-stereo] [--require-world-stereo]\n"
+            << "                                [--require-engine-center-world-stereo]\n"
+            << "                                [--require-ui-then-engine-center-world]\n"
             << "                                [--require-pose] [--require-camera]\n"
-            << "                                [--require-advancing] [--sample-delay-ms <ms>]\n";
+            << "                                [--require-desktop-assist-ready]\n"
+            << "                                [--require-desktop-assist]\n"
+            << "                                [--require-desktop-assist-ui-quad]\n"
+            << "                                [--require-advancing] [--sample-delay-ms <ms>]\n"
+            << "                                [--transition-timeout-ms <ms>]\n";
     }
 
     bool finiteArray(const float* values, int count)
@@ -189,6 +273,26 @@ namespace
         return typed->writing == 0
             && out.writing == 0
             && sequenceBefore == sequenceAfter;
+    }
+
+    bool copyDesktopAssistUiQuadHeaderChecked(
+        const void* source,
+        fnvxr::shared::SharedDesktopAssistUiQuadHeader& out,
+        LONG& sequenceBefore,
+        LONG& sequenceAfter)
+    {
+        const auto* header = static_cast<const fnvxr::shared::SharedDesktopAssistUiQuadHeader*>(source);
+        if (header->writing != 0)
+            return false;
+        sequenceBefore = header->sequence;
+        MemoryBarrier();
+        std::memcpy(&out, header, sizeof(out));
+        MemoryBarrier();
+        sequenceAfter = header->sequence;
+        return header->writing == 0
+            && out.writing == 0
+            && sequenceBefore == sequenceAfter
+            && out.sequence == sequenceBefore;
     }
 
     void jsonBool(const char* name, bool value, bool trailing = true)
@@ -296,14 +400,57 @@ namespace
 
     bool counterAdvanced(const CounterStatus& before, const CounterStatus& after)
     {
-        if (!before.usable || !after.usable || before.modular32 != after.modular32)
+        if (!before.usable || !after.usable || before.domain != after.domain)
             return false;
-        if (!before.modular32)
+        if (before.domain == CounterDomain::StrictlyIncreasing)
             return after.value > before.value;
-        const std::uint32_t older = static_cast<std::uint32_t>(before.value);
-        const std::uint32_t newer = static_cast<std::uint32_t>(after.value);
-        const std::uint32_t delta = newer - older;
-        return newer != 0u && delta != 0u && delta < 0x80000000u;
+        if (before.domain == CounterDomain::NonzeroModulo32)
+        {
+            const std::uint32_t older = static_cast<std::uint32_t>(before.value);
+            const std::uint32_t newer = static_cast<std::uint32_t>(after.value);
+            const std::uint32_t delta = newer - older;
+            return newer != 0u && delta != 0u && delta < 0x80000000u;
+        }
+
+        // publicationGeneration is a nonzero modulo-2^64 ABA guard. It is
+        // deliberately independent of the wrapped 32-bit display sequence:
+        // a fresh stereo publication must move this generation forward even
+        // when its signed LONG sequence looks plausible after a wrap.
+        const std::uint64_t older = before.value;
+        const std::uint64_t newer = after.value;
+        const std::uint64_t delta = newer - older;
+        return newer != 0u
+            && delta != 0u
+            && delta < (std::uint64_t{1} << 63u);
+    }
+
+    bool copyStereoHeaderChecked(
+        const void* source,
+        fnvxr::shared::SharedD3D9StereoFrameHeader& out,
+        LONG& sequenceBefore,
+        LONG& sequenceAfter,
+        std::uint64_t& publicationGeneration)
+    {
+        publicationGeneration = 0u;
+        const auto* header = static_cast<
+            const fnvxr::shared::SharedD3D9StereoFrameHeader*>(source);
+        if (!header)
+            return false;
+
+        const bool headerStable = copyFrameHeaderChecked(
+            source,
+            out,
+            sequenceBefore,
+            sequenceAfter);
+        // This tool maps the evidence record read-only.  The producer already
+        // brackets both the 64-bit generation and the header metadata with
+        // `writing` plus the frame sequence, so a successful seqlock-style
+        // copy is the read-only snapshot boundary.  Do not use an interlocked
+        // read here: Windows interlocked operations require write access even
+        // when their value does not change.
+        publicationGeneration = static_cast<std::uint64_t>(
+            out.publicationGeneration);
+        return headerStable && publicationGeneration != 0u;
     }
 
     bool stereoPayloadLayoutUsable(const fnvxr::shared::SharedD3D9StereoFrameHeader& header)
@@ -328,6 +475,273 @@ namespace
             && header.rightPayloadOffset == expectedRight
             && expectedRight + planeBytes <= expectedLeft + slotBytes
             && expectedRight + planeBytes <= header.totalMappingBytes;
+    }
+
+    bool stereoProducerCarriesSameTransactionEyes(LONG producerMode)
+    {
+        return producerMode >= 0
+            && fnvxr::shared::stereoProducerCarriesSameTransactionEyes(
+                static_cast<std::uint32_t>(producerMode));
+    }
+
+    StereoPayloadEvidence inspectStereoPayload(
+        const void* mappingView,
+        const fnvxr::shared::SharedD3D9StereoFrameHeader& header,
+        LONG sequence) noexcept
+    {
+        StereoPayloadEvidence evidence;
+        if (!mappingView
+            || header.sequence != sequence
+            || !stereoPayloadLayoutUsable(header))
+        {
+            return evidence;
+        }
+
+        const std::size_t planeBytes = static_cast<std::size_t>(
+            header.pitchBytes) * static_cast<std::size_t>(header.height);
+        const auto* bytes = static_cast<const std::uint8_t*>(mappingView);
+        const auto* left = bytes + header.leftPayloadOffset;
+        const auto* right = bytes + header.rightPayloadOffset;
+        evidence.layoutUsable = true;
+        for (std::size_t offset = 0u; offset < planeBytes; offset += 4u)
+        {
+            const bool leftNonBlack = left[offset] != 0u
+                || left[offset + 1u] != 0u
+                || left[offset + 2u] != 0u;
+            const bool rightNonBlack = right[offset] != 0u
+                || right[offset + 1u] != 0u
+                || right[offset + 2u] != 0u;
+            if (leftNonBlack)
+                ++evidence.leftNonBlackPixels;
+            if (rightNonBlack)
+                ++evidence.rightNonBlackPixels;
+            if (left[offset] != right[offset]
+                || left[offset + 1u] != right[offset + 1u]
+                || left[offset + 2u] != right[offset + 2u])
+            {
+                ++evidence.differentPixels;
+            }
+        }
+
+        MemoryBarrier();
+        const auto* live = static_cast<
+            const fnvxr::shared::SharedD3D9StereoFrameHeader*>(mappingView);
+        evidence.stable = live->writing == 0
+            && live->sequence == sequence
+            && live->publishedSlot == header.publishedSlot;
+        return evidence;
+    }
+
+    struct StereoFrameObservation
+    {
+        bool present = false;
+        bool monoUiQuad = false;
+        bool engineCenterWorld = false;
+        std::uint64_t transactionId = 0u;
+        std::uint64_t sourceFrame = 0u;
+        std::uint64_t runtimeStateSample = 0u;
+        std::uint64_t publicationGeneration = 0u;
+        std::uint64_t rendererProducerEpoch = 0u;
+    };
+
+    bool stereoTransactionTokenMatches(
+        const fnvxr::shared::SharedD3D9StereoFrameHeader& header) noexcept
+    {
+        std::uint32_t expected = static_cast<std::uint32_t>(
+            header.transactionId);
+        if (expected == 0u)
+            expected = 1u;
+        return fnvxr::shared::sequencedValueBits(header.renderPairSequence)
+            == expected;
+    }
+
+    bool nonzeroGenerationFollows(
+        std::uint64_t newer,
+        std::uint64_t older) noexcept
+    {
+        const std::uint64_t delta = newer - older;
+        return newer != 0u
+            && delta != 0u
+            && delta < (std::uint64_t{1} << 63u);
+    }
+
+    bool readStereoPresentationObservation(
+        StereoFrameObservation& observation)
+    {
+        observation = {};
+        MappingView mapping;
+        if (!mapping.open(
+                fnvxr::shared::D3D9StereoFrameSharedMappingName,
+                SharedStereoMappingBytes))
+        {
+            return false;
+        }
+        observation.present = true;
+
+        fnvxr::shared::SharedD3D9StereoFrameHeader header {};
+        LONG sequenceBefore = 0;
+        LONG sequenceAfter = 0;
+        std::uint64_t publicationGeneration = 0u;
+        const bool stable = copyStereoHeaderChecked(
+            mapping.view,
+            header,
+            sequenceBefore,
+            sequenceAfter,
+            publicationGeneration);
+        const bool dimensionsOk = header.width > 0
+            && header.height > 0
+            && header.width <= static_cast<LONG>(
+                fnvxr::shared::D3D9SharedFrameMaxWidth)
+            && header.height <= static_cast<LONG>(
+                fnvxr::shared::D3D9SharedFrameMaxHeight)
+            && header.pitchBytes == header.width * 4;
+        const bool common = stable
+            && header.magic == fnvxr::shared::D3D9StereoFrameSharedMagic
+            && header.version == fnvxr::shared::D3D9StereoFrameSharedVersion
+            && header.headerBytes == sizeof(header)
+            && header.totalMappingBytes == SharedStereoMappingBytes
+            && dimensionsOk
+            && header.rendererProducerEpoch != 0u
+            && header.producerProcessId != 0u
+            && publicationGeneration != 0u
+            && header.transactionId != 0u
+            && header.sourceFrame != 0u
+            && header.runtimeStateSample != 0u
+            && stereoTransactionTokenMatches(header)
+            && header.poseValid != 0
+            && fnvxr::shared::sequencedValueIsPublished(
+                header.poseSequence)
+            && header.renderedDisplayTime > 0
+            && header.referenceSpaceGeneration != 0u
+            && header.producerEpoch != 0u
+            && stereoPayloadLayoutUsable(header);
+        const StereoPayloadEvidence payload = common
+            ? inspectStereoPayload(mapping.view, header, sequenceAfter)
+            : StereoPayloadEvidence {};
+
+        observation.transactionId = header.transactionId;
+        observation.sourceFrame = header.sourceFrame;
+        observation.runtimeStateSample = header.runtimeStateSample;
+        observation.publicationGeneration = publicationGeneration;
+        observation.rendererProducerEpoch = header.rendererProducerEpoch;
+        observation.monoUiQuad = common
+            && header.producerMode == static_cast<LONG>(
+                fnvxr::shared::StereoProducerMonoUiQuad)
+            && header.separated == 0
+            && header.worldCandidate == 0
+            && header.uiActive != 0
+            && payload.layoutUsable
+            && payload.stable
+            && payload.leftNonBlackPixels != 0u
+            && payload.rightNonBlackPixels != 0u
+            && payload.differentPixels == 0u;
+        observation.engineCenterWorld = common
+            && header.producerMode == static_cast<LONG>(
+                fnvxr::shared::StereoProducerEngineCenter)
+            && fnvxr::shared::stereoProducerCarriesSameTransactionEyes(
+                fnvxr::shared::StereoProducerEngineCenter)
+            && header.separated != 0
+            && header.worldCandidate != 0
+            && header.uiActive == 0
+            && payload.complete();
+        return true;
+    }
+
+    StereoTransitionStatus observeUiThenEngineCenterWorld(
+        int requestedTimeoutMs)
+    {
+        StereoTransitionStatus status {};
+        const int timeoutMs = requestedTimeoutMs < 0
+            ? 0
+            : (requestedTimeoutMs > 60000 ? 60000 : requestedTimeoutMs);
+        const ULONGLONG startedAt = GetTickCount64();
+        for (;;)
+        {
+            StereoFrameObservation observation {};
+            if (readStereoPresentationObservation(observation))
+            {
+                ++status.samples;
+                if (observation.monoUiQuad)
+                {
+                    status.uiObserved = true;
+                    status.uiPixelsVerified = true;
+                    status.uiTransactionId = observation.transactionId;
+                    status.uiSourceFrame = observation.sourceFrame;
+                    status.uiRuntimeStateSample =
+                        observation.runtimeStateSample;
+                    status.uiPublicationGeneration =
+                        observation.publicationGeneration;
+                    status.uiRendererProducerEpoch =
+                        observation.rendererProducerEpoch;
+                }
+                else if (status.uiObserved
+                    && observation.engineCenterWorld)
+                {
+                    status.worldObservedAfterUi = true;
+                    status.worldPixelsVerified = true;
+                    status.worldTransactionId = observation.transactionId;
+                    status.worldSourceFrame = observation.sourceFrame;
+                    status.worldRuntimeStateSample =
+                        observation.runtimeStateSample;
+                    status.worldPublicationGeneration =
+                        observation.publicationGeneration;
+                    status.worldRendererProducerEpoch =
+                        observation.rendererProducerEpoch;
+                    status.complete = observation.transactionId
+                            > status.uiTransactionId
+                        && observation.sourceFrame > status.uiSourceFrame
+                        && observation.rendererProducerEpoch
+                            == status.uiRendererProducerEpoch
+                        && nonzeroGenerationFollows(
+                            observation.publicationGeneration,
+                            status.uiPublicationGeneration);
+                    if (status.complete)
+                        return status;
+                }
+            }
+
+            if (GetTickCount64() - startedAt
+                >= static_cast<ULONGLONG>(timeoutMs))
+            {
+                return status;
+            }
+            Sleep(25u);
+        }
+    }
+
+    StereoTransitionStatus printUiThenEngineCenterWorldTransition(
+        const Options& options)
+    {
+        const StereoTransitionStatus status =
+            options.requireUiThenEngineCenterWorld
+                ? observeUiThenEngineCenterWorld(options.transitionTimeoutMs)
+                : StereoTransitionStatus {};
+        std::cout << "\"uiThenEngineCenterWorld\":{\n";
+        jsonBool("required", options.requireUiThenEngineCenterWorld);
+        jsonNumber("timeoutMs", static_cast<std::uint64_t>(
+            options.transitionTimeoutMs < 0
+                ? 0
+                : (options.transitionTimeoutMs > 60000
+                    ? 60000
+                    : options.transitionTimeoutMs)));
+        jsonNumber("samples", status.samples);
+        jsonBool("uiObserved", status.uiObserved);
+        jsonBool("uiPixelsVerified", status.uiPixelsVerified);
+        jsonNumber("uiTransactionId", status.uiTransactionId);
+        jsonNumber("uiSourceFrame", status.uiSourceFrame);
+        jsonNumber("uiRuntimeStateSample", status.uiRuntimeStateSample);
+        jsonNumber("uiPublicationGeneration", status.uiPublicationGeneration);
+        jsonNumber("uiRendererProducerEpoch", status.uiRendererProducerEpoch);
+        jsonBool("worldObservedAfterUi", status.worldObservedAfterUi);
+        jsonBool("worldPixelsVerified", status.worldPixelsVerified);
+        jsonNumber("worldTransactionId", status.worldTransactionId);
+        jsonNumber("worldSourceFrame", status.worldSourceFrame);
+        jsonNumber("worldRuntimeStateSample", status.worldRuntimeStateSample);
+        jsonNumber("worldPublicationGeneration", status.worldPublicationGeneration);
+        jsonNumber("worldRendererProducerEpoch", status.worldRendererProducerEpoch);
+        jsonBool("complete", status.complete, false);
+        std::cout << "},\n";
+        return status;
     }
 
     CounterStatus readPlayerCounter(const char* mappingName, std::uint32_t expectedMagic, std::uint32_t expectedVersion)
@@ -388,6 +802,113 @@ namespace
         return status;
     }
 
+    CounterStatus readDesktopAssistCounter(bool requireCameraPoseApplied = true)
+    {
+        CounterStatus status;
+        MappingView mapping;
+        if (!mapping.open(
+                fnvxr::shared::DesktopAssistSharedMappingName,
+                sizeof(fnvxr::shared::SharedDesktopAssistState)))
+        {
+            return status;
+        }
+
+        fnvxr::shared::SharedDesktopAssistState state {};
+        LONG sequenceBefore = 0;
+        LONG sequenceAfter = 0;
+        const bool stable = copyTornChecked(mapping.view, state, sequenceBefore, sequenceAfter);
+        constexpr std::uint32_t readyFlags =
+            fnvxr::shared::DesktopAssistFlagLeaseCurrent
+            | fnvxr::shared::DesktopAssistFlagCameraHookInstalled
+            | fnvxr::shared::DesktopAssistFlagFirstPerson
+            | fnvxr::shared::DesktopAssistFlagPlayerTransformValid
+            | fnvxr::shared::DesktopAssistFlagCameraLocalTransformValid
+            | fnvxr::shared::DesktopAssistFlagBodyRootTransformValid;
+        const bool ready = stable
+            && state.magic == fnvxr::shared::DesktopAssistSharedMagic
+            && state.version == fnvxr::shared::DesktopAssistSharedVersion
+            && (state.flags & readyFlags) == readyFlags
+            && finite3(state.playerWorldPos)
+            && finiteArray(state.playerWorldRot, 9)
+            && finite3(state.cameraLocalPos)
+            && finiteArray(state.cameraLocalRot, 9)
+            && state.bodyRootAddress != 0u
+            && finite3(state.bodyRootWorldPos)
+            && finiteArray(state.bodyRootWorldRot, 9);
+        status.present = true;
+        status.usable = ready
+            && (!requireCameraPoseApplied
+                || ((state.flags & fnvxr::shared::DesktopAssistFlagCameraPoseApplied) != 0u
+                    && state.poseSequence != 0u
+                    && state.poseProducerEpoch != 0u));
+        status.value = state.frame;
+        return status;
+    }
+
+    DesktopAssistUiQuadStatus readDesktopAssistUiQuadStatus()
+    {
+        DesktopAssistUiQuadStatus status;
+        MappingView mapping;
+        if (!mapping.open(
+                fnvxr::shared::DesktopAssistUiQuadSharedMappingName,
+                SharedDesktopAssistUiQuadMappingBytes))
+        {
+            return status;
+        }
+
+        status.present = true;
+        const auto* source = static_cast<const fnvxr::shared::SharedDesktopAssistUiQuadHeader*>(
+            mapping.view);
+        status.stable = copyDesktopAssistUiQuadHeaderChecked(
+            mapping.view,
+            status.header,
+            status.sequenceBefore,
+            status.sequenceAfter);
+        status.headerComplete = status.stable
+            && fnvxr::engine::desktopAssistUiQuadHeaderIsComplete(status.header);
+        if (!status.headerComplete)
+            return status;
+
+        std::size_t payloadBytes = 0u;
+        if (!fnvxr::engine::desktopAssistUiQuadPayloadLayoutIsValid(
+                status.header,
+                &payloadBytes))
+        {
+            return status;
+        }
+
+        const auto* pixels = reinterpret_cast<const std::uint8_t*>(mapping.view)
+            + status.header.headerBytes;
+        std::uint32_t nonBlack = 0u;
+        const std::uint32_t hash = fnvxr::engine::desktopAssistUiQuadPixelHash(
+            pixels,
+            payloadBytes,
+            &nonBlack);
+        MemoryBarrier();
+        const LONG finalSequence = source->sequence;
+        const LONG finalWriting = source->writing;
+        status.stable = status.stable
+            && finalWriting == 0
+            && finalSequence == status.sequenceAfter;
+        status.pixelsHashMatch = status.stable && hash == status.header.pixelHash;
+        status.nonBlackCountMatch = status.stable
+            && nonBlack == status.header.nonBlackSampleCount;
+        status.usable = status.headerComplete
+            && status.pixelsHashMatch
+            && status.nonBlackCountMatch;
+        return status;
+    }
+
+    CounterStatus readDesktopAssistUiQuadCounter()
+    {
+        const DesktopAssistUiQuadStatus uiQuad = readDesktopAssistUiQuadStatus();
+        CounterStatus status;
+        status.present = uiQuad.present;
+        status.usable = uiQuad.usable;
+        status.value = uiQuad.header.captureOrdinal;
+        return status;
+    }
+
     CounterStatus readVideoCounter()
     {
         CounterStatus status;
@@ -398,7 +919,11 @@ namespace
         fnvxr::shared::SharedD3D9FrameHeader header {};
         LONG sequenceBefore = 0;
         LONG sequenceAfter = 0;
-        const bool stable = copyFrameHeaderChecked(mapping.view, header, sequenceBefore, sequenceAfter);
+        const bool stable = copyFrameHeaderChecked(
+            mapping.view,
+            header,
+            sequenceBefore,
+            sequenceAfter);
         const bool dimensionsOk = header.width > 0 && header.height > 0
             && header.width <= static_cast<LONG>(fnvxr::shared::D3D9SharedFrameMaxWidth)
             && header.height <= static_cast<LONG>(fnvxr::shared::D3D9SharedFrameMaxHeight)
@@ -409,7 +934,9 @@ namespace
         return status;
     }
 
-    CounterStatus readStereoCounter(bool requireWorld)
+    CounterStatus readStereoCounter(
+        bool requireWorld,
+        bool requireEngineCenterWorld = false)
     {
         CounterStatus status;
         MappingView mapping;
@@ -419,7 +946,13 @@ namespace
         fnvxr::shared::SharedD3D9StereoFrameHeader header {};
         LONG sequenceBefore = 0;
         LONG sequenceAfter = 0;
-        const bool stable = copyFrameHeaderChecked(mapping.view, header, sequenceBefore, sequenceAfter);
+        std::uint64_t publicationGeneration = 0u;
+        const bool stable = copyStereoHeaderChecked(
+            mapping.view,
+            header,
+            sequenceBefore,
+            sequenceAfter,
+            publicationGeneration);
         const bool dimensionsOk = header.width > 0 && header.height > 0
             && header.width <= static_cast<LONG>(fnvxr::shared::D3D9SharedFrameMaxWidth)
             && header.height <= static_cast<LONG>(fnvxr::shared::D3D9SharedFrameMaxHeight)
@@ -430,7 +963,10 @@ namespace
             && header.totalMappingBytes == SharedStereoMappingBytes
             && header.rendererProducerEpoch != 0
             && header.producerProcessId != 0
-            && header.publicationGeneration != 0
+            && publicationGeneration != 0u
+            && header.transactionId != 0u
+            && header.sourceFrame != 0u
+            && header.runtimeStateSample != 0u
             && stereoPayloadLayoutUsable(header);
         const bool usable = stable && protocolOk
             && dimensionsOk
@@ -441,17 +977,26 @@ namespace
             && header.producerEpoch != 0
             && header.uiActive == 0;
         const bool coherentSameTickProducer =
-            (header.producerMode == static_cast<LONG>(fnvxr::shared::StereoProducerNativeSameFrame)
-                || header.producerMode == static_cast<LONG>(fnvxr::shared::StereoProducerSingleTraversal))
+            stereoProducerCarriesSameTransactionEyes(header.producerMode)
             && fnvxr::shared::sequencedValueBits(header.renderPairSequence) != 0u;
-        const bool world = usable
+        const bool worldMetadata = usable
             && coherentSameTickProducer
             && header.worldCandidate != 0
             && header.separated != 0;
+        const StereoPayloadEvidence payloadEvidence = worldMetadata && requireWorld
+            ? inspectStereoPayload(mapping.view, header, sequenceAfter)
+            : StereoPayloadEvidence {};
+        const bool world = worldMetadata
+            && (!requireWorld || payloadEvidence.complete());
+        const bool engineCenterWorld = world
+            && header.producerMode == static_cast<LONG>(
+                fnvxr::shared::StereoProducerEngineCenter);
         status.present = true;
-        status.usable = requireWorld ? world : usable;
-        status.modular32 = true;
-        status.value = fnvxr::shared::sequencedValueBits(header.sequence);
+        status.usable = requireEngineCenterWorld
+            ? engineCenterWorld
+            : (requireWorld ? world : usable);
+        status.domain = CounterDomain::NonzeroModulo64;
+        status.value = publicationGeneration;
         return status;
     }
 
@@ -505,8 +1050,16 @@ namespace
             "Local\\FNVXR_Player_State", fnvxr::shared::PlayerSharedMagic, fnvxr::shared::PlayerSharedVersion);
         const CounterStatus runtimeBefore = readRuntimeCounter();
         const CounterStatus cameraBefore = readCameraCounter();
+        const CounterStatus desktopAssistBefore = readDesktopAssistCounter(
+            options.requireDesktopAssist);
+        const CounterStatus desktopAssistUiQuadBefore = readDesktopAssistUiQuadCounter();
         const CounterStatus videoBefore = readVideoCounter();
-        const CounterStatus stereoBefore = readStereoCounter(options.requireWorldStereo);
+        const CounterStatus stereoBefore = readStereoCounter(
+            options.requireWorldStereo
+                || options.requireEngineCenterWorldStereo
+                || options.requireUiThenEngineCenterWorld,
+            options.requireEngineCenterWorldStereo
+                || options.requireUiThenEngineCenterWorld);
         const CounterStatus poseBefore = readPoseCounter();
 
         const int sampleDelayMs = options.sampleDelayMs < 0 ? 0 : options.sampleDelayMs;
@@ -516,13 +1069,25 @@ namespace
             "Local\\FNVXR_Player_State", fnvxr::shared::PlayerSharedMagic, fnvxr::shared::PlayerSharedVersion);
         const CounterStatus runtimeAfter = readRuntimeCounter();
         const CounterStatus cameraAfter = readCameraCounter();
+        const CounterStatus desktopAssistAfter = readDesktopAssistCounter(
+            options.requireDesktopAssist);
+        const CounterStatus desktopAssistUiQuadAfter = readDesktopAssistUiQuadCounter();
         const CounterStatus videoAfter = readVideoCounter();
-        const CounterStatus stereoAfter = readStereoCounter(options.requireWorldStereo);
+        const CounterStatus stereoAfter = readStereoCounter(
+            options.requireWorldStereo
+                || options.requireEngineCenterWorldStereo
+                || options.requireUiThenEngineCenterWorld,
+            options.requireEngineCenterWorldStereo
+                || options.requireUiThenEngineCenterWorld);
         const CounterStatus poseAfter = readPoseCounter();
 
         const bool anySpecificRequirement = options.requirePlayer || options.requireRuntime
-            || options.requireCamera || options.requireVideo || options.requireStereo
-            || options.requireWorldStereo || options.requirePose;
+            || options.requireCamera || options.requireDesktopAssistReady
+            || options.requireDesktopAssist || options.requireDesktopAssistUiQuad
+            || options.requireVideo || options.requireStereo
+            || options.requireWorldStereo || options.requireEngineCenterWorldStereo
+            || options.requireUiThenEngineCenterWorld
+            || options.requirePose;
         bool allRequiredAdvanced = true;
         if (!anySpecificRequirement || options.requirePlayer)
             allRequiredAdvanced = allRequiredAdvanced && counterAdvanced(playerBefore, playerAfter);
@@ -530,9 +1095,16 @@ namespace
             allRequiredAdvanced = allRequiredAdvanced && counterAdvanced(runtimeBefore, runtimeAfter);
         if (!anySpecificRequirement || options.requireCamera)
             allRequiredAdvanced = allRequiredAdvanced && counterAdvanced(cameraBefore, cameraAfter);
+        if (!anySpecificRequirement || options.requireDesktopAssistReady || options.requireDesktopAssist)
+            allRequiredAdvanced = allRequiredAdvanced && counterAdvanced(desktopAssistBefore, desktopAssistAfter);
+        if (!anySpecificRequirement || options.requireDesktopAssistUiQuad)
+            allRequiredAdvanced = allRequiredAdvanced
+                && counterAdvanced(desktopAssistUiQuadBefore, desktopAssistUiQuadAfter);
         if (!anySpecificRequirement || options.requireVideo)
             allRequiredAdvanced = allRequiredAdvanced && counterAdvanced(videoBefore, videoAfter);
-        if (!anySpecificRequirement || options.requireStereo || options.requireWorldStereo)
+        if (!anySpecificRequirement || options.requireStereo || options.requireWorldStereo
+            || options.requireEngineCenterWorldStereo
+            || options.requireUiThenEngineCenterWorld)
             allRequiredAdvanced = allRequiredAdvanced && counterAdvanced(stereoBefore, stereoAfter);
         if (!anySpecificRequirement || options.requirePose)
             allRequiredAdvanced = allRequiredAdvanced && counterAdvanced(poseBefore, poseAfter);
@@ -542,6 +1114,8 @@ namespace
         jsonFreshCounter("player", playerBefore, playerAfter);
         jsonFreshCounter("runtime", runtimeBefore, runtimeAfter);
         jsonFreshCounter("camera", cameraBefore, cameraAfter);
+        jsonFreshCounter("desktopAssist", desktopAssistBefore, desktopAssistAfter);
+        jsonFreshCounter("desktopAssistUiQuad", desktopAssistUiQuadBefore, desktopAssistUiQuadAfter);
         jsonFreshCounter("video", videoBefore, videoAfter);
         jsonFreshCounter("stereo", stereoBefore, stereoAfter);
         jsonFreshCounter("pose", poseBefore, poseAfter);
@@ -580,6 +1154,7 @@ namespace
         jsonNumber("phase", state.phase);
         jsonBool("uiInputAllowed", state.uiInputAllowed != 0);
         jsonBool("cameraActive", state.cameraActive != 0);
+        jsonBool("showroomActive", state.showroomActive != 0);
         jsonBool("usable", usable, false);
         std::cout << "},\n";
         return usable;
@@ -617,6 +1192,128 @@ namespace
         jsonBool("usable", usable, false);
         std::cout << "},\n";
         return usable;
+    }
+
+    DesktopAssistStatus printDesktopAssist()
+    {
+        MappingView mapping;
+        std::cout << "\"desktopAssist\":{\n";
+        if (!mapping.open(
+                fnvxr::shared::DesktopAssistSharedMappingName,
+                sizeof(fnvxr::shared::SharedDesktopAssistState)))
+        {
+            jsonBool("present", false, false);
+            std::cout << "},\n";
+            return {};
+        }
+
+        fnvxr::shared::SharedDesktopAssistState state {};
+        LONG sequenceBefore = 0;
+        LONG sequenceAfter = 0;
+        const bool stable = copyTornChecked(mapping.view, state, sequenceBefore, sequenceAfter);
+        const bool magicOk = state.magic == fnvxr::shared::DesktopAssistSharedMagic;
+        const bool versionOk = state.version == fnvxr::shared::DesktopAssistSharedVersion;
+        constexpr std::uint32_t readyFlags =
+            fnvxr::shared::DesktopAssistFlagLeaseCurrent
+            | fnvxr::shared::DesktopAssistFlagCameraHookInstalled
+            | fnvxr::shared::DesktopAssistFlagFirstPerson
+            | fnvxr::shared::DesktopAssistFlagPlayerTransformValid
+            | fnvxr::shared::DesktopAssistFlagCameraLocalTransformValid
+            | fnvxr::shared::DesktopAssistFlagBodyRootTransformValid;
+        const bool ready = stable && magicOk && versionOk
+            && (state.flags & readyFlags) == readyFlags
+            && finite3(state.playerWorldPos)
+            && finiteArray(state.playerWorldRot, 9)
+            && finite3(state.cameraLocalPos)
+            && finiteArray(state.cameraLocalRot, 9)
+            && state.bodyRootAddress != 0u
+            && finite3(state.bodyRootWorldPos)
+            && finiteArray(state.bodyRootWorldRot, 9);
+        const bool poseApplied = ready
+            && (state.flags & fnvxr::shared::DesktopAssistFlagCameraPoseApplied) != 0u
+            && state.poseSequence != 0u
+            && state.poseProducerEpoch != 0u;
+
+        jsonBool("present", true);
+        jsonBool("stable", stable);
+        jsonBool("magicOk", magicOk);
+        jsonBool("versionOk", versionOk);
+        jsonSigned("sequenceBefore", sequenceBefore);
+        jsonSigned("sequenceAfter", sequenceAfter);
+        jsonNumber("frame", state.frame);
+        jsonNumber("flags", state.flags);
+        jsonNumber("poseSequence", state.poseSequence);
+        jsonNumber("poseProducerEpoch", state.poseProducerEpoch);
+        jsonBool("leaseCurrent", (state.flags & fnvxr::shared::DesktopAssistFlagLeaseCurrent) != 0u);
+        jsonBool("cameraHookInstalled", (state.flags & fnvxr::shared::DesktopAssistFlagCameraHookInstalled) != 0u);
+        jsonBool("cameraPoseApplied", (state.flags & fnvxr::shared::DesktopAssistFlagCameraPoseApplied) != 0u);
+        jsonBool("firstPerson", (state.flags & fnvxr::shared::DesktopAssistFlagFirstPerson) != 0u);
+        jsonBool("playerTransformValid", (state.flags & fnvxr::shared::DesktopAssistFlagPlayerTransformValid) != 0u);
+        jsonBool("cameraLocalTransformValid", (state.flags & fnvxr::shared::DesktopAssistFlagCameraLocalTransformValid) != 0u);
+        jsonBool("bodyRootTransformValid", (state.flags & fnvxr::shared::DesktopAssistFlagBodyRootTransformValid) != 0u);
+        jsonNumber("bodyRootAddress", state.bodyRootAddress);
+        jsonFloatArray3("playerWorldPos", state.playerWorldPos);
+        jsonFloatArray3("cameraLocalPos", state.cameraLocalPos);
+        jsonFloatArray3("bodyRootWorldPos", state.bodyRootWorldPos);
+        jsonBool("ready", ready);
+        jsonBool("poseApplied", poseApplied);
+        jsonBool("usable", poseApplied, false);
+        std::cout << "},\n";
+        return { ready, poseApplied };
+    }
+
+    bool printDesktopAssistUiQuad()
+    {
+        const DesktopAssistUiQuadStatus status = readDesktopAssistUiQuadStatus();
+        std::cout << "\"desktopAssistUiQuad\":{\n";
+        if (!status.present)
+        {
+            jsonBool("present", false, false);
+            std::cout << "},\n";
+            return false;
+        }
+
+        const auto& header = status.header;
+        const bool magicOk = header.magic == fnvxr::shared::DesktopAssistUiQuadSharedMagic;
+        const bool versionOk = header.version == fnvxr::shared::DesktopAssistUiQuadSharedVersion;
+        const bool headerBytesOk = header.headerBytes == sizeof(header);
+        const bool requiredFlags = (header.flags & fnvxr::engine::DesktopAssistUiQuadRequiredFlags)
+            == fnvxr::engine::DesktopAssistUiQuadRequiredFlags;
+        const bool payloadLayoutOk = fnvxr::engine::desktopAssistUiQuadPayloadLayoutIsValid(header);
+        const bool runtimeUiConfirmed = fnvxr::engine::desktopAssistUiQuadRuntimeConfirmedUi(header);
+
+        jsonBool("present", true);
+        jsonBool("stable", status.stable);
+        jsonBool("magicOk", magicOk);
+        jsonBool("versionOk", versionOk);
+        jsonBool("headerBytesOk", headerBytesOk);
+        jsonBool("requiredFlags", requiredFlags);
+        jsonBool("payloadLayoutOk", payloadLayoutOk);
+        jsonBool("runtimeUiConfirmed", runtimeUiConfirmed);
+        jsonSigned("sequenceBefore", status.sequenceBefore);
+        jsonSigned("sequenceAfter", status.sequenceAfter);
+        jsonSigned("sequence", header.sequence);
+        jsonNumber("flags", header.flags);
+        jsonSigned("width", header.width);
+        jsonSigned("height", header.height);
+        jsonSigned("pitchBytes", header.pitchBytes);
+        jsonSigned("format", header.format);
+        jsonNumber("runtimeStateSample", header.runtimeStateSample);
+        jsonNumber("poseFrame", header.poseFrame);
+        jsonSigned("poseSequence", header.poseSequence);
+        jsonNumber("runtimePhase", header.runtimePhase);
+        jsonNumber("runtimeMenuBits", header.runtimeMenuBits);
+        jsonNumber("pixelHash", header.pixelHash);
+        jsonNumber("captureFailure", header.captureFailure);
+        jsonNumber("nonBlackSampleCount", header.nonBlackSampleCount);
+        jsonNumber("poseProducerEpoch", header.poseProducerEpoch);
+        jsonNumber("captureOrdinal", header.captureOrdinal);
+        jsonBool("headerComplete", status.headerComplete);
+        jsonBool("pixelsHashMatch", status.pixelsHashMatch);
+        jsonBool("nonBlackCountMatch", status.nonBlackCountMatch);
+        jsonBool("usable", status.usable, false);
+        std::cout << "},\n";
+        return status.usable;
     }
 
     bool printVideo()
@@ -669,7 +1366,13 @@ namespace
         fnvxr::shared::SharedD3D9StereoFrameHeader header {};
         LONG sequenceBefore = 0;
         LONG sequenceAfter = 0;
-        const bool stable = copyFrameHeaderChecked(mapping.view, header, sequenceBefore, sequenceAfter);
+        std::uint64_t publicationGeneration = 0u;
+        const bool stable = copyStereoHeaderChecked(
+            mapping.view,
+            header,
+            sequenceBefore,
+            sequenceAfter,
+            publicationGeneration);
         const bool magicOk = header.magic == fnvxr::shared::D3D9StereoFrameSharedMagic;
         const bool protocolOk = magicOk
             && header.version == fnvxr::shared::D3D9StereoFrameSharedVersion
@@ -677,7 +1380,10 @@ namespace
             && header.totalMappingBytes == SharedStereoMappingBytes
             && header.rendererProducerEpoch != 0
             && header.producerProcessId != 0
-            && header.publicationGeneration != 0
+            && publicationGeneration != 0u
+            && header.transactionId != 0u
+            && header.sourceFrame != 0u
+            && header.runtimeStateSample != 0u
             && stereoPayloadLayoutUsable(header);
         const bool dimensionsOk = header.width > 0 && header.height > 0
             && header.width <= static_cast<LONG>(fnvxr::shared::D3D9SharedFrameMaxWidth)
@@ -694,19 +1400,31 @@ namespace
             == static_cast<LONG>(fnvxr::shared::StereoProducerNativeSameFrame);
         const bool singleTraversal = header.producerMode
             == static_cast<LONG>(fnvxr::shared::StereoProducerSingleTraversal);
+        const bool engineCenter = header.producerMode
+            == static_cast<LONG>(fnvxr::shared::StereoProducerEngineCenter);
         const bool coherentSameTickProducer =
-            (nativeSameFrame || singleTraversal)
+            stereoProducerCarriesSameTransactionEyes(header.producerMode)
             && fnvxr::shared::sequencedValueBits(header.renderPairSequence) != 0u;
         const bool worldStereo = usable
             && coherentSameTickProducer
             && header.worldCandidate != 0
             && header.separated != 0;
+        const StereoPayloadEvidence payloadEvidence = worldStereo
+            ? inspectStereoPayload(mapping.view, header, sequenceAfter)
+            : StereoPayloadEvidence {};
+        const bool payloadEvidenceComplete = payloadEvidence.complete();
+        const bool usableWorldStereo = worldStereo && payloadEvidenceComplete;
+        const bool engineCenterWorldStereo = usableWorldStereo && engineCenter;
 
         jsonBool("present", true);
         jsonBool("stable", stable);
         jsonBool("magicOk", magicOk);
         jsonBool("protocolOk", protocolOk);
         jsonSigned("sequence", header.sequence);
+        jsonNumber("publicationGeneration", publicationGeneration);
+        jsonNumber("transactionId", header.transactionId);
+        jsonNumber("sourceFrame", header.sourceFrame);
+        jsonNumber("runtimeStateSample", header.runtimeStateSample);
         jsonSigned("width", header.width);
         jsonSigned("height", header.height);
         jsonSigned("pitchBytes", header.pitchBytes);
@@ -721,11 +1439,19 @@ namespace
         jsonSigned("renderPairSequence", header.renderPairSequence);
         jsonBool("nativeSameFrame", nativeSameFrame);
         jsonBool("singleTraversal", singleTraversal);
+        jsonBool("engineCenter", engineCenter);
         jsonBool("coherentSameTickProducer", coherentSameTickProducer);
+        jsonBool("payloadLayoutUsable", payloadEvidence.layoutUsable);
+        jsonBool("payloadStable", payloadEvidence.stable);
+        jsonNumber("leftNonBlackPixels", payloadEvidence.leftNonBlackPixels);
+        jsonNumber("rightNonBlackPixels", payloadEvidence.rightNonBlackPixels);
+        jsonNumber("differentPixels", payloadEvidence.differentPixels);
+        jsonBool("payloadEvidenceComplete", payloadEvidenceComplete);
         jsonBool("usableForHostStereo", usable);
-        jsonBool("usableWorldStereo", worldStereo, false);
+        jsonBool("usableWorldStereo", usableWorldStereo);
+        jsonBool("usableEngineCenterWorldStereo", engineCenterWorldStereo, false);
         std::cout << "},\n";
-        return { usable, worldStereo };
+        return { usable, usableWorldStereo, engineCenterWorldStereo };
     }
 
     bool printPose()
@@ -818,10 +1544,23 @@ int main(int argc, char** argv)
     options.requireVideo = hasArg(args, "--require-video");
     options.requireStereo = hasArg(args, "--require-stereo");
     options.requireWorldStereo = hasArg(args, "--require-world-stereo");
+    options.requireEngineCenterWorldStereo = hasArg(
+        args,
+        "--require-engine-center-world-stereo");
+    options.requireUiThenEngineCenterWorld = hasArg(
+        args,
+        "--require-ui-then-engine-center-world");
     options.requirePose = hasArg(args, "--require-pose");
     options.requireCamera = hasArg(args, "--require-camera");
+    options.requireDesktopAssistReady = hasArg(args, "--require-desktop-assist-ready");
+    options.requireDesktopAssist = hasArg(args, "--require-desktop-assist");
+    options.requireDesktopAssistUiQuad = hasArg(args, "--require-desktop-assist-ui-quad");
     options.requireAdvancing = hasArg(args, "--require-advancing");
     options.sampleDelayMs = argInt(args, "--sample-delay-ms", options.sampleDelayMs);
+    options.transitionTimeoutMs = argInt(
+        args,
+        "--transition-timeout-ms",
+        options.transitionTimeoutMs);
 
     std::cout << "{\n";
     const PlayerStatus player = printPlayer(
@@ -831,8 +1570,12 @@ int main(int argc, char** argv)
         fnvxr::shared::PlayerSharedVersion);
     const bool runtime = printRuntime();
     const bool camera = printCamera();
+    const DesktopAssistStatus desktopAssist = printDesktopAssist();
+    const bool desktopAssistUiQuad = printDesktopAssistUiQuad();
     const bool video = printVideo();
     const StereoStatus stereo = printStereo();
+    const StereoTransitionStatus uiThenEngineCenterWorld =
+        printUiThenEngineCenterWorldTransition(options);
     bool advancing = true;
     if (options.requireAdvancing)
         advancing = printFreshness(options);
@@ -843,9 +1586,16 @@ int main(int argc, char** argv)
     failed = failed || (options.requirePlayer && !player.usable);
     failed = failed || (options.requireRuntime && !runtime);
     failed = failed || (options.requireCamera && !camera);
+    failed = failed || (options.requireDesktopAssistReady && !desktopAssist.ready);
+    failed = failed || (options.requireDesktopAssist && !desktopAssist.poseApplied);
+    failed = failed || (options.requireDesktopAssistUiQuad && !desktopAssistUiQuad);
     failed = failed || (options.requireVideo && !video);
     failed = failed || (options.requireStereo && !stereo.usable);
     failed = failed || (options.requireWorldStereo && !stereo.world);
+    failed = failed || (options.requireEngineCenterWorldStereo
+        && !stereo.engineCenterWorld);
+    failed = failed || (options.requireUiThenEngineCenterWorld
+        && !uiThenEngineCenterWorld.complete);
     failed = failed || (options.requirePose && !pose);
     failed = failed || (options.requireAdvancing && !advancing);
     return failed ? 2 : 0;

@@ -51,8 +51,15 @@ struct RetailNiAccumulatorLayout
 
 struct RetailNiCameraLayout
 {
-    std::uint8_t opaqueBase[0x9C];
-    float worldToCamera[16];
+    // NiCamera retains the NiAVObject spatial state through 0x9B, followed
+    // by the 0x10-byte world-bound block.  The world-to-camera affine matrix
+    // starts after that block at 0xAC and occupies three rows of four floats.
+    // The authenticated NiCamera::SetViewFrustum body writes the frustum at
+    // 0xDC..0xF4, while the authenticated factory pushes a 0x114-byte object
+    // allocation.  Treating this affine matrix as a 4x4 matrix consumes the
+    // frustum and is unsafe for an in-process renderer.
+    std::uint8_t opaqueBase[0xAC];
+    float worldToCamera[12];
     RetailNiFrustumLayout frustum;
     float minimumNearPlane;
     float maximumFarNearRatio;
@@ -62,13 +69,27 @@ struct RetailNiCameraLayout
 
 struct RetailSceneGraphLayout
 {
+    // A live retail World SceneGraph snapshot establishes these fields at the
+    // 0xAC NiNode boundary: camera, transient visible array, culler, opaque
+    // word, and FOV.  The older disabled xNVSE declaration that placed them
+    // at 0xDC does not describe the loaded FalloutNV.exe 1.4.0.525 object.
     std::uint8_t opaqueNode[0xAC];
     RetailPointer32 camera;
     RetailPointer32 visibleArray;
     RetailPointer32 cullingProcess;
-    std::uint8_t isMenuSceneGraph;
-    std::uint8_t reservedB9[3];
+    // This is an undocumented word at 0xB8. It is not a
+    // menu-state flag and must not influence world-versus-UI routing.
+    std::uint32_t opaqueUnknownB8;
     float cameraFov;
+};
+
+// The stock AccumulateScene wrapper installs the active shader accumulator in
+// NiDX9Renderer before any geometry is admitted. Only the proven leading
+// ownership field is modeled here; the remainder of the renderer is opaque.
+struct RetailRendererAccumulatorOwnerLayout
+{
+    std::uint8_t opaqueBase[0x08];
+    RetailPointer32 accumulator;
 };
 
 struct RetailNiCullingProcessLayout
@@ -117,6 +138,7 @@ static_assert(sizeof(RetailNiVisibleArrayLayout) == 0x10u);
 static_assert(sizeof(RetailNiAccumulatorLayout) == 0x0Cu);
 static_assert(sizeof(RetailNiCameraLayout) == 0x114u);
 static_assert(sizeof(RetailSceneGraphLayout) == 0xC0u);
+static_assert(sizeof(RetailRendererAccumulatorOwnerLayout) == 0x0Cu);
 static_assert(sizeof(RetailNiCullingProcessLayout) == 0x90u);
 static_assert(sizeof(RetailBSCullingProcessLayout) == 0xC8u);
 static_assert(sizeof(RetailBSShaderAccumulatorLayout) == 0x280u);
@@ -130,7 +152,7 @@ static_assert(offsetof(RetailNiAccumulatorLayout, vtable) == 0x00u);
 static_assert(offsetof(RetailNiAccumulatorLayout, referenceCount) == 0x04u);
 static_assert(offsetof(RetailNiAccumulatorLayout, camera) == 0x08u);
 
-static_assert(offsetof(RetailNiCameraLayout, worldToCamera) == 0x9Cu);
+static_assert(offsetof(RetailNiCameraLayout, worldToCamera) == 0xACu);
 static_assert(offsetof(RetailNiCameraLayout, frustum) == 0xDCu);
 static_assert(offsetof(RetailNiCameraLayout, minimumNearPlane) == 0xF8u);
 static_assert(offsetof(RetailNiCameraLayout, maximumFarNearRatio) == 0xFCu);
@@ -140,8 +162,10 @@ static_assert(offsetof(RetailNiCameraLayout, lodAdjust) == 0x110u);
 static_assert(offsetof(RetailSceneGraphLayout, camera) == 0xACu);
 static_assert(offsetof(RetailSceneGraphLayout, visibleArray) == 0xB0u);
 static_assert(offsetof(RetailSceneGraphLayout, cullingProcess) == 0xB4u);
-static_assert(offsetof(RetailSceneGraphLayout, isMenuSceneGraph) == 0xB8u);
+static_assert(offsetof(RetailSceneGraphLayout, opaqueUnknownB8) == 0xB8u);
 static_assert(offsetof(RetailSceneGraphLayout, cameraFov) == 0xBCu);
+static_assert(
+    offsetof(RetailRendererAccumulatorOwnerLayout, accumulator) == 0x08u);
 
 static_assert(offsetof(RetailNiCullingProcessLayout, useAppendFunction) == 0x04u);
 static_assert(offsetof(RetailNiCullingProcessLayout, visibleArray) == 0x08u);
@@ -173,6 +197,11 @@ static_assert(std::is_trivially_copyable_v<RetailBSCullingProcessLayout>);
 static_assert(std::is_trivially_copyable_v<RetailBSShaderAccumulatorLayout>);
 
 inline constexpr std::uintptr_t SceneGraphSingletonPointerAddress = 0x011DEB7Cu;
+inline constexpr std::uintptr_t RendererSingletonPointerAddress = 0x011F4748u;
+inline constexpr std::uintptr_t AccumulatingAccumulatorPointerAddress =
+    0x011F95ECu;
+inline constexpr std::uintptr_t RenderingAccumulatorPointerAddress =
+    0x011F95F0u;
 inline constexpr std::uintptr_t BSCullingProcessVtableAddress = 0x0101E2ECu;
 inline constexpr std::uintptr_t BSShaderAccumulatorVtableAddress = 0x010ADFF8u;
 
@@ -200,6 +229,17 @@ using NiFreeFunction = void (FNVXR_RETAIL_CDECL*)(
     void* allocation,
     std::uint32_t byteCount);
 using NiCameraCreateFunction = RetailNiCameraLayout* (FNVXR_RETAIL_CDECL*)();
+// RenderFirstPerson is called through three sealed local E8 callsites in the
+// exact retail frame.  ECX carries the renderer-owned instance and the callee
+// pops the four dword stack arguments (`ret 0x10`).  The argument meanings are
+// intentionally opaque here: the stereo relay preserves and reuses the exact
+// stock call frame instead of synthesizing gameplay values.
+using RenderFirstPersonFunction = void (FNVXR_RETAIL_THISCALL*)(
+    void* rendererInstance,
+    std::uint32_t argument0,
+    std::uint32_t argument1,
+    std::uint32_t argument2,
+    std::uint32_t argument3);
 using BSCullingProcessConstructorFunction = RetailBSCullingProcessLayout*
     (FNVXR_RETAIL_THISCALL*)(
         RetailBSCullingProcessLayout* storage,
@@ -230,6 +270,15 @@ using AccumulatorAddVisibleArrayFunction = void
     (FNVXR_RETAIL_THISCALL*)(
         RetailNiAccumulatorLayout* accumulator,
         RetailNiVisibleArrayLayout* visibleArray);
+using AccumulatorFinishAccumulatingFunction = void
+    (FNVXR_RETAIL_THISCALL*)(
+        RetailNiAccumulatorLayout* accumulator);
+// Auxiliary shader modes invoke this cdecl wrapper. It first dispatches the
+// +0xA4 NiAccumulator finish operation, then enters their shader-batch
+// builder. RenderWorldSceneGraph mode 0 does not use the latter stage.
+using FinishAccumulatingShaderAccumulatorFunction = void
+    (FNVXR_RETAIL_CDECL*)(
+        RetailBSShaderAccumulatorLayout* accumulator);
 using GeometryOnVisibleFunction = void
     (FNVXR_RETAIL_THISCALL*)(
         void* geometry,
@@ -240,6 +289,10 @@ using CullingProcessAltFunction = void
         RetailNiCameraLayout* camera,
         void* sceneObject,
         RetailNiVisibleArrayLayout* visibleArray);
+using CullingProcessSetAccumulatorFunction = void
+    (FNVXR_RETAIL_THISCALL*)(
+        RetailBSCullingProcessLayout* cullingProcess,
+        RetailBSShaderAccumulatorLayout* accumulator);
 using CullingProcessFunction = void
     (FNVXR_RETAIL_THISCALL*)(
         RetailBSCullingProcessLayout* cullingProcess,
@@ -264,6 +317,12 @@ using AccumulatorRenderFunction = void (FNVXR_RETAIL_CDECL*)(
     RetailNiCameraLayout* camera,
     RetailBSShaderAccumulatorLayout* accumulator,
     std::uint32_t branchSelectorOrContext);
+using RendererSetAccumulatorFunction = void
+    (FNVXR_RETAIL_THISCALL*)(
+        RetailRendererAccumulatorOwnerLayout* renderer,
+        RetailBSShaderAccumulatorLayout* accumulator);
+using SetCurrentAccumulatorFunction = void (FNVXR_RETAIL_CDECL*)(
+    RetailBSShaderAccumulatorLayout* accumulator);
 
 #undef FNVXR_RETAIL_CDECL
 #undef FNVXR_RETAIL_THISCALL
@@ -283,12 +342,32 @@ struct RetailFunctionAbiDescriptor
     std::uint8_t independentLoadedSamples = 0;
 };
 
-// Every callable range below matched in two independent loaded retail process
-// samples.  The second sample also captured the stock constructor call sites
-// and both world-branch/wrapper call frames, establishing the argument
-// semantics recorded here.  Runtime use still requires a synchronous match in
+// RenderFirstPerson has an exact ABI contract, but its body cannot join the
+// generic raw-hash inventory: the supported JIP compatibility module replaces
+// one local call inside that body.  The compatibility proof verifies its
+// normalized body separately before an authority is issued.  Keep the call
+// frame descriptor here so callers remain typed without accidentally making a
+// known normalized function fail the generic byte inventory.
+inline constexpr RetailFunctionAbiDescriptor RetailRenderFirstPersonAbi {
+    "RenderFirstPerson",
+    FirstPersonRenderAddress,
+    3361u,
+    sha256FromHex("7F734D69C1C74C2099BE684FB4FE682BF84B3F75A108F109CCF1DF74EF9D55F2"),
+    RetailX86CallingConvention::Thiscall,
+    4u,
+    16u,
+    true,
+    true,
+    true,
+    2u,
+};
+
+// Every generic callable range below matched in two independent loaded retail
+// process samples.  The second sample also captured the stock constructor call
+// sites and both world-branch/wrapper call frames, establishing the argument
+// semantics recorded here. Runtime use still requires a synchronous match in
 // the exact target process; this static inventory is never sufficient alone.
-inline constexpr std::array<RetailFunctionAbiDescriptor, 22>
+inline constexpr std::array<RetailFunctionAbiDescriptor, 28>
     RetailFunctionAbiInventory {{
         {
             "Ni_Alloc",
@@ -350,6 +429,19 @@ inline constexpr std::array<RetailFunctionAbiDescriptor, 22>
             RetailX86CallingConvention::Thiscall,
             0u,
             0u,
+            true,
+            true,
+            true,
+            2u,
+        },
+        {
+            "BSCullingProcess::SetAccumulator",
+            0x004A0FD0u,
+            32u,
+            sha256FromHex("0E8D694C72A4D0CE8E0C4D7AE13C736A60DD52C30814F123F3D7968CB08867B0"),
+            RetailX86CallingConvention::Thiscall,
+            1u,
+            4u,
             true,
             true,
             true,
@@ -421,6 +513,19 @@ inline constexpr std::array<RetailFunctionAbiDescriptor, 22>
             2u,
         },
         {
+            "NiAccumulator::FinishAccumulating",
+            0x00A9B570u,
+            437u,
+            sha256FromHex("192CA9CE2B5C39AC15A0DBFA4F6D2650471A17775AD3950032419C381A3FB20F"),
+            RetailX86CallingConvention::Thiscall,
+            0u,
+            0u,
+            true,
+            true,
+            true,
+            2u,
+        },
+        {
             "NiAccumulator::AddVisibleArray",
             0x00A9B790u,
             189u,
@@ -428,6 +533,45 @@ inline constexpr std::array<RetailFunctionAbiDescriptor, 22>
             RetailX86CallingConvention::Thiscall,
             1u,
             4u,
+            true,
+            true,
+            true,
+            2u,
+        },
+        {
+            "NiDX9Renderer::SetAccumulator",
+            0x004DC540u,
+            28u,
+            sha256FromHex("074EEB885B54AD9928D05953D884D7EBE1E972F343218CB3B259847C544059CE"),
+            RetailX86CallingConvention::Thiscall,
+            1u,
+            4u,
+            true,
+            true,
+            true,
+            2u,
+        },
+        {
+            "SetAccumulatingAccumulator",
+            0x00B54AC0u,
+            67u,
+            sha256FromHex("090D769BE42412C91238B145FAF565C7E798B33383C36C013FC63D3F414D22E0"),
+            RetailX86CallingConvention::Cdecl,
+            1u,
+            0u,
+            true,
+            true,
+            true,
+            2u,
+        },
+        {
+            "SetRenderingAccumulator",
+            0x00B54B10u,
+            67u,
+            sha256FromHex("7275C2641733458099883732EAFB7CEFDC6B5C791F1ECB56AC24BF6864F7B7D3"),
+            RetailX86CallingConvention::Cdecl,
+            1u,
+            0u,
             true,
             true,
             true,
@@ -480,6 +624,19 @@ inline constexpr std::array<RetailFunctionAbiDescriptor, 22>
             RetailX86CallingConvention::Thiscall,
             1u,
             4u,
+            true,
+            true,
+            true,
+            2u,
+        },
+        {
+            "FinishAccumulatingShaderAccumulator",
+            0x00B65E80u,
+            51u,
+            sha256FromHex("9D03349FA8780CF4B1898D4B0355D03BD58343E6D514ABE5F44734C63F8E0684"),
+            RetailX86CallingConvention::Cdecl,
+            1u,
+            0u,
             true,
             true,
             true,

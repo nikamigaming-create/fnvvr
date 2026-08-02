@@ -7,12 +7,12 @@ the printable report is generated at `output/pdf/fnvxr_6dof_coordinate_proof.pdf
 
 ## Frames
 
-OpenXR local axes are `(right, up, back)`, with `-Z` forward. NiCamera local
-axes are also `(right, up, back)`, so native camera translation uses the
-identity map:
+OpenXR local axes are `(right, up, back)`, with `-Z` forward. Retail NiCamera
+local axes are `(forward, up, right)`, so camera vectors use this proper
+basis conversion:
 
 ```text
-xr_to_nicamera_local(x, y, z) = (x, y, z)
+xr_to_nicamera_local(x, y, z) = (-z, y, x)
 ```
 
 Actor/Gamebryo vectors instead use `(right, forward, up)`:
@@ -21,9 +21,10 @@ Actor/Gamebryo vectors instead use `(right, forward, up)`:
 xr_to_actor(x, y, z) = (x, -z, y)
 ```
 
-Applying the actor permutation before a NiCamera basis is the old fault. A
-physical `100 mm` forward displacement `(0,0,-0.1)` became local camera-up
-`(0,+0.1,0)`. A physical lift became camera-back.
+Applying no conversion sends headset X/pitch to camera-forward and makes a
+nod behave as a roll/orbit. Applying the actor permutation is also wrong. A
+physical `100 mm` forward displacement `(0,0,-0.1)` maps to local
+camera-forward `(+0.1,0,0)`; a physical lift remains camera-up.
 
 The configured Fallout scale used here is the approximation `s = 70 units/m`,
 derived from the documented roughly 7 units per 10 cm / 64 units per yard; it
@@ -45,6 +46,7 @@ Let:
 - `p_i, R_i` be the source OpenXR pose of eye `i`.
 - `C` be the leveled NiCamera world rotation.
 - `b` be the engine-authored camera anchor.
+- `P` be the OpenXR-to-NiCamera basis rotation, `(x,y,z) -> (-z,y,x)`.
 - `X` be any point in the OpenXR room frame.
 
 The native eye camera is:
@@ -52,27 +54,30 @@ The native eye camera is:
 ```text
 d_i       = R_o^T (p_i - p_o)
 R_i_local = R_o^T R_i
-p_i_game  = b + s C d_i
-R_i_game  = C R_i_local
+d_i_camera = P d_i
+R_i_camera = P R_i_local P^T
+p_i_game  = b + s C d_i_camera
+R_i_game  = C R_i_camera
 ```
 
 Map the room point by the same similarity transform:
 
 ```text
-X_game = b + s C R_o^T (X - p_o)
+X_game = b + s C P R_o^T (X - p_o)
 ```
 
 Then its coordinates in eye `i` are:
 
 ```text
 R_i_game^T (X_game - p_i_game)
-= (C R_o^T R_i)^T [s C R_o^T (X - p_i)]
-= s R_i^T R_o C^T C R_o^T (X - p_i)
-= s R_i^T (X - p_i)
+= (C P R_o^T R_i P^T)^T [s C P R_o^T (X - p_i)]
+= s P R_i^T R_o P^T C^T C P R_o^T (X - p_i)
+= s P R_i^T (X - p_i)
 ```
 
-Thus the engine eye frame is exactly the OpenXR eye frame multiplied by one
-uniform scale. Perspective direction ratios are unchanged.
+Thus the engine eye frame is the OpenXR eye frame expressed in the audited
+NiCamera basis and multiplied by one uniform scale. `P` is a rotation, so
+perspective direction ratios are unchanged.
 
 This theorem requires the pixels, `p_i/R_i`, center camera factor, eye camera
 factor, and FOV to belong to one accepted source-pose transaction. The host now

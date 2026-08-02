@@ -1,0 +1,447 @@
+diff --git a/src/mcp_integration.h b/src/mcp_integration.h
+index 4c09f04..0a5e5f5 100644
+--- a/src/mcp_integration.h
++++ b/src/mcp_integration.h
+@@ -31,6 +31,13 @@ inline void McpLogf(const char* fmt, ...) {
+ }
+ 
+ inline std::string GetSimulatorDataPath() {
++    char explicitPath[MAX_PATH]{};
++    DWORD explicitLength = GetEnvironmentVariableA(
++        "OPENXR_SIMULATOR_DATA_DIR", explicitPath, (DWORD)sizeof(explicitPath));
++    if (explicitLength > 0 && explicitLength < sizeof(explicitPath)) {
++        CreateDirectoryA(explicitPath, nullptr);
++        return explicitPath;
++    }
+     char base[MAX_PATH]{};
+     DWORD len = GetEnvironmentVariableA("LOCALAPPDATA", base, (DWORD)sizeof(base));
+     if (len > 0 && len < sizeof(base)) {
+@@ -555,6 +562,22 @@ inline float ParseJsonFloat(const char* json, const char* key, float defaultVal)
+     return (float)atof(pos);
+ }
+ 
++inline uint64_t ParseJsonUInt64(const char* json, const char* key, uint64_t defaultVal) {
++    char searchKey[64];
++    snprintf(searchKey, sizeof(searchKey), "\"%s\"", key);
++    const char* pos = strstr(json, searchKey);
++    if (!pos) return defaultVal;
++    pos = strchr(pos, ':');
++    if (!pos) return defaultVal;
++    pos++;
++    while (*pos == ' ' || *pos == '\t') pos++;
++    return _strtoui64(pos, nullptr, 10);
++}
++
++inline float ClampFloat(float value, float minimum, float maximum) {
++    return value < minimum ? minimum : (value > maximum ? maximum : value);
++}
++
+ // Returns true if `key` appears in the JSON (regardless of value).
+ // Used to detect "field omitted" vs "field set to 0".
+ inline bool JsonHasKey(const char* json, const char* key) {
+@@ -834,15 +857,31 @@ inline bool CheckProjLogDumpRequest() {
+ // Allows setting right or left controller position/orientation and trigger
+ struct ControllerPoseCommand {
+     bool valid = false;
++    uint64_t sequence = 0;
+     int hand = 1;           // 0=left, 1=right
+     float posX = 0.2f;     // Position offset from head (head-local space)
++    bool posXSet = false;
+     float posY = -0.3f;
++    bool posYSet = false;
+     float posZ = -0.4f;
++    bool posZSet = false;
+     float yaw = 0.0f;      // Yaw offset relative to head
++    bool yawSet = false;
+     float pitch = -0.3f;   // Pitch offset relative to head
++    bool pitchSet = false;
+     float trigger = 0.0f;  // 0.0-1.0 trigger value
+     bool triggerSet = false;
++    float grip = 0.0f;     // 0.0-1.0 grip value
++    bool gripSet = false;
+     int  buttonA = -1;     // -1=unchanged, 0=released, 1=pressed
++    int  primary = -1;
++    int  secondary = -1;
++    int  menu = -1;
++    int  thumbstickClick = -1;
++    float thumbstickX = 0.0f;
++    float thumbstickY = 0.0f;
++    bool thumbstickXSet = false;
++    bool thumbstickYSet = false;
+ };
+ 
+ // Check for controller pose command from MCP
+@@ -858,39 +897,81 @@ inline ControllerPoseCommand CheckControllerPoseCommand() {
+         fclose(f);
+ 
+         cmd.valid = true;
++        cmd.sequence = ParseJsonUInt64(buf, "sequence", 0);
+         cmd.hand = (int)ParseJsonFloat(buf, "hand", 1.0f);
+-        cmd.posX = ParseJsonFloat(buf, "posX", 0.2f);
+-        cmd.posY = ParseJsonFloat(buf, "posY", -0.3f);
+-        cmd.posZ = ParseJsonFloat(buf, "posZ", -0.4f);
+-        cmd.yaw = ParseJsonFloat(buf, "yaw", 0.0f);
+-        cmd.pitch = ParseJsonFloat(buf, "pitch", -0.3f);
++        cmd.posXSet = JsonHasKey(buf, "posX");
++        cmd.posYSet = JsonHasKey(buf, "posY");
++        cmd.posZSet = JsonHasKey(buf, "posZ");
++        cmd.yawSet = JsonHasKey(buf, "yaw");
++        cmd.pitchSet = JsonHasKey(buf, "pitch");
++        if (cmd.posXSet) cmd.posX = ParseJsonFloat(buf, "posX", 0.2f);
++        if (cmd.posYSet) cmd.posY = ParseJsonFloat(buf, "posY", -0.3f);
++        if (cmd.posZSet) cmd.posZ = ParseJsonFloat(buf, "posZ", -0.4f);
++        if (cmd.yawSet) cmd.yaw = ParseJsonFloat(buf, "yaw", 0.0f);
++        if (cmd.pitchSet) cmd.pitch = ParseJsonFloat(buf, "pitch", -0.3f);
+         cmd.trigger = ParseJsonFloat(buf, "trigger", -1.0f);
+         cmd.triggerSet = (cmd.trigger >= 0.0f);
+         if (!cmd.triggerSet) cmd.trigger = 0.0f;
++        else cmd.trigger = ClampFloat(cmd.trigger, 0.0f, 1.0f);
++        cmd.grip = ParseJsonFloat(buf, "grip", -1.0f);
++        cmd.gripSet = (cmd.grip >= 0.0f);
++        if (!cmd.gripSet) cmd.grip = 0.0f;
++        else cmd.grip = ClampFloat(cmd.grip, 0.0f, 1.0f);
+         cmd.buttonA = (int)ParseJsonFloat(buf, "buttonA", -1.0f);
++        cmd.primary = (int)ParseJsonFloat(buf, "primary", -1.0f);
++        cmd.secondary = (int)ParseJsonFloat(buf, "secondary", -1.0f);
++        cmd.menu = (int)ParseJsonFloat(buf, "menu", -1.0f);
++        cmd.thumbstickClick = (int)ParseJsonFloat(buf, "thumbstickClick", -1.0f);
++        cmd.thumbstickXSet = JsonHasKey(buf, "thumbstickX");
++        cmd.thumbstickYSet = JsonHasKey(buf, "thumbstickY");
++        if (cmd.thumbstickXSet) {
++            cmd.thumbstickX = ClampFloat(
++                ParseJsonFloat(buf, "thumbstickX", 0.0f), -1.0f, 1.0f);
++        }
++        if (cmd.thumbstickYSet) {
++            cmd.thumbstickY = ClampFloat(
++                ParseJsonFloat(buf, "thumbstickY", 0.0f), -1.0f, 1.0f);
++        }
+ 
+         // Delete the file after reading (one-shot command)
+         DeleteFileA(cmdPath.c_str());
+-        McpLogf("Controller pose command: hand=%d pos(%.2f, %.2f, %.2f) yaw=%.2f pitch=%.2f trigger=%.1f",
+-                cmd.hand, cmd.posX, cmd.posY, cmd.posZ, cmd.yaw, cmd.pitch, cmd.trigger);
++        McpLogf("Controller command: sequence=%llu hand=%d pos(%.2f, %.2f, %.2f) yaw=%.2f pitch=%.2f trigger=%.1f grip=%.1f stick=(%.2f,%.2f)",
++                (unsigned long long)cmd.sequence, cmd.hand,
++                cmd.posX, cmd.posY, cmd.posZ, cmd.yaw, cmd.pitch,
++                cmd.trigger, cmd.grip, cmd.thumbstickX, cmd.thumbstickY);
+     }
+     return cmd;
+ }
+ 
+ // Write acknowledgment that command was processed
+-inline void WriteCommandAck(const char* cmdType, bool success) {
++inline void WriteCommandAck(const char* cmdType, bool success, uint64_t sequence = 0) {
+     std::string ackPath = GetSimulatorDataPath() + "\\command_ack.json";
++    char temporaryName[96]{};
++    snprintf(
++        temporaryName,
++        sizeof(temporaryName),
++        "\\command_ack.%lu.%lu.tmp",
++        (unsigned long)GetCurrentProcessId(),
++        (unsigned long)GetCurrentThreadId());
++    std::string temporaryPath = GetSimulatorDataPath() + temporaryName;
+     FILE* f = nullptr;
+-    if (fopen_s(&f, ackPath.c_str(), "w") == 0 && f) {
++    if (fopen_s(&f, temporaryPath.c_str(), "w") == 0 && f) {
+         SYSTEMTIME st;
+         GetLocalTime(&st);
+         fprintf(f, "{\n");
+         fprintf(f, "  \"timestamp\": \"%04d-%02d-%02dT%02d:%02d:%02d.%03d\",\n",
+                 st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+         fprintf(f, "  \"command\": \"%s\",\n", cmdType);
++        fprintf(f, "  \"sequence\": %llu,\n", (unsigned long long)sequence);
+         fprintf(f, "  \"success\": %s\n", success ? "true" : "false");
+         fprintf(f, "}\n");
+         fclose(f);
++        if (!MoveFileExA(
++                temporaryPath.c_str(),
++                ackPath.c_str(),
++                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
++            DeleteFileA(temporaryPath.c_str());
++        }
+     }
+ }
+ 
+diff --git a/src/runtime.cpp b/src/runtime.cpp
+index 201bee2..4e1d302 100644
+--- a/src/runtime.cpp
++++ b/src/runtime.cpp
+@@ -122,8 +122,26 @@ inline UINT D3D12CalcSubresource(UINT MipSlice, UINT ArraySlice, UINT PlaneSlice
+ 
+ // Simple logging (debug output + file log)
+ static FILE* g_LogFile = nullptr;
++static bool EnvEnabled(const char* name) {
++    char value[16]{};
++    const DWORD length = GetEnvironmentVariableA(name, value, (DWORD)sizeof(value));
++    return length > 0 && length < sizeof(value) &&
++           (_stricmp(value, "1") == 0 || _stricmp(value, "true") == 0 ||
++            _stricmp(value, "yes") == 0 || _stricmp(value, "on") == 0);
++}
++static bool SimulatorHeadless() {
++    static const bool enabled = EnvEnabled("OPENXR_SIMULATOR_HEADLESS");
++    return enabled;
++}
+ static void EnsureLogFile() {
+     if (g_LogFile) return;
++    char explicitPath[MAX_PATH]{};
++    DWORD explicitLength = GetEnvironmentVariableA(
++        "OPENXR_SIMULATOR_LOG_PATH", explicitPath, (DWORD)sizeof(explicitPath));
++    if (explicitLength > 0 && explicitLength < sizeof(explicitPath)) {
++        fopen_s(&g_LogFile, explicitPath, "a");
++        if (g_LogFile) return;
++    }
+     char base[MAX_PATH]{};
+     DWORD len = GetEnvironmentVariableA("LOCALAPPDATA", base, (DWORD)sizeof(base));
+     char path[MAX_PATH]{};
+@@ -468,6 +486,27 @@ static float g_poseSweepFreq     = 0.25f;  // Hz
+ static bool g_mouseCapture = false;
+ static POINT g_lastMousePos = {0, 0};
+ 
++struct CurrentHeadAngles {
++    float yaw;
++    float pitch;
++    float roll;
++};
++
++static CurrentHeadAngles GetCurrentHeadAngles() {
++    CurrentHeadAngles result{g_headYaw, g_headPitch, g_headRoll};
++    if (g_poseSweepEnabled) {
++        const float elapsed =
++            (float)GetTickCount64() * 0.001f - g_poseSweepStartT;
++        const float angularFrequency = 6.2831853f * g_poseSweepFreq;
++        result.yaw = g_poseSweepYawAmp * sinf(angularFrequency * elapsed);
++        result.pitch =
++            g_poseSweepPitchAmp * sinf(angularFrequency * elapsed + 1.0f);
++        result.roll =
++            g_poseSweepRollAmp * sinf(angularFrequency * elapsed + 2.0f);
++    }
++    return result;
++}
++
+ // Controller tracking state for motion controller emulation
+ // Positions are relative to head position, orientation follows head by default
+ struct ControllerState {
+@@ -510,6 +549,10 @@ static ControllerState g_rightController = {
+ // Map XrSpace handles to controller type (0=none, 1=left grip, 2=left aim, 3=right grip, 4=right aim)
+ static std::unordered_map<XrSpace, int> g_controllerSpaces;
+ 
++// Reference-space identity is needed to return VIEW->LOCAL as the current
++// tracked HMD pose instead of an unrelated identity transform.
++static std::unordered_map<XrSpace, XrReferenceSpaceType> g_referenceSpaceTypes;
++
+ // Map XrPath to path string for controller detection
+ static std::unordered_map<XrPath, std::string> g_pathStrings;
+ 
+@@ -524,18 +567,19 @@ static XrTime g_lastFrameTime = 0;
+ 
+ // Get controller world pose (combines head pose with controller offset)
+ static void GetControllerPose(const ControllerState& ctrl, XrPosef* outPose) {
++    const CurrentHeadAngles head = GetCurrentHeadAngles();
+     // Controller orientation = head orientation + controller offsets
+-    float totalYaw = g_headYaw + ctrl.yawOffset;
+-    float totalPitch = g_headPitch + ctrl.pitchOffset;
++    float totalYaw = head.yaw + ctrl.yawOffset;
++    float totalPitch = head.pitch + ctrl.pitchOffset;
+     outPose->orientation = QuatFromYawPitch(totalYaw, totalPitch);
+ 
+     // Controller position = head position + rotated offset
+     // Rotate the offset by head yaw only (not pitch) for natural hand movement
+-    XrQuaternionf headYawQ = QuatFromYawPitch(g_headYaw, 0.0f);
++    XrQuaternionf headYawQ = QuatFromYawPitch(head.yaw, 0.0f);
+ 
+     // Simple rotation of offset by head yaw
+-    float cosY = cosf(g_headYaw);
+-    float sinY = sinf(g_headYaw);
++    float cosY = cosf(head.yaw);
++    float sinY = sinf(head.yaw);
+     outPose->position.x = g_headPos.x + ctrl.posOffset.x * cosY - ctrl.posOffset.z * sinY;
+     outPose->position.y = g_headPos.y + ctrl.posOffset.y;
+     outPose->position.z = g_headPos.z + ctrl.posOffset.x * sinY + ctrl.posOffset.z * cosY;
+@@ -2480,8 +2524,9 @@ static XrResult XRAPI_PTR xrBeginSession_runtime(XrSession s, const XrSessionBeg
+     Log("[SimXR] ============================================");
+     rt::PushState(s, XR_SESSION_STATE_SYNCHRONIZED); 
+     rt::PushState(s, XR_SESSION_STATE_VISIBLE);
+-    // Only push FOCUSED if window is actually active/focused
+-    if (rt::g_session.hwnd && rt::g_session.isFocused) {
++    // A headless run has no preview window to acquire focus. It is explicitly
++    // command-driven, so publish FOCUSED immediately.
++    if (SimulatorHeadless() || (rt::g_session.hwnd && rt::g_session.isFocused)) {
+         rt::PushState(s, XR_SESSION_STATE_FOCUSED);
+     }
+     return XR_SUCCESS; 
+@@ -2861,19 +2906,41 @@ static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession, const XrFrameWaitInfo*,
+         mcp::ControllerPoseCommand ctrlCmd = mcp::CheckControllerPoseCommand();
+         if (ctrlCmd.valid) {
+             rt::ControllerState& ctrl = (ctrlCmd.hand == 0) ? rt::g_leftController : rt::g_rightController;
+-            ctrl.posOffset.x = ctrlCmd.posX;
+-            ctrl.posOffset.y = ctrlCmd.posY;
+-            ctrl.posOffset.z = ctrlCmd.posZ;
+-            ctrl.yawOffset = ctrlCmd.yaw;
+-            ctrl.pitchOffset = ctrlCmd.pitch;
++            if (ctrlCmd.posXSet) ctrl.posOffset.x = ctrlCmd.posX;
++            if (ctrlCmd.posYSet) ctrl.posOffset.y = ctrlCmd.posY;
++            if (ctrlCmd.posZSet) ctrl.posOffset.z = ctrlCmd.posZ;
++            if (ctrlCmd.yawSet) ctrl.yawOffset = ctrlCmd.yaw;
++            if (ctrlCmd.pitchSet) ctrl.pitchOffset = ctrlCmd.pitch;
+             if (ctrlCmd.triggerSet) {
+                 ctrl.triggerValue = ctrlCmd.trigger;
+                 ctrl.triggerPressed = (ctrlCmd.trigger >= 0.5f);
+             }
++            if (ctrlCmd.gripSet) {
++                ctrl.gripValue = ctrlCmd.grip;
++                ctrl.gripPressed = (ctrlCmd.grip >= 0.5f);
++            }
+             if (ctrlCmd.buttonA >= 0) {
+                 ctrl.primaryPressed = (ctrlCmd.buttonA != 0);
+             }
+-            mcp::WriteCommandAck("controller_pose", true);
++            if (ctrlCmd.primary >= 0) {
++                ctrl.primaryPressed = (ctrlCmd.primary != 0);
++            }
++            if (ctrlCmd.secondary >= 0) {
++                ctrl.secondaryPressed = (ctrlCmd.secondary != 0);
++            }
++            if (ctrlCmd.menu >= 0) {
++                ctrl.menuPressed = (ctrlCmd.menu != 0);
++            }
++            if (ctrlCmd.thumbstickClick >= 0) {
++                ctrl.thumbstickPressed = (ctrlCmd.thumbstickClick != 0);
++            }
++            if (ctrlCmd.thumbstickXSet) {
++                ctrl.thumbstick.x = ctrlCmd.thumbstickX;
++            }
++            if (ctrlCmd.thumbstickYSet) {
++                ctrl.thumbstick.y = ctrlCmd.thumbstickY;
++            }
++            mcp::WriteCommandAck("controller_pose", true, ctrlCmd.sequence);
+         }
+     }
+ 
+@@ -2900,6 +2967,7 @@ static XrResult XRAPI_PTR xrBeginFrame_runtime(XrSession, const XrFrameBeginInfo
+ // NOT touched on subsequent calls — once it exists, the user (or the menu
+ // resize callback) owns its size.
+ static void ensurePreviewWindow(rt::Session& s, UINT initialClientW, UINT initialClientH) {
++    if (SimulatorHeadless()) return;
+     if (s.hwnd) return;
+ 
+     // Register window class if not done (use global flag)
+@@ -4969,12 +5037,14 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession, const XrFrameEndInfo* in
+                 if (mcp::g_projLogCount < mcp::PROJ_LOG_CAPACITY) ++mcp::g_projLogCount;
+             }
+ 
+-            presentProjection(rt::g_session, *proj, hasOverlays);  // skipPresent if overlays pending
++            if (!SimulatorHeadless()) {
++                presentProjection(rt::g_session, *proj, hasOverlays);  // skipPresent if overlays pending
++            }
+         }
+     }
+ 
+     // Third pass: render overlay layers (quad, cylinder) on top of the projection
+-    for (uint32_t i = 0; i < info->layerCount; ++i) {
++    for (uint32_t i = 0; !SimulatorHeadless() && i < info->layerCount; ++i) {
+         const XrCompositionLayerBaseHeader* base = info->layers[i];
+         if (!base) continue;
+ 
+@@ -5049,22 +5119,13 @@ static XrResult XRAPI_PTR xrLocateViews_runtime(XrSession, const XrViewLocateInf
+     // a continuous range of orientations and any handedness/axis bug
+     // produces a visible "world rotates wrong way" symptom instantly.
+     // Each axis uses a different phase so the signal isn't degenerate.
+-    float effYaw   = rt::g_headYaw;
+-    float effPitch = rt::g_headPitch;
+-    float effRoll  = rt::g_headRoll;
+-    if (rt::g_poseSweepEnabled) {
+-        float t = (float)GetTickCount64() * 0.001f - rt::g_poseSweepStartT;
+-        const float TWO_PI = 6.2831853f;
+-        float w = TWO_PI * rt::g_poseSweepFreq;
+-        effYaw   = rt::g_poseSweepYawAmp   * sinf(w * t);
+-        effPitch = rt::g_poseSweepPitchAmp * sinf(w * t + 1.0f);
+-        effRoll  = rt::g_poseSweepRollAmp  * sinf(w * t + 2.0f);
+-    }
++    const rt::CurrentHeadAngles head = rt::GetCurrentHeadAngles();
+ 
+     // Use dynamic head pose from mouse look (yaw + pitch) plus optional
+     // MCP-injected roll so off-axis quaternion-handedness bugs (which
+     // identity pose hides) actually surface in the simulator.
+-    XrQuaternionf orientation = rt::QuatFromYawPitchRoll(effYaw, effPitch, effRoll);
++    XrQuaternionf orientation =
++        rt::QuatFromYawPitchRoll(head.yaw, head.pitch, head.roll);
+     
+     // Helper function to rotate a vector by a quaternion
+     auto rotateVector = [](XrQuaternionf q, XrVector3f v) -> XrVector3f {
+@@ -5131,11 +5192,14 @@ static XrResult XRAPI_PTR xrCreateReferenceSpace_runtime(XrSession, const XrRefe
+     if (!info || !space) return XR_ERROR_VALIDATION_FAILURE;
+     static uintptr_t nextSpace = 100;
+     *space = (XrSpace)(nextSpace++);
++    rt::g_referenceSpaceTypes[*space] = info->referenceSpaceType;
+     Logf("[SimXR] xrCreateReferenceSpace: type=%d space=%p", info->referenceSpaceType, *space);
+     return XR_SUCCESS;
+ }
+ 
+ static XrResult XRAPI_PTR xrDestroySpace_runtime(XrSpace space) {
++    rt::g_controllerSpaces.erase(space);
++    rt::g_referenceSpaceTypes.erase(space);
+     Logf("[SimXR] xrDestroySpace: space=%p", space);
+     return XR_SUCCESS;
+ }
+@@ -5181,10 +5245,25 @@ static XrResult XRAPI_PTR xrLocateSpace_runtime(XrSpace space, XrSpace baseSpace
+             location->pose.position = {0, 0, 0};
+         }
+     } else {
+-        // Default for non-controller spaces (identity pose)
+-        location->locationFlags = XR_SPACE_LOCATION_POSITION_VALID_BIT | XR_SPACE_LOCATION_ORIENTATION_VALID_BIT;
++        location->locationFlags = XR_SPACE_LOCATION_POSITION_VALID_BIT |
++                                  XR_SPACE_LOCATION_ORIENTATION_VALID_BIT |
++                                  XR_SPACE_LOCATION_POSITION_TRACKED_BIT |
++                                  XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT;
+         location->pose.orientation = {0, 0, 0, 1};
+         location->pose.position = {0, 0, 0};
++
++        const auto spaceIt = rt::g_referenceSpaceTypes.find(space);
++        const auto baseIt = rt::g_referenceSpaceTypes.find(baseSpace);
++        if (spaceIt != rt::g_referenceSpaceTypes.end() &&
++            baseIt != rt::g_referenceSpaceTypes.end() &&
++            spaceIt->second == XR_REFERENCE_SPACE_TYPE_VIEW &&
++            (baseIt->second == XR_REFERENCE_SPACE_TYPE_LOCAL ||
++             baseIt->second == XR_REFERENCE_SPACE_TYPE_STAGE)) {
++            const rt::CurrentHeadAngles head = rt::GetCurrentHeadAngles();
++            location->pose.orientation =
++                rt::QuatFromYawPitchRoll(head.yaw, head.pitch, head.roll);
++            location->pose.position = rt::g_headPos;
++        }
+     }
+     return XR_SUCCESS;
+ }
+@@ -5275,6 +5354,17 @@ static XrResult XRAPI_PTR xrCreateAction_runtime(XrActionSet, const XrActionCrea
+             }
+         }
+     }
++    if (handBinding == 0) {
++        std::string lowerName = actName;
++        for (char& c : lowerName) c = (char)tolower((unsigned char)c);
++        if (lowerName.rfind("left_", 0) == 0 ||
++            lowerName == "button_x" || lowerName == "button_y") {
++            handBinding = 1;
++        } else if (lowerName.rfind("right_", 0) == 0 ||
++                   lowerName == "button_a" || lowerName == "button_b") {
++            handBinding = 2;
++        }
++    }
+     rt::g_actionHand[*action] = handBinding;
+ 
+     return XR_SUCCESS;
+@@ -5348,9 +5438,13 @@ static XrResult XRAPI_PTR xrGetActionStateBoolean_runtime(XrSession, const XrAct
+             buttonState = ctrl->gripPressed;
+         } else if (ActionNameMatches(name, "menu")) {
+             buttonState = ctrl->menuPressed;
+-        } else if (ActionNameMatches(name, "primary") || ActionNameMatches(name, "a_button") || ActionNameMatches(name, "x_button")) {
++        } else if (ActionNameMatches(name, "primary") || ActionNameMatches(name, "a_button") ||
++                   ActionNameMatches(name, "x_button") || ActionNameMatches(name, "button_a") ||
++                   ActionNameMatches(name, "button_x")) {
+             buttonState = ctrl->primaryPressed;
+-        } else if (ActionNameMatches(name, "secondary") || ActionNameMatches(name, "b_button") || ActionNameMatches(name, "y_button")) {
++        } else if (ActionNameMatches(name, "secondary") || ActionNameMatches(name, "b_button") ||
++                   ActionNameMatches(name, "y_button") || ActionNameMatches(name, "button_b") ||
++                   ActionNameMatches(name, "button_y")) {
+             buttonState = ctrl->secondaryPressed;
+         } else if (ActionNameMatches(name, "thumbstick") || ActionNameMatches(name, "joystick")) {
+             buttonState = ctrl->thumbstickPressed;

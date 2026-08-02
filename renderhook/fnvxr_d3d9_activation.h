@@ -25,8 +25,9 @@ constexpr bool productionRendererAuthorized(const ProductionRendererProof& proof
         && proof.retainedD3D9HookSetAudited;
 }
 
-// Checked-in builds are forwarding shims only.  Changing environment values
-// cannot alter this compile-time result.
+// The checked-in legacy interposer remains forwarding-only. Changing
+// environment values cannot alter this compile-time result; the independently
+// bounded visual-trial bridge below does not grant any of these capabilities.
 inline constexpr ProductionRendererProof CompiledProductionRendererProof {};
 inline constexpr bool ProductionRendererAuthorized =
     productionRendererAuthorized(CompiledProductionRendererProof);
@@ -59,16 +60,18 @@ inline constexpr InterpositionPolicy CompiledInterpositionPolicy =
     interpositionPolicy(ProductionRendererAuthorized);
 
 // This is separate from the retired replay interposer above. It describes
-// the narrow exact-retail route: an Ex-backed enumerator, one authorized
-// RenderWorldSceneGraph detour, engine-owned eye rendering, and GPU-only color
-// transport. It never authorizes the retained D3D9 device-vtable hook set.
+// the narrow exact-retail route: Fallout's ordinary D3D9 device, one
+// authorized RenderWorldSceneGraph detour, engine-owned eye rendering, a
+// bounded CPU readback transport, and a single leased Present slot used to
+// finish deferred startup. It never authorizes the retained draw-hook set.
 struct RetailVrBridgePolicy
 {
     bool compiled = false;
     bool exactCurrentProcessAuthorityRequired = true;
-    bool exBackedGameDevice = true;
+    bool exBackedGameDevice = false;
     bool retailWorldHookOnly = true;
-    bool patchD3D9DeviceVtable = false;
+    bool replaceD3D9DeviceVtablePointer = false;
+    bool leaseNativePresentSlot = false;
     bool cpuImageTransfer = false;
     bool legacyDrawReplay = false;
 };
@@ -76,12 +79,95 @@ struct RetailVrBridgePolicy
 inline constexpr RetailVrBridgePolicy CompiledRetailVrBridgePolicy {
     true,
     true,
-    true,
+    false,
     true,
     false,
-    false,
+    true,
+    true,
     false,
 };
+
+// Runtime configuration can request only the bounded CPU visual trial.  It
+// cannot widen the compiled bridge policy or authorize the retained D3D9
+// replay interposer.
+struct RetailVrVisualTrialRequest
+{
+    bool exactProfileMatched = false;
+    bool engineCenterStereoRequested = false;
+    bool stereoWorldDisabled = false;
+    bool legacyImageDiagnosticsRequested = false;
+    bool retainedStereoGameTexturesRequested = false;
+    bool unprovenColorOnlyStereoDiagnosticRequested = false;
+    bool allowStereoWorld2dFallback = false;
+    bool showGamePlaneOnStereoLoss = false;
+    bool stereoFallbackMonoFullscreen = false;
+};
+
+constexpr bool retailVrVisualTrialAuthorized(
+    const RetailVrBridgePolicy& policy,
+    const RetailVrVisualTrialRequest& request) noexcept
+{
+    return policy.compiled
+        && policy.exactCurrentProcessAuthorityRequired
+        && !policy.exBackedGameDevice
+        && policy.retailWorldHookOnly
+        && !policy.replaceD3D9DeviceVtablePointer
+        && policy.leaseNativePresentSlot
+        && policy.cpuImageTransfer
+        && !policy.legacyDrawReplay
+        && request.exactProfileMatched
+        && request.engineCenterStereoRequested
+        && !request.stereoWorldDisabled
+        && !request.legacyImageDiagnosticsRequested
+        && !request.retainedStereoGameTexturesRequested
+        && !request.unprovenColorOnlyStereoDiagnosticRequested
+        && !request.allowStereoWorld2dFallback
+        && !request.showGamePlaneOnStereoLoss
+        && !request.stereoFallbackMonoFullscreen;
+}
+
+// Physical play uses the same exact-retail, ordinary-D3D9 eye renderer as the
+// bounded visual trial. Input remains outside this bridge and is authorized
+// independently by the xNVSE current-process capability. Keeping a distinct
+// request prevents an interactive launcher flag from silently widening the
+// historical visual-trial profile.
+struct RetailVrPhysicalPlayRequest
+{
+    bool exactProfileMatched = false;
+    bool physicalHeadsetPlayRequested = false;
+    bool engineCenterStereoRequested = false;
+    bool stereoWorldDisabled = false;
+    bool legacyImageDiagnosticsRequested = false;
+    bool retainedStereoGameTexturesRequested = false;
+    bool unprovenColorOnlyStereoDiagnosticRequested = false;
+    bool allowStereoWorld2dFallback = false;
+    bool showGamePlaneOnStereoLoss = false;
+    bool stereoFallbackMonoFullscreen = false;
+};
+
+constexpr bool retailVrPhysicalPlayAuthorized(
+    const RetailVrBridgePolicy& policy,
+    const RetailVrPhysicalPlayRequest& request) noexcept
+{
+    return policy.compiled
+        && policy.exactCurrentProcessAuthorityRequired
+        && !policy.exBackedGameDevice
+        && policy.retailWorldHookOnly
+        && !policy.replaceD3D9DeviceVtablePointer
+        && policy.leaseNativePresentSlot
+        && policy.cpuImageTransfer
+        && !policy.legacyDrawReplay
+        && request.exactProfileMatched
+        && request.physicalHeadsetPlayRequested
+        && request.engineCenterStereoRequested
+        && !request.stereoWorldDisabled
+        && !request.legacyImageDiagnosticsRequested
+        && !request.retainedStereoGameTexturesRequested
+        && !request.unprovenColorOnlyStereoDiagnosticRequested
+        && !request.allowStereoWorld2dFallback
+        && !request.showGamePlaneOnStereoLoss
+        && !request.stereoFallbackMonoFullscreen;
+}
 
 static_assert(CompiledInterpositionPolicy.forwardSystemExports);
 static_assert(!CompiledInterpositionPolicy.wrapDirect3D9);
@@ -93,9 +179,10 @@ static_assert(!CompiledInterpositionPolicy.perFrameLogging);
 static_assert(CompiledRetailVrBridgePolicy.compiled);
 static_assert(
     CompiledRetailVrBridgePolicy.exactCurrentProcessAuthorityRequired);
-static_assert(CompiledRetailVrBridgePolicy.exBackedGameDevice);
+static_assert(!CompiledRetailVrBridgePolicy.exBackedGameDevice);
 static_assert(CompiledRetailVrBridgePolicy.retailWorldHookOnly);
-static_assert(!CompiledRetailVrBridgePolicy.patchD3D9DeviceVtable);
-static_assert(!CompiledRetailVrBridgePolicy.cpuImageTransfer);
+static_assert(!CompiledRetailVrBridgePolicy.replaceD3D9DeviceVtablePointer);
+static_assert(CompiledRetailVrBridgePolicy.leaseNativePresentSlot);
+static_assert(CompiledRetailVrBridgePolicy.cpuImageTransfer);
 static_assert(!CompiledRetailVrBridgePolicy.legacyDrawReplay);
 }

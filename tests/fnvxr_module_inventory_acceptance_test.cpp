@@ -216,7 +216,7 @@ void testOwnedAsciiSnapshots()
 
 void testCensusShape()
 {
-    static_assert(AllowedModuleCount == 124u);
+    static_assert(AllowedModuleCount == 126u);
     static_assert(
         MaximumDiagnosticModuleCount == 512u,
         "pure acceptance must match the census builder's fixed bound");
@@ -225,17 +225,19 @@ void testCensusShape()
     std::size_t windows = 0;
     std::size_t driver = 0;
     std::size_t exact = 0;
+    std::size_t graphicsHooks = 0;
     std::size_t d3dNames = 0;
     std::size_t dinputNames = 0;
     for (const ExpectedModule& module : AllowedModules)
     {
         require(normalizedRelativePath(module.normalizedRelativePath),
             "allowlist contains a non-normalized path");
-        require(baseName(module.normalizedRelativePath)
-                != "gameoverlayrenderer.dll",
-            "Steam overlay entered the allowlist");
-        require(baseName(module.normalizedRelativePath) != "nvspcap.dll",
-            "NVIDIA capture overlay entered the allowlist");
+        if (module.graphicsHookModule)
+        {
+            ++graphicsHooks;
+            require(module.loadedExecutableSectionsRequired,
+                "a graphics hook lacks mapped-code verification");
+        }
         if (module.exactIdentityRequired)
         {
             ++exact;
@@ -255,10 +257,10 @@ void testCensusShape()
         if (baseName(module.normalizedRelativePath) == "dinput8.dll")
             ++dinputNames;
     }
-    require(game == 13u && steam == 5u && windows == 101u && driver == 5u,
+    require(game == 13u && steam == 6u && windows == 102u && driver == 5u,
         "census origin counts changed");
-    require(exact == 10u,
-        "main/NVSE/FNVXR/JIP/ShowOff and retail dependency pins changed");
+    require(exact == 9u && graphicsHooks == 2u,
+        "exact retail pins or bounded graphics hook inventory changed");
     require(d3dNames == 2u && dinputNames == 2u,
         "known local/system duplicate names are not represented exactly");
 
@@ -282,9 +284,9 @@ void testCensusShape()
     require(AllowedModules[mainIndex].exactIdentity.sha256
             == "518C87F58A6C4D9826E9EF8FBB7F4213882FA70822675610D45AEA2464502A57",
         "retail executable pin changed");
-    require(AllowedModules[fnvxrIndex].exactIdentity.sha256
-            == "E394CB96DC1F881E66DF5E11877BCCBA55033FE50A4D407FD70CCB359BB3650D",
-        "FNVXR plugin pin changed");
+    require(!AllowedModules[fnvxrIndex].exactIdentityRequired
+            && AllowedModules[fnvxrIndex].loadedExecutableSectionsRequired,
+        "the attested current FNVXR plugin lost mapped-code verification");
     require(AllowedModules[jipIndex].exactIdentity.sha256
             == "9D2779647ED0CE63043390F47FC978E3234AF8E558DC6CB6BCB231478A2D74D4",
         "JIP pin changed");
@@ -310,7 +312,7 @@ void testDefaultAndCompleteEvidence()
     const ModuleInventoryAssessment complete =
         assessModuleInventory(completeEvidence(modules, postProofModules));
     require(complete.moduleSetAccepted
-            && complete.overlaysAbsent
+            && complete.graphicsHookModulesAccepted
             && complete.proxyPoliciesAccepted
             && complete.jipProofAccepted
             && complete.showOffProofAccepted
@@ -782,7 +784,7 @@ void testEveryExactIdentityField()
                 == InventoryFailure::ExactIdentityMismatch,
             "SHA-256 mismatch was accepted");
     }
-    require(tested == 10u, "not every exact identity pin was exercised");
+    require(tested == 9u, "not every exact identity pin was exercised");
 
     std::vector<ModuleObservation> malformed = golden;
     malformed[0].identity.sha256 = "ABC";
@@ -897,199 +899,98 @@ void testEveryExactGameModuleRequiresMappedCodeProof()
                 && !result.overallAccepted,
             "an exact game-tree module without mapped-code proof was accepted");
     }
-    require(tested == 10u,
+    require(tested == 9u,
         "not every exact game-tree mapped executable was exercised");
 }
 
-void testOverlaysAreExplicitlyProhibited()
+void testGraphicsHookCoexistenceIsBounded()
 {
     const std::vector<ModuleObservation> golden = completeModuleSet();
     const std::vector<ModuleObservation> postProofModules = golden;
     const ModuleInventoryEvidence evidence =
         completeEvidence(golden, postProofModules);
 
-    std::vector<ModuleObservation> modules = golden;
-    modules.back().origin = ModuleOrigin::SteamRuntime;
-    modules.back().normalizedRelativePath = "gameoverlayrenderer.dll";
-    modules.back().normalizedModuleName = "gameoverlayrenderer.dll";
-    modules.back().identity = syntheticIdentity(500u);
-    modules.back().runtimeModuleBytes = modules.back().identity.sizeOfImage;
-    modules.back().authenticodeValid = true;
-    ModuleInventoryAssessment result = assess(evidence, modules);
-    require(result.failure == InventoryFailure::ProhibitedSteamOverlay
-            && !result.overlaysAbsent
-            && !result.overallAccepted,
-        "Steam render overlay was accepted");
-
-    modules = golden;
-    modules.back().origin = ModuleOrigin::WindowsRuntime;
-    modules.back().normalizedRelativePath = "system32/nvspcap.dll";
-    modules.back().normalizedModuleName = "nvspcap.dll";
-    modules.back().identity = syntheticIdentity(501u);
-    modules.back().runtimeModuleBytes = modules.back().identity.sizeOfImage;
-    modules.back().authenticodeValid = true;
-    result = assess(evidence, modules);
-    require(result.failure == InventoryFailure::ProhibitedNvidiaCapture
-            && !result.overlaysAbsent
-            && !result.overallAccepted,
-        "NVIDIA capture overlay was accepted");
-
-    const auto withExtraOverlay = [](
-        const std::vector<ModuleObservation>& source,
-        ModuleOrigin origin,
-        std::string_view relativePath,
-        std::string_view moduleName,
-        std::size_t identityIndex) {
-        std::vector<ModuleObservation> extra = source;
-        ModuleObservation overlay = source.back();
-        overlay.origin = origin;
-        overlay.normalizedRelativePath = relativePath;
-        overlay.normalizedModuleName = moduleName;
-        overlay.identity = syntheticIdentity(identityIndex);
-        overlay.runtimeModuleBytes = overlay.identity.sizeOfImage;
-        overlay.authenticodeValid = true;
-        extra.push_back(overlay);
-        return extra;
+    const auto findPath = [&](std::string_view path) {
+        for (std::size_t index = 0u; index < golden.size(); ++index)
+        {
+            if (golden[index].normalizedRelativePath.view() == path)
+                return index;
+        }
+        return golden.size();
     };
+    const std::size_t steamOverlay =
+        findPath("gameoverlayrenderer.dll");
+    const std::size_t nvidiaCapture =
+        findPath("system32/nvspcap.dll");
+    const std::size_t productPlugin =
+        findPath("data/nvse/plugins/nvse_fnvxr.dll");
+    require(steamOverlay < golden.size()
+            && nvidiaCapture < golden.size()
+            && productPlugin < golden.size(),
+        "the bounded live hook/product module set is incomplete");
 
-    std::vector<ModuleObservation> extra = withExtraOverlay(
-        golden,
-        ModuleOrigin::SteamRuntime,
-        "gameoverlayrenderer.dll",
-        "gameoverlayrenderer.dll",
-        502u);
-    result = assess(evidence, extra);
-    require(result.failure == InventoryFailure::ProhibitedSteamOverlay
-            && !result.overlaysAbsent
+    ModuleInventoryAssessment result = assessModuleInventory(evidence);
+    require(result.overallAccepted
+            && result.graphicsHookModulesAccepted,
+        "canonical signed graphics hooks did not coexist with exact engine proofs");
+
+    for (std::size_t index : { steamOverlay, nvidiaCapture })
+    {
+        std::vector<ModuleObservation> changed = golden;
+        changed[index].authenticodeValid = false;
+        result = assess(evidence, changed);
+        require(result.failure == InventoryFailure::UnsignedRuntime
+                && !result.overallAccepted,
+            "an unsigned graphics hook module was accepted");
+
+        changed = golden;
+        changed[index].loadedExecutableSectionsMatched = false;
+        result = assess(evidence, changed);
+        require(result.failure
+                    == InventoryFailure::LoadedExecutableSectionsMismatch
+                && !result.overallAccepted,
+            "a graphics hook with changed loaded code was accepted");
+
+        changed = golden;
+        changed[index].origin = ModuleOrigin::Unknown;
+        result = assess(evidence, changed);
+        require(result.failure == InventoryFailure::UnexpectedModule
+                && !result.overallAccepted,
+            "a graphics hook from the wrong canonical origin was accepted");
+    }
+
+    std::vector<ModuleObservation> changed = golden;
+    changed[productPlugin].loadedExecutableSectionsMatched = false;
+    result = assess(evidence, changed);
+    require(result.failure
+                == InventoryFailure::LoadedExecutableSectionsMismatch
             && !result.overallAccepted,
-        "an extra Steam overlay was reduced to a primary count mismatch");
+        "the current staged FNVXR plugin was accepted with changed mapped code");
 
-    extra = withExtraOverlay(
-        golden,
-        ModuleOrigin::WindowsRuntime,
-        "system32/nvspcap.dll",
-        "nvspcap.dll",
-        503u);
-    result = assess(evidence, extra);
-    require(result.failure == InventoryFailure::ProhibitedNvidiaCapture
-            && !result.overlaysAbsent
+    changed = golden;
+    changed[steamOverlay].normalizedRelativePath =
+        "notgameoverlayrenderer.dll";
+    changed[steamOverlay].normalizedModuleName =
+        "notgameoverlayrenderer.dll";
+    result = assess(evidence, changed);
+    require(result.failure == InventoryFailure::UnexpectedModule
             && !result.overallAccepted,
-        "an extra NVIDIA overlay was reduced to a primary count mismatch");
+        "an overlay lookalike outside the exact canonical path was accepted");
 
-    std::vector<ModuleObservation> postExtra = withExtraOverlay(
-        golden,
-        ModuleOrigin::SteamRuntime,
-        "gameoverlayrenderer.dll",
-        "gameoverlayrenderer.dll",
-        504u);
-    result = assessModuleInventory(completeEvidence(golden, postExtra));
-    require(result.failure == InventoryFailure::ProhibitedSteamOverlay
-            && !result.overlaysAbsent
-            && !result.overallAccepted,
-        "an extra post-proof Steam overlay was reduced to a count mismatch");
-
-    postExtra = withExtraOverlay(
-        golden,
-        ModuleOrigin::WindowsRuntime,
-        "system32/nvspcap.dll",
-        "nvspcap.dll",
-        505u);
-    result = assessModuleInventory(completeEvidence(golden, postExtra));
-    require(result.failure == InventoryFailure::ProhibitedNvidiaCapture
-            && !result.overlaysAbsent
-            && !result.overallAccepted,
-        "an extra post-proof NVIDIA overlay was reduced to a count mismatch");
-
-    extra = withExtraOverlay(
-        golden,
-        ModuleOrigin::SteamRuntime,
-        "gameoverlayrenderer.dll",
-        "gameoverlayrenderer.dll",
-        506u);
-    extra.front().normalizedModuleName.captureComplete = false;
-    result = assess(evidence, extra);
-    require(result.failure == InventoryFailure::InvalidObservationTextSnapshot
-            && !result.overallAccepted,
-        "an invalid primary name snapshot was scanned as an overlay");
-
-    postExtra = withExtraOverlay(
-        golden,
-        ModuleOrigin::WindowsRuntime,
-        "system32/nvspcap.dll",
-        "nvspcap.dll",
-        507u);
-    postExtra.front().normalizedModuleName.captureComplete = false;
-    result = assessModuleInventory(completeEvidence(golden, postExtra));
-    require(result.failure == InventoryFailure::InvalidObservationTextSnapshot
-            && !result.overallAccepted,
-        "an invalid post-proof name snapshot was scanned as an overlay");
-
-    std::vector<ModuleObservation> bothOverlays = withExtraOverlay(
-        golden,
-        ModuleOrigin::SteamRuntime,
-        "gameoverlayrenderer.dll",
-        "gameoverlayrenderer.dll",
-        508u);
-    bothOverlays = withExtraOverlay(
-        bothOverlays,
-        ModuleOrigin::WindowsRuntime,
-        "system32/nvspcap.dll",
-        "nvspcap.dll",
-        509u);
-    result = assess(evidence, bothOverlays);
-    require(bothOverlays.size() == AllowedModuleCount + 2u
-            && result.failure == InventoryFailure::ProhibitedSteamOverlay
-            && !result.overlaysAbsent
-            && !result.overallAccepted,
-        "the observed 126-module dual-overlay census became a count mismatch");
-
-    std::vector<ModuleObservation> orderedDirty = golden;
-    ModuleObservation benignExtra = golden.back();
-    benignExtra.origin = ModuleOrigin::Unknown;
-    benignExtra.normalizedRelativePath = "unrecognized_extra.dll";
-    benignExtra.normalizedModuleName = "unrecognized_extra.dll";
-    benignExtra.identity = syntheticIdentity(510u);
-    benignExtra.runtimeModuleBytes = benignExtra.identity.sizeOfImage;
-    benignExtra.authenticodeValid = true;
-    orderedDirty.push_back(benignExtra);
-    orderedDirty = withExtraOverlay(
-        orderedDirty,
-        ModuleOrigin::WindowsRuntime,
-        "system32/nvspcap.dll",
-        "nvspcap.dll",
-        511u);
-    result = assess(evidence, orderedDirty);
-    require(orderedDirty.size() == AllowedModuleCount + 2u
-            && result.failure == InventoryFailure::ProhibitedNvidiaCapture
-            && !result.overlaysAbsent
-            && !result.overallAccepted,
-        "a non-overlay extra before NVIDIA capture masked the prohibition");
-
-    std::vector<ModuleObservation> mixedCase = golden;
-    mixedCase.push_back(benignExtra);
-    mixedCase = withExtraOverlay(
-        mixedCase,
-        ModuleOrigin::SteamRuntime,
-        "gameoverlayrenderer.dll",
-        "GameOverlayRenderer.dll",
-        512u);
-    result = assess(evidence, mixedCase);
-    require(mixedCase.size() == AllowedModuleCount + 2u
-            && result.failure == InventoryFailure::ProhibitedSteamOverlay
-            && !result.overlaysAbsent
-            && !result.overallAccepted,
-        "mixed-case Toolhelp overlay basename became a count mismatch");
-
-    std::vector<ModuleObservation> lookalike = withExtraOverlay(
-        golden,
-        ModuleOrigin::SteamRuntime,
-        "notgameoverlayrenderer.dll",
-        "notGameOverlayRenderer.dll",
-        513u);
-    result = assess(evidence, lookalike);
+    changed = golden;
+    changed.push_back(golden[steamOverlay]);
+    result = assess(evidence, changed);
     require(result.failure == InventoryFailure::PrimaryModuleCountMismatch
             && !result.overallAccepted,
-        "a non-exact overlay basename was treated as prohibited");
+        "an extra graphics hook escaped the exact module cardinality gate");
+
+    std::vector<ModuleObservation> changedPostProof = golden;
+    changedPostProof[nvidiaCapture].loadedExecutableSectionsMatched = false;
+    result = assessModuleInventory(
+        completeEvidence(golden, changedPostProof));
+    require(result.failure == InventoryFailure::PostProofObservationMismatch
+            && !result.overallAccepted,
+        "a graphics hook mutation between adjacent censuses was accepted");
 }
 
 void testEveryProxyPolicyGate()
@@ -1208,7 +1109,7 @@ int main()
     testObservationTextSnapshotsFailClosed();
     testRuntimeMappingsAreExactAndDisjoint();
     testEveryExactGameModuleRequiresMappedCodeProof();
-    testOverlaysAreExplicitlyProhibited();
+    testGraphicsHookCoexistenceIsBounded();
     testEveryProxyPolicyGate();
     testJipAndShowOffProofsAreIndependent();
     std::cout << "module inventory acceptance contract PASS\n";

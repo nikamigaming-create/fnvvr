@@ -20,7 +20,7 @@ if (Test-Path -LiteralPath $staleCompleteMarker) {
     Remove-Item -LiteralPath $staleCompleteMarker -Force
 }
 
-if (-not ("FnvxrStereoFrameReaderV7" -as [type])) {
+if (-not ("FnvxrStereoFrameReaderV8" -as [type])) {
     $compilerParameters = New-Object System.CodeDom.Compiler.CompilerParameters
     $compilerParameters.CompilerOptions = "/unsafe"
     [void]$compilerParameters.ReferencedAssemblies.Add("System.Drawing.dll")
@@ -34,11 +34,11 @@ using System.Security.Cryptography;
 using System.Collections.Generic;
 using System.Threading;
 
-public static class FnvxrStereoFrameReaderV7 {
+public static class FnvxrStereoFrameReaderV8 {
     const UInt32 SharedStereoMagic = 0x53585646;
-    const UInt32 SharedStereoVersion = 7;
+    const UInt32 SharedStereoVersion = 8;
     // Keep this synchronized with sizeof(SharedD3D9StereoFrameHeader).
-    const int HeaderSize = 216;
+    const int HeaderSize = 240;
     const int MaxWidth = 4096;
     const int MaxHeight = 2560;
     const int SlotCount = 4;
@@ -270,6 +270,9 @@ public static class FnvxrStereoFrameReaderV7 {
         UInt64 firstProducerEpoch = 0;
         UInt64 firstRendererProducerEpoch = 0;
         UInt64 firstPublicationGeneration = 0;
+        UInt64 firstTransactionId = 0;
+        UInt64 firstSourceFrame = 0;
+        UInt64 firstRuntimeStateSample = 0;
         int firstReferenceSpaceGeneration = 0;
         int firstProducerProcessId = 0;
         int firstWidth = 0;
@@ -282,7 +285,7 @@ public static class FnvxrStereoFrameReaderV7 {
         PixelMetrics firstMetrics = null;
         string firstArtifactSha256 = null;
         try {
-            readerLease = CreateMutex(IntPtr.Zero, false, "Local\\FNVXR_D3D9_Stereo_CaptureReader_v7");
+            readerLease = CreateMutex(IntPtr.Zero, false, "Local\\FNVXR_D3D9_Stereo_CaptureReader_v8");
             if (readerLease == IntPtr.Zero)
                 throw new InvalidOperationException("Could not create the stereo capture reader lease.");
             UInt32 waitResult = WaitForSingleObject(readerLease, 0);
@@ -292,7 +295,7 @@ public static class FnvxrStereoFrameReaderV7 {
             resetReaderClaim = true;
             while (DateTime.UtcNow < deadline) {
                 if (mapping == IntPtr.Zero) {
-                    mapping = OpenFileMapping(FILE_MAP_READ | FILE_MAP_WRITE, false, "Local\\FNVXR_D3D9_StereoFrame_v7");
+                    mapping = OpenFileMapping(FILE_MAP_READ | FILE_MAP_WRITE, false, "Local\\FNVXR_D3D9_StereoFrame_v8");
                     if (mapping == IntPtr.Zero) {
                         Thread.Sleep(250);
                         continue;
@@ -332,6 +335,9 @@ public static class FnvxrStereoFrameReaderV7 {
                 int producerProcessId = ReadInt32(view, 192);
                 int publishedSlot = ReadInt32(view, PublishedSlotOffset);
                 UInt64 publicationGeneration = unchecked((UInt64)NativeInterlockedReadInt64(IntPtr.Add(view, 208)));
+                UInt64 transactionId = unchecked((UInt64)ReadInt64(view, 216));
+                UInt64 sourceFrame = unchecked((UInt64)ReadInt64(view, 224));
+                UInt64 runtimeStateSample = unchecked((UInt64)ReadInt64(view, 232));
                 int expectedLeftPayloadOffset = publishedSlot >= 0 && publishedSlot < SlotCount
                     ? HeaderSize + publishedSlot * SlotBytes
                     : -1;
@@ -359,13 +365,16 @@ public static class FnvxrStereoFrameReaderV7 {
                     && poseSequence != 0
                     && (poseSequence & 1u) == 0u
                     && renderedDisplayTime > 0
-                    && producerMode == 3
+                    && producerMode == 4
                     && renderPairSequence != 0
                     && referenceSpaceGeneration > 0
                     && producerEpoch > 0
                     && rendererProducerEpoch > 0
                     && publicationGeneration > 0
                     && producerProcessId > 0
+                    && transactionId > 0
+                    && sourceFrame > 0
+                    && runtimeStateSample > 0
                     && (expectedProducerProcessId <= 0 || producerProcessId == expectedProducerProcessId);
                 if (!sane) {
                     Thread.Sleep(100);
@@ -460,6 +469,7 @@ public static class FnvxrStereoFrameReaderV7 {
                     && firstRendererProducerEpoch == rendererProducerEpoch
                     && firstReferenceSpaceGeneration == referenceSpaceGeneration
                     && firstProducerProcessId == producerProcessId
+                    && firstRuntimeStateSample <= runtimeStateSample
                     && firstWidth == width
                     && firstHeight == height
                     && firstFormat == format
@@ -470,6 +480,8 @@ public static class FnvxrStereoFrameReaderV7 {
                     && Advanced(renderPairSequence, firstQualifiedPair)
                     && Advanced(poseSequence, firstQualifiedPoseSequence)
                     && publicationGeneration > firstPublicationGeneration
+                    && transactionId > firstTransactionId
+                    && sourceFrame > firstSourceFrame
                     && renderedDisplayTime > firstRenderedDisplayTime;
                 if (!advancesFirst) {
                     firstQualifiedSequence = sequence;
@@ -479,6 +491,9 @@ public static class FnvxrStereoFrameReaderV7 {
                     firstProducerEpoch = producerEpoch;
                     firstRendererProducerEpoch = rendererProducerEpoch;
                     firstPublicationGeneration = publicationGeneration;
+                    firstTransactionId = transactionId;
+                    firstSourceFrame = sourceFrame;
+                    firstRuntimeStateSample = runtimeStateSample;
                     firstReferenceSpaceGeneration = referenceSpaceGeneration;
                     firstProducerProcessId = producerProcessId;
                     firstWidth = width;
@@ -523,6 +538,12 @@ public static class FnvxrStereoFrameReaderV7 {
                     "  \"rendererProducerEpoch\": \"" + rendererProducerEpoch + "\",\n" +
                     "  \"firstPublicationGeneration\": \"" + firstPublicationGeneration + "\",\n" +
                     "  \"publicationGeneration\": \"" + publicationGeneration + "\",\n" +
+                    "  \"firstTransactionId\": \"" + firstTransactionId + "\",\n" +
+                    "  \"transactionId\": \"" + transactionId + "\",\n" +
+                    "  \"firstSourceFrame\": \"" + firstSourceFrame + "\",\n" +
+                    "  \"sourceFrame\": \"" + sourceFrame + "\",\n" +
+                    "  \"firstRuntimeStateSample\": \"" + firstRuntimeStateSample + "\",\n" +
+                    "  \"runtimeStateSample\": \"" + runtimeStateSample + "\",\n" +
                     "  \"firstProducerProcessId\": " + firstProducerProcessId + ",\n" +
                     "  \"producerProcessId\": " + producerProcessId + ",\n" +
                     "  \"producerMode\": " + producerMode + ",\n" +
@@ -592,7 +613,7 @@ public static class FnvxrStereoFrameReaderV7 {
 '@
 }
 
-$manifest = [FnvxrStereoFrameReaderV7]::Capture(
+$manifest = [FnvxrStereoFrameReaderV8]::Capture(
     $SceneDir,
     $SceneName,
     $TimeoutSeconds,

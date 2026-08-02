@@ -33,7 +33,7 @@ struct StereoFrameIdentity
 struct StereoPublicationEvidence
 {
     bool colorPairComplete = false;
-    bool depthPairComplete = false;
+    bool renderLocalDepthPairComplete = false;
     bool sameSimulationTick = false;
     bool poseMatched = false;
     bool conservativeVisibilityComplete = false;
@@ -133,7 +133,7 @@ inline product::StereoFrameProof makeStereoFrameProof(
     proof.poseSequence = identity.poseSequence;
     proof.runtimeStateSample = identity.runtimeStateSample;
     proof.colorPairComplete = evidence.colorPairComplete;
-    proof.depthPairComplete = evidence.depthPairComplete;
+    proof.renderLocalDepthPairComplete = evidence.renderLocalDepthPairComplete;
     proof.sameSimulationTick = evidence.sameSimulationTick;
     proof.poseMatched = evidence.poseMatched;
     proof.conservativeVisibilityComplete = evidence.conservativeVisibilityComplete;

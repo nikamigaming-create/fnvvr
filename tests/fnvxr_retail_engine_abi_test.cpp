@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstring>
 #include <cstdlib>
 #include <iostream>
 #include <string_view>
@@ -36,15 +37,52 @@ int main()
         "BSShaderAccumulator must be 0x280 bytes");
 
     require(
-        offsetof(RetailNiCameraLayout, worldToCamera) == 0x9Cu
+        offsetof(RetailNiCameraLayout, worldToCamera) == 0xACu
             && offsetof(RetailNiCameraLayout, frustum) == 0xDCu
             && offsetof(RetailNiCameraLayout, viewport) == 0x100u,
         "NiCamera world transform, frustum, and viewport offsets must stay exact");
     require(
         offsetof(RetailSceneGraphLayout, camera) == 0xACu
             && offsetof(RetailSceneGraphLayout, visibleArray) == 0xB0u
-            && offsetof(RetailSceneGraphLayout, cullingProcess) == 0xB4u,
-        "SceneGraph camera, visibility, and culler offsets must stay exact");
+            && offsetof(RetailSceneGraphLayout, cullingProcess) == 0xB4u
+            && offsetof(RetailSceneGraphLayout, opaqueUnknownB8) == 0xB8u,
+        "SceneGraph camera, visibility, culler, and opaque-field offsets must stay exact");
+
+    RetailSceneGraphLayout scene {};
+    constexpr RetailPointer32 unrelatedNodePointer = 0x00B664F0u;
+    constexpr RetailPointer32 cameraAtLiveRetailOffset = 0x12345678u;
+    constexpr RetailPointer32 cullerAtLiveRetailOffset = 0x23456789u;
+    std::memcpy(
+        reinterpret_cast<std::uint8_t*>(&scene) + 0x9Cu,
+        &unrelatedNodePointer,
+        sizeof(unrelatedNodePointer));
+    std::memcpy(
+        reinterpret_cast<std::uint8_t*>(&scene)
+            + offsetof(RetailSceneGraphLayout, camera),
+        &cameraAtLiveRetailOffset,
+        sizeof(cameraAtLiveRetailOffset));
+    std::memcpy(
+        reinterpret_cast<std::uint8_t*>(&scene)
+            + offsetof(RetailSceneGraphLayout, cullingProcess),
+        &cullerAtLiveRetailOffset,
+        sizeof(cullerAtLiveRetailOffset));
+    require(
+        scene.camera == cameraAtLiveRetailOffset
+            && scene.cullingProcess == cullerAtLiveRetailOffset
+            && scene.camera != unrelatedNodePointer,
+        "the SceneGraph overlay must read the live retail camera and culler slots");
+
+    RetailNiCameraLayout camera {};
+    const float retailNearDistance = 5.0f;
+    std::memcpy(
+        reinterpret_cast<std::uint8_t*>(&camera)
+            + offsetof(RetailNiCameraLayout, frustum)
+            + offsetof(RetailNiFrustumLayout, nearDistance),
+        &retailNearDistance,
+        sizeof(retailNearDistance));
+    require(
+        camera.frustum.nearDistance == retailNearDistance,
+        "the NiCamera overlay must read its frustum after the world-bound block");
     require(
         offsetof(RetailBSCullingProcessLayout, topCullMode) == 0x90u
             && offsetof(RetailBSCullingProcessLayout, shaderAccumulator) == 0xC4u,
@@ -61,6 +99,10 @@ int main()
     static_assert(std::is_pointer_v<BSCullingProcessConstructorFunction>);
     static_assert(std::is_pointer_v<BSShaderAccumulatorConstructorFunction>);
     static_assert(std::is_pointer_v<AccumulatorAddVisibleArrayFunction>);
+    static_assert(
+        std::is_pointer_v<AccumulatorFinishAccumulatingFunction>);
+    static_assert(
+        std::is_pointer_v<FinishAccumulatingShaderAccumulatorFunction>);
     static_assert(std::is_pointer_v<GeometryOnVisibleFunction>);
     static_assert(std::is_pointer_v<CullingProcessAltFunction>);
     static_assert(std::is_pointer_v<AccumulatorRenderFunction>);
@@ -80,8 +122,19 @@ int main()
         retailFunctionInventoryProductionProven(),
         "the independently captured ABI inventory must be production-proven");
     require(
-        RetailFunctionAbiInventory.size() == 22u,
-        "the complete ABI inventory must include the OnVisible dispatch thunk");
+        RetailFunctionAbiInventory.size() == 28u,
+        "the generic raw-hash ABI inventory must exclude the JIP-normalized first-person renderer");
+    const RetailFunctionAbiDescriptor& firstPerson =
+        RetailRenderFirstPersonAbi;
+    require(
+        structurallyValid(firstPerson)
+            && productionProven(firstPerson)
+            && firstPerson.preferredAddress == FirstPersonRenderAddress
+            && firstPerson.callingConvention
+                == RetailX86CallingConvention::Thiscall
+            && firstPerson.stackArgumentCount == 4u
+            && firstPerson.calleePopBytes == 16u,
+        "the separately normalized first-person renderer must retain its exact ABI contract");
 
     for (std::size_t left = 0; left < RetailFunctionAbiInventory.size(); ++left)
     {
@@ -133,8 +186,24 @@ int main()
             "shared ABI and core-manifest identities must not drift apart");
     }
     require(
-        coreFunctionsCrossChecked == 7u,
-        "all seven core accumulator/culling ABI bodies must cross-check the manifest");
+        coreFunctionsCrossChecked == 9u,
+        "all raw-hashable core world ABI bodies must cross-check the manifest");
+    const auto coreFirstPerson = std::find_if(
+        RetailEngineManifest.begin(),
+        RetailEngineManifest.end(),
+        [](const LoadedFunctionManifestEntry& entry) {
+            return entry.name && std::string_view(entry.name) == "RenderFirstPerson";
+        });
+    require(
+        coreFirstPerson != RetailEngineManifest.end()
+            && coreFirstPerson->preferredAddress == firstPerson.preferredAddress
+            && coreFirstPerson->byteCount == firstPerson.byteCount
+            && coreFirstPerson->sha256.valid == firstPerson.sha256.valid
+            && std::equal(
+                coreFirstPerson->sha256.bytes.begin(),
+                coreFirstPerson->sha256.bytes.end(),
+                firstPerson.sha256.bytes.begin()),
+        "the normalized first-person ABI must cross-check the separately normalized core manifest body");
 
     const auto allocate = findFunction("Ni_Alloc");
     const auto free = findFunction("Ni_Free");
@@ -193,6 +262,35 @@ int main()
         "the shader deleting destructor must stay independently hash-gated");
 
     const auto addVisibleArray = findFunction("NiAccumulator::AddVisibleArray");
+    const auto finishVisible =
+        findFunction("NiAccumulator::FinishAccumulating");
+    const auto finishShader =
+        findFunction("FinishAccumulatingShaderAccumulator");
+    require(
+        finishVisible != RetailFunctionAbiInventory.end()
+            && finishVisible->preferredAddress == 0x00A9B570u
+            && finishVisible->byteCount == 437u
+            && finishVisible->callingConvention
+                == RetailX86CallingConvention::Thiscall
+            && finishVisible->stackArgumentCount == 0u
+            && finishVisible->sha256.bytes
+                == sha256FromHex(
+                       "192CA9CE2B5C39AC15A0DBFA4F6D2650471A17775AD3950032419C381A3FB20F")
+                       .bytes,
+        "the +0xA4 visible-list finishing target must be independently hash-sealed");
+    require(
+        finishShader != RetailFunctionAbiInventory.end()
+            && finishShader->preferredAddress == 0x00B65E80u
+            && finishShader->byteCount == 51u
+            && finishShader->callingConvention
+                == RetailX86CallingConvention::Cdecl
+            && finishShader->stackArgumentCount == 1u
+            && finishShader->calleePopBytes == 0u
+            && finishShader->sha256.bytes
+                == sha256FromHex(
+                       "9D03349FA8780CF4B1898D4B0355D03BD58343E6D514ABE5F44734C63F8E0684")
+                       .bytes,
+        "the stock shader-batch preparation wrapper must retain its exact cdecl ABI");
     require(
         addVisibleArray != RetailFunctionAbiInventory.end()
             && addVisibleArray->preferredAddress == 0x00A9B790u

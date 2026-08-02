@@ -78,7 +78,7 @@ quad. UI input remains ordinary retail mouse/keyboard/controller input.
 
 All non-blocking gameplay requires native stereo with no persistent gameplay
 HUD. A world transition requires a fresh, complete, pose-matched same-frame
-color/depth pair whose retail source frame strictly postdates the last displayed
+color pair with validated render-local eye depth/stencil whose retail source frame strictly postdates the last displayed
 UI frame. That UI freshness watermark survives transition-hold expiry. A UI
 transition enters the flat retail surface; an invalid or stale gameplay
 transaction is rejected and is not reported as mono VR.

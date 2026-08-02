@@ -49,11 +49,41 @@ constexpr std::uintptr_t ShowOffBase = 0x30000000u;
 constexpr std::uint32_t ShowOffImageBytes = 0x00110000u;
 constexpr std::uint32_t ShowOffTimestamp = 0x22222222u;
 constexpr std::uint32_t ShowOffPreferredBase = 0x10000000u;
+constexpr std::uintptr_t JohnnyGuitarBase = 0x31000000u;
+constexpr std::uint32_t JohnnyGuitarImageBytes = 0x0004C000u;
+constexpr std::uint32_t JohnnyGuitarTimestamp = 0x33333333u;
+constexpr std::uint32_t JohnnyGuitarPreferredBase = 0x10000000u;
 constexpr std::uintptr_t RenderFirstPersonPreferred = 0x00875110u;
 constexpr std::size_t RenderFirstPersonBytes = 3361u;
 constexpr std::size_t JipCallOffset = 0x00B6u;
 constexpr std::uintptr_t StockTargetPreferred = 0x007148C0u;
 constexpr std::uint32_t UnknownTextRva = 0x00D00000u;
+constexpr std::size_t UpdateCameraCoreIndex = 3u;
+constexpr std::uint32_t UpdateCameraRva = 0x00030000u;
+constexpr std::uintptr_t UpdateCameraPreferred = PreferredMainBase
+    + UpdateCameraRva;
+constexpr std::size_t UpdateCameraBytes = 0x0200u;
+constexpr std::size_t JohnnyRenderFirstPersonCallOffset = 0x01E2u;
+constexpr std::uintptr_t JohnnyRenderFirstPersonStockTargetPreferred =
+    0x00422000u;
+constexpr std::uint32_t JohnnyRenderFirstPersonHookRva =
+    JohnnyGuitar528RenderFirstPersonHookRva;
+constexpr std::size_t JohnnyUpdateCameraOverwriteOffset = 0x0040u;
+constexpr std::array<std::uint8_t, 5> JohnnyUpdateCameraOriginalBytes {
+    0xDFu, 0xE0u, 0xF6u, 0xC4u, 0x41u,
+};
+constexpr std::size_t JohnnyUpdateCameraFirstCallOffset = 0x0080u;
+constexpr std::uintptr_t JohnnyUpdateCameraFirstStockTargetPreferred =
+    0x00423000u;
+constexpr std::size_t JohnnyUpdateCameraSecondCallOffset = 0x00A0u;
+constexpr std::uintptr_t JohnnyUpdateCameraSecondStockTargetPreferred =
+    0x00424000u;
+constexpr std::uint32_t JohnnyUpdateCameraOverwriteHookRva =
+    JohnnyGuitar528UpdateCameraOverwriteHookRva;
+constexpr std::uint32_t JohnnyUpdateCameraFirstCallHookRva =
+    JohnnyGuitar528UpdateCameraFirstCallHookRva;
+constexpr std::uint32_t JohnnyUpdateCameraSecondCallHookRva =
+    JohnnyGuitar528UpdateCameraSecondCallHookRva;
 
 void writeU16(
     std::vector<std::uint8_t>& bytes,
@@ -147,21 +177,31 @@ struct Fixture
         std::vector<std::uint8_t>(JipImageBytes);
     std::vector<std::uint8_t> showOffImage =
         std::vector<std::uint8_t>(ShowOffImageBytes);
+    std::vector<std::uint8_t> johnnyGuitarImage =
+        std::vector<std::uint8_t>(JohnnyGuitarImageBytes);
     std::vector<std::uint8_t> jipFile =
         std::vector<std::uint8_t>(257u, 0x4Au);
     std::vector<std::uint8_t> showOffFile =
         std::vector<std::uint8_t>(389u, 0x53u);
+    std::vector<std::uint8_t> johnnyGuitarFile =
+        std::vector<std::uint8_t>(431u, 0x4Bu);
     std::vector<std::uint8_t> stockFirstPerson =
         std::vector<std::uint8_t>(RenderFirstPersonBytes, 0x90u);
+    std::vector<std::uint8_t> stockUpdateCamera =
+        std::vector<std::uint8_t>(UpdateCameraBytes, 0x91u);
 
-    std::array<LoadedFunctionManifestEntry, 13> coreManifest {};
-    std::array<RetailFunctionAbiDescriptor, 22> functions {};
+    std::array<
+        LoadedFunctionManifestEntry,
+        RetailEngineManifest.size()> coreManifest {};
+    std::array<
+        RetailFunctionAbiDescriptor,
+        RetailFunctionAbiInventory.size()> functions {};
     std::array<RetailVtableSlotDescriptor, 16> slots {};
     std::array<RetailVtableBlockDescriptor, 1> blocks {};
     std::vector<SyntheticModule> modulesBefore {};
     std::vector<SyntheticModule> modulesAfter {};
-    std::array<SyntheticByteRange, 3> byteRanges {};
-    std::array<SyntheticProtectionRange, 6> protections {};
+    std::array<SyntheticByteRange, 4> byteRanges {};
+    std::array<SyntheticProtectionRange, 8> protections {};
     SyntheticRetailCompatibilityContract contract {};
     SyntheticRetailCompatibilitySnapshot snapshot {};
 
@@ -185,6 +225,12 @@ struct Fixture
             0u,
             ShowOffImageBytes,
             ShowOffPreferredBase);
+        initializeLoadedPe32(
+            johnnyGuitarImage,
+            JohnnyGuitarTimestamp,
+            0u,
+            JohnnyGuitarImageBytes,
+            JohnnyGuitarPreferredBase);
         initializeProtectedFunctions();
         initializeVtables();
         initializeJipPatch();
@@ -219,6 +265,44 @@ struct Fixture
                 stockDisplacement[index];
         }
 
+        stockFirstPerson[JohnnyRenderFirstPersonCallOffset] = 0xE8u;
+        const std::uintptr_t johnnyRenderStockRuntime = RuntimeMainBase
+            + (JohnnyRenderFirstPersonStockTargetPreferred
+                - PreferredMainBase);
+        const auto johnnyRenderStockDisplacement = encodeRel32(
+            functionRuntime + JohnnyRenderFirstPersonCallOffset + 5u,
+            johnnyRenderStockRuntime);
+        std::copy(
+            johnnyRenderStockDisplacement.begin(),
+            johnnyRenderStockDisplacement.end(),
+            stockFirstPerson.begin() + JohnnyRenderFirstPersonCallOffset + 1u);
+
+        std::copy(
+            JohnnyUpdateCameraOriginalBytes.begin(),
+            JohnnyUpdateCameraOriginalBytes.end(),
+            stockUpdateCamera.begin() + JohnnyUpdateCameraOverwriteOffset);
+        const std::uintptr_t updateRuntime = RuntimeMainBase + UpdateCameraRva;
+        const auto writeStockUpdateCall = [this, updateRuntime](
+                                             std::size_t offset,
+                                             std::uintptr_t targetPreferred) {
+            stockUpdateCamera[offset] = 0xE8u;
+            const std::uintptr_t targetRuntime = RuntimeMainBase
+                + (targetPreferred - PreferredMainBase);
+            const auto displacement = encodeRel32(
+                updateRuntime + offset + 5u,
+                targetRuntime);
+            std::copy(
+                displacement.begin(),
+                displacement.end(),
+                stockUpdateCamera.begin() + offset + 1u);
+        };
+        writeStockUpdateCall(
+            JohnnyUpdateCameraFirstCallOffset,
+            JohnnyUpdateCameraFirstStockTargetPreferred);
+        writeStockUpdateCall(
+            JohnnyUpdateCameraSecondCallOffset,
+            JohnnyUpdateCameraSecondStockTargetPreferred);
+
         for (std::size_t index = 0u; index < coreManifest.size(); ++index)
         {
             if (index == 2u)
@@ -230,6 +314,22 @@ struct Fixture
                     sha256ForSyntheticCompatibilityAuthority(
                         stockFirstPerson.data(),
                         stockFirstPerson.size()),
+                };
+                continue;
+            }
+            if (index == UpdateCameraCoreIndex)
+            {
+                std::copy(
+                    stockUpdateCamera.begin(),
+                    stockUpdateCamera.end(),
+                    mainImage.begin() + UpdateCameraRva);
+                coreManifest[index] = {
+                    "PlayerCharacter::UpdateCamera",
+                    UpdateCameraPreferred,
+                    stockUpdateCamera.size(),
+                    sha256ForSyntheticCompatibilityAuthority(
+                        stockUpdateCamera.data(),
+                        stockUpdateCamera.size()),
                 };
                 continue;
             }
@@ -364,6 +464,14 @@ struct Fixture
                 showOffFile.size(),
             },
             {
+                L"johnnyguitar.dll",
+                L"C:\\Games\\Data\\NVSE\\Plugins\\johnnyguitar.dll",
+                JohnnyGuitarBase,
+                johnnyGuitarImage.size(),
+                johnnyGuitarFile.data(),
+                johnnyGuitarFile.size(),
+            },
+            {
                 L"unrelated_mod.dll",
                 L"C:\\Games\\Data\\NVSE\\Plugins\\unrelated_mod.dll",
                 0x35000000u,
@@ -394,6 +502,16 @@ struct Fixture
             JipImageBytes,
             JipPreferredBase,
         };
+        contract.johnnyGuitar = {
+            L"johnnyguitar.dll",
+            johnnyGuitarFile.size(),
+            sha256ForSyntheticCompatibilityAuthority(
+                johnnyGuitarFile.data(),
+                johnnyGuitarFile.size()),
+            JohnnyGuitarTimestamp,
+            JohnnyGuitarImageBytes,
+            JohnnyGuitarPreferredBase,
+        };
         contract.showOff = {
             L"showoffnvse.dll",
             showOffFile.size(),
@@ -413,6 +531,24 @@ struct Fixture
             JipGuardRva,
             19u,
         };
+        contract.johnnyGuitarRewrite = {
+            RenderFirstPersonPreferred,
+            RenderFirstPersonBytes,
+            JohnnyRenderFirstPersonCallOffset,
+            JohnnyRenderFirstPersonStockTargetPreferred,
+            UpdateCameraPreferred,
+            UpdateCameraBytes,
+            JohnnyUpdateCameraOverwriteOffset,
+            JohnnyUpdateCameraOriginalBytes,
+            JohnnyUpdateCameraFirstCallOffset,
+            JohnnyUpdateCameraFirstStockTargetPreferred,
+            JohnnyUpdateCameraSecondCallOffset,
+            JohnnyUpdateCameraSecondStockTargetPreferred,
+            JohnnyRenderFirstPersonHookRva,
+            JohnnyUpdateCameraOverwriteHookRva,
+            JohnnyUpdateCameraFirstCallHookRva,
+            JohnnyUpdateCameraSecondCallHookRva,
+        };
         contract.coreManifest = coreManifest.data();
         contract.coreManifestCount = coreManifest.size();
         contract.functionInventory = functions.data();
@@ -429,6 +565,8 @@ struct Fixture
             { RuntimeMainBase, mainImage.data(), mainImage.size() },
             { JipBase, jipImage.data(), jipImage.size() },
             { ShowOffBase, showOffImage.data(), showOffImage.size() },
+            { JohnnyGuitarBase,
+                johnnyGuitarImage.data(), johnnyGuitarImage.size() },
         }};
         protections = {{
             { RuntimeMainBase, 0x1000u, SyntheticMemoryAccess::ReadOnly, false },
@@ -442,6 +580,11 @@ struct Fixture
                 SyntheticMemoryAccess::ExecuteRead, false },
             { ShowOffBase, ShowOffImageBytes,
                 SyntheticMemoryAccess::ReadOnly, false },
+            { JohnnyGuitarBase, 0x1000u,
+                SyntheticMemoryAccess::ReadOnly, false },
+            { JohnnyGuitarBase + 0x1000u,
+                JohnnyGuitarImageBytes - 0x1000u,
+                SyntheticMemoryAccess::ExecuteRead, false },
         }};
         snapshot.modulesBefore = modulesBefore.data();
         snapshot.moduleCountBefore = modulesBefore.size();
@@ -472,6 +615,53 @@ struct Fixture
             stockFirstPerson.end(),
             mainImage.begin() + rva);
     }
+
+    void restoreStockUpdateCamera()
+    {
+        std::copy(
+            stockUpdateCamera.begin(),
+            stockUpdateCamera.end(),
+            mainImage.begin() + UpdateCameraRva);
+    }
+
+    void applyExactJohnnyGuitarRewrites()
+    {
+        const std::uint32_t firstPersonRva = static_cast<std::uint32_t>(
+            RenderFirstPersonPreferred - PreferredMainBase);
+        const std::uintptr_t firstPersonRuntime = RuntimeMainBase
+            + firstPersonRva;
+        mainImage[firstPersonRva + JohnnyRenderFirstPersonCallOffset] = 0xE8u;
+        const auto renderDisplacement = encodeRel32(
+            firstPersonRuntime + JohnnyRenderFirstPersonCallOffset + 5u,
+            JohnnyGuitarBase + JohnnyRenderFirstPersonHookRva);
+        std::copy(
+            renderDisplacement.begin(),
+            renderDisplacement.end(),
+            mainImage.begin()
+                + firstPersonRva + JohnnyRenderFirstPersonCallOffset + 1u);
+
+        const auto applyUpdateCall = [this](
+                                         std::size_t offset,
+                                         std::uint32_t hookRva) {
+            mainImage[UpdateCameraRva + offset] = 0xE8u;
+            const auto displacement = encodeRel32(
+                RuntimeMainBase + UpdateCameraRva + offset + 5u,
+                JohnnyGuitarBase + hookRva);
+            std::copy(
+                displacement.begin(),
+                displacement.end(),
+                mainImage.begin() + UpdateCameraRva + offset + 1u);
+        };
+        applyUpdateCall(
+            JohnnyUpdateCameraOverwriteOffset,
+            JohnnyUpdateCameraOverwriteHookRva);
+        applyUpdateCall(
+            JohnnyUpdateCameraFirstCallOffset,
+            JohnnyUpdateCameraFirstCallHookRva);
+        applyUpdateCall(
+            JohnnyUpdateCameraSecondCallOffset,
+            JohnnyUpdateCameraSecondCallHookRva);
+    }
 };
 
 void requireRejected(
@@ -491,8 +681,8 @@ void testExactOptionalModulesAndJipNormalizationAuthorize()
         "the exact narrow compatibility proof did not authorize");
     require(proof.evidence.retailExecutableIdentityMatched
             && proof.evidence.moduleSnapshotStable
-            && proof.evidence.prohibitedModulesAbsent
             && proof.evidence.jip5730ExactOrAbsent
+            && proof.evidence.johnnyGuitar528ExactOrAbsent
             && proof.evidence.showOff184ExactOrAbsent
             && proof.evidence.renderFirstPersonStockOrJipNormalized
             && proof.evidence.protectedCoreBodiesMatched
@@ -503,10 +693,12 @@ void testExactOptionalModulesAndJipNormalizationAuthorize()
         "the complete proof did not derive every evidence field");
     require(proof.diagnostics.jipPresent
             && proof.diagnostics.jipNormalizationApplied
+            && proof.diagnostics.johnnyGuitarPresent
+            && !proof.diagnostics.johnnyGuitarNormalizationApplied
             && proof.diagnostics.showOffPresent,
         "the exact optional-module path was not diagnosed");
-    require(proof.diagnostics.protectedCoreBodiesHashed == 13u
-            && proof.diagnostics.protectedFunctionsHashed == 22u
+    require(proof.diagnostics.protectedCoreBodiesHashed == 15u
+            && proof.diagnostics.protectedFunctionsHashed == 28u
             && proof.diagnostics.protectedVtableSlotsRead == 16u
             && proof.diagnostics.protectedVtableBytesHashed == 0x50u,
         "not every protected engine range was inspected");
@@ -517,20 +709,22 @@ void testOptionalAbsenceAndUnrelatedModificationsAreAllowed()
     Fixture fixture;
     fixture.restoreStockFirstPerson();
     fixture.modulesBefore.erase(fixture.modulesBefore.begin() + 1u,
-        fixture.modulesBefore.begin() + 3u);
+        fixture.modulesBefore.begin() + 4u);
     fixture.modulesAfter = fixture.modulesBefore;
     fixture.mainImage[UnknownTextRva] ^= 0xA5u;
     const RetailCompatibilityProof proof = fixture.evaluate();
     require(proof.compatible
             && proof.evidence.jip5730ExactOrAbsent
+            && proof.evidence.johnnyGuitar528ExactOrAbsent
             && proof.evidence.showOff184ExactOrAbsent
             && !proof.diagnostics.jipPresent
+            && !proof.diagnostics.johnnyGuitarPresent
             && !proof.diagnostics.showOffPresent
             && !proof.diagnostics.jipNormalizationApplied,
         "optional module absence or unrelated modded text was rejected");
 }
 
-void testExactModuleIdentitiesAndOverlaysFailClosed()
+void testExactModuleIdentitiesAndStableGraphicsHooksCoexist()
 {
     Fixture fixture;
     fixture.jipFile[0] ^= 1u;
@@ -546,6 +740,14 @@ void testExactModuleIdentitiesAndOverlaysFailClosed()
         "a non-exact ShowOff file was not identified");
     requireRejected(rejected, "a non-exact ShowOff file authorized");
     fixture.showOffFile[0] ^= 1u;
+
+    fixture.johnnyGuitarFile[0] ^= 1u;
+    rejected = fixture.evaluate();
+    require(rejected.failure
+            == RetailCompatibilityFailure::JohnnyGuitar528IdentityMismatch,
+        "a non-exact JohnnyGuitar file was not identified");
+    requireRejected(rejected, "a non-exact JohnnyGuitar file authorized");
+    fixture.johnnyGuitarFile[0] ^= 1u;
 
     constexpr std::size_t LoadedTimestampOffset = 0x80u + 4u + 4u;
     fixture.jipImage[LoadedTimestampOffset] ^= 1u;
@@ -564,6 +766,17 @@ void testExactModuleIdentitiesAndOverlaysFailClosed()
     fixture.modulesBefore.pop_back();
     fixture.modulesAfter.pop_back();
 
+    SyntheticModule duplicateJohnny = fixture.modulesBefore[3];
+    duplicateJohnny.runtimeBase += 0x01000000u;
+    fixture.modulesBefore.push_back(duplicateJohnny);
+    fixture.modulesAfter.push_back(duplicateJohnny);
+    rejected = fixture.evaluate();
+    require(rejected.failure
+            == RetailCompatibilityFailure::DuplicateJohnnyGuitarModule,
+        "duplicate JohnnyGuitar modules were not rejected");
+    fixture.modulesBefore.pop_back();
+    fixture.modulesAfter.pop_back();
+
     const SyntheticModule overlay {
         L"GameOverlayRenderer.DLL",
         L"C:\\Steam\\GameOverlayRenderer.DLL",
@@ -574,11 +787,18 @@ void testExactModuleIdentitiesAndOverlaysFailClosed()
     };
     fixture.modulesBefore.push_back(overlay);
     fixture.modulesAfter.push_back(overlay);
+    const RetailCompatibilityProof coexistence = fixture.evaluate();
+    require(coexistence.compatible
+            && coexistence.evidence.moduleSnapshotStable,
+        "a stable graphics hook invalidated exact protected-byte proof");
+
+    fixture.mainImage[CoreFirstRva] ^= 0x10u;
     rejected = fixture.evaluate();
     require(rejected.failure
-            == RetailCompatibilityFailure::ProhibitedOverlayOrCaptureLoaded,
-        "the known Steam overlay was not rejected by basename");
-    requireRejected(rejected, "a known overlay authorized");
+            == RetailCompatibilityFailure::ProtectedCoreBodyMismatch,
+        "a graphics hook bypassed protected engine-byte verification");
+    requireRejected(rejected,
+        "changed protected engine bytes authorized with a graphics hook loaded");
 }
 
 void testOnlyTheProvenJipRewriteCanNormalize()
@@ -608,6 +828,48 @@ void testOnlyTheProvenJipRewriteCanNormalize()
     require(rejected.failure
             == RetailCompatibilityFailure::JipRenderFirstPersonRewriteMismatch,
         "a JIP-shaped rewrite was accepted without the exact JIP module");
+}
+
+void testExactJohnnyGuitarRewriteGroupRequiresEverySealedCall()
+{
+    Fixture fixture;
+    fixture.applyExactJohnnyGuitarRewrites();
+    RetailCompatibilityProof proof = fixture.evaluate();
+    require(proof.compatible
+            && proof.failure == RetailCompatibilityFailure::None
+            && proof.diagnostics.jipNormalizationApplied
+            && proof.diagnostics.johnnyGuitarNormalizationApplied,
+        "the exact JohnnyGuitar rewrite group was not authorized");
+
+    fixture.mainImage[UpdateCameraRva + JohnnyUpdateCameraFirstCallOffset + 3u]
+        ^= 0xC3u;
+    proof = fixture.evaluate();
+    require(proof.failure
+            == RetailCompatibilityFailure::JohnnyGuitarProtectedRewriteMismatch,
+        "a changed JohnnyGuitar protected-core call bypassed its exact seal");
+    requireRejected(proof,
+        "a changed JohnnyGuitar protected-core call authorized observation");
+
+    Fixture missingJip;
+    missingJip.applyExactJohnnyGuitarRewrites();
+    missingJip.modulesBefore.erase(missingJip.modulesBefore.begin() + 3u);
+    missingJip.modulesAfter = missingJip.modulesBefore;
+    proof = missingJip.evaluate();
+    require(proof.failure
+            == RetailCompatibilityFailure::JipRenderFirstPersonRewriteMismatch,
+        "a JohnnyGuitar rewrite group was accepted without exact JohnnyGuitar");
+    requireRejected(proof,
+        "a JohnnyGuitar rewrite group without JohnnyGuitar authorized observation");
+
+    Fixture partialGroup;
+    partialGroup.applyExactJohnnyGuitarRewrites();
+    partialGroup.restoreStockUpdateCamera();
+    proof = partialGroup.evaluate();
+    require(proof.failure
+            == RetailCompatibilityFailure::JohnnyGuitarProtectedRewriteMismatch,
+        "a partial JohnnyGuitar rewrite group was accepted");
+    requireRejected(proof,
+        "a partial JohnnyGuitar rewrite group authorized observation");
 }
 
 void testEveryProtectedFunctionSlotAndBlockFailsClosed()
@@ -694,8 +956,9 @@ int main()
 {
     testExactOptionalModulesAndJipNormalizationAuthorize();
     testOptionalAbsenceAndUnrelatedModificationsAreAllowed();
-    testExactModuleIdentitiesAndOverlaysFailClosed();
+    testExactModuleIdentitiesAndStableGraphicsHooksCoexist();
     testOnlyTheProvenJipRewriteCanNormalize();
+    testExactJohnnyGuitarRewriteGroupRequiresEverySealedCall();
     testEveryProtectedFunctionSlotAndBlockFailsClosed();
     testSnapshotsAndProtectionMustRemainSynchronous();
     testProductionEntryRejectsThisProcess();

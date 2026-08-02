@@ -39,15 +39,17 @@ void writePointer32(
         sizeof(value));
 }
 
-RetailNiTransformLayout identityTransform(
+RetailNiTransformLayout levelRetailCameraTransform(
     float x = 0.0f,
     float y = 0.0f,
     float z = 0.0f)
 {
     RetailNiTransformLayout result {};
-    result.rotation[0] = 1.0f;
-    result.rotation[4] = 1.0f;
-    result.rotation[8] = 1.0f;
+    // Retail NiCamera columns are forward, up, right. Use a level camera
+    // facing +world-Y with +world-Z up and +world-X right.
+    result.rotation[2] = 1.0f;
+    result.rotation[3] = 1.0f;
+    result.rotation[7] = 1.0f;
     result.translation[0] = x;
     result.translation[1] = y;
     result.translation[2] = z;
@@ -63,7 +65,7 @@ void initializeCamera(
 {
     camera = {};
     writePointer32(camera, 0u, 0x0109CB9Cu);
-    const RetailNiTransformLayout transform = identityTransform(x, y, z);
+    const RetailNiTransformLayout transform = levelRetailCameraTransform(x, y, z);
     detail::retailCameraWriteTransform(
         &camera,
         RetailNiAvObjectLocalTransformOffset,
@@ -118,6 +120,80 @@ RetailTrackedFrame validFrame()
     return frame;
 }
 
+stereo::Quaternion axisAngle(
+    float x,
+    float y,
+    float z,
+    float radians)
+{
+    const float half = radians * 0.5f;
+    const float sine = std::sin(half);
+    return stereo::normalized({
+        x * sine,
+        y * sine,
+        z * sine,
+        std::cos(half),
+    });
+}
+
+void setTrackedOrientation(
+    RetailTrackedFrame& frame,
+    const stereo::Quaternion& orientation)
+{
+    const float quaternion[4] {
+        orientation.x,
+        orientation.y,
+        orientation.z,
+        orientation.w,
+    };
+    std::memcpy(frame.pose.hmdRot, quaternion, sizeof(quaternion));
+    std::memcpy(frame.pose.leftEyeRot, quaternion, sizeof(quaternion));
+    std::memcpy(frame.pose.rightEyeRot, quaternion, sizeof(quaternion));
+
+    const stereo::Matrix3 rotation =
+        stereo::columnRotationFromQuaternion(orientation);
+    const stereo::Vector3 left =
+        stereo::transform(rotation, { -0.032f, 0.0f, 0.0f });
+    const stereo::Vector3 right =
+        stereo::transform(rotation, { 0.032f, 0.0f, 0.0f });
+    frame.pose.leftEyePos[0] = left.x;
+    frame.pose.leftEyePos[1] = left.y;
+    frame.pose.leftEyePos[2] = left.z;
+    frame.pose.rightEyePos[0] = right.x;
+    frame.pose.rightEyePos[1] = right.y;
+    frame.pose.rightEyePos[2] = right.z;
+}
+
+stereo::Vector3 cameraRight(
+    const RetailCameraMutableState& camera)
+{
+    return {
+        camera.world.rotation[2],
+        camera.world.rotation[5],
+        camera.world.rotation[8],
+    };
+}
+
+stereo::Vector3 cameraUp(
+    const RetailCameraMutableState& camera)
+{
+    return {
+        camera.world.rotation[1],
+        camera.world.rotation[4],
+        camera.world.rotation[7],
+    };
+}
+
+stereo::Vector3 cameraForward(
+    const RetailCameraMutableState& camera)
+{
+    return {
+        camera.world.rotation[0],
+        camera.world.rotation[3],
+        camera.world.rotation[6],
+    };
+}
+
 #if defined(_MSC_VER) && defined(_M_IX86)
 #define FNVXR_TEST_CDECL __cdecl
 #define FNVXR_TEST_THISCALL_IMPL __fastcall
@@ -160,7 +236,7 @@ Target engineFunction(Source source) noexcept
 void testWorldToCameraContract()
 {
     RetailNiTransformLayout world {};
-    // Columns: right=(0,1,0), up=(0,0,1), back=(1,0,0).
+    // Columns: forward=(0,1,0), up=(0,0,1), right=(1,0,0).
     world.rotation[1] = 0.0f;
     world.rotation[2] = 1.0f;
     world.rotation[3] = 1.0f;
@@ -169,37 +245,30 @@ void testWorldToCameraContract()
     world.translation[1] = 20.0f;
     world.translation[2] = 30.0f;
     world.scale = 1.0f;
-    abi::RetailNiFrustumLayout frustum {};
-    frustum.left = -2.0f;
-    frustum.right = 1.0f;
-    frustum.top = 1.5f;
-    frustum.bottom = -0.5f;
-    frustum.nearDistance = 5.0f;
-    frustum.farDistance = 100.0f;
-    float matrix[16] {};
+    float matrix[12] {};
     require(
-        detail::buildRetailWorldToCamera(world, frustum, matrix),
-        "known retail right/up/back camera did not produce a matrix");
+        detail::buildRetailWorldToCamera(world, matrix),
+        "known retail forward/up/right camera did not produce a matrix");
     require(
-        nearlyEqual(matrix[0], -1.0f / 3.0f)
-            && nearlyEqual(matrix[1], 2.0f / 3.0f)
+        nearlyEqual(matrix[0], 0.0f)
+            && nearlyEqual(matrix[1], 1.0f)
             && nearlyEqual(matrix[2], 0.0f)
-            && nearlyEqual(matrix[3], -10.0f)
-            && nearlyEqual(matrix[4], 0.5f)
+            && nearlyEqual(matrix[3], -20.0f)
+            && nearlyEqual(matrix[4], 0.0f)
             && nearlyEqual(matrix[5], 0.0f)
             && nearlyEqual(matrix[6], 1.0f)
-            && nearlyEqual(matrix[7], -35.0f)
-            && nearlyEqual(matrix[8], -100.0f / 95.0f)
-            && nearlyEqual(matrix[11], 5.0f / 95.0f * 100.0f)
-            && nearlyEqual(matrix[12], -1.0f)
-            && nearlyEqual(matrix[15], 10.0f),
-        "world-to-clip signs or off-center projection terms changed");
+            && nearlyEqual(matrix[7], -30.0f)
+            && nearlyEqual(matrix[8], -1.0f)
+            && nearlyEqual(matrix[9], 0.0f)
+            && nearlyEqual(matrix[10], 0.0f)
+            && nearlyEqual(matrix[11], 10.0f),
+        "world-to-camera affine signs or translation changed");
 }
 
-void testCapturedRetailWorldToCamera()
+void testCapturedRetailWorldMatrices()
 {
     // One loaded retail transaction logged these camera/frustum/matrix values
-    // together. The rotation columns below are the normalized right/up/back
+    // together. The rotation columns below are the normalized forward/up/right
     // axes present in that same matrix; the position and frustum are the
     // independently logged NiCamera fields.
     RetailNiTransformLayout world {};
@@ -223,10 +292,30 @@ void testCapturedRetailWorldToCamera()
     frustum.bottom = -1.42814791f;
     frustum.nearDistance = 5.0f;
     frustum.farDistance = 353840.0f;
+    float worldToCamera[12] {};
+    require(
+        detail::buildRetailWorldToCamera(world, worldToCamera),
+        "captured retail camera did not pass the affine matrix contract");
+    const float capturedWorldToCamera[12] {
+        0.29196088f, -0.95642990f, 0.0f, 19949.9493f,
+        0.0f, 0.0f, 1.0f, -8258.8574f,
+        0.95643002f, 0.29196101f, 0.0f, 69601.5485f,
+    };
+    for (std::size_t index = 0u; index < 12u; ++index)
+    {
+        const float tolerance = index % 4u == 3u ? 0.1f : 0.00005f;
+        require(
+            nearlyEqual(
+                worldToCamera[index],
+                capturedWorldToCamera[index],
+                tolerance),
+            "captured retail affine world-to-camera diverged");
+    }
+
     float actual[16] {};
     require(
-        detail::buildRetailWorldToCamera(world, frustum, actual),
-        "captured retail camera did not pass the matrix contract");
+        detail::buildRetailWorldToClip(world, frustum, actual),
+        "captured retail camera did not pass the world-to-clip contract");
     const float captured[16] {
         0.212122f, -0.694887f, 0.0f, 14494.5f,
         0.184770f, 0.0564031f, 0.835479f, 6546.05f,
@@ -238,7 +327,7 @@ void testCapturedRetailWorldToCamera()
         const float tolerance = index % 4u == 3u ? 0.1f : 0.00005f;
         require(
             nearlyEqual(actual[index], captured[index], tolerance),
-            "direct camera matrix diverged from loaded retail capture");
+            "derived world-to-clip matrix diverged from loaded retail capture");
     }
 }
 
@@ -251,8 +340,9 @@ void testOriginAndRig()
     require(
         first.complete() && first.relatched
             && nearlyEqual(first.origin.position.x, 0.0f)
-            && nearlyEqual(first.origin.orientation.w, 1.0f),
-        "first gameplay pose did not latch one rigid eye-midpoint/yaw origin");
+            && nearlyEqual(first.origin.orientation.w, 1.0f)
+            && nearlyEqual(first.origin.headOrientation.w, 1.0f),
+        "first gameplay pose did not latch one rigid movement/view origin");
 
     abi::RetailNiCameraLayout stock {};
     initializeCamera(stock, 100.0f, 200.0f, 300.0f);
@@ -386,6 +476,162 @@ void testOriginAndRig()
         "parented private camera was admitted as local-equals-world");
 }
 
+void testTrackedOrientationAxes()
+{
+    constexpr float Pi = 3.14159265358979323846f;
+    constexpr float ThirtyDegrees = Pi / 6.0f;
+    abi::RetailNiCameraLayout stock {};
+    initializeCamera(stock, 100.0f, 200.0f, 300.0f);
+
+    const RetailTrackedFrame baseline = validFrame();
+    const RetailVrOriginCandidate origin =
+        prepareRetailVrOriginCandidate({}, baseline);
+    require(origin.complete(), "orientation test origin did not latch");
+
+    RetailTrackedFrame pitchFrame = baseline;
+    pitchFrame.pose.frame = 11u;
+    pitchFrame.runtime.frame = 11u;
+    pitchFrame.poseSequence = 4u;
+    pitchFrame.runtimeSequence = 4u;
+    setTrackedOrientation(
+        pitchFrame,
+        axisAngle(1.0f, 0.0f, 0.0f, ThirtyDegrees));
+    const RetailDerivedEyeCameraRig pitchRig =
+        deriveRetailEyeCameraRig(
+            &stock,
+            pitchFrame,
+            origin.origin,
+            70.0f);
+    require(
+        pitchRig.complete(),
+        "a valid OpenXR pitch pose did not derive an eye-camera rig");
+    const stereo::Vector3 pitchForward =
+        cameraForward(pitchRig.center);
+    require(
+        nearlyEqual(pitchForward.x, 0.0f, 0.001f)
+            && pitchForward.y > 0.85f
+            && pitchForward.z > 0.49f,
+        "OpenXR pitch did not tilt NiCamera forward toward world up");
+
+    RetailTrackedFrame yawFrame = pitchFrame;
+    yawFrame.pose.frame = 12u;
+    yawFrame.runtime.frame = 12u;
+    yawFrame.poseSequence = 6u;
+    yawFrame.runtimeSequence = 6u;
+    setTrackedOrientation(
+        yawFrame,
+        axisAngle(0.0f, 1.0f, 0.0f, ThirtyDegrees));
+    const RetailDerivedEyeCameraRig yawRig =
+        deriveRetailEyeCameraRig(
+            &stock,
+            yawFrame,
+            origin.origin,
+            70.0f);
+    require(
+        yawRig.complete(),
+        "a valid OpenXR yaw pose did not derive an eye-camera rig");
+    const stereo::Vector3 yawForward = cameraForward(yawRig.center);
+    const stereo::Vector3 yawUp = cameraUp(yawRig.center);
+    require(
+        yawForward.x < -0.49f
+            && yawForward.y > 0.85f
+            && nearlyEqual(yawForward.z, 0.0f, 0.001f)
+            && nearlyEqual(yawUp.x, 0.0f, 0.001f)
+            && nearlyEqual(yawUp.y, 0.0f, 0.001f)
+            && yawUp.z > 0.99f,
+        "OpenXR yaw was swapped with pitch or roll in NiCamera space");
+
+    RetailTrackedFrame rollFrame = pitchFrame;
+    rollFrame.pose.frame = 13u;
+    rollFrame.runtime.frame = 13u;
+    rollFrame.poseSequence = 8u;
+    rollFrame.runtimeSequence = 8u;
+    setTrackedOrientation(
+        rollFrame,
+        axisAngle(0.0f, 0.0f, 1.0f, ThirtyDegrees));
+    const RetailDerivedEyeCameraRig rollRig =
+        deriveRetailEyeCameraRig(
+            &stock,
+            rollFrame,
+            origin.origin,
+            70.0f);
+    require(
+        rollRig.complete(),
+        "a valid OpenXR roll pose did not derive an eye-camera rig");
+    const stereo::Vector3 rollRight = cameraRight(rollRig.center);
+    const stereo::Vector3 rollUp = cameraUp(rollRig.center);
+    const stereo::Vector3 rollForward =
+        cameraForward(rollRig.center);
+    require(
+        rollRight.x > 0.85f
+            && rollRight.z > 0.49f
+            && rollUp.x < -0.49f
+            && rollUp.z > 0.85f
+            && nearlyEqual(rollForward.x, 0.0f, 0.001f)
+            && rollForward.y > 0.99f
+            && nearlyEqual(rollForward.z, 0.0f, 0.001f),
+        "OpenXR roll did not rotate NiCamera right/up about forward");
+}
+
+void testFullOrientationRecenter()
+{
+    constexpr float Pi = 3.14159265358979323846f;
+    constexpr float ThirtyDegrees = Pi / 6.0f;
+    abi::RetailNiCameraLayout stock {};
+    initializeCamera(stock, 100.0f, 200.0f, 300.0f);
+
+    RetailTrackedFrame frame = validFrame();
+    const stereo::Quaternion restingHead = stereo::multiply(
+        axisAngle(0.0f, 1.0f, 0.0f, ThirtyDegrees),
+        axisAngle(1.0f, 0.0f, 0.0f, -ThirtyDegrees));
+    setTrackedOrientation(frame, restingHead);
+    const RetailVrOriginCandidate origin = prepareRetailVrOriginCandidate(
+        {},
+        frame);
+    require(
+        origin.complete() && origin.relatched,
+        "full-orientation recenter origin did not latch");
+
+    const RetailDerivedEyeCameraRig neutralRig = deriveRetailEyeCameraRig(
+        &stock,
+        frame,
+        origin.origin,
+        70.0f);
+    const stereo::Vector3 neutralForward = cameraForward(neutralRig.center);
+    const stereo::Vector3 neutralUp = cameraUp(neutralRig.center);
+    require(
+        neutralRig.complete()
+            && nearlyEqual(neutralForward.x, 0.0f, 0.001f)
+            && neutralForward.y > 0.99f
+            && nearlyEqual(neutralForward.z, 0.0f, 0.001f)
+            && nearlyEqual(neutralUp.x, 0.0f, 0.001f)
+            && nearlyEqual(neutralUp.y, 0.0f, 0.001f)
+            && neutralUp.z > 0.99f,
+        "recenter preserved a resting headset tilt in the camera");
+
+    frame.pose.frame += 1u;
+    frame.runtime.frame += 1u;
+    frame.poseSequence += 2;
+    frame.runtimeSequence += 2;
+    setTrackedOrientation(
+        frame,
+        stereo::multiply(
+            restingHead,
+            axisAngle(1.0f, 0.0f, 0.0f, ThirtyDegrees)));
+    const RetailDerivedEyeCameraRig pitchRig = deriveRetailEyeCameraRig(
+        &stock,
+        frame,
+        origin.origin,
+        70.0f);
+    const stereo::Vector3 pitchForward = cameraForward(pitchRig.center);
+    require(
+        pitchRig.complete()
+            && nearlyEqual(pitchForward.x, 0.0f, 0.001f)
+            && pitchForward.y > 0.85f
+            && pitchForward.z > 0.49f,
+        "vertical head motion did not remain a camera-local pitch after recenter");
+}
+
 void testPrivateCameraOwnership()
 {
     abi::RetailNiCameraLayout center {};
@@ -432,8 +678,10 @@ int main()
     static_assert(sizeof(RetailNiTransformLayout) == 0x34u);
     static_assert(sizeof(RetailNiCameraSpatialEvidenceLayout) == 0x114u);
     testWorldToCameraContract();
-    testCapturedRetailWorldToCamera();
+    testCapturedRetailWorldMatrices();
     testOriginAndRig();
+    testTrackedOrientationAxes();
+    testFullOrientationRecenter();
     testPrivateCameraOwnership();
     std::cout << "retail distinct-eye camera transaction passed\n";
     return EXIT_SUCCESS;

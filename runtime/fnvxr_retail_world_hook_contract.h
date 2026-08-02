@@ -21,6 +21,20 @@ inline constexpr std::uint32_t RetailWorldStackArgumentBytes = 0x10u;
 inline constexpr std::uint32_t RetailWorldHookIndependentProcessSamples = 2u;
 inline constexpr bool RetailWorldHookContractHeaderContainsIssuer = false;
 
+// RenderWorldSceneGraph calls this stock cdecl wrapper while its renderer and
+// culling setup is still live.  A private stereo pass must run at one of the
+// three exact call instructions below; calling ProcessAlt after the whole
+// world function returns loses that setup and is not a valid equivalent.
+inline constexpr std::uintptr_t RetailWorldAccumulateSceneAddress =
+    0x00B6BEE0u;
+inline constexpr std::uintptr_t
+    RetailWorldRenderAccumulatorWithoutFinalizeAddress = 0x00B6BA20u;
+inline constexpr std::uintptr_t RetailWorldFinalizeAccumulatorAddress =
+    0x00B6B930u;
+inline constexpr std::uintptr_t RetailWorldRenderAndFinalizeAccumulatorAddress =
+    0x00B6C0D0u;
+inline constexpr std::size_t RetailWorldAccumulationCallPatchByteCount = 5u;
+
 // The five stolen bytes are three complete instructions:
 //   push ebp; mov ebp, esp; push -1
 // Copying six bytes, as the retired DoRenderFrame detour did, would split the
@@ -178,6 +192,99 @@ inline constexpr std::array<RetailWorldCallSiteContract, 2>
         },
     }};
 
+struct RetailWorldAccumulationCallSiteContract
+{
+    enum class RelayKind : std::uint8_t
+    {
+        AccumulateScene = 0u,
+        RenderWithoutFinalize,
+        FinalizeOnly,
+        RenderAndFinalize,
+    };
+
+    const char* name = nullptr;
+    std::uintptr_t preferredCallAddress = 0u;
+    std::array<std::uint8_t, RetailWorldAccumulationCallPatchByteCount>
+        bytes {};
+    std::uintptr_t preferredTargetAddress = 0u;
+    std::uint32_t independentLoadedProcessSamples = 0u;
+    RelayKind relayKind = RelayKind::AccumulateScene;
+};
+
+// The first three entries are the exact `call AccumulateScene` instructions
+// inside the same 4698-byte retail RenderWorldSceneGraph body. The final four
+// are their branch-local completion calls. The primary branch renders and
+// finalizes separately; the alternate branches use the stock combined
+// wrapper. The private transaction runs only after the stock completion call
+// returns, so its renderer work cannot leak into the desktop accumulator's
+// finalization. No shared helper is hooked globally.
+inline constexpr std::array<RetailWorldAccumulationCallSiteContract, 7>
+    RetailWorldAccumulationCallSiteContractInventory {{
+        {
+            "primary accumulation call",
+            0x0087415Bu,
+            {{ 0xE8u, 0x80u, 0x7Du, 0x2Fu, 0x00u }},
+            RetailWorldAccumulateSceneAddress,
+            2u,
+            RetailWorldAccumulationCallSiteContract::RelayKind::
+                AccumulateScene,
+        },
+        {
+            "alternate accumulation call",
+            0x008742B7u,
+            {{ 0xE8u, 0x24u, 0x7Cu, 0x2Fu, 0x00u }},
+            RetailWorldAccumulateSceneAddress,
+            2u,
+            RetailWorldAccumulationCallSiteContract::RelayKind::
+                AccumulateScene,
+        },
+        {
+            "third accumulation call",
+            0x0087436Du,
+            {{ 0xE8u, 0x6Eu, 0x7Bu, 0x2Fu, 0x00u }},
+            RetailWorldAccumulateSceneAddress,
+            2u,
+            RetailWorldAccumulationCallSiteContract::RelayKind::
+                AccumulateScene,
+        },
+        {
+            "primary post-accumulation render call",
+            0x00874180u,
+            {{ 0xE8u, 0x9Bu, 0x78u, 0x2Fu, 0x00u }},
+            RetailWorldRenderAccumulatorWithoutFinalizeAddress,
+            2u,
+            RetailWorldAccumulationCallSiteContract::RelayKind::
+                RenderWithoutFinalize,
+        },
+        {
+            "primary post-render finalize call",
+            0x008741DBu,
+            {{ 0xE8u, 0x50u, 0x77u, 0x2Fu, 0x00u }},
+            RetailWorldFinalizeAccumulatorAddress,
+            2u,
+            RetailWorldAccumulationCallSiteContract::RelayKind::
+                FinalizeOnly,
+        },
+        {
+            "alternate post-accumulation render/finalize call",
+            0x008742D9u,
+            {{ 0xE8u, 0xF2u, 0x7Du, 0x2Fu, 0x00u }},
+            RetailWorldRenderAndFinalizeAccumulatorAddress,
+            2u,
+            RetailWorldAccumulationCallSiteContract::RelayKind::
+                RenderAndFinalize,
+        },
+        {
+            "third post-accumulation render/finalize call",
+            0x0087438Fu,
+            {{ 0xE8u, 0x3Cu, 0x7Du, 0x2Fu, 0x00u }},
+            RetailWorldRenderAndFinalizeAccumulatorAddress,
+            2u,
+            RetailWorldAccumulationCallSiteContract::RelayKind::
+                RenderAndFinalize,
+        },
+    }};
+
 constexpr bool retailWorldBytesEqual(
     const std::uint8_t* bytes,
     std::size_t byteCount,
@@ -328,6 +435,66 @@ inline RetailWorldCallSiteObservation observeRetailWorldCallSite(
     return result;
 }
 
+struct RetailWorldAccumulationCallSiteObservation
+{
+    bool bytesReadable = false;
+    bool exactInstructionMatches = false;
+    bool callAddressMatches = false;
+    bool targetDecoded = false;
+    std::uintptr_t targetAddress = 0u;
+    bool targetMatches = false;
+
+    bool complete() const noexcept
+    {
+        return bytesReadable
+            && exactInstructionMatches
+            && callAddressMatches
+            && targetDecoded
+            && targetMatches;
+    }
+};
+
+inline RetailWorldAccumulationCallSiteObservation
+observeRetailWorldAccumulationCallSite(
+    const std::uint8_t* bytes,
+    std::size_t byteCount,
+    std::uintptr_t runtimeCallAddress,
+    std::uintptr_t runtimeWorldAddress,
+    const RetailWorldAccumulationCallSiteContract& contract) noexcept
+{
+    RetailWorldAccumulationCallSiteObservation result {};
+    result.bytesReadable = bytes && byteCount >= contract.bytes.size();
+    if (!result.bytesReadable)
+        return result;
+
+    result.exactInstructionMatches = retailWorldBytesEqual(
+        bytes,
+        byteCount,
+        contract.bytes.data(),
+        contract.bytes.size());
+
+    std::uintptr_t expectedRuntimeCallAddress = 0u;
+    result.callAddressMatches = relocateRetailWorldPreferredAddress(
+            runtimeWorldAddress,
+            contract.preferredCallAddress,
+            expectedRuntimeCallAddress)
+        && runtimeCallAddress == expectedRuntimeCallAddress;
+
+    result.targetDecoded = decodeRetailWorldRel32Target(
+        bytes,
+        byteCount,
+        runtimeCallAddress,
+        result.targetAddress);
+    std::uintptr_t expectedRuntimeTarget = 0u;
+    result.targetMatches = result.targetDecoded
+        && relocateRetailWorldPreferredAddress(
+            runtimeWorldAddress,
+            contract.preferredTargetAddress,
+            expectedRuntimeTarget)
+        && result.targetAddress == expectedRuntimeTarget;
+    return result;
+}
+
 struct RetailWorldHookSeamObservation
 {
     bool bodyReadable = false;
@@ -388,6 +555,34 @@ inline RetailWorldRelativeJump encodeRetailWorldX86Jump(
     const std::uint32_t displacement = target - (source + 5u);
     result.bytes = {{
         0xE9u,
+        static_cast<std::uint8_t>(displacement & 0xFFu),
+        static_cast<std::uint8_t>((displacement >> 8u) & 0xFFu),
+        static_cast<std::uint8_t>((displacement >> 16u) & 0xFFu),
+        static_cast<std::uint8_t>((displacement >> 24u) & 0xFFu),
+    }};
+    result.valid = true;
+    return result;
+}
+
+struct RetailWorldRelativeCall
+{
+    bool valid = false;
+    std::array<std::uint8_t, 5> bytes {};
+};
+
+inline RetailWorldRelativeCall encodeRetailWorldX86Call(
+    std::uintptr_t instructionAddress,
+    std::uintptr_t targetAddress) noexcept
+{
+    RetailWorldRelativeCall result {};
+    if (instructionAddress > 0xFFFFFFFFu || targetAddress > 0xFFFFFFFFu)
+        return result;
+
+    const std::uint32_t source = static_cast<std::uint32_t>(instructionAddress);
+    const std::uint32_t target = static_cast<std::uint32_t>(targetAddress);
+    const std::uint32_t displacement = target - (source + 5u);
+    result.bytes = {{
+        0xE8u,
         static_cast<std::uint8_t>(displacement & 0xFFu),
         static_cast<std::uint8_t>((displacement >> 8u) & 0xFFu),
         static_cast<std::uint8_t>((displacement >> 16u) & 0xFFu),

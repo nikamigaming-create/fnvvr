@@ -117,6 +117,29 @@ int main()
                 == 0x00A9B84Du,
         "AddVisibleArray must cover only its callable body, not the adjacent cluster");
 
+    const auto finishVisible = std::find_if(
+        RetailEngineManifest.begin(),
+        RetailEngineManifest.end(),
+        [](const LoadedFunctionManifestEntry& entry) {
+            return std::string_view(entry.name)
+                == "NiAccumulator::FinishAccumulating";
+        });
+    const auto finishShader = std::find_if(
+        RetailEngineManifest.begin(),
+        RetailEngineManifest.end(),
+        [](const LoadedFunctionManifestEntry& entry) {
+            return std::string_view(entry.name)
+                == "FinishAccumulatingShaderAccumulator";
+        });
+    require(
+        finishVisible != RetailEngineManifest.end()
+            && finishVisible->preferredAddress == 0x00A9B570u
+            && finishVisible->byteCount == 437u
+            && finishShader != RetailEngineManifest.end()
+            && finishShader->preferredAddress == 0x00B65E80u
+            && finishShader->byteCount == 51u,
+        "both stock finish-accumulating bodies must be exact loaded-memory seals");
+
     constexpr Sha256Digest malformed = sha256FromHex(
         "G8CC17DF032791EAF2C6D898898827F72A1EB63926B1423E7DDB395395C3D0D5");
     require(!malformed.valid, "invalid SHA-256 hex must be rejected, not decoded as zero");

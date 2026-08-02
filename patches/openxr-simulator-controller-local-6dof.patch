@@ -1,0 +1,243 @@
+diff --git a/src/mcp_integration.h b/src/mcp_integration.h
+index 0a5e5f5..024abeb 100644
+--- a/src/mcp_integration.h
++++ b/src/mcp_integration.h
+@@ -853,22 +853,30 @@ inline bool CheckProjLogDumpRequest() {
+     return true;
+ }
+
+-// Controller pose control structure for MCP
+-// Allows setting right or left controller position/orientation and trigger
++// Controller pose control structure for MCP.
++//
++// Legacy commands omit the space field and retain the simulator's head-relative
++// controller convenience mode. Explicit "space":"local" publishes the
++// pose directly in the OpenXR LOCAL space, matching a real tracked hand:
++// moving the HMD must not move that hand.
+ struct ControllerPoseCommand {
+     bool valid = false;
+     uint64_t sequence = 0;
+     int hand = 1;           // 0=left, 1=right
+-    float posX = 0.2f;     // Position offset from head (head-local space)
++    float posX = 0.2f;     // Head offset, or LOCAL X when localSpace is set.
+     bool posXSet = false;
+     float posY = -0.3f;
+     bool posYSet = false;
+     float posZ = -0.4f;
+     bool posZSet = false;
+-    float yaw = 0.0f;      // Yaw offset relative to head
++    float yaw = 0.0f;      // Head-relative offset, or LOCAL yaw.
+     bool yawSet = false;
+     float pitch = -0.3f;   // Pitch offset relative to head
+     bool pitchSet = false;
++    float roll = 0.0f;     // LOCAL roll, or a head-relative offset.
++    bool rollSet = false;
++    bool localSpace = false;
++    bool localSpaceSet = false;
+     float trigger = 0.0f;  // 0.0-1.0 trigger value
+     bool triggerSet = false;
+     float grip = 0.0f;     // 0.0-1.0 grip value
+@@ -884,8 +892,10 @@ struct ControllerPoseCommand {
+     bool thumbstickYSet = false;
+ };
+
+-// Check for controller pose command from MCP
+-// File format: {"hand": 1, "posX": 0.2, "posY": -0.3, "posZ": -0.4, "yaw": 0, "pitch": -0.3, "trigger": 0.0}
++// Check for controller pose command from MCP.
++// File format:
++// {"hand":1,"space":"local","posX":0.2,"posY":1.4,"posZ":-0.4,
++//  "yaw":0,"pitch":-0.3,"roll":0,"trigger":0.0}
+ inline ControllerPoseCommand CheckControllerPoseCommand() {
+     ControllerPoseCommand cmd;
+     std::string cmdPath = GetSimulatorDataPath() + "\\controller_pose_command.json";
+@@ -904,11 +914,19 @@ inline ControllerPoseCommand CheckControllerPoseCommand() {
+         cmd.posZSet = JsonHasKey(buf, "posZ");
+         cmd.yawSet = JsonHasKey(buf, "yaw");
+         cmd.pitchSet = JsonHasKey(buf, "pitch");
++        cmd.rollSet = JsonHasKey(buf, "roll");
++        cmd.localSpaceSet = JsonHasKey(buf, "space");
+         if (cmd.posXSet) cmd.posX = ParseJsonFloat(buf, "posX", 0.2f);
+         if (cmd.posYSet) cmd.posY = ParseJsonFloat(buf, "posY", -0.3f);
+         if (cmd.posZSet) cmd.posZ = ParseJsonFloat(buf, "posZ", -0.4f);
+         if (cmd.yawSet) cmd.yaw = ParseJsonFloat(buf, "yaw", 0.0f);
+         if (cmd.pitchSet) cmd.pitch = ParseJsonFloat(buf, "pitch", -0.3f);
++        if (cmd.rollSet) cmd.roll = ParseJsonFloat(buf, "roll", 0.0f);
++        if (cmd.localSpaceSet) {
++            const char* spaceKey = strstr(buf, "\"space\"");
++            const char* spaceValue = spaceKey ? strchr(spaceKey, ':') : nullptr;
++            cmd.localSpace = spaceValue && strstr(spaceValue, "\"local\"");
++        }
+         cmd.trigger = ParseJsonFloat(buf, "trigger", -1.0f);
+         cmd.triggerSet = (cmd.trigger >= 0.0f);
+         if (!cmd.triggerSet) cmd.trigger = 0.0f;
+@@ -935,10 +953,11 @@ inline ControllerPoseCommand CheckControllerPoseCommand() {
+
+         // Delete the file after reading (one-shot command)
+         DeleteFileA(cmdPath.c_str());
+-        McpLogf("Controller command: sequence=%llu hand=%d pos(%.2f, %.2f, %.2f) yaw=%.2f pitch=%.2f trigger=%.1f grip=%.1f stick=(%.2f,%.2f)",
++        McpLogf("Controller command: sequence=%llu hand=%d space=%s pos(%.2f, %.2f, %.2f) yaw=%.2f pitch=%.2f roll=%.2f trigger=%.1f grip=%.1f stick=(%.2f,%.2f)",
+                 (unsigned long long)cmd.sequence, cmd.hand,
++                cmd.localSpaceSet ? (cmd.localSpace ? "local" : "head") : "unchanged",
+                 cmd.posX, cmd.posY, cmd.posZ, cmd.yaw, cmd.pitch,
+-                cmd.trigger, cmd.grip, cmd.thumbstickX, cmd.thumbstickY);
++                cmd.roll, cmd.trigger, cmd.grip, cmd.thumbstickX, cmd.thumbstickY);
+     }
+     return cmd;
+ }
+diff --git a/src/runtime.cpp b/src/runtime.cpp
+index 4e1d302..1a4514a 100644
+--- a/src/runtime.cpp
++++ b/src/runtime.cpp
+@@ -507,12 +507,16 @@ static CurrentHeadAngles GetCurrentHeadAngles() {
+     return result;
+ }
+
+-// Controller tracking state for motion controller emulation
+-// Positions are relative to head position, orientation follows head by default
++// Controller tracking state for motion controller emulation.  The legacy
++// preview mode is head-relative, but file IPC can explicitly switch a
++// controller into LOCAL-space tracking.  LOCAL is what a physical OpenXR
++// hand supplies: its pose is independent of the HMD pose.
+ struct ControllerState {
+     XrVector3f posOffset;  // Offset from head position (in head-local space)
+     float yawOffset;       // Additional yaw relative to head
+     float pitchOffset;     // Additional pitch relative to head
++    float rollOffset;      // Additional roll, or LOCAL roll.
++    bool poseInLocalSpace; // posOffset/yaw/pitch/roll are OpenXR LOCAL.
+     bool isTracking;       // Whether controller is "tracked"
+
+     // Input state for button/trigger emulation
+@@ -532,18 +536,19 @@ struct ControllerState {
+     XrVector3f angularVelocity; // rad/s
+     float prevYaw;              // Previous yaw for angular velocity
+     float prevPitch;            // Previous pitch for angular velocity
++    float prevRoll;             // Previous roll for angular velocity
+ };
+ static ControllerState g_leftController = {
+-    {-0.2f, -0.3f, -0.4f}, 0.0f, -0.3f, true,  // Position/orientation
++    {-0.2f, -0.3f, -0.4f}, 0.0f, -0.3f, 0.0f, false, true,  // Position/orientation
+     false, false, false, false, false, false,   // Button states
+     0.0f, 0.0f, {0.0f, 0.0f},                   // Analog values
+-    {0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f}, 0.0f, 0.0f  // Velocity tracking
++    {0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f}, 0.0f, 0.0f, 0.0f  // Velocity tracking
+ };
+ static ControllerState g_rightController = {
+-    {0.2f, -0.3f, -0.4f}, 0.0f, -0.3f, true,   // Position/orientation
++    {0.2f, -0.3f, -0.4f}, 0.0f, -0.3f, 0.0f, false, true,   // Position/orientation
+     false, false, false, false, false, false,   // Button states
+     0.0f, 0.0f, {0.0f, 0.0f},                   // Analog values
+-    {0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f}, 0.0f, 0.0f  // Velocity tracking
++    {0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f}, 0.0f, 0.0f, 0.0f  // Velocity tracking
+ };
+
+ // Map XrSpace handles to controller type (0=none, 1=left grip, 2=left aim, 3=right grip, 4=right aim)
+@@ -565,13 +570,26 @@ static std::unordered_map<XrAction, int> g_actionHand;
+ // Time tracking for velocity calculation
+ static XrTime g_lastFrameTime = 0;
+
+-// Get controller world pose (combines head pose with controller offset)
++// Defined below with the same handedness/order as the tracked HMD path.
++XrQuaternionf QuatFromYawPitchRoll(float yaw, float pitch, float roll);
++
++// Get controller pose in OpenXR LOCAL space.  Head-relative preview controls
++// retain their legacy behaviour; explicit LOCAL controller commands do not
++// inherit either HMD translation or rotation.
+ static void GetControllerPose(const ControllerState& ctrl, XrPosef* outPose) {
++    if (ctrl.poseInLocalSpace) {
++        outPose->orientation = QuatFromYawPitchRoll(
++            ctrl.yawOffset, ctrl.pitchOffset, ctrl.rollOffset);
++        outPose->position = ctrl.posOffset;
++        return;
++    }
++
+     const CurrentHeadAngles head = GetCurrentHeadAngles();
+     // Controller orientation = head orientation + controller offsets
+     float totalYaw = head.yaw + ctrl.yawOffset;
+     float totalPitch = head.pitch + ctrl.pitchOffset;
+-    outPose->orientation = QuatFromYawPitch(totalYaw, totalPitch);
++    outPose->orientation = QuatFromYawPitchRoll(
++        totalYaw, totalPitch, head.roll + ctrl.rollOffset);
+
+     // Controller position = head position + rotated offset
+     // Rotate the offset by head yaw only (not pitch) for natural hand movement
+@@ -2638,6 +2656,8 @@ static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession, const XrFrameWaitInfo*,
+             // Also rotate the controller
+             rt::g_rightController.yawOffset = 0.5f * sinf(animTime * speed * 1.5f);
+             rt::g_rightController.pitchOffset = -0.3f + 0.3f * cosf(animTime * speed);
++            rt::g_rightController.rollOffset = 0.0f;
++            rt::g_rightController.poseInLocalSpace = false;
+         }
+
+         // Right controller manipulation (numpad keys) - only when auto motion is off
+@@ -2686,6 +2706,8 @@ static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession, const XrFrameWaitInfo*,
+             rt::g_rightController.posOffset = {0.2f, -0.3f, -0.4f};
+             rt::g_rightController.yawOffset = 0.0f;
+             rt::g_rightController.pitchOffset = -0.3f;
++            rt::g_rightController.rollOffset = 0.0f;
++            rt::g_rightController.poseInLocalSpace = false;
+             autoMotionEnabled = false;
+         }
+
+@@ -2756,27 +2778,45 @@ static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession, const XrFrameWaitInfo*,
+             rt::g_leftController.linearVelocity.y = (leftPose.position.y - rt::g_leftController.prevPosWorld.y) / deltaTime;
+             rt::g_leftController.linearVelocity.z = (leftPose.position.z - rt::g_leftController.prevPosWorld.z) / deltaTime;
+
+-            // Angular velocity from yaw/pitch delta
+-            float totalRightYaw = rt::g_headYaw + rt::g_rightController.yawOffset;
+-            float totalRightPitch = rt::g_headPitch + rt::g_rightController.pitchOffset;
++            // Angular velocity from the same LOCAL/relative pose selection
++            // used by xrLocateSpace.
++            const rt::CurrentHeadAngles currentHead = rt::GetCurrentHeadAngles();
++            float totalRightYaw = rt::g_rightController.poseInLocalSpace
++                ? rt::g_rightController.yawOffset
++                : currentHead.yaw + rt::g_rightController.yawOffset;
++            float totalRightPitch = rt::g_rightController.poseInLocalSpace
++                ? rt::g_rightController.pitchOffset
++                : currentHead.pitch + rt::g_rightController.pitchOffset;
++            float totalRightRoll = rt::g_rightController.poseInLocalSpace
++                ? rt::g_rightController.rollOffset
++                : currentHead.roll + rt::g_rightController.rollOffset;
+             rt::g_rightController.angularVelocity.x = (totalRightPitch - rt::g_rightController.prevPitch) / deltaTime;
+             rt::g_rightController.angularVelocity.y = (totalRightYaw - rt::g_rightController.prevYaw) / deltaTime;
+-            rt::g_rightController.angularVelocity.z = 0.0f;
+-
+-            float totalLeftYaw = rt::g_headYaw + rt::g_leftController.yawOffset;
+-            float totalLeftPitch = rt::g_headPitch + rt::g_leftController.pitchOffset;
++            rt::g_rightController.angularVelocity.z = (totalRightRoll - rt::g_rightController.prevRoll) / deltaTime;
++
++            float totalLeftYaw = rt::g_leftController.poseInLocalSpace
++                ? rt::g_leftController.yawOffset
++                : currentHead.yaw + rt::g_leftController.yawOffset;
++            float totalLeftPitch = rt::g_leftController.poseInLocalSpace
++                ? rt::g_leftController.pitchOffset
++                : currentHead.pitch + rt::g_leftController.pitchOffset;
++            float totalLeftRoll = rt::g_leftController.poseInLocalSpace
++                ? rt::g_leftController.rollOffset
++                : currentHead.roll + rt::g_leftController.rollOffset;
+             rt::g_leftController.angularVelocity.x = (totalLeftPitch - rt::g_leftController.prevPitch) / deltaTime;
+             rt::g_leftController.angularVelocity.y = (totalLeftYaw - rt::g_leftController.prevYaw) / deltaTime;
+-            rt::g_leftController.angularVelocity.z = 0.0f;
++            rt::g_leftController.angularVelocity.z = (totalLeftRoll - rt::g_leftController.prevRoll) / deltaTime;
+
+             // Update previous state for next frame
+             rt::g_rightController.prevPosWorld = rightPose.position;
+             rt::g_rightController.prevYaw = totalRightYaw;
+             rt::g_rightController.prevPitch = totalRightPitch;
++            rt::g_rightController.prevRoll = totalRightRoll;
+
+             rt::g_leftController.prevPosWorld = leftPose.position;
+             rt::g_leftController.prevYaw = totalLeftYaw;
+             rt::g_leftController.prevPitch = totalLeftPitch;
++            rt::g_leftController.prevRoll = totalLeftRoll;
+         }
+
+     }
+@@ -2911,6 +2951,8 @@ static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession, const XrFrameWaitInfo*,
+             if (ctrlCmd.posZSet) ctrl.posOffset.z = ctrlCmd.posZ;
+             if (ctrlCmd.yawSet) ctrl.yawOffset = ctrlCmd.yaw;
+             if (ctrlCmd.pitchSet) ctrl.pitchOffset = ctrlCmd.pitch;
++            if (ctrlCmd.rollSet) ctrl.rollOffset = ctrlCmd.roll;
++            if (ctrlCmd.localSpaceSet) ctrl.poseInLocalSpace = ctrlCmd.localSpace;
+             if (ctrlCmd.triggerSet) {
+                 ctrl.triggerValue = ctrlCmd.trigger;
+                 ctrl.triggerPressed = (ctrlCmd.trigger >= 0.5f);

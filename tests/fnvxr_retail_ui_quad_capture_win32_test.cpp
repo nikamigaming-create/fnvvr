@@ -154,11 +154,12 @@ struct FakeDevice
 int main()
 {
     using namespace fnvxr;
+    constexpr std::size_t TestVtableEntryCount = 32u;
     TestState state {};
     state.frame = validFrame(shared::RuntimePhaseMenu);
     gState = &state;
 
-    std::array<void*, d3d9::RetailD3D9ExDeviceMethodCount> originalVtable {};
+    std::array<void*, TestVtableEntryCount> originalVtable {};
     originalVtable[d3d9::RetailD3D9PresentVtableSlot] =
         entryFromPresent(&originalPresent);
     originalVtable.back() = reinterpret_cast<void*>(
@@ -180,28 +181,30 @@ int main()
         hook.initializeAuthorizedDevice(device, operations),
         "authorized per-device Present hook installation failed");
     require(hook.ready(), "installed Present hook is not ready");
-    void** privateVtable = fake.vtable;
+    void** installedVtable = fake.vtable;
     require(
-        privateVtable != originalVtable.data(),
-        "shared D3D vtable was mutated instead of cloning the device vtable");
+        installedVtable == originalVtable.data(),
+        "the native D3D device vptr changed");
     require(
         other.vtable == originalVtable.data(),
         "unrelated device vtable pointer changed");
     require(
-        privateVtable[d3d9::RetailD3D9ExDeviceMethodCount - 1u]
+        installedVtable[TestVtableEntryCount - 1u]
             == originalVtable.back(),
-        "D3D9Ex tail method was not preserved");
+        "a non-Present D3D9Ex entry changed");
     require(
         hook.initializeAuthorizedDevice(device, operations)
-            && fake.vtable == privateVtable,
+            && fake.vtable == installedVtable,
         "Present hook installation was not idempotent");
     require(
         !hook.initializeAuthorizedDevice(otherDevice, operations),
         "installed hook admitted another device");
 
     RetailD3D9PresentFunction present = presentFromEntry(
-        privateVtable[d3d9::RetailD3D9PresentVtableSlot]);
-    require(present != nullptr, "private Present entry is null");
+        installedVtable[d3d9::RetailD3D9PresentVtableSlot]);
+    require(
+        present != nullptr && present != &originalPresent,
+        "the single leased Present entry was not installed");
     RECT source { 1, 2, 3, 4 };
     RECT destination { 5, 6, 7, 8 };
     RGNDATA dirty {};
@@ -275,8 +278,10 @@ int main()
         hook.detachWhileDeviceAlive(),
         "test device hook did not detach cleanly");
     require(
-        fake.vtable == originalVtable.data(),
-        "test detach did not restore the original device vtable");
+        fake.vtable == originalVtable.data()
+            && originalVtable[d3d9::RetailD3D9PresentVtableSlot]
+                == entryFromPresent(&originalPresent),
+        "test detach did not restore the original Present entry");
 
     std::cout << "retail UI-only v5 Present capture passed\n";
     return EXIT_SUCCESS;

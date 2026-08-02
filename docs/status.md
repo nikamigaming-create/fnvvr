@@ -1,6 +1,6 @@
 # FNVVR Retail Status
 
-Last updated: 2026-07-18
+Last updated: 2026-08-01
 
 ## Direction Locked
 
@@ -20,6 +20,12 @@ newer retail source-frame identity is ready, then the compositor changes to
 world stereo atomically. That freshness watermark remains enforced after the
 bounded quad hold expires into a safety blank.
 
+`stereo-visual-trial-v5` remains a bounded CPU-v8 visual route.
+`retail-vr-play-v1` is the separately named physical-play investigation route;
+it may collect physical evidence but cannot set `fullProductAccepted` or widen
+the visual-trial authority. The Phase 0 records in `docs/` now make that
+distinction and each capability boundary explicit.
+
 ## Proven Foundation
 
 - xNVSE `6.4.8` and OpenXR SDK `release-1.1.60` are pinned and fetched into
@@ -29,12 +35,14 @@ bounded quad hold expires into a safety blank.
 - Retail FNV loads the plugin and proxy DLLs through the normal xNVSE/game
   process. Exact standard-retail runtime identity is required; the no-gore and
   editor runtimes are rejected.
-- Retail mutation remains hard source-fused. The current plugin returns inert
-  before creating mappings/listeners or applying camera, input, rig, or code
-  hooks. Config and environment values cannot bypass that fuse. A future fuse
-  change is still insufficient without a synchronous live PE/function/module
-  integrity check at the exact mutation decision; the current validator
-  deliberately rejects.
+- Full product mutation remains hard source-fused. The explicit
+  `stereo-visual-trial-v5` exception authorizes only authenticated runtime
+  publication in the plugin and one exact world-render detour in the D3D
+  bridge. It refuses the plugin full bridge, input, camera, rig, weapon, and
+  projectile hooks at both the main-loop policy and point-of-mutation gates.
+  The separate `desktop-assist` profile remains a narrowly modeled
+  first-person camera-local rotation test that refuses translation, world
+  rendering, input, weapon/rig, legacy replay, and OpenXR.
 - The standalone host creates a real OpenXR session and samples HMD, grip, aim,
   buttons, triggers, squeeze, and thumbsticks.
 - Shared pose ABI v5 carries independent left/right grip and aim poses with
@@ -54,16 +62,19 @@ bounded quad hold expires into a safety blank.
   even when its ID is mod-added or its TileMenu pointer lags. The raw engine
   MenuMode bit is retained as a diagnostic because live gameplay can report it
   continuously.
-- The retail D3D9 proxy's mono UI capture remains useful. Its per-draw replay
-  and CPU readback/ring are historical diagnostics and a production NO-GO.
-  The legacy flat retail producer is now runtime-fused, and direct plugin-only
-  game installation is fused; the guarded stage/validate path is the only
-  game-tree deployment route.
-- GPU stereo metadata uses a fixed 200-byte cross-architecture v4 ABI, one
-  fully ordered odd/even producer helper, non-aliased color/depth handles, an
-  exact runtime-state sample identity, and a frame-bound consumer-observed
-  shared-fence requirement. No GPU resource producer or consumer is implemented
-  yet, so this is a tested contract rather than a completed transport.
+- The retail D3D9 proxy's mono UI capture remains useful. Per-draw replay is a
+  production NO-GO. A separate CPU-v8 readback transport is admitted only for
+  the bounded stereo visual trial; it carries the two engine-rendered BGRA8
+  eye images to OpenXR and is not the production performance architecture.
+  Direct plugin-only game installation remains fused; the guarded
+  build/attest/supervise/restore transaction is the only live product route.
+- Product GPU transport v1 is the color-only ABI v5 contract: two non-aliased
+  color resources, exact producer/process/epoch and frame/pose/runtime
+  lineage, adapter identity, and a consumer-observed GPU completion/release
+  fence. Per-eye depth/stencil remains mandatory inside the retail transaction
+  but is render-local; OpenXR depth submission is not a v1 release gate. The
+  older v4 color-plus-encoded-depth ABI remains compatibility/research-only and
+  no live supported v5 producer/consumer recovery proof exists yet.
 - Retail player rig discovery searches for and logs arm-chain, hand, weapon,
   projectile, and muzzle-flash nodes; retained runs have not proved a complete
   non-null weapon/projectile/muzzle chain. FABRIK solver tests cover the arm
@@ -98,23 +109,61 @@ bounded quad hold expires into a safety blank.
 
 ## Current Headset Boundary
 
-All live OpenXR presentation is source-blocked in both the host executable and
-the guarded launcher. This includes the former flat-compositor baseline. The
-retained live observations below explain the boundary; they are not a current
-authorization to launch the game or headset.
+The guarded launcher now authorizes one bounded stereo visual trial, not the
+full product. It attests x64/Win32 builds, starts the OpenXR host first,
+temporarily stages the exact four Win32 artifacts, requires exact loaded
+module identities plus advancing pose/runtime state, accepts only distinct
+engine-stereo output submitted as two OpenXR projection views, and restores
+the prior game-root files on every exit path. Controller and tracked-weapon
+acceptance remain explicitly false.
 
-The legacy stereo environment function now throws before setting activation
-variables. Independent host and D3D product-integration fuses also remain
-false, so changing one historical proof constant cannot revive the old mono
-gameplay fallback/HUD path. The standalone OpenXR diagnostic is separately
-source-fused before loading the OpenXR loader.
+The process-local headless OpenXR Simulator now provides a non-interactive
+runtime, deterministic HMD/controller state, and final-eye capture without
+changing the active system runtime. The 2026-07-29 full source checkpoint
+passed 224/224 tests. Retained run
+`20260729-120130-129-4a961da02e23` completed its bounded TTW world-only trial
+with `trialReady=true`, no supervisor error, 68 unique CPU-v8 stereo
+transactions and pose sequences sustained for 19.254 seconds, and 119
+contiguous accepted final-swapchain eye pairs. Its deterministic 12.1-second
+head sweep published and consumed 82 commands spanning X/Y/Z translation plus
+yaw/pitch/roll, then restored the centered pose. The four staged game artifacts
+and plugin profile were restored, and the load-only save/NVSE files were
+unchanged.
+
+This is a retained simulator S3D/6DoF visual-trial result, not full product or
+physical-headset acceptance. The run proves that commanded six-axis HMD motion
+can remain live through distinct retail engine eye rendering and OpenXR
+submission. It does not authorize game input, player/body mutation, controller
+interaction, tracked-weapon mutation, or projectile aiming; those product gates
+remain explicitly false.
 
 ### Head tracking
 
-HMD orientation is available on both sides of the bridge and the retail camera
-apply path exists. The last observed behavior was not an acceptable 6DoF
-camera: looking around pivoted too much of the player/body frame with the head.
-Until a live test proves otherwise, head/body decoupling is the first blocker.
+HMD orientation and translation are available on both sides of the bridge and
+the retail camera apply path exists. The last physical behavior was not an
+acceptable 6DoF camera: looking around pivoted too much of the player/body
+frame with the head. There is now a deterministic synthetic-pose assist
+harness, a headless simulator with scripted pose sweeps, and a rotation-local
+desktop camera transaction with a separate post-hook local-camera observation
+record. The retained simulator trial exercised all three translation axes and
+all three rotation axes while advancing distinct eye transactions, then
+recentered without a crash, stereo loss, or supervisor watchdog failure. That
+is the current repeatable six-axis camera proof; physical-headset head/body
+decoupling and deliberate controller-relative body heading still have not
+passed. The same transaction has a separately scoped CPU menu-source capture
+record: it requires a confirmed menu state, current pose-producer epoch,
+matching runtime frame, and verified non-black pixel hash, then clears on
+non-UI Present. Unit/source tests pass and the product route has produced
+Start Menu source frames, but the desktop camera transaction and physical
+head/body decoupling have not yet passed against gameplay. This does not yet
+constitute physical-headset or full UI-transition acceptance.
+
+The same explicitly approved desktop session can now optionally collect the
+existing retail runtime probe after first-person body-root readiness. That
+collector is external read-only process observation only: it stores its output
+even when its intentionally incomplete production proof exits nonzero, and it
+does not activate the renderer, OpenXR, input, or world stereo. No such live
+capture has been taken yet.
 
 Acceptance requires:
 
@@ -125,6 +174,8 @@ Acceptance requires:
 - movement/turn controls retain a deliberate body heading independent of
   moment-to-moment head look;
 - entering or leaving any UI mode cannot leave a stale camera transform behind.
+- a menu-source capture must be current, pixel-complete, and invalidated again
+  on return to gameplay before any later headset-quad work is considered.
 
 ### Weapon aim
 
@@ -184,27 +235,28 @@ then complete restoration and atomic publication. Failure discards isolated
 outputs. The backend must handle both stock world-accumulation branches and
 must not globally hook helpers shared by auxiliary passes.
 
-Read-only samples established stable candidate addresses and loaded instruction
-blocks for the world/culling/accumulator path. That is not yet sufficient to
-authorize construction or rendering: constructor arguments, ownership,
-destruction, both stock branches, synchronous loaded-page identity, and the
-complete compatibility patch sets remain hard gates. The strict probe exposed
-a compatibility conflict: JIP LN 57.30 rewrites the
-call displacement at `0x008751C7..0x008751CA` inside `RenderFirstPerson`; no
-other bytes in that function differed in that sample. The target was inside the
-loaded `jip_nvse.dll` (installed SHA-256
-`9D2779647ED0CE63043390F47FC978E3234AF8E558DC6CB6BCB231478A2D74D4`).
-Later initialization samples also showed JIP-era rewrites in accumulator and
-culling helpers, proving that hash-before-initialization was a TOCTOU bug. The
-probe now waits for live SceneGraph initialization, hashes afterward, and
-rejects the loaded JIP module itself until its complete patch set is normalized
-and bound to an exact module hash. This supports continuing the bounded engine
-renderer implementation; it is not proof that headset VR is finished.
+The bounded visual-trial backend now owns private left/right cameras,
+accumulators, color targets, and depth/stencil targets; collects one
+conservative visible set; binds and clears each complete eye target before
+population; restores retail state; and publishes only a complete distinct-eye
+transaction. The retained TTW exterior-world trial proved that schedule live
+for 119 contiguous accepted final-swapchain pairs during a commanded six-axis
+head sweep. It does not yet prove every stock accumulation branch, scene
+class, exterior/interior transition, blocking-UI transition, or production
+performance requirement.
 
-Installed `ShowOffNVSE.dll` is also treated as uncontrolled module inventory;
-it has not been normalized or authorized by the engine proof. JIP and ShowOff
-remain installed for the user's mod stack, but no production stereo/mutation
-gate can pass while their complete loaded patch sets are unverified.
+The retained compatibility failure was not a new JIP accumulator/culler patch.
+The exact installed JIP 57.30 `RenderFirstPerson` call rewrite is already
+normalized. The failing `ProtectedCoreBodyMismatch` occurred because FNVXR's
+Present bootstrap installed its own `RenderWorldSceneGraph` detour before the
+xNVSE main-loop observer performed its first exact proof. Initialization is now
+ordered: the plugin proves stock code and advances its neutral runtime
+publication first; only then may Present acquire independent D3D authority and
+install the world detour. For this profile the plugin remains publication-only,
+and redundant guards prevent its protected `PlayerCharacter::UpdateCamera`
+hook from running. The exact installed JIP/ShowOff inventory passed the
+pre-detour compatibility phase in the retained evidence; this is still not
+full product or arbitrary-mod compatibility acceptance.
 
 ## xNVSE Extraction Boundary
 
@@ -217,35 +269,38 @@ That is not a blanket promise that every engine behavior can be copied out and
 replayed externally. Gameplay-critical changes should remain in-process:
 weapon transforms, muzzle/projectile direction, hit tests, activation, and
 animation state must be applied or confirmed by retail FNV. The standalone
-host should publish desired poses/input, open accepted GPU resources, and
-compose only complete color/depth transactions. Unknown layouts need exact
+host should publish desired poses/input, open accepted GPU color resources, and
+compose only transactions with complete render-local depth evidence. Unknown layouts need exact
 executable checks, pointer validation, logging, and fail-closed rejection.
 
 ## Immediate Blockers
 
-1. Implement the read-only live census/evidence adapter and the independently
-   sampled loaded-page reference manifest for Steam-encrypted `FalloutNV.exe`.
-   It must leave all proxy/JIP/ShowOff proof dispositions failed until their
-   complete patch and mapped-image evidence exists.
-2. Implement the exact-version/hash-validated world-boundary backend for both
-   stock accumulation branches with complete authoritative state restoration,
-   plus explicit hash-bound compatibility contracts for the complete loaded
-   patch sets of JIP, ShowOff, and any other code-mutating module; arbitrary or
-   unenumerated patched code remains a hard reject.
-3. Prove center/center, then distinct-eye transactions using one conservative
-   visible set and fresh non-aliased per-eye accumulators.
-4. Implement GPU-native D3D9Ex-to-D3D11/OpenXR color and encoded-depth sharing
-   with handles, adapter identity, completion sequencing, and transaction IDs;
-   no CPU eye-pixel ring.
+1. Repeat the retained simulator six-axis visual trial on Quest Link/Air Link
+   in a loaded gameplay world. Require advancing pose/runtime state, the exact
+   world-hook initialization record, distinct nonzero left/right OpenXR output
+   hashes, clean recentering, and head/body decoupling under physical motion.
+2. Prove center/center and distinct-eye behavior live across both stock
+   accumulation branches, exterior/interior transitions, first-person
+   geometry, particles, transparency, and blocking UI transitions.
+3. Complete the read-only live census/reference evidence for every supported
+   code-mutating module. Arbitrary or unenumerated patches remain a hard
+   reject.
+4. Replace bounded CPU-v8 eye transfer with GPU-native v5 color sharing from
+   D3D9Ex to D3D11/OpenXR, adapter identity, completion/release sequencing,
+   transaction IDs, and validated render-local per-eye depth/stencil. OpenXR
+   depth-layer submission is outside the v1 release gate.
 5. Prove the authoritative retail weapon, muzzle, projectile/hit, recoil, and
    reload chain against the right-controller aim pose.
-6. Pass retail/headset acceptance across UI transitions, exterior/interior cell
-   changes, first-person geometry, particles/transparency, twelve-direction
-   pose motion, and performance. Invalid gameplay stereo is a visible reject,
-   never a successful mono fallback.
+6. Pass full retail/headset acceptance and performance. Invalid gameplay
+   stereo remains a visible reject, never a successful mono fallback.
 
 ## Safe Local Artifacts
 
+- current 224/224 product build attestation at
+  `local/product-build/fnvxr-product-Release.json`;
+- retained dynamic six-axis run manifest, raw final-eye captures, and verified
+  29.75-second 2560x720 side-by-side H.264 proof under
+  `local/product-runs/20260729-120130-129-4a961da02e23/`;
 - nonce-bound, tested no-launch StageOnly manifest under
   `local/openxr-retail-sidecar-runs/20260718-085015-525/`;
 - independent no-copy/no-launch ValidateOnly manifest under

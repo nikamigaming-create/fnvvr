@@ -15,8 +15,9 @@ enum class RetailWorldControllerFailure : std::uint8_t
     None = 0u,
     OperationsIncomplete,
     InvalidHookFrame,
-    OriginalUiCallRejected,
+    OriginalRetailPassRejected,
     TrackedFrameRejected,
+    TransactionClaimRejected,
     CameraFrameRejected,
     StereoRenderRejected,
     GpuPublicationRejected,
@@ -43,12 +44,26 @@ struct RetailWorldControllerResult
 struct RetailWorldControllerOperations
 {
     void* context = nullptr;
-    bool (*callOriginalForUi)(
+    // The exact trampoline runs one stock retail pass after the authenticated
+    // route decision. In UI it is the UI pass; in gameplay it is an internal
+    // renderer prelude that initializes the stock world state before the
+    // isolated eye transaction. The prelude is never itself publishable.
+    bool (*callOriginalRetailPass)(
         void*,
         const RetailWorldHookDispatchFrame&) noexcept = nullptr;
-    bool (*readTrackedGameplayFrame)(
+    // The controller owns the final UI-versus-world presentation decision;
+    // providers therefore supply a validated published snapshot rather than
+    // pre-classifying it as gameplay.
+    bool (*readTrackedFrame)(
         void*,
         RetailTrackedFrame&) noexcept = nullptr;
+    // UI and world publications share one monotonically increasing identity
+    // domain. Claim the world identity before deriving/rendering either eye so
+    // the renderer generation and the published pair can never diverge after
+    // an intervening UI quad.
+    bool (*claimWorldTransaction)(
+        void*,
+        std::uint64_t&) noexcept = nullptr;
     bool (*prepareDistinctCameraFrame)(
         void*,
         const RetailWorldHookDispatchFrame&,
@@ -68,8 +83,9 @@ constexpr bool retailWorldControllerOperationsComplete(
     const RetailWorldControllerOperations& operations) noexcept
 {
     return operations.context
-        && operations.callOriginalForUi
-        && operations.readTrackedGameplayFrame
+        && operations.callOriginalRetailPass
+        && operations.readTrackedFrame
+        && operations.claimWorldTransaction
         && operations.prepareDistinctCameraFrame
         && operations.renderStereoWorld
         && operations.publishGpuPair;
@@ -79,16 +95,14 @@ class RetailWorldController final
 {
 public:
     bool initialize(
-        const RetailWorldControllerOperations& operations,
-        std::uint64_t firstTransactionId = 1u) noexcept
+        const RetailWorldControllerOperations& operations) noexcept
     {
-        if (!retailWorldControllerOperationsComplete(operations)
-            || firstTransactionId == 0u)
+        if (!retailWorldControllerOperationsComplete(operations))
         {
             return false;
         }
         mOperations = operations;
-        mNextTransactionId = firstTransactionId;
+        mLastClaimedTransactionId = 0u;
         mInitialized = true;
         return true;
     }
@@ -96,7 +110,6 @@ public:
     bool ready() const noexcept
     {
         return mInitialized
-            && mNextTransactionId != 0u
             && retailWorldControllerOperationsComplete(mOperations);
     }
 
@@ -112,17 +125,29 @@ public:
             return failure(RetailWorldControllerFailure::InvalidHookFrame);
         }
 
-        const auto* sceneGraph =
-            static_cast<const abi::RetailSceneGraphLayout*>(
-                hookFrame.retailThis);
-        if (sceneGraph->isMenuSceneGraph != 0u)
+        RetailTrackedFrame tracked {};
+        if (!mOperations.readTrackedFrame(
+                mOperations.context,
+                tracked))
         {
-            if (!mOperations.callOriginalForUi(
+            return failure(
+                RetailWorldControllerFailure::TrackedFrameRejected);
+        }
+
+        // The SceneGraph word at 0xE8 is undocumented and cannot classify a
+        // menu safely. Route only from the authenticated published runtime
+        // state, so UI and world remain mutually exclusive without guessing
+        // from private engine memory.
+        const RetailTrackedPresentationRoute route =
+            retailTrackedPresentationRoute(tracked);
+        if (route == RetailTrackedPresentationRoute::MonoUiQuad)
+        {
+            if (!mOperations.callOriginalRetailPass(
                     mOperations.context,
                     hookFrame))
             {
                 return failure(
-                    RetailWorldControllerFailure::OriginalUiCallRejected);
+                    RetailWorldControllerFailure::OriginalRetailPassRejected);
             }
             return {
                 RetailWorldHookDisposition::CallOriginalForUi,
@@ -130,22 +155,40 @@ public:
                 0u,
             };
         }
-
-        if (mNextTransactionId
-            == (std::numeric_limits<std::uint64_t>::max)())
+        if (route != RetailTrackedPresentationRoute::BinocularWorld)
         {
-            return failure(RetailWorldControllerFailure::CameraFrameRejected);
+            return failure(RetailWorldControllerFailure::TrackedFrameRejected);
         }
-        const std::uint64_t transactionId = mNextTransactionId++;
-        RetailTrackedFrame tracked {};
-        if (!mOperations.readTrackedGameplayFrame(
+
+        // The entry detour otherwise suppresses the stock body completely.
+        // Run its exact trampoline once before building the private visible
+        // list so per-frame renderer/culling setup has occurred. This pass is
+        // not sent to the headset and cannot satisfy a stereo transaction;
+        // only the later explicit left/right eye pair may be published.
+        if (!mOperations.callOriginalRetailPass(
                 mOperations.context,
-                tracked))
+                hookFrame))
         {
             return failure(
-                RetailWorldControllerFailure::TrackedFrameRejected,
-                transactionId);
+                RetailWorldControllerFailure::OriginalRetailPassRejected);
         }
+
+        std::uint64_t transactionId = 0u;
+        if (!mOperations.claimWorldTransaction(
+                mOperations.context,
+                transactionId)
+            || transactionId == 0u
+            || transactionId == (std::numeric_limits<std::uint64_t>::max)()
+            || transactionId <= mLastClaimedTransactionId)
+        {
+            return failure(
+                RetailWorldControllerFailure::TransactionClaimRejected);
+        }
+        // Claiming reserves the identity even if camera preparation or
+        // rendering later fails. The next completed frame must still never
+        // reuse an identity that was already associated with an attempted
+        // world transaction.
+        mLastClaimedTransactionId = transactionId;
         RetailCenterRuntimeFrame frame {};
         if (!mOperations.prepareDistinctCameraFrame(
                 mOperations.context,
@@ -158,20 +201,19 @@ public:
                 RetailWorldControllerFailure::CameraFrameRejected,
                 transactionId);
         }
-        // Hook identity and the exact validated shared snapshot are
-        // authoritative. A provider may supply calibrated scale or private
-        // camera preparation state, but it cannot substitute a different
-        // scene, camera, pose, or transaction lineage.
-        frame.sceneObject = reinterpret_cast<void*>(
-            static_cast<std::uintptr_t>(
-                hookFrame.arguments.sharedRenderObjectAddress));
-        frame.sceneGraph = sceneGraph;
-        frame.stockCenterCamera = reinterpret_cast<
-            abi::RetailNiCameraLayout*>(static_cast<std::uintptr_t>(
-                sceneGraph->camera));
+        // The exact stock body obtains its culling root independently from
+        // its stack-side shared render object before it calls
+        // AccumulateScene. The hook's `this` is renderer-owned, and the
+        // shared stack object is likewise not a substitute scene root. The
+        // provider has already resolved the same live global SceneGraph and
+        // stock camera that the stock body uses, so preserve that root for
+        // the private conservative traversal.
+        frame.sceneObject = const_cast<abi::RetailSceneGraphLayout*>(
+            frame.sceneGraph);
         frame.tracked = tracked;
         frame.generation = transactionId;
         if (!frame.sceneObject
+            || !frame.sceneGraph
             || !frame.stockCenterCamera
             || !std::isfinite(frame.gameUnitsPerMeter)
             || frame.gameUnitsPerMeter <= 0.0f)
@@ -220,7 +262,7 @@ private:
     }
 
     RetailWorldControllerOperations mOperations {};
-    std::uint64_t mNextTransactionId = 0u;
+    std::uint64_t mLastClaimedTransactionId = 0u;
     bool mInitialized = false;
 };
 }

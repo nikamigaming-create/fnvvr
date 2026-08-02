@@ -106,7 +106,7 @@ public:
         if (failPrepare)
             return false;
         evidence.colorPairComplete = true;
-        evidence.depthPairComplete = !omitDepth;
+        evidence.renderLocalDepthPairComplete = !omitDepth;
         evidence.sameSimulationTick = true;
         evidence.poseMatched = true;
         evidence.conservativeVisibilityComplete = true;

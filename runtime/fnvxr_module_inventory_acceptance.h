@@ -166,6 +166,8 @@ struct ExpectedModule
     ModuleOrigin origin = ModuleOrigin::Unknown;
     std::string_view normalizedRelativePath {};
     bool exactIdentityRequired = false;
+    bool loadedExecutableSectionsRequired = false;
+    bool graphicsHookModule = false;
     PeIdentity exactIdentity {};
 };
 
@@ -181,27 +183,46 @@ constexpr ExpectedModule exactGameModule(
         ModuleOrigin::GameTree,
         path,
         true,
+        true,
+        false,
         { PeMachineX86, timeDateStamp, sizeOfImage, preferredImageBase, fileSize, sha256 }
     };
 }
 
 constexpr ExpectedModule observedGameProxy(std::string_view path) noexcept
 {
-    return { ModuleOrigin::GameTree, path, false, {} };
+    return { ModuleOrigin::GameTree, path, false, false, false, {} };
+}
+
+// The product cannot embed an exact hash of its own final DLL without a
+// self-referential digest. The attested launcher verifies the staged hash;
+// in-process authority independently requires that the loaded executable
+// sections still match that staged file.
+constexpr ExpectedModule currentProductModule(std::string_view path) noexcept
+{
+    return { ModuleOrigin::GameTree, path, false, true, false, {} };
 }
 
 constexpr ExpectedModule signedRuntime(
     ModuleOrigin origin,
     std::string_view path) noexcept
 {
-    return { origin, path, false, {} };
+    return { origin, path, false, false, false, {} };
 }
 
-// Exact census-derived allowlist. The two prohibited overlay modules observed
-// during the audit (GameOverlayRenderer.dll and nvspcap.dll) are intentionally
-// absent. Local D3D/DInput/XInput identities are authorized separately through
-// the transparent-proxy evidence below because the audited live files predate
-// their source fuses and must never be mistaken for approved transparent builds.
+constexpr ExpectedModule signedGraphicsHookRuntime(
+    ModuleOrigin origin,
+    std::string_view path) noexcept
+{
+    return { origin, path, false, true, true, {} };
+}
+
+// Exact census-derived allowlist. Graphics hook modules are admitted only at
+// their canonical signed runtime paths with their loaded executable sections
+// matching disk in both adjacent censuses. Protected retail engine bytes and
+// owned JIP/ShowOff patch inventories remain independent mandatory proofs.
+// Local D3D/DInput/XInput identities are authorized separately through the
+// transparent-proxy evidence below.
 inline constexpr ExpectedModule AllowedModules[] {
     exactGameModule("falloutnv.exe", 16549704u, 0x4E0D50EDu, 0x107B000u, 0x00400000u,
         "518C87F58A6C4D9826E9EF8FBB7F4213882FA70822675610D45AEA2464502A57"),
@@ -222,8 +243,7 @@ inline constexpr ExpectedModule AllowedModules[] {
     observedGameProxy("xinput1_3.dll"),
     exactGameModule("data/nvse/plugins/jip_nvse.dll", 502272u, 0x665225A8u, 0x80000u, 0x10000000u,
         "9D2779647ED0CE63043390F47FC978E3234AF8E558DC6CB6BCB231478A2D74D4"),
-    exactGameModule("data/nvse/plugins/nvse_fnvxr.dll", 10752u, 0xE126C195u, 0x8000u, 0x10000000u,
-        "E394CB96DC1F881E66DF5E11877BCCBA55033FE50A4D407FD70CCB359BB3650D"),
+    currentProductModule("data/nvse/plugins/nvse_fnvxr.dll"),
     exactGameModule("data/nvse/plugins/showoffnvse.dll", 1091584u, 0x69C84C9Bu, 0x110000u, 0x10000000u,
         "37CB22C5288FEDD0D57196C8C2F6BBABA5A1DAFD9CE58F14DAC9410DBEE7EF3E"),
 
@@ -232,6 +252,9 @@ inline constexpr ExpectedModule AllowedModules[] {
     signedRuntime(ModuleOrigin::SteamRuntime, "steamclient.dll"),
     signedRuntime(ModuleOrigin::SteamRuntime, "tier0_s.dll"),
     signedRuntime(ModuleOrigin::SteamRuntime, "vstdlib_s.dll"),
+    signedGraphicsHookRuntime(
+        ModuleOrigin::SteamRuntime,
+        "gameoverlayrenderer.dll"),
 
     signedRuntime(ModuleOrigin::NvidiaDriverRuntime, "nvdd.inf_amd64_55661cb7fab2ea8e/nvd3dum.dll"),
     signedRuntime(ModuleOrigin::NvidiaDriverRuntime, "nvdd.inf_amd64_55661cb7fab2ea8e/nvgpucomp32.dll"),
@@ -298,6 +321,9 @@ inline constexpr ExpectedModule AllowedModules[] {
     signedRuntime(ModuleOrigin::WindowsRuntime, "system32/mswsock.dll"),
     signedRuntime(ModuleOrigin::WindowsRuntime, "system32/ntdll.dll"),
     signedRuntime(ModuleOrigin::WindowsRuntime, "system32/ntmarta.dll"),
+    signedGraphicsHookRuntime(
+        ModuleOrigin::WindowsRuntime,
+        "system32/nvspcap.dll"),
     signedRuntime(ModuleOrigin::WindowsRuntime, "system32/nvapi.dll"),
     signedRuntime(ModuleOrigin::WindowsRuntime, "system32/ole32.dll"),
     signedRuntime(ModuleOrigin::WindowsRuntime, "system32/oleacc.dll"),
@@ -345,7 +371,7 @@ inline constexpr ExpectedModule AllowedModules[] {
 
 inline constexpr std::size_t AllowedModuleCount =
     sizeof(AllowedModules) / sizeof(AllowedModules[0]);
-static_assert(AllowedModuleCount == 124u, "census-derived allowlist count changed");
+static_assert(AllowedModuleCount == 126u, "census-derived allowlist count changed");
 
 // Acceptance still requires exactly AllowedModuleCount observations. This
 // fixed census-builder envelope permits pure acceptance to diagnose known
@@ -476,8 +502,6 @@ enum class InventoryFailure : std::uint8_t
     PostProofEnumerationIncomplete,
     WrongPostProofEnumerationMode,
     RevalidationNotTransactionAdjacent,
-    ProhibitedSteamOverlay,
-    ProhibitedNvidiaCapture,
     InvalidObservationTextSnapshot,
     NonCanonicalPath,
     InvalidPeIdentity,
@@ -499,7 +523,7 @@ enum class InventoryFailure : std::uint8_t
 struct ModuleInventoryAssessment
 {
     bool moduleSetAccepted = false;
-    bool overlaysAbsent = false;
+    bool graphicsHookModulesAccepted = false;
     bool proxyPoliciesAccepted = false;
     bool jipProofAccepted = false;
     bool showOffProofAccepted = false;
@@ -811,31 +835,6 @@ inline bool moduleNameSnapshotsValid(
     return true;
 }
 
-inline InventoryFailure prohibitedOverlayFailure(
-    const ModuleObservation* observations,
-    std::size_t count,
-    std::size_t& prohibitedIndex) noexcept
-{
-    for (std::size_t index = 0; index < count; ++index)
-    {
-        const std::string_view moduleName =
-            observations[index].normalizedModuleName.view();
-        if (asciiCaseInsensitiveEqual(
-                moduleName,
-                "gameoverlayrenderer.dll"))
-        {
-            prohibitedIndex = index;
-            return InventoryFailure::ProhibitedSteamOverlay;
-        }
-        if (asciiCaseInsensitiveEqual(moduleName, "nvspcap.dll"))
-        {
-            prohibitedIndex = index;
-            return InventoryFailure::ProhibitedNvidiaCapture;
-        }
-    }
-    return InventoryFailure::None;
-}
-
 inline ModuleInventoryAssessment assessModuleInventory(
     const ModuleInventoryEvidence& evidence) noexcept
 {
@@ -909,9 +908,8 @@ inline ModuleInventoryAssessment assessModuleInventory(
     }
 
     // The normalized module names are owned, bounded snapshots. Validate all
-    // snapshots before viewing any of them, then diagnose known prohibited
-    // overlays in both independently captured censuses. This scan does not
-    // relax the exact-count acceptance gate below.
+    // snapshots before viewing any of them. Exact count, canonical path,
+    // signature, mapped-code, and adjacent-census gates follow below.
     std::size_t diagnosticIndex = 0u;
     if (!moduleNameSnapshotsValid(
             evidence.modules,
@@ -926,25 +924,6 @@ inline ModuleInventoryAssessment assessModuleInventory(
         result.observationIndex = diagnosticIndex;
         return result;
     }
-    InventoryFailure overlayFailure = prohibitedOverlayFailure(
-        evidence.modules,
-        evidence.moduleCount,
-        diagnosticIndex);
-    if (overlayFailure == InventoryFailure::None)
-    {
-        overlayFailure = prohibitedOverlayFailure(
-            evidence.postProofModules,
-            evidence.postProofModuleCount,
-            diagnosticIndex);
-    }
-    if (overlayFailure != InventoryFailure::None)
-    {
-        result.failure = overlayFailure;
-        result.observationIndex = diagnosticIndex;
-        result.overlaysAbsent = false;
-        return result;
-    }
-
     if (evidence.moduleCount != AllowedModuleCount)
     {
         result.failure = InventoryFailure::PrimaryModuleCountMismatch;
@@ -1051,7 +1030,7 @@ inline ModuleInventoryAssessment assessModuleInventory(
     result.showOffProofAccepted = showOffProofContentAccepted;
 
     std::array<bool, AllowedModuleCount> seen {};
-    result.overlaysAbsent = true;
+    std::size_t acceptedGraphicsHookModules = 0u;
     for (std::size_t index = 0; index < evidence.moduleCount; ++index)
     {
         result.observationIndex = index;
@@ -1061,22 +1040,6 @@ inline ModuleInventoryAssessment assessModuleInventory(
             || !module.identity.sha256.valid())
         {
             result.failure = InventoryFailure::InvalidObservationTextSnapshot;
-            return result;
-        }
-        if (asciiCaseInsensitiveEqual(
-                module.normalizedModuleName.view(),
-                "gameoverlayrenderer.dll"))
-        {
-            result.overlaysAbsent = false;
-            result.failure = InventoryFailure::ProhibitedSteamOverlay;
-            return result;
-        }
-        if (asciiCaseInsensitiveEqual(
-                module.normalizedModuleName.view(),
-                "nvspcap.dll"))
-        {
-            result.overlaysAbsent = false;
-            result.failure = InventoryFailure::ProhibitedNvidiaCapture;
             return result;
         }
         if (!module.canonicalPathObserved
@@ -1138,13 +1101,14 @@ inline ModuleInventoryAssessment assessModuleInventory(
             result.failure = InventoryFailure::ExactIdentityMismatch;
             return result;
         }
-        if (expected.origin == ModuleOrigin::GameTree
-            && expected.exactIdentityRequired
+        if (expected.loadedExecutableSectionsRequired
             && !module.loadedExecutableSectionsMatched)
         {
             result.failure = InventoryFailure::LoadedExecutableSectionsMismatch;
             return result;
         }
+        if (expected.graphicsHookModule)
+            ++acceptedGraphicsHookModules;
     }
 
     for (std::size_t index = 0; index < AllowedModuleCount; ++index)
@@ -1166,6 +1130,14 @@ inline ModuleInventoryAssessment assessModuleInventory(
             result.observationIndex = index;
             return result;
         }
+    }
+
+    result.graphicsHookModulesAccepted =
+        acceptedGraphicsHookModules == 2u;
+    if (!result.graphicsHookModulesAccepted)
+    {
+        result.failure = InventoryFailure::MissingModule;
+        return result;
     }
 
     result.moduleSetAccepted = true;

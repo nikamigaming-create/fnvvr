@@ -11,10 +11,121 @@ void require(bool condition, const char* message)
     if (!condition)
         throw std::runtime_error(message);
 }
+
+bool snapshotEyeTargets(void*) noexcept { return false; }
+bool bindEyeTarget(
+    void*,
+    fnvxr::engine::CenterRendererEye,
+    fnvxr::engine::CenterRendererEyeIsolation&) noexcept
+{
+    return false;
+}
+bool bindEyeTargetPreservingContents(
+    void*,
+    fnvxr::engine::CenterRendererEye,
+    fnvxr::engine::CenterRendererEyeIsolation&) noexcept
+{
+    return false;
+}
+bool endEyeTarget(
+    void*,
+    fnvxr::engine::CenterRendererEye,
+    fnvxr::engine::CenterRendererEyeIsolation&) noexcept
+{
+    return false;
+}
+void rollbackEyeTarget(
+    void*,
+    fnvxr::engine::CenterRendererEye,
+    fnvxr::engine::CenterRendererEyeIsolation&) noexcept
+{
+}
+bool restoreEyeTargets(void*) noexcept { return false; }
+bool prepareCameraFrame(
+    void*,
+    const fnvxr::engine::RetailWorldAccumulationCallFrame&,
+    const fnvxr::engine::RetailTrackedFrame&,
+    std::uint64_t,
+    fnvxr::engine::RetailCenterRuntimeFrame&) noexcept
+{
+    return false;
+}
+bool armAccumulationCallRelay(void*, std::uintptr_t) noexcept
+{
+    return true;
+}
+void disarmAccumulationCallRelay(void*) noexcept
+{
+}
+bool armRenderPhaseCallRelays(
+    void*,
+    std::uintptr_t,
+    std::uintptr_t) noexcept
+{
+    return true;
+}
+void disarmRenderPhaseCallRelays(void*) noexcept
+{
+}
+bool armFirstPersonCallRelay(void*, std::uintptr_t) noexcept
+{
+    return true;
+}
+void disarmFirstPersonCallRelay(void*) noexcept
+{
+}
+bool armFirstPersonPreparedRenderRelay(void*, std::uintptr_t) noexcept
+{
+    return true;
+}
+void disarmFirstPersonPreparedRenderRelay(void*) noexcept
+{
+}
+bool firstPersonGameplayLeaseReady(void*) noexcept
+{
+    return true;
+}
+bool publishCpuPair(
+    void*,
+    const fnvxr::engine::RetailTrackedFrame&,
+    std::uint64_t) noexcept
+{
+    return false;
+}
+bool publishCpuMonoUiQuad(
+    void*,
+    const fnvxr::engine::RetailTrackedFrame&,
+    std::uint64_t) noexcept
+{
+    return false;
+}
+bool prepareColorProducer(void*, std::uint64_t) noexcept
+{
+    return false;
+}
+fnvxr::d3d9::color_transport::ProducerPublication produceColorPair(
+    void*,
+    const fnvxr::d3d9::color_transport::ProducerFrameIdentity&) noexcept
+{
+    return {};
+}
 }
 
 int main()
 {
+    fnvxr::d3d9::RetailVrPrivateRenderDispatchGate privateRenderGate;
+    require(
+        !privateRenderGate.active()
+            && privateRenderGate.tryEnter()
+            && privateRenderGate.active()
+            && !privateRenderGate.tryEnter(),
+        "private-render dispatch gate admitted a nested bridge transaction");
+    privateRenderGate.leave();
+    require(
+        !privateRenderGate.active() && privateRenderGate.tryEnter(),
+        "private-render dispatch gate did not reopen after the outer transaction");
+    privateRenderGate.leave();
+
     fnvxr::d3d9::RetailV5PublicationSequence publications;
     std::uint64_t firstWorld = 0u;
     std::uint64_t ui = 0u;
@@ -41,9 +152,106 @@ int main()
             && invalid == 0u,
         "unknown presentation mode consumed a publication identity");
 
-    fnvxr::d3d9::RetailVrBridgeWin32<4096u> bridge;
+    fnvxr::d3d9::RetailVrBridgeOperations cpuOperations {};
+    cpuOperations.context = &cpuOperations;
+    cpuOperations.eyeTargets = {
+        &cpuOperations,
+        &snapshotEyeTargets,
+        &bindEyeTarget,
+        &endEyeTarget,
+        &rollbackEyeTarget,
+        &restoreEyeTargets,
+        &bindEyeTargetPreservingContents,
+    };
+    cpuOperations.armAccumulationCallRelay = &armAccumulationCallRelay;
+    cpuOperations.disarmAccumulationCallRelay = &disarmAccumulationCallRelay;
+    cpuOperations.armRenderPhaseCallRelays = &armRenderPhaseCallRelays;
+    cpuOperations.disarmRenderPhaseCallRelays =
+        &disarmRenderPhaseCallRelays;
+    cpuOperations.armFirstPersonCallRelay = &armFirstPersonCallRelay;
+    cpuOperations.disarmFirstPersonCallRelay = &disarmFirstPersonCallRelay;
+    cpuOperations.armFirstPersonPreparedRenderRelay =
+        &armFirstPersonPreparedRenderRelay;
+    cpuOperations.disarmFirstPersonPreparedRenderRelay =
+        &disarmFirstPersonPreparedRenderRelay;
+    cpuOperations.firstPersonGameplayLeaseReady =
+        &firstPersonGameplayLeaseReady;
+    cpuOperations.prepareDistinctCameraFrame = &prepareCameraFrame;
+    cpuOperations.publicationTransport =
+        fnvxr::d3d9::RetailVrPublicationTransport::CpuReadback;
+    cpuOperations.publishCpuPair = &publishCpuPair;
+    cpuOperations.publishCpuMonoUiQuad = &publishCpuMonoUiQuad;
     require(
-        !bridge.initialize({}, 0u),
+        fnvxr::d3d9::retailVrBridgeOperationsComplete(cpuOperations),
+        "complete ordinary-D3D9 CPU publication operations were rejected");
+    cpuOperations.publishCpuMonoUiQuad = nullptr;
+    require(
+        !fnvxr::d3d9::retailVrBridgeOperationsComplete(cpuOperations),
+        "CPU bridge accepted a world publisher without its mono UI publisher");
+    cpuOperations.publishCpuMonoUiQuad = &publishCpuMonoUiQuad;
+    cpuOperations.publishCpuPair = nullptr;
+    require(
+        !fnvxr::d3d9::retailVrBridgeOperationsComplete(cpuOperations),
+        "bridge accepted neither a CPU publisher nor a complete GPU publisher");
+
+    fnvxr::d3d9::RetailVrBridgeOperations gpuOperations {};
+    gpuOperations.context = &gpuOperations;
+    gpuOperations.eyeTargets = {
+        &gpuOperations,
+        &snapshotEyeTargets,
+        &bindEyeTarget,
+        &endEyeTarget,
+        &rollbackEyeTarget,
+        &restoreEyeTargets,
+        &bindEyeTargetPreservingContents,
+    };
+    gpuOperations.armAccumulationCallRelay = &armAccumulationCallRelay;
+    gpuOperations.disarmAccumulationCallRelay = &disarmAccumulationCallRelay;
+    gpuOperations.armRenderPhaseCallRelays = &armRenderPhaseCallRelays;
+    gpuOperations.disarmRenderPhaseCallRelays =
+        &disarmRenderPhaseCallRelays;
+    gpuOperations.armFirstPersonCallRelay = &armFirstPersonCallRelay;
+    gpuOperations.disarmFirstPersonCallRelay = &disarmFirstPersonCallRelay;
+    gpuOperations.armFirstPersonPreparedRenderRelay =
+        &armFirstPersonPreparedRenderRelay;
+    gpuOperations.disarmFirstPersonPreparedRenderRelay =
+        &disarmFirstPersonPreparedRenderRelay;
+    gpuOperations.firstPersonGameplayLeaseReady =
+        &firstPersonGameplayLeaseReady;
+    gpuOperations.prepareDistinctCameraFrame = &prepareCameraFrame;
+    gpuOperations.publicationTransport =
+        fnvxr::d3d9::RetailVrPublicationTransport::GpuSharedTextures;
+    gpuOperations.prepareColorProducer = &prepareColorProducer;
+    gpuOperations.produceColorPair = &produceColorPair;
+    require(
+        fnvxr::d3d9::retailVrBridgeOperationsComplete(gpuOperations),
+        "complete GPU-shared-texture publication operations were rejected");
+
+    gpuOperations.publishCpuPair = &publishCpuPair;
+    require(
+        !fnvxr::d3d9::retailVrBridgeOperationsComplete(gpuOperations),
+        "GPU bridge accepted a hidden CPU fallback");
+    gpuOperations.publishCpuPair = nullptr;
+    gpuOperations.publishCpuMonoUiQuad = &publishCpuMonoUiQuad;
+    require(
+        !fnvxr::d3d9::retailVrBridgeOperationsComplete(gpuOperations),
+        "GPU bridge accepted a hidden CPU UI fallback");
+    gpuOperations.publishCpuMonoUiQuad = nullptr;
+    gpuOperations.publicationTransport =
+        fnvxr::d3d9::RetailVrPublicationTransport::CpuReadback;
+    require(
+        !fnvxr::d3d9::retailVrBridgeOperationsComplete(gpuOperations),
+        "CPU bridge accepted GPU callbacks instead of an explicit CPU route");
+
+    fnvxr::d3d9::RetailVrBridgeWin32<4096u> bridge;
+    const auto initialDiagnostics = bridge.frameDiagnostics();
+    require(
+        initialDiagnostics.dispatchCount == 0u
+            && initialDiagnostics.stereoCompleteCount == 0u
+            && !initialDiagnostics.eyeCamera.captured,
+        "bridge diagnostics did not start empty");
+    require(
+        !bridge.initialize({}, 0u, 0u, 0u, 0u, 0u, 0u),
         "empty bridge operations unexpectedly initialized");
 #if defined(_WIN32) && defined(_M_IX86)
     require(

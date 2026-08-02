@@ -26,6 +26,41 @@ constexpr std::uint32_t VrOriginStateRenderLease = 1;
 constexpr std::uint32_t VrOriginStateCommitted = 2;
 constexpr std::uint32_t CameraSharedMagic = 0x43585646; // FNXC
 constexpr std::uint32_t CameraSharedVersion = 1;
+// This mapping exists only for the deliberately narrow desktop-assist camera
+// experiment.  It reports the camera's local transform separately from the
+// normal world-camera telemetry, so a rotation-local test cannot accidentally
+// claim a renderer/world-transform proof.
+constexpr std::uint32_t DesktopAssistSharedMagic = 0x41585646; // FVXA
+// Version 2 makes the body-root observation explicit.  The old v1 record
+// exposed a first-person node as `playerWorld*`, which is insufficient to
+// prove that HMD rotation did not leak into the actual player/body frame.
+constexpr std::uint32_t DesktopAssistSharedVersion = 2;
+inline constexpr char DesktopAssistSharedMappingName[] =
+    "Local\\FNVXR_Desktop_Assist_State_v2";
+constexpr std::uint32_t DesktopAssistFlagLeaseCurrent = 1u << 0;
+constexpr std::uint32_t DesktopAssistFlagCameraHookInstalled = 1u << 1;
+constexpr std::uint32_t DesktopAssistFlagCameraPoseApplied = 1u << 2;
+constexpr std::uint32_t DesktopAssistFlagFirstPerson = 1u << 3;
+constexpr std::uint32_t DesktopAssistFlagPlayerTransformValid = 1u << 4;
+constexpr std::uint32_t DesktopAssistFlagCameraLocalTransformValid = 1u << 5;
+constexpr std::uint32_t DesktopAssistFlagCameraWorldTransformValid = 1u << 6;
+constexpr std::uint32_t DesktopAssistFlagBodyRootTransformValid = 1u << 7;
+// This mapping is a desktop-assist-only evidence record for a captured retail
+// menu frame. It never carries world-stereo pixels and is deliberately named
+// separately from the legacy D3D9 frame/stereo mappings so an OpenXR consumer
+// cannot mistake it for a product presentation source.
+constexpr std::uint32_t DesktopAssistUiQuadSharedMagic = 0x55585646; // FVXU
+constexpr std::uint32_t DesktopAssistUiQuadSharedVersion = 1;
+inline constexpr char DesktopAssistUiQuadSharedMappingName[] =
+    "Local\\FNVXR_Desktop_Assist_Ui_Quad_v1";
+inline constexpr char DesktopAssistUiQuadProducerMutexName[] =
+    "Local\\FNVXR_Desktop_Assist_Ui_Quad_Producer_v1";
+constexpr std::uint32_t DesktopAssistUiQuadFlagLeaseCurrent = 1u << 0;
+constexpr std::uint32_t DesktopAssistUiQuadFlagPresentHookInstalled = 1u << 1;
+constexpr std::uint32_t DesktopAssistUiQuadFlagRuntimeUiConfirmed = 1u << 2;
+constexpr std::uint32_t DesktopAssistUiQuadFlagPixelCopyComplete = 1u << 3;
+constexpr std::uint32_t DesktopAssistUiQuadFlagPixelContentNonBlack = 1u << 4;
+constexpr std::uint32_t DesktopAssistUiQuadFlagPoseEpochCurrent = 1u << 5;
 constexpr std::uint32_t RuntimeSharedMagic = 0x53585646; // FNVS
 constexpr std::uint32_t RuntimeSharedVersion = 1;
 constexpr std::uint32_t PlayerSharedMagic = 0x50564e46; // FNVP
@@ -40,8 +75,18 @@ constexpr std::uint32_t InputEventQueueLength = 64;
 inline constexpr char InputEventWriterMutexName[] = "Local\\FNVXR_Input_Event_Writer_v1";
 constexpr std::uint32_t D3D9FrameSharedMagic = 0x46585646; // FNVF
 constexpr std::uint32_t D3D9StereoFrameSharedMagic = 0x53585646; // FNXS
-constexpr std::uint32_t D3D9StereoFrameSharedVersion = 7;
-inline constexpr char D3D9StereoFrameSharedMappingName[] = "Local\\FNVXR_D3D9_StereoFrame_v7";
+// v8 makes the CPU engine-center transport name the exact retail
+// presentation transaction, source frame, and runtime-state observation.
+// The old v7 header could carry stereo pixels but not prove that a flat menu
+// capture belonged to the UI state currently shown by the host.
+constexpr std::uint32_t D3D9StereoFrameSharedVersion = 8;
+inline constexpr char D3D9StereoFrameSharedMappingName[] = "Local\\FNVXR_D3D9_StereoFrame_v8";
+inline constexpr char D3D9StereoFrameProducerMutexName[] =
+    "Local\\FNVXR_D3D9_Stereo_Producer_v8";
+inline constexpr char D3D9StereoFrameHostReaderMutexName[] =
+    "Local\\FNVXR_D3D9_Stereo_HostReader_v8";
+inline constexpr char D3D9StereoFrameCaptureReaderMutexName[] =
+    "Local\\FNVXR_D3D9_Stereo_CaptureReader_v8";
 constexpr std::uint32_t D3D9SharedFrameMaxWidth = 4096;
 constexpr std::uint32_t D3D9SharedFrameMaxHeight = 2560;
 // Two independent consumers (the OpenXR host and the evidence capturer) each
@@ -75,10 +120,24 @@ inline LONG selectWritableStereoFrameSlot(
 // NativeSameFrame is the legacy two-engine-traversal producer. SingleTraversal
 // applies the HMD pose to the retail camera once, builds one Gamebryo scene,
 // and replays that exact D3D draw stream into both eyes from the same tick.
+// EngineCenter renders one conservative center cull into two private engine
+// accumulators and publishes those exact same-transaction eye targets.
 constexpr std::uint32_t StereoProducerUnknown = 0;
 constexpr std::uint32_t StereoProducerDrawReplay = 1;
 constexpr std::uint32_t StereoProducerNativeSameFrame = 2;
 constexpr std::uint32_t StereoProducerSingleTraversal = 3;
+constexpr std::uint32_t StereoProducerEngineCenter = 4;
+// A deliberately flat retail menu capture. It shares the engine-center
+// transaction domain, but is never eligible as a binocular world producer.
+constexpr std::uint32_t StereoProducerMonoUiQuad = 5;
+
+constexpr bool stereoProducerCarriesSameTransactionEyes(
+    std::uint32_t producerMode) noexcept
+{
+    return producerMode == StereoProducerNativeSameFrame
+        || producerMode == StereoProducerSingleTraversal
+        || producerMode == StereoProducerEngineCenter;
+}
 
 constexpr std::uint32_t RuntimePhaseUnknown = 0;
 constexpr std::uint32_t RuntimePhaseMenu = 1;
@@ -109,6 +168,13 @@ constexpr std::uint32_t RuntimeBlockingMenuBits =
     | RuntimePipBoyMenuBit
     | RuntimeGenericMenuBit;
 
+enum class RuntimeControllerMode : std::uint32_t
+{
+    Unknown = 0u,
+    Ui = 1u,
+    Gameplay = 2u,
+};
+
 inline bool runtimeLoadingMenuBlocksInput(bool rawLoadingVisible, bool actionableMenuVisible)
 {
     return rawLoadingVisible && !actionableMenuVisible;
@@ -132,6 +198,46 @@ inline bool runtimeUiActive(std::uint32_t phase, std::uint32_t menuBits, std::ui
     return !runtimeGameplayPhase(phase, menuBits, showroomActive);
 }
 
+// Controller mutation has one authoritative tri-state contract shared by the
+// OpenXR publisher and the exact-retail xNVSE consumer. Loading, stale reads,
+// non-actionable MenuMode-only frames, showroom frames, and camera-less
+// startup frames are deliberately Unknown so neither UI nor gameplay actions
+// can leak across a transition.
+inline RuntimeControllerMode runtimeControllerMode(
+    std::uint32_t phase,
+    std::uint32_t menuBits,
+    std::uint32_t showroomActive,
+    bool cameraActive,
+    bool fresh)
+{
+    if (!fresh)
+        return RuntimeControllerMode::Unknown;
+    if (phase == RuntimePhaseMenu
+        && runtimeUiInputAllowed(menuBits)
+        && showroomActive == 0u)
+    {
+        return RuntimeControllerMode::Ui;
+    }
+    if (cameraActive
+        && runtimeGameplayPhase(phase, menuBits, showroomActive))
+    {
+        return RuntimeControllerMode::Gameplay;
+    }
+    return RuntimeControllerMode::Unknown;
+}
+
+inline const char* runtimeControllerModeName(
+    RuntimeControllerMode mode) noexcept
+{
+    switch (mode)
+    {
+        case RuntimeControllerMode::Unknown: return "unknown";
+        case RuntimeControllerMode::Ui: return "ui";
+        case RuntimeControllerMode::Gameplay: return "gameplay";
+    }
+    return "invalid";
+}
+
 constexpr std::uint32_t PlayerSharedFlagPlayerNodeValid = 1u << 0;
 constexpr std::uint32_t PlayerSharedFlagCameraValid = 1u << 1;
 constexpr std::uint32_t PlayerSharedFlagCellKnown = 1u << 2;
@@ -142,6 +248,7 @@ constexpr std::uint32_t PlayerSharedFlagWeaponClassKnown = 1u << 6;
 constexpr std::uint32_t PlayerSharedWeaponClassReservedIndex = 0;
 constexpr std::uint32_t PlayerSharedEquippedWeaponFormIdReservedIndex = 1;
 constexpr std::uint32_t PlayerSharedEquippedFavoriteSlotReservedIndex = 2;
+constexpr std::uint32_t PlayerSharedFirstPersonWeaponNodeReservedIndex = 3;
 constexpr std::uint32_t PlayerWeaponClassUnknown = 0;
 constexpr std::uint32_t PlayerWeaponClassNone = 1;
 constexpr std::uint32_t PlayerWeaponClassUnarmed = 2;
@@ -323,6 +430,22 @@ inline bool nonzeroSharedCounterAdvanced(LONG current, LONG previous)
     return currentBits != 0u && delta != 0u && delta < 0x80000000u;
 }
 
+// publicationGeneration is stored in a signed LONG64 only because that is
+// the Win32 interlocked storage type. Its identity and ordering are modulo
+// 2^64, with zero reserved as the cold/uninitialized sentinel. In particular,
+// a valid publication must not become stale merely because it crosses the
+// signed high bit or wraps from UINT64_MAX to 1.
+inline bool nonzeroSharedGenerationAdvanced(LONG64 current, LONG64 previous)
+{
+    const std::uint64_t currentBits = static_cast<std::uint64_t>(current);
+    const std::uint64_t previousBits = static_cast<std::uint64_t>(previous);
+    const std::uint64_t delta = currentBits - previousBits;
+    return currentBits != 0u
+        && previousBits != 0u
+        && delta != 0u
+        && delta < (std::uint64_t { 1 } << 63u);
+}
+
 // Forward distance in the publication domain 1..UINT32_MAX. Zero is skipped,
 // so ordinary modulo-2^32 subtraction is one too large across the wrap.
 inline std::uint64_t nonzeroSharedCounterDistance(
@@ -482,6 +605,62 @@ struct SharedCameraState
     float worldPos[3];
 };
 
+// A post-hook, same-process observation record.  `cameraLocal*` is the exact
+// local NiCamera transform read after the rotation-only assist hook returns;
+// it is intentionally not a substitute for a world transform or pixel proof.
+struct SharedDesktopAssistState
+{
+    std::uint32_t magic;
+    std::uint32_t version;
+    volatile LONG sequence;
+    std::uint32_t flags;
+    std::uint64_t frame;
+    std::uint32_t cameraNodeAddress;
+    std::uint32_t poseSequence;
+    std::uint64_t poseProducerEpoch;
+    float playerWorldRot[9];
+    float playerWorldPos[3];
+    float cameraLocalRot[9];
+    float cameraLocalPos[3];
+    float cameraWorldRot[9];
+    float cameraWorldPos[3];
+    // This is PlayerCharacter::GetRootNode(false), not the first-person node.
+    // It is read-only evidence for the head/body acceptance check.
+    std::uint32_t bodyRootAddress;
+    std::uint32_t bodyRootReserved;
+    float bodyRootWorldRot[9];
+    float bodyRootWorldPos[3];
+};
+
+// This header prefixes a fixed-size pixel mapping. Pixels follow immediately
+// after the header in BGRA/XRGB rows. `writing` remains nonzero until the
+// pixels and their exact pose/runtime lineage have been committed together.
+// It deliberately proves only a desktop menu source capture, not a headset
+// quad submission or a binocular world frame.
+struct SharedDesktopAssistUiQuadHeader
+{
+    std::uint32_t magic;
+    std::uint32_t version;
+    std::uint32_t headerBytes;
+    volatile LONG writing;
+    volatile LONG sequence;
+    std::uint32_t flags;
+    LONG width;
+    LONG height;
+    LONG pitchBytes;
+    LONG format;
+    std::uint64_t runtimeStateSample;
+    std::uint64_t poseFrame;
+    LONG poseSequence;
+    std::uint32_t runtimePhase;
+    std::uint32_t runtimeMenuBits;
+    std::uint32_t pixelHash;
+    std::uint32_t captureFailure;
+    std::uint32_t nonBlackSampleCount;
+    std::uint64_t poseProducerEpoch;
+    std::uint64_t captureOrdinal;
+};
+
 struct SharedRuntimeState
 {
     std::uint32_t magic;
@@ -552,6 +731,17 @@ struct SharedD3D9StereoFrameHeader
     // with rendererProducerEpoch, a reader cannot confuse a wrapped 32-bit
     // sequence with the publication it originally inspected.
     volatile LONG64 publicationGeneration;
+    // Full identity of the shared UI/world presentation domain. This remains
+    // distinct from the wrapped renderPairSequence used by older consumers.
+    std::uint64_t transactionId;
+    // Monotonic retail render-frame identity. It is intentionally not the
+    // same field as poseSequence: a menu and a world render may use one pose
+    // snapshot while still requiring distinct transition ordering.
+    std::uint64_t sourceFrame;
+    // Exact runtime-state observation under which the pixels were produced.
+    // This lets a host refuse a menu texture if the retail UI state changed
+    // before the copy reached the compositor.
+    std::uint64_t runtimeStateSample;
 };
 
 struct SharedPlayerState
@@ -617,9 +807,11 @@ static_assert(sizeof(SharedVrPoseState) == 288, "SharedVrPoseState layout change
 static_assert(sizeof(SharedVrOriginState) == 216, "SharedVrOriginState layout changed unexpectedly");
 static_assert(sizeof(SharedCameraState) == 80, "SharedCameraState layout changed");
 static_assert(sizeof(SharedRuntimeState) == 88, "SharedRuntimeState layout changed");
+static_assert(sizeof(SharedDesktopAssistUiQuadHeader) == 96, "SharedDesktopAssistUiQuadHeader layout changed");
 static_assert(sizeof(SharedD3D9FrameHeader) == 28, "SharedD3D9FrameHeader layout changed");
-static_assert(sizeof(SharedD3D9StereoFrameHeader) == 216, "SharedD3D9StereoFrameHeader layout changed");
+static_assert(sizeof(SharedD3D9StereoFrameHeader) == 240, "SharedD3D9StereoFrameHeader layout changed");
 static_assert(sizeof(SharedPlayerState) == 160, "SharedPlayerState layout changed");
+static_assert(sizeof(SharedDesktopAssistState) == 240, "SharedDesktopAssistState layout changed");
 static_assert(sizeof(SharedCommandState) == 216, "SharedCommandState layout changed");
 static_assert(sizeof(SharedInputEvent) == 32, "SharedInputEvent layout changed");
 static_assert(sizeof(SharedInputEventQueue) == 2088, "SharedInputEventQueue layout changed");
@@ -642,6 +834,15 @@ static_assert(offsetof(SharedPlayerState, playerWorldRot) == 40, "SharedPlayerSt
 static_assert(offsetof(SharedPlayerState, playerWorldPos) == 76, "SharedPlayerState playerWorldPos offset changed");
 static_assert(offsetof(SharedPlayerState, cameraWorldRot) == 88, "SharedPlayerState cameraWorldRot offset changed");
 static_assert(offsetof(SharedPlayerState, cameraWorldPos) == 124, "SharedPlayerState cameraWorldPos offset changed");
+static_assert(offsetof(SharedDesktopAssistState, sequence) == 8, "SharedDesktopAssistState sequence offset changed");
+static_assert(offsetof(SharedDesktopAssistState, frame) == 16, "SharedDesktopAssistState frame offset changed");
+static_assert(offsetof(SharedDesktopAssistState, cameraNodeAddress) == 24, "SharedDesktopAssistState camera offset changed");
+static_assert(offsetof(SharedDesktopAssistState, poseSequence) == 28, "SharedDesktopAssistState pose sequence offset changed");
+static_assert(offsetof(SharedDesktopAssistState, poseProducerEpoch) == 32, "SharedDesktopAssistState producer epoch offset changed");
+static_assert(offsetof(SharedDesktopAssistState, cameraLocalRot) == 88, "SharedDesktopAssistState local camera rotation offset changed");
+static_assert(offsetof(SharedDesktopAssistState, bodyRootAddress) == 184, "SharedDesktopAssistState body root offset changed");
+static_assert(offsetof(SharedDesktopAssistState, bodyRootWorldRot) == 192, "SharedDesktopAssistState body rotation offset changed");
+static_assert(offsetof(SharedDesktopAssistState, bodyRootWorldPos) == 228, "SharedDesktopAssistState body position offset changed");
 static_assert(offsetof(SharedCommandState, sequence) == 8, "SharedCommandState sequence offset changed");
 static_assert(offsetof(SharedCommandState, requestId) == 12, "SharedCommandState requestId offset changed");
 static_assert(offsetof(SharedCommandState, requestedFrame) == 32, "SharedCommandState requestedFrame offset changed");
@@ -669,6 +870,11 @@ static_assert(offsetof(SharedVrOriginState, bodyRootAddress) == 152, "SharedVrOr
 static_assert(offsetof(SharedVrOriginState, bodyRootWorldRot) == 160, "SharedVrOriginState body rotation offset changed");
 static_assert(offsetof(SharedVrOriginState, bodyRootWorldPos) == 196, "SharedVrOriginState body position offset changed");
 static_assert(offsetof(SharedVrOriginState, bodyRootWorldScale) == 208, "SharedVrOriginState body scale offset changed");
+static_assert(offsetof(SharedDesktopAssistUiQuadHeader, writing) == 12, "SharedDesktopAssistUiQuadHeader writing offset changed");
+static_assert(offsetof(SharedDesktopAssistUiQuadHeader, sequence) == 16, "SharedDesktopAssistUiQuadHeader sequence offset changed");
+static_assert(offsetof(SharedDesktopAssistUiQuadHeader, runtimeStateSample) == 40, "SharedDesktopAssistUiQuadHeader runtime sample offset changed");
+static_assert(offsetof(SharedDesktopAssistUiQuadHeader, poseProducerEpoch) == 80, "SharedDesktopAssistUiQuadHeader producer epoch offset changed");
+static_assert(offsetof(SharedDesktopAssistUiQuadHeader, captureOrdinal) == 88, "SharedDesktopAssistUiQuadHeader capture ordinal offset changed");
 static_assert(offsetof(SharedD3D9StereoFrameHeader, writing) == 12, "SharedD3D9StereoFrameHeader writing offset changed");
 static_assert(offsetof(SharedD3D9StereoFrameHeader, sequence) == 16, "SharedD3D9StereoFrameHeader sequence offset changed");
 static_assert(offsetof(SharedD3D9StereoFrameHeader, renderedDisplayTime) == 56, "SharedD3D9StereoFrameHeader renderedDisplayTime offset changed");
@@ -682,5 +888,8 @@ static_assert(offsetof(SharedD3D9StereoFrameHeader, producerProcessId) == 192, "
 static_assert(offsetof(SharedD3D9StereoFrameHeader, publishedSlot) == 196, "SharedD3D9StereoFrameHeader published slot offset changed");
 static_assert(offsetof(SharedD3D9StereoFrameHeader, readerSlots) == 200, "SharedD3D9StereoFrameHeader reader slots offset changed");
 static_assert(offsetof(SharedD3D9StereoFrameHeader, publicationGeneration) == 208, "SharedD3D9StereoFrameHeader publication generation offset changed");
-static_assert(sizeof(SharedD3D9StereoFrameHeader) == 216, "SharedD3D9StereoFrameHeader size changed");
+static_assert(offsetof(SharedD3D9StereoFrameHeader, transactionId) == 216, "SharedD3D9StereoFrameHeader transaction offset changed");
+static_assert(offsetof(SharedD3D9StereoFrameHeader, sourceFrame) == 224, "SharedD3D9StereoFrameHeader source-frame offset changed");
+static_assert(offsetof(SharedD3D9StereoFrameHeader, runtimeStateSample) == 232, "SharedD3D9StereoFrameHeader runtime-sample offset changed");
+static_assert(sizeof(SharedD3D9StereoFrameHeader) == 240, "SharedD3D9StereoFrameHeader size changed");
 }

@@ -334,7 +334,8 @@ issueCurrentProcessBoundRetailRuntimeAuthorityForTest(
             creationTime100ns;
         auto& compatibility = decision.revalidation.compatibilityProof;
         compatibility.evidence = {
-            true, true, true, true, true, true, true, true, true, true, true,
+            true, true, true, true, true, true, true, true, true, true,
+            true,
         };
         compatibility.diagnostics.runtimeImageBase = imageBase;
         compatibility.diagnostics.processId = processId;

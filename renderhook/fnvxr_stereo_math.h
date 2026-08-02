@@ -86,8 +86,9 @@ struct EyeMatrices
 
 struct EyeCullFrustum
 {
-    // Eye pose expressed in the same body-local right/up/back frame as the
-    // center camera. Rotation maps eye-local vectors into that body frame.
+    // Culling is performed in the OpenXR body-local right/up/back frame.
+    // This is deliberately distinct from the retail NiCamera storage basis
+    // (forward/up/right) used when the derived camera is written.
     Matrix3 rotation {};
     Vector3 position {};
     float left = 0.0f;
@@ -236,6 +237,16 @@ inline Quaternion relativeOrientation(const Quaternion& origin, const Quaternion
     return multiply(conjugated(normalized(origin)), normalized(current));
 }
 
+// The camera's recenter anchor is a physical headset orientation, not a
+// movement frame.  Keep its full pitch and roll so the next local X-axis
+// motion remains a pitch instead of being measured against a tilted yaw-only
+// frame.  Callers that transform room translation must use
+// gravityAlignedYawOrientation separately.
+inline Quaternion fullHeadOrientationOrigin(const Quaternion& hmd)
+{
+    return normalized(hmd);
+}
+
 inline Matrix3 columnRotationFromQuaternion(const Quaternion& input)
 {
     const Quaternion q = normalized(input);
@@ -280,13 +291,24 @@ inline Matrix3 gamebryoHeadRotation(const Quaternion& relativeXrOrientation)
     return xrRotationToGamebryoColumn(columnRotationFromQuaternion(relativeXrOrientation));
 }
 
-// NiCamera's local frame is already the OpenXR camera convention: +X is
-// right, +Y is up, and -Z is forward.  It is not the Gamebryo actor frame
-// (+X right, +Y forward, +Z up).  Applying the actor-basis permutation to a
-// camera-local delta swaps headset yaw and pitch.
+// The audited retail NiCamera transform stores local columns as
+// forward/up/right, whereas OpenXR local coordinates are right/up/back.  The
+// two bases share their up axis, which is why an unconverted headset yaw can
+// look correct while headset pitch is written as a roll around camera-forward.
+// Convert the rotation operator by the proper basis change P R P^T.  For an
+// OpenXR quaternion (x, y, z, w), the equivalent retail-camera quaternion is
+// (-z, y, x, w): headset +X/right becomes NiCamera +Z/right.
+inline Quaternion xrOrientationToNiCameraLocal(
+    const Quaternion& relativeXrOrientation)
+{
+    const Quaternion xr = normalized(relativeXrOrientation);
+    return normalized({ -xr.z, xr.y, xr.x, xr.w });
+}
+
 inline Matrix3 cameraLocalHeadRotation(const Quaternion& relativeXrOrientation)
 {
-    return columnRotationFromQuaternion(relativeXrOrientation);
+    return columnRotationFromQuaternion(
+        xrOrientationToNiCameraLocal(relativeXrOrientation));
 }
 
 inline Matrix3 multiply(const Matrix3& lhs, const Matrix3& rhs)
@@ -321,46 +343,47 @@ inline Vector3 transform(const Matrix3& matrix, const Vector3& value)
     };
 }
 
-// Preserve the retail NiCamera column layout (right, up, back) while removing
-// engine-authored pitch/roll from the body frame.  A generic Z-up yaw matrix
-// has columns (right, forward, up); feeding that to NiCamera puts world-up in
-// its back/right pipeline and turns the rendered scene sideways.
+// Preserve the retail NiCamera column layout (forward, up, right) while
+// removing engine-authored pitch/roll from the body frame. A generic Z-up yaw
+// matrix has a different local-column convention, so construct the level
+// forward/up/right basis explicitly.
 inline Matrix3 gravityLevelCameraWorldRotation(const Matrix3& cameraWorld)
 {
-    float rightX = cameraWorld.m[0][0];
-    float rightY = cameraWorld.m[1][0];
-    float horizontalLength = std::sqrt(rightX * rightX + rightY * rightY);
+    float forwardX = cameraWorld.m[0][0];
+    float forwardY = cameraWorld.m[1][0];
+    float horizontalLength = std::sqrt(
+        forwardX * forwardX + forwardY * forwardY);
     if (!std::isfinite(horizontalLength) || horizontalLength < 0.000001f)
     {
-        // A valid camera normally has a horizontal right column.  If it does
-        // not, recover it from the projected +Z/back column without changing
-        // the handedness: right x up = back.
-        float backX = cameraWorld.m[0][2];
-        float backY = cameraWorld.m[1][2];
-        horizontalLength = std::sqrt(backX * backX + backY * backY);
+        // A valid camera normally has a horizontal forward column. If it
+        // does not, recover it from the projected +Z/right column while
+        // preserving the handedness: forward x up = right.
+        float rightX = cameraWorld.m[0][2];
+        float rightY = cameraWorld.m[1][2];
+        horizontalLength = std::sqrt(rightX * rightX + rightY * rightY);
         if (!std::isfinite(horizontalLength) || horizontalLength < 0.000001f)
             return cameraWorld;
-        backX /= horizontalLength;
-        backY /= horizontalLength;
-        rightX = -backY;
-        rightY = backX;
+        rightX /= horizontalLength;
+        rightY /= horizontalLength;
+        forwardX = -rightY;
+        forwardY = rightX;
     }
     else
     {
-        rightX /= horizontalLength;
-        rightY /= horizontalLength;
+        forwardX /= horizontalLength;
+        forwardY /= horizontalLength;
     }
 
     Matrix3 result {};
-    // Column 0: camera right. Column 1: camera up. Column 2: camera back.
-    result.m[0][0] = rightX;
-    result.m[1][0] = rightY;
+    // Column 0: camera forward. Column 1: camera up. Column 2: camera right.
+    result.m[0][0] = forwardX;
+    result.m[1][0] = forwardY;
     result.m[2][0] = 0.0f;
     result.m[0][1] = 0.0f;
     result.m[1][1] = 0.0f;
     result.m[2][1] = 1.0f;
-    result.m[0][2] = rightY;
-    result.m[1][2] = -rightX;
+    result.m[0][2] = forwardY;
+    result.m[1][2] = -forwardX;
     result.m[2][2] = 0.0f;
     return result;
 }
@@ -462,14 +485,12 @@ inline Vector3 xrVectorToGamebryo(const Vector3& xr)
     return { xr.x, -xr.z, xr.y };
 }
 
-// NiCamera local axes already match OpenXR pose axes:
-//   +X right, +Y up, +Z back (-Z forward).
-// Do not apply the actor-basis permutation (right, forward, up) before a
-// vector is multiplied by a NiCamera right/up/back world rotation. Doing so
-// turns physical forward motion into camera-up and height into camera-back.
+// OpenXR local coordinates are right/up/back. Retail NiCamera local
+// coordinates are forward/up/right. This is the vector form of the same
+// basis conversion used by cameraLocalHeadRotation above.
 inline Vector3 xrVectorToNiCameraLocal(const Vector3& xr)
 {
-    return xr;
+    return { -xr.z, xr.y, xr.x };
 }
 
 // Bound both displaced, possibly canted OpenXR eye frusta with one center

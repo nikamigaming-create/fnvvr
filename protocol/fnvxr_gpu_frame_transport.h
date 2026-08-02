@@ -11,6 +11,9 @@
 
 namespace fnvxr::gpu
 {
+// ABI v4 is retained for compatibility/research tests. Product transport v1
+// uses the separate color_v5 ABI and must not combine its metadata with this
+// color-plus-encoded-depth descriptor.
 inline constexpr std::uint32_t SharedStereoFrameMagic = 0x47585646u; // FNVG
 inline constexpr std::uint32_t SharedStereoFrameVersion = 4;
 inline constexpr char SharedStereoFrameMappingName[] =

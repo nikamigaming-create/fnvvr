@@ -185,6 +185,7 @@ CenterRendererOperations operations(FakeContext& context)
         snapshot,
         collect,
         bind,
+        bind,
         setCamera,
         addVisible,
         render,
@@ -284,7 +285,7 @@ int main()
     };
     require(
         successContext.calls == expected,
-        "target binding must precede AddVisibleArray for both ordered eyes");
+        "each eye must render immediately after its own population");
 
     FakeContext failureContext;
     failureContext.failRightRender = true;

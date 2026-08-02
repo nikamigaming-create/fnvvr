@@ -3,6 +3,7 @@
 #include <windows.h>
 
 #include "fnvxr_shared_state.h"
+#include "fnvxr_stereo_visual_trial_automation_authority.h"
 
 #include <cctype>
 #include <cstdint>
@@ -81,6 +82,7 @@ void usage()
         << "  fnvxr_command save [saveName] [--wait-ms N]\n"
         << "  fnvxr_command quit [--wait-ms N]\n"
         << "  fnvxr_command console <line> [--wait-ms N]\n"
+        << "  fnvxr_command fresh-character [--wait-ms N]\n"
         << "  fnvxr_command save-and-quit [saveName] [--wait-ms N] [--delay-ms N]\n";
 }
 
@@ -356,6 +358,19 @@ int main(int argc, char** argv)
         if (payload.empty())
             return fail("missing console line");
         return sendAndMaybeWait(mapping, fnvxr::shared::CommandTypeConsole, payload, waitMs);
+    }
+
+    if (verb == "fresh-character")
+    {
+        if (!payload.empty())
+            return fail("fresh-character does not accept a caller-supplied command or name");
+        return sendAndMaybeWait(
+            mapping,
+            fnvxr::shared::CommandTypeConsole,
+            std::string(
+                fnvxr::engine::stereo_visual_trial_automation::
+                    FreshCharacterStartCommand),
+            waitMs);
     }
 
     if (verb == "save-and-quit")

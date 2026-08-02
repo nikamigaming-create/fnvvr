@@ -36,6 +36,20 @@ struct CenterRendererLifecycleTestAuthority final
 };
 }
 
+namespace fnvxr::engine::geometry
+{
+template <std::size_t Capacity>
+struct PrivateGeometryCollectorBindingTestAuthority
+{
+    static void setOriginalAppendOverride(
+        PrivateGeometryCollectorBinding<Capacity>& binding,
+        std::uintptr_t address) noexcept
+    {
+        binding.mStorage.originalAppendOverrideForTest = address;
+    }
+};
+}
+
 namespace
 {
 using namespace fnvxr::engine;
@@ -72,31 +86,99 @@ enum class Event : std::uint8_t
     Snapshot,
     BindLeft,
     AddLeft,
+    FinishLeft,
     RenderLeft,
     FinalizeLeft,
     EndLeft,
     BindRight,
     AddRight,
+    FinishRight,
     RenderRight,
     FinalizeRight,
     EndRight,
     Restore,
 };
 
+struct QueueGeometryFixture
+{
+    std::array<std::uint8_t, 0xA0u> geometry {};
+    std::array<std::uint8_t, 0x1Au> property {};
+
+    void initialize() noexcept
+    {
+#if defined(_MSC_VER) && defined(_M_IX86)
+        const abi::RetailPointer32 propertyAddress =
+            static_cast<abi::RetailPointer32>(
+                reinterpret_cast<std::uintptr_t>(property.data()));
+        const std::uint16_t propertyFlags = 0x0001u;
+        std::memcpy(
+            geometry.data() + 0x9Cu,
+            &propertyAddress,
+            sizeof(propertyAddress));
+        std::memcpy(
+            property.data() + 0x18u,
+            &propertyFlags,
+            sizeof(propertyFlags));
+#endif
+    }
+};
+
 struct FakeState
 {
     std::vector<Event> events {};
+    Binding* binding = nullptr;
     abi::RetailBSShaderAccumulatorLayout* left = nullptr;
     abi::RetailBSShaderAccumulatorLayout* right = nullptr;
     int accumulatorConstructionCount = 0;
-    int geometry[3] { 1, 2, 3 };
+    QueueGeometryFixture geometry[3] {};
+    abi::RetailPointer32 stockGeometryPointers[3] {};
+    abi::RetailNiVisibleArrayLayout stockVisibleArray {};
     std::uint32_t addCount = 0u;
-    abi::RetailPointer32 visiblePointers[2] {};
+    std::uint32_t stockAppendCount = 0u;
     abi::RetailNiCameraLayout* cullCamera = nullptr;
     abi::RetailNiCameraLayout* eyeCameras[2] {};
+    abi::RetailRendererAccumulatorOwnerLayout renderer {};
+    abi::RetailBSShaderAccumulatorLayout stockAccumulator {};
+    abi::RetailPointer32 rendererSingleton = 0u;
+    abi::RetailPointer32 accumulatingAccumulator = 0u;
+    abi::RetailPointer32 renderingAccumulator = 0u;
+    abi::RetailPointer32 populationRenderingAccumulator = 0u;
+    abi::RetailPointer32 stockCullerVtable = 0u;
 };
 
 FakeState* gState = nullptr;
+
+abi::RetailPointer32 accumulatorAddress(
+    abi::RetailBSShaderAccumulatorLayout* accumulator)
+{
+    return static_cast<abi::RetailPointer32>(
+        reinterpret_cast<std::uintptr_t>(accumulator));
+}
+
+void replaceAccumulatorOwner(
+    abi::RetailPointer32& owner,
+    abi::RetailBSShaderAccumulatorLayout* accumulator)
+{
+    const abi::RetailPointer32 replacement = accumulatorAddress(accumulator);
+    if (owner == replacement)
+        return;
+#if defined(_MSC_VER) && defined(_M_IX86)
+    if (owner != 0u)
+    {
+        auto* previous = reinterpret_cast<
+            abi::RetailBSShaderAccumulatorLayout*>(
+                static_cast<std::uintptr_t>(owner));
+        require(previous->referenceCount > 0u,
+            "an accumulator owner released an unowned reference");
+        --previous->referenceCount;
+    }
+#endif
+    owner = replacement;
+#if defined(_MSC_VER) && defined(_M_IX86)
+    if (accumulator)
+        ++accumulator->referenceCount;
+#endif
+}
 
 void* FNVXR_TEST_CDECL fakeAllocate(std::uint32_t byteCount)
 {
@@ -148,8 +230,13 @@ abi::RetailBSCullingProcessLayout* FNVXR_TEST_THISCALL_IMPL fakeCullerConstruct(
     require(
         argument == RetailWorldCullerConstructorArgument,
         "runtime changed the culler constructor argument");
+#if defined(_MSC_VER) && defined(_M_IX86)
+    storage->base.vtable = gState->stockCullerVtable;
+#else
     storage->base.vtable = static_cast<abi::RetailPointer32>(
         abi::BSCullingProcessVtableAddress);
+#endif
+    storage->base.useAppendFunction = 0u;
     return storage;
 }
 
@@ -158,8 +245,60 @@ void FNVXR_TEST_THISCALL_IMPL fakeCullerDestroy(
     FNVXR_TEST_TRAILING_EDX)
 {
     require(
-        culler && culler->base.vtable == abi::BSCullingProcessVtableAddress,
+        culler && culler->base.vtable == gState->stockCullerVtable,
         "runtime did not restore the stock culler vtable before teardown");
+    if (culler->shaderAccumulator != 0u)
+    {
+        auto* accumulator = reinterpret_cast<
+            abi::RetailBSShaderAccumulatorLayout*>(
+                static_cast<std::uintptr_t>(culler->shaderAccumulator));
+        require(
+            accumulator->referenceCount > 0u,
+            "culler teardown released an unowned accumulator");
+        --accumulator->referenceCount;
+        culler->shaderAccumulator = 0u;
+    }
+}
+
+void FNVXR_TEST_THISCALL_IMPL fakeSetCullerAccumulator(
+    abi::RetailBSCullingProcessLayout* culler,
+    FNVXR_TEST_EDX_ARGUMENT
+    abi::RetailBSShaderAccumulatorLayout* accumulator)
+{
+    if (culler->shaderAccumulator != 0u)
+    {
+        auto* previous = reinterpret_cast<
+            abi::RetailBSShaderAccumulatorLayout*>(
+                static_cast<std::uintptr_t>(
+                    culler->shaderAccumulator));
+        require(previous->referenceCount > 0u,
+            "the runtime culler released an unowned accumulator");
+        --previous->referenceCount;
+    }
+    culler->shaderAccumulator = static_cast<abi::RetailPointer32>(
+        reinterpret_cast<std::uintptr_t>(accumulator));
+    if (accumulator)
+        ++accumulator->referenceCount;
+}
+
+void FNVXR_TEST_THISCALL_IMPL fakeRendererSetAccumulator(
+    abi::RetailRendererAccumulatorOwnerLayout* renderer,
+    FNVXR_TEST_EDX_ARGUMENT
+    abi::RetailBSShaderAccumulatorLayout* accumulator)
+{
+    replaceAccumulatorOwner(renderer->accumulator, accumulator);
+}
+
+void FNVXR_TEST_CDECL fakeSetAccumulatingAccumulator(
+    abi::RetailBSShaderAccumulatorLayout* accumulator)
+{
+    replaceAccumulatorOwner(gState->accumulatingAccumulator, accumulator);
+}
+
+void FNVXR_TEST_CDECL fakeSetRenderingAccumulator(
+    abi::RetailBSShaderAccumulatorLayout* accumulator)
+{
+    replaceAccumulatorOwner(gState->renderingAccumulator, accumulator);
 }
 
 abi::RetailBSShaderAccumulatorLayout* FNVXR_TEST_THISCALL_IMPL
@@ -181,6 +320,8 @@ fakeAccumulatorConstruct(
         gState->right = storage;
     storage->vtable = static_cast<abi::RetailPointer32>(
         abi::BSShaderAccumulatorVtableAddress);
+    storage->referenceCount = 0u;
+    storage->renderMode = 0u;
     return storage;
 }
 
@@ -191,6 +332,9 @@ fakeAccumulatorDestroy(
     std::uint32_t flags)
 {
     require(flags == 1u, "runtime changed scalar deleting-destructor flags");
+    require(
+        accumulator->referenceCount == 0u,
+        "runtime did not consume its accumulator ownership reference before destruction");
     ::operator delete(accumulator);
     return accumulator;
 }
@@ -219,35 +363,31 @@ void FNVXR_TEST_THISCALL_IMPL fakeProcessAlt(
     FNVXR_TEST_EDX_ARGUMENT
     abi::RetailNiCameraLayout* camera,
     void*,
-    abi::RetailNiVisibleArrayLayout*)
-{
-    gState->events.push_back(Event::Cull);
-    gState->cullCamera = camera;
-#if defined(_MSC_VER) && defined(_M_IX86)
-    auto* vtable = reinterpret_cast<abi::RetailPointer32*>(
-        static_cast<std::uintptr_t>(culler->base.vtable));
-    const auto callback = reinterpret_cast<
-        geometry::PrivateGeometryCollectorVslotCallbackFunction<Capacity>>(
-            static_cast<std::uintptr_t>(
-                vtable[Binding::AppendVtableEntryIndex]));
-    callback(culler, nullptr, &gState->geometry[0]);
-    callback(culler, nullptr, &gState->geometry[1]);
-    callback(culler, nullptr, &gState->geometry[2]);
-#else
-    (void)culler;
-#endif
-}
-
-void FNVXR_TEST_THISCALL_IMPL fakeAddVisible(
-    abi::RetailNiAccumulatorLayout* accumulator,
-    FNVXR_TEST_EDX_ARGUMENT
     abi::RetailNiVisibleArrayLayout* visible)
 {
-    const bool left = reinterpret_cast<abi::RetailBSShaderAccumulatorLayout*>(
-        accumulator) == gState->left;
-    gState->events.push_back(left ? Event::AddLeft : Event::AddRight);
-    require(gState->addCount < 2u, "visible set added more than twice");
-    gState->visiblePointers[gState->addCount++] = visible->geometryPointers;
+    static_cast<void>(culler);
+    static_cast<void>(camera);
+    static_cast<void>(visible);
+    require(false, "post-stock runtime work must not replay ProcessAlt");
+}
+
+#if defined(_MSC_VER) && defined(_M_IX86)
+void __fastcall fakeOriginalAppend(
+    abi::RetailBSCullingProcessLayout* culler,
+    void*,
+    void*)
+{
+    require(culler != nullptr, "the stock append wrapper lost its culler");
+    ++gState->stockAppendCount;
+}
+#endif
+
+void FNVXR_TEST_THISCALL_IMPL fakeAddVisible(
+    abi::RetailNiAccumulatorLayout*,
+    FNVXR_TEST_EDX_ARGUMENT
+    abi::RetailNiVisibleArrayLayout*)
+{
+    require(false, "runtime must not replay AddVisibleArray for private eyes");
 }
 
 void FNVXR_TEST_CDECL fakeRender(
@@ -256,11 +396,29 @@ void FNVXR_TEST_CDECL fakeRender(
     std::uint32_t context)
 {
     require(context == RetailWorldRenderContext, "wrong render context");
+    fakeSetRenderingAccumulator(accumulator);
     const bool left = accumulator == gState->left;
     require(
         camera == gState->eyeCameras[left ? 0 : 1],
         "render did not receive the accumulator's exact eye camera");
     gState->events.push_back(left ? Event::RenderLeft : Event::RenderRight);
+}
+
+void FNVXR_TEST_THISCALL_IMPL fakeFinishAccumulating(
+    abi::RetailNiAccumulatorLayout* base
+    FNVXR_TEST_TRAILING_EDX)
+{
+    auto* accumulator =
+        reinterpret_cast<abi::RetailBSShaderAccumulatorLayout*>(base);
+    const bool left = accumulator == gState->left;
+    const abi::RetailPointer32 expected = accumulatorAddress(accumulator);
+    require(gState->renderer.accumulator == expected
+            && gState->accumulatingAccumulator == expected
+            && gState->renderingAccumulator
+                == gState->populationRenderingAccumulator,
+        "runtime changed accumulator ownership before finish-accumulating");
+    gState->events.push_back(
+        left ? Event::FinishLeft : Event::FinishRight);
 }
 
 void FNVXR_TEST_CDECL fakeFinalize(
@@ -282,6 +440,40 @@ Target engineFunction(Source source) noexcept
     return reinterpret_cast<Target>(source);
 }
 
+void FNVXR_TEST_CDECL fakeAccumulateScene(
+    abi::RetailNiCameraLayout* camera,
+    void* scene,
+    abi::RetailBSCullingProcessLayout* culler)
+{
+    require(
+        camera && scene && culler
+            && culler == gState->binding->cullingProcess()
+            && culler->base.vtable == gState->stockCullerVtable,
+        "runtime did not use its constructor-owned culler for eye accumulation");
+    auto* accumulator = reinterpret_cast<
+        abi::RetailBSShaderAccumulatorLayout*>(
+            static_cast<std::uintptr_t>(culler->shaderAccumulator));
+    require(
+        accumulator
+            && camera
+                == gState->eyeCameras[
+                    accumulator == gState->left ? 0 : 1]
+            && accumulator->shadowScene
+                == gState->stockAccumulator.shadowScene,
+        "runtime did not inherit the exact stock frame state");
+    culler->base.camera = static_cast<abi::RetailPointer32>(
+        reinterpret_cast<std::uintptr_t>(camera));
+    replaceAccumulatorOwner(gState->renderer.accumulator, accumulator);
+    fakeSetAccumulatingAccumulator(accumulator);
+    require(
+        gState->renderingAccumulator
+            == gState->populationRenderingAccumulator,
+        "private accumulation changed the prepared stock rendering lane");
+    gState->events.push_back(
+        accumulator == gState->left ? Event::AddLeft : Event::AddRight);
+    ++gState->addCount;
+}
+
 RetailEngineCallResolution fakeResolution()
 {
     RetailEngineCalls calls {};
@@ -292,6 +484,9 @@ RetailEngineCallResolution fakeResolution()
         abi::BSCullingProcessConstructorFunction>(&fakeCullerConstruct);
     calls.cullingProcessDestroy = engineFunction<
         abi::BSCullingProcessDestructorBodyFunction>(&fakeCullerDestroy);
+    calls.cullingProcessSetAccumulator = engineFunction<
+        abi::CullingProcessSetAccumulatorFunction>(
+            &fakeSetCullerAccumulator);
     calls.shaderAccumulatorConstruct = engineFunction<
         abi::BSShaderAccumulatorConstructorFunction>(
             &fakeAccumulatorConstruct);
@@ -304,10 +499,22 @@ RetailEngineCallResolution fakeResolution()
         abi::AccumulatorSetCameraFunction>(&fakeSetCamera);
     calls.cullingProcessAlt = engineFunction<abi::CullingProcessAltFunction>(
         &fakeProcessAlt);
+    calls.accumulateScene = engineFunction<abi::AccumulateSceneFunction>(
+        &fakeAccumulateScene);
     calls.accumulatorAddVisibleArray = engineFunction<
         abi::AccumulatorAddVisibleArrayFunction>(&fakeAddVisible);
+    calls.accumulatorFinishAccumulating = engineFunction<
+        abi::AccumulatorFinishAccumulatingFunction>(
+            &fakeFinishAccumulating);
+    calls.rendererSetAccumulator = engineFunction<
+        abi::RendererSetAccumulatorFunction>(&fakeRendererSetAccumulator);
+    calls.setAccumulatingAccumulator = &fakeSetAccumulatingAccumulator;
+    calls.setRenderingAccumulator = &fakeSetRenderingAccumulator;
     calls.renderAccumulatorWithoutFinalize = &fakeRender;
     calls.finalizeAccumulator = &fakeFinalize;
+    calls.rendererSingleton = &gState->rendererSingleton;
+    calls.accumulatingAccumulator = &gState->accumulatingAccumulator;
+    calls.renderingAccumulator = &gState->renderingAccumulator;
     return { calls, RetailEngineCallResolutionFailure::None };
 }
 
@@ -406,7 +613,25 @@ int main()
     using namespace fnvxr::engine;
     FakeState state;
     gState = &state;
+    state.stockAccumulator.referenceCount = 4u;
+    state.stockAccumulator.shadowScene = 0x00ABC000u;
+    state.rendererSingleton = static_cast<abi::RetailPointer32>(
+        reinterpret_cast<std::uintptr_t>(&state.renderer));
+    const abi::RetailPointer32 stockAccumulatorAddress =
+        static_cast<abi::RetailPointer32>(
+            reinterpret_cast<std::uintptr_t>(&state.stockAccumulator));
+    state.renderer.accumulator = stockAccumulatorAddress;
+    state.accumulatingAccumulator = stockAccumulatorAddress;
+    state.renderingAccumulator = stockAccumulatorAddress;
+    state.populationRenderingAccumulator = stockAccumulatorAddress;
     auto vtable = stockVtable();
+#if defined(_MSC_VER) && defined(_M_IX86)
+    state.stockCullerVtable = static_cast<abi::RetailPointer32>(
+        reinterpret_cast<std::uintptr_t>(vtable.data()));
+#else
+    state.stockCullerVtable = static_cast<abi::RetailPointer32>(
+        abi::BSCullingProcessVtableAddress);
+#endif
     const RetailEngineCallResolution resolution = fakeResolution();
     const bool admitted = true;
     RetailEyeTargetOperations targets {
@@ -416,6 +641,7 @@ int main()
         &end,
         &rollback,
         &restore,
+        &bind,
     };
 
     RetailCenterStereoRuntime<Capacity> runtime;
@@ -429,6 +655,16 @@ int main()
             targets),
         "complete private resources and eye targets did not initialize");
     require(runtime.ready(), "initialized center runtime is not ready");
+    state.binding = runtime.resources().collectorBinding();
+#if defined(_MSC_VER) && defined(_M_IX86)
+    geometry::PrivateGeometryCollectorBindingTestAuthority<Capacity>
+        ::setOriginalAppendOverride(
+            *state.binding,
+            reinterpret_cast<std::uintptr_t>(&fakeOriginalAppend));
+#endif
+    require(
+        runtime.eyeCameraFailure() == RetailEyeCameraFailure::None,
+        "successful eye-camera initialization must clear diagnostic failure state");
 
     int sceneObject = 0;
     abi::RetailNiCameraLayout stockCamera {};
@@ -458,27 +694,58 @@ int main()
     abi::RetailSceneGraphLayout sceneGraph {};
     sceneGraph.camera = static_cast<abi::RetailPointer32>(
         reinterpret_cast<std::uintptr_t>(&stockCamera));
-    sceneGraph.isMenuSceneGraph = 1u;
+    sceneGraph.opaqueUnknownB8 = 0xDEADBEEFu;
+    RetailTrackedFrame uiTracked = trackedFrame(9u, 1);
+    uiTracked.runtime.phase = fnvxr::shared::RuntimePhaseMenu;
     const RetailCenterRuntimeFrame uiFrame {
         &sceneObject,
         &sceneGraph,
         &stockCamera,
-        {},
-        0.0f,
+        uiTracked,
+        70.0f,
         1u,
     };
     const RetailCenterRuntimeFrameResult ui = runtime.renderWorld(
         CenterRendererLifecycleTestAuthority::issue(admitted),
         uiFrame);
     require(
-        ui.disposition == RetailWorldHookDisposition::CallOriginalForUi
-            && ui.failure == RetailCenterRuntimeFailure::None
+        ui.disposition == RetailWorldHookDisposition::RejectGameplayFrame
+#if defined(_MSC_VER) && defined(_M_IX86)
+            && ui.failure == RetailCenterRuntimeFailure::TrackedFrameRejected
+#else
+            // The x64 structural test intentionally cannot truncate an
+            // arbitrary host pointer into the retail 32-bit camera field.
+            // The Win32 branch below proves the tracked-UI rejection.
+            && ui.failure == RetailCenterRuntimeFailure::CameraPointerMismatch
+#endif
             && state.events.empty(),
-        "menu scene must call the original without touching stereo resources");
+        "world-only runtime must reject confirmed UI without interpreting the opaque SceneGraph field");
 
 #if defined(_MSC_VER) && defined(_M_IX86)
-    sceneGraph.isMenuSceneGraph = 0u;
+    abi::RetailBSCullingProcessLayout stockCuller {};
+    stockCuller.base.vtable = state.stockCullerVtable;
+    stockCuller.base.useAppendFunction = 0u;
+    for (std::size_t index = 0u; index < 3u; ++index)
+    {
+        state.geometry[index].initialize();
+        state.stockGeometryPointers[index] = static_cast<abi::RetailPointer32>(
+            reinterpret_cast<std::uintptr_t>(
+                state.geometry[index].geometry.data()));
+    }
+    state.stockVisibleArray = {
+        static_cast<abi::RetailPointer32>(
+            reinterpret_cast<std::uintptr_t>(state.stockGeometryPointers)),
+        3u,
+        3u,
+        0u,
+    };
+    stockCuller.base.visibleArray = static_cast<abi::RetailPointer32>(
+        reinterpret_cast<std::uintptr_t>(&state.stockVisibleArray));
+    fakeSetCullerAccumulator(&stockCuller, nullptr, &state.stockAccumulator);
+    sceneGraph.cullingProcess = static_cast<abi::RetailPointer32>(
+        reinterpret_cast<std::uintptr_t>(&stockCuller));
     const abi::RetailNiCameraLayout stockBefore = stockCamera;
+    const abi::RetailBSCullingProcessLayout stockCullerBefore = stockCuller;
     const RetailCenterRuntimeFrame gameplay {
         &sceneObject,
         &sceneGraph,
@@ -486,7 +753,26 @@ int main()
         trackedFrame(10u, 2),
         70.0f,
         2u,
+        &stockCuller,
     };
+    require(
+        runtime.beginStockCullerCapture(&stockCuller),
+        "runtime did not install its temporary live stock-culler dispatch");
+    state.events.push_back(Event::Cull);
+    const auto* captureVtable = reinterpret_cast<const abi::RetailPointer32*>(
+        static_cast<std::uintptr_t>(stockCuller.base.vtable));
+    const auto captureAppend = reinterpret_cast<
+        geometry::PrivateGeometryCollectorVslotCallbackFunction<Capacity>>(
+            static_cast<std::uintptr_t>(
+                captureVtable[Binding::AppendVtableEntryIndex]));
+    for (QueueGeometryFixture& geometry : state.geometry)
+        captureAppend(&stockCuller, nullptr, geometry.geometry.data());
+    const bool captureFinished = runtime.finishStockCullerCapture(&stockCuller);
+    require(
+        captureFinished
+            && stockCuller.base.vtable == state.stockCullerVtable
+            && state.stockAppendCount == 3u,
+        "runtime did not restore the stock culler and forward each Append call");
     const RetailCenterRuntimeFrameResult stereo = runtime.renderWorld(
         CenterRendererLifecycleTestAuthority::issue(admitted),
         gameplay);
@@ -496,9 +782,12 @@ int main()
             && stereo.renderer.complete
             && stereo.renderer.visibleGeometryCount == 3u,
         "gameplay did not complete one cull and two engine renders");
+    require(
+        runtime.eyeCameraDiagnostics().complete(),
+        "runtime did not retain matching per-eye renderer/culler cameras");
     const std::vector<Event> expected {
-        Event::Snapshot,
         Event::Cull,
+        Event::Snapshot,
         Event::BindLeft,
         Event::AddLeft,
         Event::RenderLeft,
@@ -511,25 +800,34 @@ int main()
         Event::EndRight,
         Event::Restore,
     };
-    require(state.events == expected, "runtime changed collect/left/right order");
+    require(state.events == expected,
+        "runtime did not render each eye from its own population");
     require(
-        state.visiblePointers[0] != 0u
-            && state.visiblePointers[0] == state.visiblePointers[1],
-        "left and right did not consume the identical visible set");
+        state.addCount == 2u,
+        "left and right did not each execute one stock accumulation");
     require(
-        state.cullCamera
-            && state.eyeCameras[0]
+        state.eyeCameras[0]
             && state.eyeCameras[1]
-            && state.cullCamera != state.eyeCameras[0]
-            && state.cullCamera != state.eyeCameras[1]
             && state.eyeCameras[0] != state.eyeCameras[1]
-            && state.cullCamera != &stockCamera
             && state.eyeCameras[0] != &stockCamera
             && state.eyeCameras[1] != &stockCamera,
-        "runtime did not use three distinct private cameras");
+        "runtime did not use distinct private eye cameras");
     require(
         std::memcmp(&stockCamera, &stockBefore, sizeof(stockCamera)) == 0,
         "runtime camera transaction mutated the stock camera");
+    require(
+        std::memcmp(
+            &stockCuller,
+            &stockCullerBefore,
+            sizeof(stockCuller)) == 0,
+        "runtime did not restore the prepared stock culler after collection");
+    require(
+        state.stockAccumulator.referenceCount == 5u,
+        "runtime did not restore the stock culler accumulator ownership reference");
+    require(state.renderer.accumulator == stockAccumulatorAddress
+            && state.accumulatingAccumulator == stockAccumulatorAddress
+            && state.renderingAccumulator == stockAccumulatorAddress,
+        "runtime did not restore the stock renderer accumulator state");
 
     const RetailCenterRuntimeFrameResult stale = runtime.renderWorld(
         CenterRendererLifecycleTestAuthority::issue(admitted),
