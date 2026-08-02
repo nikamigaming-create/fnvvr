@@ -9,7 +9,7 @@
 
 namespace fnvxr::engine
 {
-// A deliberately narrow writer contract for the six audited accumulation and
+// A deliberately narrow writer contract for the seven audited accumulation and
 // render-phase E8 calls in RenderWorldSceneGraph. It has no allocation or
 // arbitrary-memory operation: the Win32 implementation accepts only one of
 // those five-byte instructions.
@@ -113,6 +113,7 @@ RetailWorldAccumulationHookInstallResult installRetailWorldAccumulationHook(
     const RetailWorldHookAuthorization&,
     const RetailWorldAccumulationHookMemoryOperations&,
     std::uint32_t,
+    std::uintptr_t,
     std::uintptr_t,
     std::uintptr_t,
     std::uintptr_t) noexcept;
@@ -518,6 +519,7 @@ private:
         std::uint32_t,
         std::uintptr_t,
         std::uintptr_t,
+        std::uintptr_t,
         std::uintptr_t) noexcept;
 };
 
@@ -560,6 +562,7 @@ private:
         const RetailWorldHookAuthorization&,
         const RetailWorldAccumulationHookMemoryOperations&,
         std::uint32_t,
+        std::uintptr_t,
         std::uintptr_t,
         std::uintptr_t,
         std::uintptr_t) noexcept;
@@ -611,6 +614,7 @@ installRetailWorldAccumulationHook(
     std::uint32_t runtimeWorldAddress,
     std::uintptr_t accumulationAdapterAddress,
     std::uintptr_t renderWithoutFinalizeAdapterAddress,
+    std::uintptr_t finalizeAdapterAddress,
     std::uintptr_t renderAndFinalizeAdapterAddress) noexcept
 {
     using Failure = RetailWorldAccumulationHookInstallFailure;
@@ -634,6 +638,8 @@ installRetailWorldAccumulationHook(
         || accumulationAdapterAddress > 0xFFFFFFFFu
         || renderWithoutFinalizeAdapterAddress == 0u
         || renderWithoutFinalizeAdapterAddress > 0xFFFFFFFFu
+        || finalizeAdapterAddress == 0u
+        || finalizeAdapterAddress > 0xFFFFFFFFu
         || renderAndFinalizeAdapterAddress == 0u
         || renderAndFinalizeAdapterAddress > 0xFFFFFFFFu)
     {
@@ -693,6 +699,9 @@ installRetailWorldAccumulationHook(
         case RetailWorldAccumulationCallSiteContract::RelayKind::
             RenderWithoutFinalize:
             adapterAddress = renderWithoutFinalizeAdapterAddress;
+            break;
+        case RetailWorldAccumulationCallSiteContract::RelayKind::FinalizeOnly:
+            adapterAddress = finalizeAdapterAddress;
             break;
         case RetailWorldAccumulationCallSiteContract::RelayKind::
             RenderAndFinalize:

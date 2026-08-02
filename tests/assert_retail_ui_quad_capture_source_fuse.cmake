@@ -187,8 +187,12 @@ math(EXPR world_publish_length "${world_publish_end} - ${world_publish_start}")
 string(SUBSTRING "${bridge_text}" ${world_publish_start} ${world_publish_length} world_publish_body)
 require_text(
     "${world_publish_body}"
-    "identity.transactionId = transactionId;"
-    "GPU world publication must preserve the identity claimed before eye rendering")
+    "pending.transactionId = transactionId;"
+    "GPU world staging must preserve the identity claimed before the later first-person pass")
+require_text(
+    "${bridge_text}"
+    "identity.transactionId = pending.transactionId;"
+    "Deferred GPU world publication must release the original claimed identity after first-person rendering")
 string(FIND "${world_publish_body}" "mPublicationSequence.claim(" world_publish_reclaim)
 if(NOT world_publish_reclaim EQUAL -1)
     message(FATAL_ERROR

@@ -248,6 +248,7 @@ constexpr std::uint32_t PlayerSharedFlagWeaponClassKnown = 1u << 6;
 constexpr std::uint32_t PlayerSharedWeaponClassReservedIndex = 0;
 constexpr std::uint32_t PlayerSharedEquippedWeaponFormIdReservedIndex = 1;
 constexpr std::uint32_t PlayerSharedEquippedFavoriteSlotReservedIndex = 2;
+constexpr std::uint32_t PlayerSharedFirstPersonWeaponNodeReservedIndex = 3;
 constexpr std::uint32_t PlayerWeaponClassUnknown = 0;
 constexpr std::uint32_t PlayerWeaponClassNone = 1;
 constexpr std::uint32_t PlayerWeaponClassUnarmed = 2;

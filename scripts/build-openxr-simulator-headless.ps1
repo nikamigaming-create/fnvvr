@@ -12,6 +12,7 @@ Set-StrictMode -Version Latest
 
 $productRoot = Split-Path -Parent $PSScriptRoot
 $patchPath = Join-Path $productRoot "patches\openxr-simulator-fnvxr-headless.patch"
+$controllerPosePatchPath = Join-Path $productRoot "patches\openxr-simulator-controller-local-6dof.patch"
 $expectedUpstreamCommit = "48a70f440ac7d9bda385994937e3da8e15a4d9bb"
 if ([string]::IsNullOrWhiteSpace($SourceRoot)) {
     $SourceRoot = Join-Path $productRoot "local\OpenXR-Simulator"
@@ -30,6 +31,9 @@ foreach ($requiredPath in @($requiredSource, $requiredMcpHeader)) {
 }
 if (-not (Test-Path -LiteralPath $patchPath -PathType Leaf)) {
     throw "The reproducible FNVXR runtime patch is missing: $patchPath"
+}
+if (-not (Test-Path -LiteralPath $controllerPosePatchPath -PathType Leaf)) {
+    throw "The reproducible LOCAL controller-pose patch is missing: $controllerPosePatchPath"
 }
 
 $runtimeSource = Get-Content -LiteralPath $requiredSource -Raw
@@ -106,12 +110,50 @@ if (-not $mcpHeader.Contains('OPENXR_SIMULATOR_DATA_DIR')) {
     throw "The FNVXR per-run simulator data-directory contract is missing."
 }
 
-& $gitPath `
-    -c "safe.directory=$safeDirectory" `
-    -C $SourceRoot `
-    apply --check --reverse $patchPath
+$controllerPosePatchPresent =
+    $runtimeSource.Contains('poseInLocalSpace') -and
+    $runtimeSource.Contains('QuatFromYawPitchRoll(float yaw, float pitch, float roll)') -and
+    $mcpHeader.Contains('localSpaceSet') -and
+    $mcpHeader.Contains('cmd.rollSet')
+
+# The controller patch is intentionally layered after the reviewed headless
+# patch. Its nearby runtime edits make the base patch's reverse check
+# inapplicable after this second layer has been installed.
+if (-not $controllerPosePatchPresent) {
+    & $gitPath `
+        -c "safe.directory=$safeDirectory" `
+        -C $SourceRoot `
+        apply --check --reverse $patchPath
+    if ($LASTEXITCODE -ne 0) {
+        throw "The OpenXR-Simulator source does not exactly contain the reviewed FNVXR headless patch."
+    }
+
+    & $gitPath -c "safe.directory=$safeDirectory" -C $SourceRoot apply --check $controllerPosePatchPath
+    if ($LASTEXITCODE -ne 0) {
+        throw "The LOCAL controller-pose patch does not apply cleanly to $sourceCommit."
+    }
+    & $gitPath -c "safe.directory=$safeDirectory" -C $SourceRoot apply $controllerPosePatchPath
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to apply the LOCAL controller-pose patch."
+    }
+    $runtimeSource = Get-Content -LiteralPath $requiredSource -Raw
+    $mcpHeader = Get-Content -LiteralPath $requiredMcpHeader -Raw
+}
+
+foreach ($requiredControllerContract in @(
+        'poseInLocalSpace',
+        'QuatFromYawPitchRoll(float yaw, float pitch, float roll)',
+        'localSpaceSet',
+        'cmd.rollSet')) {
+    if (-not $runtimeSource.Contains($requiredControllerContract) -and
+        -not $mcpHeader.Contains($requiredControllerContract)) {
+        throw "The LOCAL controller-pose contract is missing: $requiredControllerContract"
+    }
+}
+
+& $gitPath -c "safe.directory=$safeDirectory" -C $SourceRoot apply --check --reverse $controllerPosePatchPath
 if ($LASTEXITCODE -ne 0) {
-    throw "The OpenXR-Simulator source does not exactly contain the reviewed FNVXR patch."
+    throw "The OpenXR-Simulator source does not exactly contain the reviewed LOCAL controller-pose patch."
 }
 
 function ConvertTo-NativeArgument {
@@ -248,6 +290,10 @@ if (-not $ConfigureOnly) {
     patch = [ordered]@{
         path = (Resolve-Path -LiteralPath $patchPath).Path
         sha256 = (Get-FileHash -LiteralPath $patchPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    }
+    controllerPosePatch = [ordered]@{
+        path = (Resolve-Path -LiteralPath $controllerPosePatchPath).Path
+        sha256 = (Get-FileHash -LiteralPath $controllerPosePatchPath -Algorithm SHA256).Hash.ToLowerInvariant()
     }
     runtimeManifest = if (Test-Path -LiteralPath $manifestPath -PathType Leaf) {
         (Resolve-Path -LiteralPath $manifestPath).Path

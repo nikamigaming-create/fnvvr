@@ -274,6 +274,8 @@ void __cdecl fakeAccumulateScene(
             && accumulator->shadowScene
                 == gState->stockAccumulator.shadowScene,
         "private eye accumulation did not inherit its exact stock frame state");
+    culler->base.camera = static_cast<abi::RetailPointer32>(
+        reinterpret_cast<std::uintptr_t>(camera));
     fakeRendererSetAccumulator(&gState->renderer, nullptr, accumulator);
     fakeSetAccumulatingAccumulator(accumulator);
     require(
@@ -501,6 +503,7 @@ int main()
         &endTargets,
         &rollbackTargets,
         &restoreTargets,
+        &bindTargets,
     };
     RetailCenterRendererOperationsContext<CollectorCapacity> context;
     state.binding = &binding;
@@ -573,7 +576,7 @@ int main()
         Restore,
     };
     require(state.calls == expected,
-        "the concrete renderer did not preserve collect-once then left/right order");
+        "the concrete renderer did not render each eye from its own population");
     const RetailCenterVisibilityDiagnostics completedVisibility =
         context.visibilityDiagnostics();
     require(
@@ -588,6 +591,21 @@ int main()
             && completedVisibility.privateAccumulatorMode == 0u
             && completedVisibility.sealedGeneration == 1u,
         "a completed stock traversal capture did not expose exact diagnostics");
+    const RetailCenterEyeCameraDiagnostics cameraDiagnostics =
+        context.eyeCameraDiagnostics();
+    require(
+        cameraDiagnostics.complete()
+            && cameraDiagnostics.leftRendererCamera
+                == static_cast<abi::RetailPointer32>(
+                    reinterpret_cast<std::uintptr_t>(&leftCamera))
+            && cameraDiagnostics.rightRendererCamera
+                == static_cast<abi::RetailPointer32>(
+                    reinterpret_cast<std::uintptr_t>(&rightCamera))
+            && cameraDiagnostics.leftCullerCamera
+                == cameraDiagnostics.leftRendererCamera
+            && cameraDiagnostics.rightCullerCamera
+                == cameraDiagnostics.rightRendererCamera,
+        "the private eye culler and renderer did not retain the same camera");
     CenterRendererVisibleSet rejectedVisibleSet {};
     require(
         !operations.collectConservativeVisibleSet(

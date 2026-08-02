@@ -26,6 +26,7 @@ using namespace fnvxr::engine;
 constexpr std::uint32_t RuntimeWorldAddress = WorldRenderAddress;
 constexpr std::uint32_t AccumulationAdapterAddress = 0x60001000u;
 constexpr std::uint32_t RenderAdapterAddress = 0x60002000u;
+constexpr std::uint32_t FinalizeAdapterAddress = 0x60002800u;
 constexpr std::uint32_t RenderAndFinalizeAdapterAddress = 0x60003000u;
 constexpr std::uintptr_t ProtectionToken = 0x7AA10C0Du;
 
@@ -152,7 +153,7 @@ int main()
     try
     {
         static_assert(
-            RetailWorldAccumulationCallSiteContractInventory.size() == 6u);
+            RetailWorldAccumulationCallSiteContractInventory.size() == 7u);
 
         FakeMemory memory;
         const RetailWorldHookAuthorization authorization =
@@ -164,6 +165,7 @@ int main()
                 RuntimeWorldAddress,
                 AccumulationAdapterAddress,
                 RenderAdapterAddress,
+                FinalizeAdapterAddress,
                 RenderAndFinalizeAdapterAddress);
         require(installed.complete(), "audited callsite lease did not install");
         require(memory.writable == 0u, "install leaked a writable code page");
@@ -217,6 +219,7 @@ int main()
                 RuntimeWorldAddress,
                 AccumulationAdapterAddress,
                 RenderAdapterAddress,
+                FinalizeAdapterAddress,
                 RenderAndFinalizeAdapterAddress);
         require(
             rejected.failure
@@ -235,6 +238,7 @@ int main()
                 RuntimeWorldAddress,
                 AccumulationAdapterAddress,
                 RenderAdapterAddress,
+                FinalizeAdapterAddress,
                 RenderAndFinalizeAdapterAddress);
         require(
             unauthorized.failure

@@ -452,9 +452,9 @@ string(REGEX MATCHALL
     visual_trial_console_calls
     "${visual_trial_automation}")
 list(LENGTH visual_trial_console_calls visual_trial_console_call_count)
-if(NOT visual_trial_console_call_count EQUAL 4)
+if(NOT visual_trial_console_call_count EQUAL 6)
     message(FATAL_ERROR
-        "Fixed visual-trial automation must have exactly the recovery plus fixed fresh-character COC/name/save console execution sites")
+        "Fixed visual-trial support must have exactly the recovery/fresh-character execution sites plus the separately bounded owned-fixture final-save and JIP weapon-draw sites")
 endif()
 string(REGEX MATCHALL
     "automation::decide\\("
@@ -482,6 +482,7 @@ foreach(required IN ITEMS
         "FNVXR_RETAIL_FIXTURE_SAVE_NAME"
         "FNVXR_RETAIL_FIXTURE_TRAIT_ONE"
         "FNVXR_RETAIL_FIXTURE_TRAIT_TWO"
+        "FNVXR_RETAIL_FIXTURE_WEAPON"
         "requestedAction = fixture::Action::Create"
         "requestedAction = fixture::Action::Load"
         "fixture::authorized(output.plan)")
@@ -531,9 +532,11 @@ extract_region(
     "if (visualTrialDisposition\n            == fnvxr::engine::RetailPluginMainLoopDisposition::\n                PublishRuntimeOnly)")
 foreach(required IN ITEMS
         "processRetailFixtureAutomation(observation)"
+        "processHeadsetWorldOnlyFixtureWeaponDraw(observation)"
         "recoverFocusLossPause("
         "processHeadsetDemoFixtureUi(observation)"
         "OpenXR display remains host-owned"
+        "fixed JIP SetWeaponOut command"
         "fixed Pip-Boy open/close taps"
         "return;")
     require_text(
@@ -569,6 +572,9 @@ foreach(required IN ITEMS
         "RetailFixtureAutomationStage::AwaitingGameplayName"
         "RetailFixtureAutomationStage::AwaitingFirstTrait"
         "RetailFixtureAutomationStage::AwaitingSecondTrait"
+        "RetailFixtureAutomationStage::AwaitingWeaponAdd"
+        "RetailFixtureAutomationStage::AwaitingWeaponAmmo"
+        "RetailFixtureAutomationStage::AwaitingWeaponEquip"
         "RetailFixtureAutomationStage::AwaitingSave"
         "retailFixtureCommandIsExact"
         "fixture::CreateStartCommand"
@@ -576,8 +582,12 @@ foreach(required IN ITEMS
         "fixture::SetFixturePlayerNameCommand"
         "fixture::SaveCommandPrefix"
         "fixture::addPerkCommand(trait)"
-        "acknowledgeExactOfficialPackMessageMenu(observation)"
-        "closeExactRetailFixtureOfficialPackMessageMenu(observation)"
+        "fixture::addWeaponCommand(fixturePlan.plan.weapon)"
+        "fixture::addWeaponAmmoCommand(fixturePlan.plan.weapon)"
+        "fixture::equipWeaponCommand(fixturePlan.plan.weapon)"
+        "fnvxrRetailFixtureWeaponLoadout"
+        "fnvxrRetailFixtureWeapon"
+        "processOwnedRetailFixtureMessageMenuAcknowledgements(observation)"
         "realStereoVisualTrialStartMenuState(observation)"
         "realRetailFixtureFreshGameplayState(observation)"
         "FixtureLoadGameplaySettlingFrames = 1u"
@@ -617,10 +627,37 @@ string(REGEX MATCHALL
     retail_fixture_console_calls
     "${retail_fixture_automation}")
 list(LENGTH retail_fixture_console_calls retail_fixture_console_call_count)
-if(NOT retail_fixture_console_call_count EQUAL 4)
+if(NOT retail_fixture_console_call_count EQUAL 5)
     message(FATAL_ERROR
-        "Retail fixture automation must have exactly its start/load, name, trait, and save console execution sites")
+        "Retail fixture automation must have exactly its start/load, name, trait, fixed-loadout, and save console execution sites")
 endif()
+
+extract_region(
+    retail_fixture_message_acknowledgements
+    "${plugin_text}"
+    "void processOwnedRetailFixtureMessageMenuAcknowledgements(\n"
+    "enum class RetailFixtureAutomationStage")
+foreach(required IN ITEMS
+        "acknowledgeExactOfficialPackMessageMenu(observation)"
+        "closeExactRetailFixtureOfficialPackMessageMenu(observation)"
+        "acknowledgeExactTtwStewieDependencyMessageMenu(observation)"
+        "closeExactRetailFixtureTtwStewieDependencyMessageMenu(observation)")
+    require_text(
+        "${retail_fixture_message_acknowledgements}"
+        "${required}"
+        "Owned retail fixture notices must retain every exact native acknowledgement path")
+endforeach()
+foreach(forbidden IN ITEMS
+        "SendInput("
+        "keybd_event("
+        "mouse_event("
+        "SetCursorPos("
+        "dispatchMenuClick(")
+    forbid_text(
+        "${retail_fixture_message_acknowledgements}"
+        "${forbidden}"
+        "Owned retail fixture notice handling must not acquire device or arbitrary menu input authority")
+endforeach()
 
 extract_region(
     retail_fixture_exact_pack_close
@@ -662,7 +699,7 @@ extract_region(
     "bool retailFixtureOfficialPackAcknowledgementRequested()\n{"
     "bool exactOfficialPackAcknowledgementRequested()")
 foreach(required IN ITEMS
-        "retailFixtureAutomationRequested()"
+        "ownedRetailFixtureMessageAcknowledgementRequested()"
         "FNVXR_RETAIL_FIXTURE_ACK_OFFICIAL_PACK_POPUP")
     require_text(
         "${retail_fixture_pack_acknowledgement_opt_in}"
@@ -679,6 +716,34 @@ foreach(forbidden IN ITEMS
         "${retail_fixture_pack_acknowledgement_opt_in}"
         "${forbidden}"
         "Retail fixture official-pack acknowledgement must not gain OS/menu-wide input authority")
+endforeach()
+
+extract_region(
+    physical_fixture_message_acknowledgement_opt_in
+    "${plugin_text}"
+    "bool physicalHeadsetFixtureMessageAcknowledgementRequested()\n{"
+    "bool ownedRetailFixtureMessageAcknowledgementRequested()")
+foreach(required IN ITEMS
+        "physicalHeadsetPlayProfileSelected()"
+        "FNVXR_PHYSICAL_HEADSET_PLAY"
+        "FNVXR_RETAIL_FIXTURE_AUTOMATION")
+    require_text(
+        "${physical_fixture_message_acknowledgement_opt_in}"
+        "${required}"
+        "Physical fixture notice acknowledgement must require both physical-play and owned-fixture opt-ins")
+endforeach()
+foreach(forbidden IN ITEMS
+        "SendInput("
+        "keybd_event("
+        "mouse_event("
+        "SetCursorPos("
+        "dispatchMenuClick("
+        "processMainGameLoop("
+        "consumeSharedCommand(")
+    forbid_text(
+        "${physical_fixture_message_acknowledgement_opt_in}"
+        "${forbidden}"
+        "Physical fixture notice acknowledgement must remain separate from general controller and command authority")
 endforeach()
 
 extract_region(

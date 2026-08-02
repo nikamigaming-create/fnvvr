@@ -19,6 +19,9 @@ param(
     [double]$PosZ = [double]::NaN,
     [double]$Yaw = [double]::NaN,
     [double]$Pitch = [double]::NaN,
+    [double]$Roll = [double]::NaN,
+    [ValidateSet("unchanged", "head", "local")]
+    [string]$PoseSpace = "unchanged",
     [switch]$ReleaseAll,
     [ValidateRange(100, 30000)][int]$WaitMilliseconds = 5000
 )
@@ -71,12 +74,16 @@ if ($ReleaseAll) {
     Add-ButtonState -Key "thumbstickClick" -State $ThumbstickClick
     if ($ThumbstickX -ge -1.0) { $command.thumbstickX = $ThumbstickX }
     if ($ThumbstickY -ge -1.0) { $command.thumbstickY = $ThumbstickY }
+    if ($PoseSpace -cne "unchanged") {
+        $command.space = $PoseSpace
+    }
     foreach ($poseField in @(
         [pscustomobject]@{ key = "posX"; value = $PosX },
         [pscustomobject]@{ key = "posY"; value = $PosY },
         [pscustomobject]@{ key = "posZ"; value = $PosZ },
         [pscustomobject]@{ key = "yaw"; value = $Yaw },
-        [pscustomobject]@{ key = "pitch"; value = $Pitch })) {
+        [pscustomobject]@{ key = "pitch"; value = $Pitch },
+        [pscustomobject]@{ key = "roll"; value = $Roll })) {
         if (-not [double]::IsNaN([double]$poseField.value)) {
             $command[$poseField.key] = [double]$poseField.value
         }

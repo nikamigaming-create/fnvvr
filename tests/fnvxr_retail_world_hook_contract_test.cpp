@@ -270,7 +270,7 @@ int main()
     }
 
     require(
-        RetailWorldAccumulationCallSiteContractInventory.size() == 6u,
+        RetailWorldAccumulationCallSiteContractInventory.size() == 7u,
         "all stock accumulation lifecycle callsites must be represented");
     require(
         RetailWorldAccumulationCallSiteContractInventory[0]
@@ -282,12 +282,15 @@ int main()
             && RetailWorldAccumulationCallSiteContractInventory[3]
                     .preferredCallAddress == 0x00874180u
             && RetailWorldAccumulationCallSiteContractInventory[4]
-                    .preferredCallAddress == 0x008742D9u
+                    .preferredCallAddress == 0x008741DBu
             && RetailWorldAccumulationCallSiteContractInventory[5]
+                    .preferredCallAddress == 0x008742D9u
+            && RetailWorldAccumulationCallSiteContractInventory[6]
                     .preferredCallAddress == 0x0087438Fu
             && RetailWorldAccumulateSceneAddress == 0x00B6BEE0u
             && RetailWorldRenderAccumulatorWithoutFinalizeAddress
                 == 0x00B6BA20u
+            && RetailWorldFinalizeAccumulatorAddress == 0x00B6B930u
             && RetailWorldRenderAndFinalizeAccumulatorAddress
                 == 0x00B6C0D0u,
         "the lifecycle inventory must pin the audited stock call addresses");
@@ -305,6 +308,9 @@ int main()
             RenderWithoutFinalize:
             expectedTarget =
                 RetailWorldRenderAccumulatorWithoutFinalizeAddress;
+            break;
+        case RetailWorldAccumulationCallSiteContract::RelayKind::FinalizeOnly:
+            expectedTarget = RetailWorldFinalizeAccumulatorAddress;
             break;
         case RetailWorldAccumulationCallSiteContract::RelayKind::
             RenderAndFinalize:

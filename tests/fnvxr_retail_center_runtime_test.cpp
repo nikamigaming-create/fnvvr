@@ -461,6 +461,8 @@ void FNVXR_TEST_CDECL fakeAccumulateScene(
             && accumulator->shadowScene
                 == gState->stockAccumulator.shadowScene,
         "runtime did not inherit the exact stock frame state");
+    culler->base.camera = static_cast<abi::RetailPointer32>(
+        reinterpret_cast<std::uintptr_t>(camera));
     replaceAccumulatorOwner(gState->renderer.accumulator, accumulator);
     fakeSetAccumulatingAccumulator(accumulator);
     require(
@@ -639,6 +641,7 @@ int main()
         &end,
         &rollback,
         &restore,
+        &bind,
     };
 
     RetailCenterStereoRuntime<Capacity> runtime;
@@ -779,6 +782,9 @@ int main()
             && stereo.renderer.complete
             && stereo.renderer.visibleGeometryCount == 3u,
         "gameplay did not complete one cull and two engine renders");
+    require(
+        runtime.eyeCameraDiagnostics().complete(),
+        "runtime did not retain matching per-eye renderer/culler cameras");
     const std::vector<Event> expected {
         Event::Cull,
         Event::Snapshot,
@@ -794,7 +800,8 @@ int main()
         Event::EndRight,
         Event::Restore,
     };
-    require(state.events == expected, "runtime changed collect/left/right order");
+    require(state.events == expected,
+        "runtime did not render each eye from its own population");
     require(
         state.addCount == 2u,
         "left and right did not each execute one stock accumulation");

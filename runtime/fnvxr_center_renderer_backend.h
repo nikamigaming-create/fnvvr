@@ -91,6 +91,10 @@ struct CenterRendererOperations
         void*,
         CenterRendererEye,
         CenterRendererEyeIsolation&) noexcept = nullptr;
+    bool (*bindEyeTargetsPreservingContents)(
+        void*,
+        CenterRendererEye,
+        CenterRendererEyeIsolation&) noexcept = nullptr;
     bool (*setAccumulatorCamera)(
         void*,
         abi::RetailBSShaderAccumulatorLayout*,
@@ -127,6 +131,7 @@ constexpr bool centerRendererOperationsComplete(
     return operations.snapshotAuthoritativeState
         && operations.collectConservativeVisibleSet
         && operations.bindEyeTargets
+        && operations.bindEyeTargetsPreservingContents
         && operations.setAccumulatorCamera
         && operations.addVisibleArray
         && operations.renderAccumulatorWithoutFinalize
@@ -366,40 +371,91 @@ inline CenterRendererResult executeCenterRendererFrame(
             visibleSet);
     }
 
+    // Build both eye accumulators before either one is finalized.  Retail's
+    // immediate/view-model geometry carries per-frame pass state; finalizing
+    // the left accumulator before constructing the right consumes that state
+    // and produces a left-only weapon.  Population is allowed to draw
+    // immediately into the currently bound eye, so end each population bind,
+    // then preserve those pixels when the queued lists are rendered.
     CenterRendererEyeIsolation isolation {};
-    CenterRendererFailure failure = detail::renderCenterEye(
-        operations,
-        CenterRendererEye::Left,
-        input.leftCamera,
-        input.leftAccumulator,
-        visibleSet,
-        isolation);
-    if (failure != CenterRendererFailure::None)
-    {
-        return detail::failCenterRenderer(
-            operations,
-            failure,
-            visibleSet,
-            &isolation,
-            CenterRendererEye::Left);
-    }
+    const auto populateEye = [&](CenterRendererEye eye,
+                                 abi::RetailNiCameraLayout* camera,
+                                 abi::RetailBSShaderAccumulatorLayout* accumulator,
+                                 bool endAfterPopulation)
+        noexcept -> CenterRendererFailure {
+        if (!operations.bindEyeTargets(operations.context, eye, isolation)
+            || !isolation.active())
+            return detail::eyeFailure(eye, CenterRendererFailure::LeftBind,
+                                      CenterRendererFailure::RightBind);
+        if (!operations.setAccumulatorCamera(
+                operations.context, accumulator, camera))
+            return detail::eyeFailure(eye,
+                                      CenterRendererFailure::LeftSetCamera,
+                                      CenterRendererFailure::RightSetCamera);
+        if (!operations.addVisibleArray(
+                operations.context, accumulator, &visibleSet.array))
+            return detail::eyeFailure(eye,
+                                      CenterRendererFailure::LeftPopulate,
+                                      CenterRendererFailure::RightPopulate);
+        if (endAfterPopulation
+            && (!operations.endEyeTargets(operations.context, eye, isolation)
+                || isolation.active()))
+            return detail::eyeFailure(eye, CenterRendererFailure::LeftEnd,
+                                      CenterRendererFailure::RightEnd);
+        return CenterRendererFailure::None;
+    };
+    const auto renderPreparedEye = [&](CenterRendererEye eye,
+                                      abi::RetailNiCameraLayout* camera,
+                                      abi::RetailBSShaderAccumulatorLayout* accumulator,
+                                      bool targetAlreadyBound)
+        noexcept -> CenterRendererFailure {
+        if ((!targetAlreadyBound
+                && (!operations.bindEyeTargetsPreservingContents(
+                        operations.context, eye, isolation)
+                    || !isolation.active()))
+            || (targetAlreadyBound && !isolation.active()))
+            return detail::eyeFailure(eye, CenterRendererFailure::LeftBind,
+                                      CenterRendererFailure::RightBind);
+        if (!operations.renderAccumulatorWithoutFinalize(
+                operations.context, camera, accumulator,
+                RetailWorldRenderContext))
+            return detail::eyeFailure(eye, CenterRendererFailure::LeftRender,
+                                      CenterRendererFailure::RightRender);
+        if (!operations.finalizeAccumulator(
+                operations.context, camera, accumulator,
+                RetailWorldRenderContext))
+            return detail::eyeFailure(eye,
+                                      CenterRendererFailure::LeftFinalize,
+                                      CenterRendererFailure::RightFinalize);
+        if (!operations.endEyeTargets(operations.context, eye, isolation)
+            || isolation.active())
+            return detail::eyeFailure(eye, CenterRendererFailure::LeftEnd,
+                                      CenterRendererFailure::RightEnd);
+        return CenterRendererFailure::None;
+    };
 
-    failure = detail::renderCenterEye(
-        operations,
-        CenterRendererEye::Right,
-        input.rightCamera,
-        input.rightAccumulator,
-        visibleSet,
-        isolation);
+    CenterRendererFailure failure = populateEye(
+        CenterRendererEye::Left, input.leftCamera, input.leftAccumulator,
+        false);
+    if (failure == CenterRendererFailure::None)
+        failure = renderPreparedEye(CenterRendererEye::Left,
+                                    input.leftCamera, input.leftAccumulator,
+                                    true);
+    if (failure == CenterRendererFailure::None)
+        failure = populateEye(CenterRendererEye::Right,
+                              input.rightCamera, input.rightAccumulator,
+                              false);
+    if (failure == CenterRendererFailure::None)
+        failure = renderPreparedEye(CenterRendererEye::Right,
+                                    input.rightCamera, input.rightAccumulator,
+                                    true);
     if (failure != CenterRendererFailure::None)
-    {
         return detail::failCenterRenderer(
-            operations,
-            failure,
-            visibleSet,
-            &isolation,
-            CenterRendererEye::Right);
-    }
+            operations, failure, visibleSet, &isolation,
+            failure >= CenterRendererFailure::RightBind
+                && failure <= CenterRendererFailure::RightEnd
+                ? CenterRendererEye::Right
+                : CenterRendererEye::Left);
 
     if (!operations.restoreAuthoritativeState(operations.context))
     {

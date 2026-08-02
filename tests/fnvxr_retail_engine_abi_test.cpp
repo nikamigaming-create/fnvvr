@@ -123,7 +123,18 @@ int main()
         "the independently captured ABI inventory must be production-proven");
     require(
         RetailFunctionAbiInventory.size() == 28u,
-        "the complete ABI inventory must include finish-accumulating, culler binding, and OnVisible dispatch");
+        "the generic raw-hash ABI inventory must exclude the JIP-normalized first-person renderer");
+    const RetailFunctionAbiDescriptor& firstPerson =
+        RetailRenderFirstPersonAbi;
+    require(
+        structurallyValid(firstPerson)
+            && productionProven(firstPerson)
+            && firstPerson.preferredAddress == FirstPersonRenderAddress
+            && firstPerson.callingConvention
+                == RetailX86CallingConvention::Thiscall
+            && firstPerson.stackArgumentCount == 4u
+            && firstPerson.calleePopBytes == 16u,
+        "the separately normalized first-person renderer must retain its exact ABI contract");
 
     for (std::size_t left = 0; left < RetailFunctionAbiInventory.size(); ++left)
     {
@@ -176,7 +187,23 @@ int main()
     }
     require(
         coreFunctionsCrossChecked == 9u,
-        "all nine core accumulator/culling ABI bodies must cross-check the manifest");
+        "all raw-hashable core world ABI bodies must cross-check the manifest");
+    const auto coreFirstPerson = std::find_if(
+        RetailEngineManifest.begin(),
+        RetailEngineManifest.end(),
+        [](const LoadedFunctionManifestEntry& entry) {
+            return entry.name && std::string_view(entry.name) == "RenderFirstPerson";
+        });
+    require(
+        coreFirstPerson != RetailEngineManifest.end()
+            && coreFirstPerson->preferredAddress == firstPerson.preferredAddress
+            && coreFirstPerson->byteCount == firstPerson.byteCount
+            && coreFirstPerson->sha256.valid == firstPerson.sha256.valid
+            && std::equal(
+                coreFirstPerson->sha256.bytes.begin(),
+                coreFirstPerson->sha256.bytes.end(),
+                firstPerson.sha256.bytes.begin()),
+        "the normalized first-person ABI must cross-check the separately normalized core manifest body");
 
     const auto allocate = findFunction("Ni_Alloc");
     const auto free = findFunction("Ni_Free");

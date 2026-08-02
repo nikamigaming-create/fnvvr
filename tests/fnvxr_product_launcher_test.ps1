@@ -231,6 +231,25 @@ if ((@(Get-FnvxrProductRetailFixtureTraitNames) -join "|") -cne
     ($expectedRetailFixtureTraits -join "|")) {
     throw "Retail fixture trait list no longer matches the supported base-retail trait set."
 }
+$expectedRetailFixtureWeapons = @(
+    "None",
+    "Pistol",
+    "RifleSingleHand",
+    "RifleTwoHand",
+    "Minigun",
+    "FragGrenade",
+    "Knife",
+    "ThrowingKnife")
+if ((@(Get-FnvxrProductRetailFixtureWeaponNames) -join "|") -cne
+    ($expectedRetailFixtureWeapons -join "|")) {
+    throw "Retail fixture weapon list no longer matches the fixed stock visibility set."
+}
+if ((Resolve-FnvxrProductRetailFixtureWeapon -Weapon "pistol") -cne "Pistol") {
+    throw "Retail fixture weapon resolver did not canonicalize the selected stock weapon."
+}
+Require-Throws -Fragment "Unsupported retail fixture weapon" -Action {
+    Resolve-FnvxrProductRetailFixtureWeapon -Weapon "NotARetailWeapon"
+}
 $fixtureTraits = Resolve-FnvxrProductRetailFixtureTraits `
     -TraitOne "goodnatured" `
     -TraitTwo "builtToDestroy"
@@ -255,6 +274,12 @@ if ((Get-FnvxrProductRetailFixtureSaveName `
         -TraitTwo "BuiltToDestroy") -cne
     "FNVXR_AutoRetail_L1_BuiltToDestroy_GoodNatured") {
     throw "Two-trait retail fixture name is not canonical and deterministic."
+}
+if ((Get-FnvxrProductRetailFixtureSaveName `
+        -TraitOne "None" `
+        -TraitTwo "None" `
+        -Weapon "Pistol") -cne "FNVXR_AutoRetail_L1_Pistol") {
+    throw "Weapon fixture name is not isolated and deterministic."
 }
 if ((Assert-FnvxrProductRetailFixtureSaveName `
         -SaveName "FNVXR_AutoRetail_L1_BuiltToDestroy_GoodNatured") -cne
@@ -289,6 +314,8 @@ foreach ($defaultForbiddenKey in @(
     "FNVXR_RETAIL_FIXTURE_SAVE_NAME",
     "FNVXR_RETAIL_FIXTURE_TRAIT_ONE",
     "FNVXR_RETAIL_FIXTURE_TRAIT_TWO",
+    "FNVXR_RETAIL_FIXTURE_WEAPON",
+    "FNVXR_HEADSET_FINAL_STOCK_FRAME_CAPTURE",
     "FNVXR_RETAIL_FIXTURE_ACK_OFFICIAL_PACK_POPUP",
     "FNVXR_RETAIL_FIXTURE_ACK_TTW_STEWIE_DEPENDENCY_WARNING",
     "FNVXR_HEADSET_DEMO_FIXTURE",
@@ -428,13 +455,15 @@ $fixtureEnvironment = Get-FnvxrProductMinimalEnvironment `
     -RetailFixtureAction "create" `
     -RetailFixtureSaveName "FNVXR_AutoRetail_L1_BuiltToDestroy_GoodNatured" `
     -RetailFixtureTraitOne "BuiltToDestroy" `
-    -RetailFixtureTraitTwo "GoodNatured"
+    -RetailFixtureTraitTwo "GoodNatured" `
+    -RetailFixtureWeapon "None"
 $expectedFixtureEnvironment = [ordered]@{
     FNVXR_RETAIL_FIXTURE_AUTOMATION = "1"
     FNVXR_RETAIL_FIXTURE_ACTION = "create"
     FNVXR_RETAIL_FIXTURE_SAVE_NAME = "FNVXR_AutoRetail_L1_BuiltToDestroy_GoodNatured"
     FNVXR_RETAIL_FIXTURE_TRAIT_ONE = "BuiltToDestroy"
     FNVXR_RETAIL_FIXTURE_TRAIT_TWO = "GoodNatured"
+    FNVXR_RETAIL_FIXTURE_WEAPON = "None"
     FNVXR_RETAIL_FIXTURE_ACK_OFFICIAL_PACK_POPUP = "1"
 }
 foreach ($key in $expectedFixtureEnvironment.Keys) {
@@ -447,6 +476,19 @@ if ([string]$fixtureEnvironment.FNVXR_RUN_PROFILE -cne "retail-fixture-v1" -or
     [string]$fixtureEnvironment.FNVXR_HOST_MODE -cne "retail-fixture" -or
     [string]$fixtureEnvironment.FNVXR_ENABLE_ENGINE_CENTER_STEREO -cne "0") {
     throw "Retail fixture environment must select the dedicated non-OpenXR profile."
+}
+$pistolFixtureEnvironment = Get-FnvxrProductMinimalEnvironment `
+    -RunId "retail-pistol-fixture-contract" `
+    -RunDirectory "C:\fnvxr-retail-pistol-fixture-contract" `
+    -OpenXrLoaderPath "" `
+    -SessionReadyTimeoutSeconds 60 `
+    -AutomateRetailFixture `
+    -RetailFixtureAction "create" `
+    -RetailFixtureSaveName "FNVXR_AutoRetail_L1_Pistol" `
+    -RetailFixtureWeapon "Pistol"
+if ([string]$pistolFixtureEnvironment.FNVXR_RETAIL_FIXTURE_WEAPON -cne "Pistol" -or
+    [string]$pistolFixtureEnvironment.FNVXR_RUN_PROFILE -cne "retail-fixture-v1") {
+    throw "Pistol fixture did not retain the bounded owned loadout selector."
 }
 $ttwFixtureEnvironment = Get-FnvxrProductMinimalEnvironment `
     -RunId "ttw-fixture-contract" `
@@ -604,6 +646,80 @@ foreach ($forbiddenHeadsetWorldInputKey in @(
         $forbiddenHeadsetWorldInputKey) {
         throw "Headset world-only capture broadened input authority through: $forbiddenHeadsetWorldInputKey"
     }
+}
+$headsetWorldWeaponDrawEnvironment = Get-FnvxrProductMinimalEnvironment `
+    -RunId "headset-world-weapon-draw-contract" `
+    -RunDirectory "C:\fnvxr-headset-world-weapon-draw-contract" `
+    -OpenXrLoaderPath "C:\fnvxr-headset-world-weapon-draw-contract\openxr_loader.dll" `
+    -SessionReadyTimeoutSeconds 60 `
+    -AutomateRetailFixture `
+    -HeadsetWorldOnlyCapture `
+    -HeadsetFixtureWeaponDraw `
+    -RetailVrFirstPersonPrivateCaller Primary `
+    -RetailFixtureAction "load" `
+    -RetailFixtureSaveName "FNVXR_AutoRetail_L1_Pistol" `
+    -RetailFixtureWeapon "Pistol" `
+    -HeadlessRuntimeManifest "C:\fnvxr-headset-world-weapon-draw-contract\openxr_simulator.json" `
+    -HeadsetMirrorCaptureDirectory "C:\fnvxr-headset-world-weapon-draw-contract\headset-mirror"
+if ([string]$headsetWorldWeaponDrawEnvironment.FNVXR_HEADSET_DEMO_FIXTURE -cne "1" -or
+    [string]$headsetWorldWeaponDrawEnvironment.FNVXR_HEADSET_WORLD_ONLY_CAPTURE -cne "1" -or
+    [string]$headsetWorldWeaponDrawEnvironment.FNVXR_HEADSET_FIXTURE_DRAW_WEAPON -cne "1" -or
+    [string]$headsetWorldWeaponDrawEnvironment.FNVXR_HEADSET_FINAL_STOCK_FRAME_CAPTURE -cne "0" -or
+    [string]$headsetWorldWeaponDrawEnvironment.FNVXR_RETAIL_FIRST_PERSON_RAW_EYE_CAPTURE -cne "1" -or
+    [string]$headsetWorldWeaponDrawEnvironment.FNVXR_RETAIL_FIRST_PERSON_DRAW_TRACE_LIMIT -cne "4096") {
+    throw "Headset world weapon draw lost its fail-closed first-person evidence environment gate."
+}
+if ([string]$headsetWorldWeaponDrawEnvironment.FNVXR_RETAIL_VR_FIRST_PERSON_PRIVATE_CALLER -cne "primary") {
+    throw "Headset world weapon draw did not carry the selected primary first-person caller proof route."
+}
+$physicalHeadsetEnvironment = Get-FnvxrProductMinimalEnvironment `
+    -RunId "physical-headset-play-contract" `
+    -RunDirectory "C:\fnvxr-physical-headset-play-contract" `
+    -OpenXrLoaderPath "C:\fnvxr-physical-headset-play-contract\openxr_loader.dll" `
+    -SessionReadyTimeoutSeconds 60 `
+    -AutomateRetailFixture `
+    -RetailFixtureAction "load" `
+    -RetailFixtureSaveName "FNVXR_AutoRetail_L1_Pistol" `
+    -RetailFixtureWeapon "Pistol" `
+    -PhysicalHeadsetPlay `
+    -PhysicalRuntimeManifest "C:\fnvxr-physical-headset-play-contract\oculus_openxr_64.json"
+if ([string]$physicalHeadsetEnvironment.FNVXR_RETAIL_VR_FIRST_PERSON_PRIVATE_CALLER -cne "third" -or
+    [string]$physicalHeadsetEnvironment.FNVXR_RETAIL_RIG_ENABLE -cne "1" -or
+    [string]$physicalHeadsetEnvironment.FNVXR_RETAIL_RIG_APPLY -cne "1" -or
+    [string]$physicalHeadsetEnvironment.FNVXR_RETAIL_WEAPON_APPLY -cne "1" -or
+    [string]$physicalHeadsetEnvironment.FNVXR_RETAIL_CENTER_INTEGRATED_FIRST_PERSON -cne "1") {
+    throw "Physical headset play must select the observed publication seam and enable its center-integrated controller/weapon rig."
+}
+foreach ($forbiddenWeaponDrawAuthorityKey in @(
+    "FNVXR_DESKTOP_ASSIST_ENABLE",
+    "FNVXR_ENABLE_CONTROLLER_BRIDGE",
+    "FNVXR_ENABLE_TRACKED_WEAPON",
+    "FNVXR_PLUGIN_KEYBOARD_MOVEMENT_ENABLE")) {
+    if ($headsetWorldWeaponDrawEnvironment.Keys -ccontains
+        $forbiddenWeaponDrawAuthorityKey) {
+        throw "Headset weapon draw broadened authority through: $forbiddenWeaponDrawAuthorityKey"
+    }
+}
+Require-Throws -Fragment "requires world-only capture" -Action {
+    Get-FnvxrProductMinimalEnvironment `
+        -RunId "invalid-headset-weapon-draw-world-contract" `
+        -RunDirectory "C:\fnvxr-invalid-headset-weapon-draw-world-contract" `
+        -OpenXrLoaderPath "C:\fnvxr-invalid-headset-weapon-draw-world-contract\openxr_loader.dll" `
+        -SessionReadyTimeoutSeconds 60 `
+        -HeadsetFixtureWeaponDraw
+}
+Require-Throws -Fragment "requires an existing owned fixture load" -Action {
+    Get-FnvxrProductMinimalEnvironment `
+        -RunId "invalid-headset-weapon-draw-create-contract" `
+        -RunDirectory "C:\fnvxr-invalid-headset-weapon-draw-create-contract" `
+        -OpenXrLoaderPath "C:\fnvxr-invalid-headset-weapon-draw-create-contract\openxr_loader.dll" `
+        -SessionReadyTimeoutSeconds 60 `
+        -AutomateRetailFixture `
+        -HeadsetWorldOnlyCapture `
+        -HeadsetFixtureWeaponDraw `
+        -RetailFixtureAction "create" `
+        -RetailFixtureSaveName "FNVXR_AutoRetail_L1_Pistol" `
+        -RetailFixtureWeapon "Pistol"
 }
 Require-Throws -Fragment "mutually exclusive" -Action {
     Get-FnvxrProductMinimalEnvironment `
@@ -888,6 +1004,7 @@ foreach ($forbiddenAutomationMechanism in @(
 foreach ($headsetDemoContract in @(
     '[switch]$HeadsetDemoFixture',
     '[switch]$HeadsetWorldOnlyCapture',
+    '[switch]$HeadsetFixtureWeaponDraw',
     '[switch]$HeadsetPoseSweep',
     'Get-FnvxrProductPipBoyOutputProof',
     'Get-FnvxrProductHeadsetDemoInputProof',
@@ -896,13 +1013,15 @@ foreach ($headsetDemoContract in @(
     'Get-FnvxrProductStereoContinuityProof',
     'Get-FnvxrProductRetailCameraPoseSweepProof',
     'invoke-openxr-simulator-head-sweep.ps1',
-    '"rendered-six-dof-proven-centered"',
+    '"rendered-six-dof-cardinal-proven-centered"',
     'pitchCameraResponseProven',
     'Wait-FnvxrProductRetailFixtureGameplay',
     'retailFixtureRequested -and -not $headsetFixtureOpenXrRun',
     'No final-headset Pip-Boy UI frame reached OpenXR',
     'FNVXR_HEADSET_DEMO_FIXTURE',
-    'FNVXR_HEADSET_WORLD_ONLY_CAPTURE')) {
+    'FNVXR_HEADSET_WORLD_ONLY_CAPTURE',
+    'FNVXR_HEADSET_FIXTURE_DRAW_WEAPON',
+    'Get-FnvxrProductHeadsetFixtureWeaponDrawProof')) {
     if (-not ($launcher.Contains($headsetDemoContract) -or
             $common.Contains($headsetDemoContract))) {
         throw "Product launcher lost headset demo/recording contract: $headsetDemoContract"
@@ -914,6 +1033,7 @@ foreach ($physicalPlayContract in @(
     '[ValidateRange(1280, 4096)][int]$PhysicalGameWidth = 1920',
     '[ValidateRange(720, 2560)][int]$PhysicalGameHeight = 1200',
     'FNVXR_PHYSICAL_HEADSET_PLAY = "1"',
+    'FNVXR_PHASE1_TRACE_TELEMETRY = "1"',
     'FNVXR_PLUGIN_KEYBOARD_MOVEMENT_ENABLE = "1"',
     'FNVXR_PLUGIN_MENU_KEYBOARD_FALLBACK = "1"',
     'FNVXR_PLUGIN_GAMEPLAY_KEYBOARD_FALLBACK = "1"',
@@ -1030,13 +1150,56 @@ foreach ($forbiddenHeadsetDemoInputText in @(
         throw "Bounded headset demo must not use desktop/controller/simulator input: $forbiddenHeadsetDemoInputText"
     }
 }
+$headsetFixtureWeaponDrawFunction = [regex]::Match(
+    $pluginSource,
+    '(?s)void processHeadsetWorldOnlyFixtureWeaponDraw\(.*?(?=// The retail GUI normally assigns)').Value
+if ([string]::IsNullOrWhiteSpace($headsetFixtureWeaponDrawFunction)) {
+    throw "Could not isolate the bounded headset fixture weapon-draw function."
+}
+foreach ($requiredHeadsetWeaponDrawText in @(
+    'headsetWorldOnlyFixtureWeaponDrawRequested()',
+    'fixture::headsetWorldOnlyFixturePreparationSaveAuthorized(',
+    'fixture::headsetWorldOnlyFixtureWeaponDrawAuthorized(',
+    'fnvxrHeadsetFixtureFinalizeSave',
+    'fixture::SetFixtureWeaponOutCommand.data()',
+    'fnvxrHeadsetFixtureWeaponDraw',
+    'fnvxrHeadsetFixtureWeaponDrawResult',
+    'FixtureInitialOfficialNoticeDrainFrames = 900u',
+    'FixturePersistedCleanSaveDrainFrames = 120u',
+    'FixtureQuietGameplayFrames = 180u',
+    'FixturePersistedCleanSaveQuietGameplayFrames = 60u',
+    'FixtureSaveSettlingFrames = 60u',
+    'DrawResultSettlingFrames = 60u',
+    'persistedCleanWeaponOut = weaponOut')) {
+    if (-not $headsetFixtureWeaponDrawFunction.Contains($requiredHeadsetWeaponDrawText)) {
+        throw "Bounded headset weapon draw lost required evidence: $requiredHeadsetWeaponDrawText"
+    }
+}
+foreach ($forbiddenHeadsetWeaponDrawText in @(
+    'SendInput',
+    'SendKeys',
+    'PostMessage',
+    'SetForegroundWindow',
+    'SetCursorPos',
+    'XInput',
+    'tapDirectInputKey(DIK_R)')) {
+    if ($headsetFixtureWeaponDrawFunction.Contains($forbiddenHeadsetWeaponDrawText)) {
+        throw "Bounded headset weapon draw must not use desktop/controller/simulator input: $forbiddenHeadsetWeaponDrawText"
+    }
+}
 $retailFixtureAutomationFunction = [regex]::Match(
     $pluginSource,
     '(?s)void processRetailFixtureAutomation\(.*?(?=void processHeadsetDemoFixtureUi)').Value
+$retailFixtureMessageHandler = [regex]::Match(
+    $pluginSource,
+    '(?s)void processOwnedRetailFixtureMessageMenuAcknowledgements\(.*?(?=enum class RetailFixtureAutomationStage)').Value
 if ([string]::IsNullOrWhiteSpace($retailFixtureAutomationFunction) -or
     -not $retailFixtureAutomationFunction.Contains(
+        'processOwnedRetailFixtureMessageMenuAcknowledgements(observation);') -or
+    [string]::IsNullOrWhiteSpace($retailFixtureMessageHandler) -or
+    -not $retailFixtureMessageHandler.Contains(
         'acknowledgeExactOfficialPackMessageMenu(observation);') -or
-    -not $retailFixtureAutomationFunction.Contains(
+    -not $retailFixtureMessageHandler.Contains(
         'closeExactRetailFixtureOfficialPackMessageMenu(observation);') -or
     $retailFixtureAutomationFunction.Contains(
         '!headsetDemoFixtureProfileSelected() || !g_headsetDemoFixtureReady')) {

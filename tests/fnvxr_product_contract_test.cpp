@@ -23,7 +23,7 @@ fnvxr::product::StereoFrameProof completeStereo(
     proof.poseSequence = sourceFrame + 2000;
     proof.runtimeStateSample = runtimeStateSample;
     proof.colorPairComplete = true;
-    proof.depthPairComplete = true;
+    proof.renderLocalDepthPairComplete = true;
     proof.sameSimulationTick = true;
     proof.poseMatched = true;
     proof.conservativeVisibilityComplete = true;
@@ -220,11 +220,11 @@ int main()
     {
         PresentationController controller;
         StereoFrameProof missingDepth = completeStereo();
-        missingDepth.depthPairComplete = false;
+        missingDepth.renderLocalDepthPairComplete = false;
         const PresentationDecision decision = controller.advance(
             input(RuntimePhaseGameplay, 0, missingDepth, {}));
         if (decision.mode != PresentationMode::SafetyBlank || decision.gameplayVrAccepted)
-            return fail("color-only gameplay must fail closed, never become a quad or accepted VR");
+            return fail("gameplay without render-local eye depth must fail closed");
     }
 
     {

@@ -49,6 +49,11 @@ struct RetailCenterRuntimeFrame
     // The actual third cdecl argument at the audited AccumulateScene call.
     // The global SceneGraph must name this exact already-prepared culler.
     abi::RetailBSCullingProcessLayout* stockCullingProcess = nullptr;
+    // xNVSE's published first-person player root.  Geometry below this root
+    // may use NiAccumulator's immediate-dispatch path, which is one-shot per
+    // retail frame.  The private renderer uses this exact ancestry boundary
+    // to queue only view-model geometry independently for both eyes.
+    abi::RetailPointer32 firstPersonRootNode = 0u;
 };
 
 struct RetailCenterCameraPoseProof
@@ -56,6 +61,11 @@ struct RetailCenterCameraPoseProof
     RetailNiTransformLayout center {};
     RetailNiTransformLayout left {};
     RetailNiTransformLayout right {};
+    // The origin is part of the same accepted tracked frame as the derived
+    // cameras.  Retain it with the transaction proof so post-run evidence can
+    // distinguish a clean relatch from a stale camera result.
+    RetailVrOrigin origin {};
+    bool originRelatched = false;
     bool valid = false;
 };
 
@@ -67,6 +77,10 @@ struct RetailCenterRuntimeFrameResult
         RetailCenterRuntimeFailure::RuntimeNotReady;
     CenterRendererResult renderer {};
     RetailCenterCameraPoseProof cameraPose {};
+    // The post-world RenderFirstPerson continuation must reuse this exact
+    // accepted rig. Re-deriving from a later pose would put a weapon in a
+    // different eye frame than the world it is composited into.
+    RetailDerivedEyeCameraRig cameraRig {};
 };
 
 // Owns the private cameras and accumulators and turns a proven retail world
@@ -205,6 +219,12 @@ public:
         return mRendererContext.accumulatorSnapshotDiagnostics();
     }
 
+    const RetailCenterEyeCameraDiagnostics& eyeCameraDiagnostics() const
+        noexcept
+    {
+        return mRendererContext.eyeCameraDiagnostics();
+    }
+
     const RetailCenterRendererTimingDiagnostics& timingDiagnostics() const
         noexcept
     {
@@ -316,6 +336,8 @@ public:
             cameraRig.center.world,
             cameraRig.left.world,
             cameraRig.right.world,
+            originCandidate.origin,
+            originCandidate.relatched,
             true,
         };
 
@@ -345,6 +367,11 @@ public:
             mResources.rightAccumulator(),
             frame.generation,
         };
+        if (!mRendererContext.setFirstPersonRootNode(
+                frame.firstPersonRootNode))
+        {
+            return reject(RetailCenterRuntimeFailure::InvalidFrame);
+        }
         CenterRendererResult renderer = executeCenterRendererFrame(
             mRendererOperations,
             authorization,
@@ -358,6 +385,7 @@ public:
                 mFailure,
                 renderer,
                 cameraPose,
+                cameraRig,
             };
         }
         mLastFrameGeneration = frame.generation;
@@ -371,6 +399,7 @@ public:
             RetailCenterRuntimeFailure::None,
             renderer,
             cameraPose,
+            cameraRig,
         };
     }
 

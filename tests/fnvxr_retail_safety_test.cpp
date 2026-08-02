@@ -31,7 +31,7 @@ fnvxr::safety::RetailMutationEvidenceToken completeEvidence(std::uint32_t proces
     }
     evidence.engineStereoComplete = true;
     evidence.gpuColorTransportComplete = true;
-    evidence.gpuDepthTransportComplete = true;
+    evidence.renderLocalDepthPairComplete = true;
     evidence.authoritativeWeaponComplete = true;
     evidence.uiModeTransitionsComplete = true;
     return evidence;
@@ -144,9 +144,9 @@ int main()
     if (retailMutationEvidenceComplete(changed, ProcessId))
         return fail("GPU color transport proof is mandatory");
     changed = complete;
-    changed.gpuDepthTransportComplete = false;
+    changed.renderLocalDepthPairComplete = false;
     if (retailMutationEvidenceComplete(changed, ProcessId))
-        return fail("GPU depth transport proof is mandatory");
+        return fail("render-local eye-depth proof is mandatory");
     changed = complete;
     changed.authoritativeWeaponComplete = false;
     if (retailMutationEvidenceComplete(changed, ProcessId))

@@ -592,11 +592,28 @@ private:
         engine::CenterRendererEye eye,
         engine::CenterRendererEyeIsolation& isolation) noexcept
     {
+        return bind(eye, isolation, true);
+    }
+
+    bool bindPreservingContents(
+        engine::CenterRendererEye eye,
+        engine::CenterRendererEyeIsolation& isolation) noexcept
+    {
+        return bind(eye, isolation, false);
+    }
+
+    bool bind(
+        engine::CenterRendererEye eye,
+        engine::CenterRendererEyeIsolation& isolation,
+        bool clearBoundTargets) noexcept
+    {
+        const bool orderValid = eyeOrderValid(eye)
+            || (!clearBoundTargets && mCompletedEyes == 3u);
         if (!ready()
             || !mSnapshotActive
             || mEyeActive
             || isolation.active()
-            || !eyeOrderValid(eye))
+            || !orderValid)
         {
             return false;
         }
@@ -623,12 +640,12 @@ private:
             mApi.context,
             mResources.device,
             false);
-        const bool targetsCleared =
-            scissorDisabled
-            && mApi.clearBoundEyeTargets(
-                mApi.context,
-                mResources.device);
-        if (!targetsCleared)
+        const bool prepared = scissorDisabled
+            && (!clearBoundTargets
+                || mApi.clearBoundEyeTargets(
+                    mApi.context,
+                    mResources.device));
+        if (!prepared)
             return false;
 
         mEyeActive = true;
@@ -820,6 +837,15 @@ struct RetailEyeTargetAdapter
         return context && context->bind(eye, isolation);
     }
 
+    static bool bindPreservingContents(
+        void* opaque,
+        engine::CenterRendererEye eye,
+        engine::CenterRendererEyeIsolation& isolation) noexcept
+    {
+        RetailEyeTargetContext* context = checked(opaque);
+        return context && context->bindPreservingContents(eye, isolation);
+    }
+
     static bool end(
         void* opaque,
         engine::CenterRendererEye eye,
@@ -859,6 +885,7 @@ inline engine::RetailEyeTargetOperations makeRetailEyeTargetOperations(
         &detail::RetailEyeTargetAdapter::end,
         &detail::RetailEyeTargetAdapter::rollback,
         &detail::RetailEyeTargetAdapter::restore,
+        &detail::RetailEyeTargetAdapter::bindPreservingContents,
     };
 }
 }

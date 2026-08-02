@@ -93,12 +93,22 @@ int main()
             == "Tribal Pack items added to inventory.");
     static_assert(
         sizeof(automation::OfficialPackNotifications)
-            / sizeof(automation::OfficialPackNotifications[0]) == 4u);
+            / sizeof(automation::OfficialPackNotifications[0]) == 5u);
     static_assert(
         automation::OfficialPackNotifications[1].title == "Classic Pack");
     static_assert(
         automation::OfficialPackNotifications[1].body
             == "Classic Pack items added to inventory.");
+    static_assert(
+        automation::OfficialPackNotifications[4].title
+            == "Gun Runners' Arsenal");
+    static_assert(
+        automation::OfficialPackNotifications[4].body
+            == "The ongoing conflict in the Mojave Wasteland has kicked weapon "
+               "manufacturers into high gear! All major and minor weapon dealers in "
+               "the region are rolling in new weapons, ammunition types, and "
+               "modifications. Head to your nearest participating vendor to peruse "
+               "the merchandise!");
     static_assert(automation::MessageMenuOkText == "OK");
     static_assert(automation::exactOfficialPackAcknowledgementAuthorized(
         true, true, true, true, false));

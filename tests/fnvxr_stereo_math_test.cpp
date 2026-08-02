@@ -396,8 +396,28 @@ int main()
 
     const auto cameraLocalPosition =
         fnvxr::stereo::xrVectorToNiCameraLocal(expectedLocalPosition);
-    if (!vectorNear(cameraLocalPosition, 0.25f, -0.10f, -0.40f))
-        return fail("OpenXR position must remain right/up/back in NiCamera-local space");
+    if (!vectorNear(cameraLocalPosition, 0.40f, -0.10f, 0.25f))
+        return fail("OpenXR position must convert right/up/back into NiCamera forward/up/right");
+
+    const auto niCameraPitch = fnvxr::stereo::cameraLocalHeadRotation(
+        axisAngle(1.0f, 0.0f, 0.0f, Pi * 0.5f));
+    if (!vectorNear(
+            fnvxr::stereo::transform(
+                niCameraPitch,
+                { 1.0f, 0.0f, 0.0f }),
+            0.0f,
+            1.0f,
+            0.0f)
+        || !vectorNear(
+            fnvxr::stereo::transform(
+                niCameraPitch,
+                { 0.0f, 0.0f, 1.0f }),
+            0.0f,
+            0.0f,
+            1.0f))
+    {
+        return fail("OpenXR headset X must become NiCamera right-axis pitch, not forward-axis roll");
+    }
 
     const fnvxr::stereo::Vector3 gameForward { 0.0f, 1.0f, 0.0f };
     const fnvxr::stereo::Vector3 gameRight { 1.0f, 0.0f, 0.0f };
@@ -444,8 +464,8 @@ int main()
     }
 
     // Captured from the retail NiCamera immediately before the sideways
-    // regression.  Its columns are camera right, up, and back.  Leveling must
-    // retain that layout instead of replacing it with an actor/world yaw
+    // regression. Its columns are camera forward, up, and right. Leveling
+    // must retain that layout instead of replacing it with an actor/world yaw
     // matrix whose third column is world-up.
     const fnvxr::stereo::Matrix3 capturedCameraWorld {{
         { 0.010f, 0.250f, -0.968f },
@@ -453,9 +473,9 @@ int main()
         { -0.000f, 0.968f, 0.250f }
     }};
     const auto levelCamera = fnvxr::stereo::gravityLevelCameraWorldRotation(capturedCameraWorld);
-    const fnvxr::stereo::Vector3 cameraLocalRight { 1.0f, 0.0f, 0.0f };
+    const fnvxr::stereo::Vector3 cameraLocalForward { 1.0f, 0.0f, 0.0f };
     const fnvxr::stereo::Vector3 cameraLocalUp { 0.0f, 1.0f, 0.0f };
-    const fnvxr::stereo::Vector3 cameraLocalForward { 0.0f, 0.0f, -1.0f };
+    const fnvxr::stereo::Vector3 cameraLocalRight { 0.0f, 0.0f, 1.0f };
     const auto levelRight = fnvxr::stereo::transform(levelCamera, cameraLocalRight);
     const auto levelUp = fnvxr::stereo::transform(levelCamera, cameraLocalUp);
     const auto levelForward = fnvxr::stereo::transform(levelCamera, cameraLocalForward);
@@ -465,22 +485,22 @@ int main()
     {
         return fail("leveled NiCamera must keep right/forward horizontal and camera up on world +Z");
     }
-    const float capturedRightLength = std::sqrt(
+    const float capturedForwardLength = std::sqrt(
         capturedCameraWorld.m[0][0] * capturedCameraWorld.m[0][0]
         + capturedCameraWorld.m[1][0] * capturedCameraWorld.m[1][0]);
     if (!vectorNear(
-            levelRight,
-            capturedCameraWorld.m[0][0] / capturedRightLength,
-            capturedCameraWorld.m[1][0] / capturedRightLength,
+            levelForward,
+            capturedCameraWorld.m[0][0] / capturedForwardLength,
+            capturedCameraWorld.m[1][0] / capturedForwardLength,
             0.0f))
     {
         return fail("leveled NiCamera must preserve the engine-authored horizontal heading");
     }
 
     // Regression witness for the native 6DoF translation bug: NiCamera's
-    // columns are right/up/back. A 10 cm OpenXR forward move is local -Z and
-    // must follow the leveled camera-forward column without gaining height.
-    // The actor mapping would turn it into +Y, which is camera-up here.
+    // columns are forward/up/right. A 10 cm OpenXR forward move is local -Z,
+    // which converts to NiCamera +X/forward and must follow the leveled
+    // camera-forward column without gaining height.
     const auto nativeForwardLocal = fnvxr::stereo::xrVectorToNiCameraLocal({ 0.0f, 0.0f, -0.10f });
     const auto nativeForwardWorld = fnvxr::stereo::transform(levelCamera, nativeForwardLocal);
     if (!vectorNear(
@@ -717,6 +737,32 @@ int main()
     const auto pitchedCameraForward = fnvxr::stereo::transform(cameraPitch, cameraLocalForward);
     if (pitchedCameraForward.z < 0.70f)
         return fail("OpenXR camera-local positive pitch must lift the view toward world-up");
+
+    // Native stereo has its own active camera transaction.  It must use the
+    // same full-orientation origin as the retail eye transaction: only room
+    // translation is yaw-aligned.  A yaw-only view origin retains the pitch
+    // and roll present at recenter, which turns a later X-axis nod into an
+    // orbital horizontal turn.
+    const auto currentAfterPurePitch = fnvxr::stereo::multiply(
+        origin,
+        axisAngle(1.0f, 0.0f, 0.0f, Pi * 0.25f));
+    const auto fullViewDelta = fnvxr::stereo::relativeOrientation(
+        fnvxr::stereo::fullHeadOrientationOrigin(origin),
+        currentAfterPurePitch);
+    const auto fullViewCamera = fnvxr::stereo::composeBodyAndHead(
+        levelCamera,
+        fnvxr::stereo::cameraLocalHeadRotation(fullViewDelta));
+    const auto fullViewForward = fnvxr::stereo::transform(
+        fullViewCamera,
+        cameraLocalForward);
+    const float pitchHorizontalCoupling = fullViewForward.x * levelRight.x
+        + fullViewForward.y * levelRight.y
+        + fullViewForward.z * levelRight.z;
+    if (std::fabs(pitchHorizontalCoupling) > 0.0001f
+        || fullViewForward.z < 0.70f)
+    {
+        return fail("tilted native recenter must keep a pure headset X motion on the pitch axis");
+    }
 
     const auto cameraRoll = fnvxr::stereo::composeBodyAndHead(
         levelCamera,

@@ -54,7 +54,9 @@ struct RuntimeEvidence
 // "two textures arrived" into full product gameplay acceptance.
 struct ProducerWorldEvidence
 {
-    bool depthPairComplete = false;
+    // This proves per-eye depth/stencil correctness inside the retail render
+    // transaction. ABI v5 does not export depth to the host.
+    bool renderLocalDepthPairComplete = false;
     bool sameSimulationTick = false;
     bool conservativeVisibilityComplete = false;
     bool resourceGraphComplete = false;
@@ -340,7 +342,8 @@ inline product::PresentationInput makePresentationInput(
     // distinct views, and exact shared-pose lineage.  Producer-only facts are
     // copied solely from explicit evidence; presentation mode is not evidence.
     proof.colorPairComplete = true;
-    proof.depthPairComplete = producerEvidence.depthPairComplete;
+    proof.renderLocalDepthPairComplete =
+        producerEvidence.renderLocalDepthPairComplete;
     proof.sameSimulationTick = producerEvidence.sameSimulationTick;
     proof.poseMatched = true;
     proof.conservativeVisibilityComplete =

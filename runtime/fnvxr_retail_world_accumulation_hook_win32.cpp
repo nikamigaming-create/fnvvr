@@ -319,4 +319,241 @@ void RetailWorldAccumulationHookWin32Memory::abandonOwnedState() noexcept
     mNextToken = 1u;
     mInitialized = false;
 }
+
+RetailFirstPersonHookWin32Memory::~RetailFirstPersonHookWin32Memory() noexcept
+{
+    if (mWritableAddress != 0u && mOriginalProtection != 0u)
+    {
+        DWORD ignored = 0u;
+        static_cast<void>(VirtualProtect(
+            reinterpret_cast<void*>(
+                static_cast<std::uintptr_t>(mWritableAddress)),
+            RetailFirstPersonCallPatchByteCount,
+            mOriginalProtection,
+            &ignored));
+    }
+    abandonOwnedState();
+}
+
+bool RetailFirstPersonHookWin32Memory::initialize(
+    std::uint32_t authorizedImageBase) noexcept
+{
+    if constexpr (!RetailWorldAccumulationHookWin32MemoryAvailable)
+    {
+        (void)authorizedImageBase;
+        return false;
+    }
+    else
+    {
+        if (mInitialized
+            || mWritableAddress != 0u
+            || authorizedImageBase == 0u
+            || !retailFirstPersonCallSiteContractInventoryProductionProven())
+        {
+            return false;
+        }
+        std::array<
+            std::uint32_t,
+            RetailFirstPersonCallSiteContractInventory.size()> addresses {};
+        for (std::size_t index = 0u; index < addresses.size(); ++index)
+        {
+            std::uintptr_t address = 0u;
+            if (!relocateRetailFirstPersonPreferredAddress(
+                    authorizedImageBase,
+                    RetailFirstPersonCallSiteContractInventory[index]
+                        .preferredCallAddress,
+                    address)
+                || address == 0u
+                || address > 0xFFFFFFFFu
+                || !readableExecutableRange(
+                    static_cast<std::uint32_t>(address),
+                    RetailFirstPersonCallPatchByteCount))
+            {
+                return false;
+            }
+            addresses[index] = static_cast<std::uint32_t>(address);
+        }
+        mImageBase = authorizedImageBase;
+        mCallSiteAddresses = addresses;
+        mNextToken = 1u;
+        mInitialized = true;
+        return true;
+    }
+}
+
+bool RetailFirstPersonHookWin32Memory::ready() const noexcept
+{
+    return RetailWorldAccumulationHookWin32MemoryAvailable
+        && mInitialized
+        && mImageBase != 0u;
+}
+
+RetailWorldAccumulationHookMemoryOperations
+RetailFirstPersonHookWin32Memory::operations() noexcept
+{
+    if (!ready())
+        return {};
+    return {
+        this,
+        &read,
+        &makeWritable,
+        &restoreProtection,
+        &write,
+        &flushInstructionCache,
+    };
+}
+
+bool RetailFirstPersonHookWin32Memory::rangeIsCallSite(
+    std::uint32_t address,
+    std::size_t byteCount) const noexcept
+{
+    if (!ready() || byteCount != RetailFirstPersonCallPatchByteCount)
+        return false;
+    for (const std::uint32_t callSite : mCallSiteAddresses)
+    {
+        if (address == callSite)
+            return true;
+    }
+    return false;
+}
+
+bool RetailFirstPersonHookWin32Memory::read(
+    void* opaque,
+    std::uint32_t address,
+    std::uint8_t* destination,
+    std::size_t byteCount) noexcept
+{
+    auto* state = static_cast<RetailFirstPersonHookWin32Memory*>(opaque);
+    if (!state || !destination || !state->rangeIsCallSite(address, byteCount))
+        return false;
+    SIZE_T transferred = 0u;
+    return ReadProcessMemory(
+            GetCurrentProcess(),
+            reinterpret_cast<const void*>(
+                static_cast<std::uintptr_t>(address)),
+            destination,
+            byteCount,
+            &transferred)
+        && transferred == byteCount;
+}
+
+RetailWorldHookProtectionLease
+RetailFirstPersonHookWin32Memory::makeWritable(
+    void* opaque,
+    std::uint32_t address,
+    std::size_t byteCount) noexcept
+{
+    auto* state = static_cast<RetailFirstPersonHookWin32Memory*>(opaque);
+    if (!state
+        || !state->rangeIsCallSite(address, byteCount)
+        || state->mWritableAddress != 0u
+        || state->mProtectionToken != 0u)
+    {
+        return {};
+    }
+    DWORD oldProtection = 0u;
+    if (!VirtualProtect(
+            reinterpret_cast<void*>(static_cast<std::uintptr_t>(address)),
+            byteCount,
+            PAGE_EXECUTE_READWRITE,
+            &oldProtection)
+        || oldProtection == 0u)
+    {
+        return {};
+    }
+    const std::uintptr_t token = static_cast<std::uintptr_t>(state->mNextToken++);
+    if (token == 0u || state->mNextToken == 0u)
+    {
+        DWORD ignored = 0u;
+        static_cast<void>(VirtualProtect(
+            reinterpret_cast<void*>(static_cast<std::uintptr_t>(address)),
+            byteCount,
+            oldProtection,
+            &ignored));
+        return {};
+    }
+    state->mWritableAddress = address;
+    state->mOriginalProtection = oldProtection;
+    state->mProtectionToken = token;
+    return { true, token };
+}
+
+bool RetailFirstPersonHookWin32Memory::restoreProtection(
+    void* opaque,
+    const RetailWorldHookProtectionLease& lease) noexcept
+{
+    auto* state = static_cast<RetailFirstPersonHookWin32Memory*>(opaque);
+    if (!state
+        || state->mWritableAddress == 0u
+        || !lease.ownershipTransferred
+        || lease.restoreToken == 0u
+        || lease.restoreToken != state->mProtectionToken
+        || state->mOriginalProtection == 0u)
+    {
+        return false;
+    }
+    DWORD ignored = 0u;
+    if (!VirtualProtect(
+            reinterpret_cast<void*>(
+                static_cast<std::uintptr_t>(state->mWritableAddress)),
+            RetailFirstPersonCallPatchByteCount,
+            state->mOriginalProtection,
+            &ignored))
+    {
+        return false;
+    }
+    state->mWritableAddress = 0u;
+    state->mProtectionToken = 0u;
+    state->mOriginalProtection = 0u;
+    return true;
+}
+
+bool RetailFirstPersonHookWin32Memory::write(
+    void* opaque,
+    std::uint32_t address,
+    const std::uint8_t* source,
+    std::size_t byteCount) noexcept
+{
+    auto* state = static_cast<RetailFirstPersonHookWin32Memory*>(opaque);
+    if (!state
+        || !source
+        || state->mWritableAddress != address
+        || !state->rangeIsCallSite(address, byteCount))
+    {
+        return false;
+    }
+    SIZE_T transferred = 0u;
+    return WriteProcessMemory(
+            GetCurrentProcess(),
+            reinterpret_cast<void*>(static_cast<std::uintptr_t>(address)),
+            source,
+            byteCount,
+            &transferred)
+        && transferred == byteCount;
+}
+
+bool RetailFirstPersonHookWin32Memory::flushInstructionCache(
+    void* opaque,
+    std::uint32_t address,
+    std::size_t byteCount) noexcept
+{
+    auto* state = static_cast<RetailFirstPersonHookWin32Memory*>(opaque);
+    if (!state || !state->rangeIsCallSite(address, byteCount))
+        return false;
+    return FlushInstructionCache(
+        GetCurrentProcess(),
+        reinterpret_cast<const void*>(static_cast<std::uintptr_t>(address)),
+        byteCount) != FALSE;
+}
+
+void RetailFirstPersonHookWin32Memory::abandonOwnedState() noexcept
+{
+    mImageBase = 0u;
+    mCallSiteAddresses = {};
+    mWritableAddress = 0u;
+    mProtectionToken = 0u;
+    mOriginalProtection = 0u;
+    mNextToken = 1u;
+    mInitialized = false;
+}
 }

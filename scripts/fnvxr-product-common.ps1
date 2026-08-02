@@ -227,10 +227,39 @@ function Resolve-FnvxrProductRetailFixtureTraits {
     }
 }
 
+function Get-FnvxrProductRetailFixtureWeaponNames {
+    # Finite stock FalloutNV.esm loadouts only. This selector is a fixture
+    # creation input, never a generic console-command or user-save input.
+    return @(
+        "None",
+        "Pistol",
+        "RifleSingleHand",
+        "RifleTwoHand",
+        "Minigun",
+        "FragGrenade",
+        "Knife",
+        "ThrowingKnife")
+}
+
+function Resolve-FnvxrProductRetailFixtureWeapon {
+    param([Parameter(Mandatory = $true)][string]$Weapon)
+
+    foreach ($candidate in @(Get-FnvxrProductRetailFixtureWeaponNames)) {
+        if ([string]::Equals(
+                $candidate,
+                $Weapon,
+                [System.StringComparison]::OrdinalIgnoreCase)) {
+            return $candidate
+        }
+    }
+    throw "Unsupported retail fixture weapon: $Weapon"
+}
+
 function Get-FnvxrProductRetailFixtureSaveName {
     param(
         [Parameter(Mandatory = $true)][string]$TraitOne,
-        [Parameter(Mandatory = $true)][string]$TraitTwo
+        [Parameter(Mandatory = $true)][string]$TraitTwo,
+        [string]$Weapon = "None"
     )
 
     $traits = Resolve-FnvxrProductRetailFixtureTraits `
@@ -240,10 +269,15 @@ function Get-FnvxrProductRetailFixtureSaveName {
         @($traits.first, $traits.second) |
             Where-Object { $_ -cne "None" } |
             Sort-Object -CaseSensitive)
+    $selectedWeapon = Resolve-FnvxrProductRetailFixtureWeapon -Weapon $Weapon
     if ($selected.Count -eq 0) {
-        return "FNVXR_AutoRetail_L1_Base"
+        if ($selectedWeapon -ceq "None") {
+            return "FNVXR_AutoRetail_L1_Base"
+        }
+        return "FNVXR_AutoRetail_L1_$selectedWeapon"
     }
-    return "FNVXR_AutoRetail_L1_" + ($selected -join "_")
+    $weaponPrefix = if ($selectedWeapon -ceq "None") { "" } else { $selectedWeapon + "_" }
+    return "FNVXR_AutoRetail_L1_" + $weaponPrefix + ($selected -join "_")
 }
 
 function Assert-FnvxrProductRetailFixtureSaveName {
@@ -259,7 +293,8 @@ function Assert-FnvxrProductRetailFixtureSaveName {
 function Get-FnvxrProductTtwFixtureSaveName {
     param(
         [Parameter(Mandatory = $true)][string]$TraitOne,
-        [Parameter(Mandatory = $true)][string]$TraitTwo
+        [Parameter(Mandatory = $true)][string]$TraitTwo,
+        [string]$Weapon = "None"
     )
 
     $traits = Resolve-FnvxrProductRetailFixtureTraits `
@@ -269,10 +304,15 @@ function Get-FnvxrProductTtwFixtureSaveName {
         @($traits.first, $traits.second) |
             Where-Object { $_ -cne "None" } |
             Sort-Object -CaseSensitive)
+    $selectedWeapon = Resolve-FnvxrProductRetailFixtureWeapon -Weapon $Weapon
     if ($selected.Count -eq 0) {
-        return "FNVXR_AutoTTW_L1_Base"
+        if ($selectedWeapon -ceq "None") {
+            return "FNVXR_AutoTTW_L1_Base"
+        }
+        return "FNVXR_AutoTTW_L1_$selectedWeapon"
     }
-    return "FNVXR_AutoTTW_L1_" + ($selected -join "_")
+    $weaponPrefix = if ($selectedWeapon -ceq "None") { "" } else { $selectedWeapon + "_" }
+    return "FNVXR_AutoTTW_L1_" + $weaponPrefix + ($selected -join "_")
 }
 
 function Assert-FnvxrProductTtwFixtureSaveName {
@@ -1023,16 +1063,30 @@ function Write-FnvxrProductJsonAtomic {
     if (-not (Test-Path -LiteralPath $directory -PathType Container)) {
         New-Item -ItemType Directory -Path $directory -Force | Out-Null
     }
-    $temporary = Join-Path $directory (".{0}.{1}.tmp" -f
-        [System.IO.Path]::GetFileName($fullPath), [Guid]::NewGuid().ToString("N"))
-    try {
-        $Value | ConvertTo-Json -Depth $Depth | Set-Content -LiteralPath $temporary -Encoding UTF8
-        Move-Item -LiteralPath $temporary -Destination $fullPath -Force
-    } finally {
-        if (Test-Path -LiteralPath $temporary -PathType Leaf) {
-            Remove-Item -LiteralPath $temporary -Force
+    # The exit watcher may be reading or replacing the same manifest while the
+    # launcher records a terminal state.  Retain atomic replacement, but treat
+    # a transient Windows handle conflict as a bounded retry rather than
+    # turning a completed retail run into a failed one.
+    $json = $Value | ConvertTo-Json -Depth $Depth
+    $lastLockError = $null
+    for ($attempt = 1; $attempt -le 6; ++$attempt) {
+        $temporary = Join-Path $directory (".{0}.{1}.tmp" -f
+            [System.IO.Path]::GetFileName($fullPath), [Guid]::NewGuid().ToString("N"))
+        try {
+            $json | Set-Content -LiteralPath $temporary -Encoding UTF8 -ErrorAction Stop
+            Move-Item -LiteralPath $temporary -Destination $fullPath -Force -ErrorAction Stop
+            return
+        } catch [System.IO.IOException] {
+            $lastLockError = $_
+            if ($attempt -eq 6) { throw }
+            Start-Sleep -Milliseconds (50 * $attempt)
+        } finally {
+            if (Test-Path -LiteralPath $temporary -PathType Leaf) {
+                Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
+            }
         }
     }
+    throw $lastLockError
 }
 
 function Get-FnvxrProductFileIdentity {
@@ -2095,6 +2149,10 @@ function Get-FnvxrProductMinimalEnvironment {
         [switch]$TtwFixture,
         [switch]$HeadsetDemoFixture,
         [switch]$HeadsetWorldOnlyCapture,
+        [switch]$HeadsetFixtureWeaponDraw,
+        [ValidateSet("None", "Primary", "Alternate", "Third")]
+        [string]$RetailVrFirstPersonPrivateCaller = "None",
+        [switch]$HeadsetControllerRigVisualTrial,
         [switch]$PhysicalHeadsetPlay,
         [ValidateRange(1280, 4096)][int]$PhysicalGameWidth = 1920,
         [ValidateRange(720, 2560)][int]$PhysicalGameHeight = 1200,
@@ -2120,10 +2178,18 @@ function Get-FnvxrProductMinimalEnvironment {
         [string]$RetailFixtureSaveName = "",
         [string]$RetailFixtureTraitOne = "None",
         [string]$RetailFixtureTraitTwo = "None",
+        [ValidateSet(
+            "None", "Pistol", "RifleSingleHand", "RifleTwoHand", "Minigun",
+            "FragGrenade", "Knife", "ThrowingKnife")]
+        [string]$RetailFixtureWeapon = "None",
         [switch]$AcknowledgeTribalPackPopup,
         [ValidateSet("FNVXR_StereoTest")]
         [string]$AutomateRecoverySaveName = "FNVXR_StereoTest",
         [string]$HeadlessRuntimeManifest = "",
+        # Uses the simulator runtime's native SBS desktop preview while
+        # retaining the same process-local runtime manifest and file IPC.
+        # It never changes the retail renderer, assets, or simulator menus.
+        [switch]$SimulatorDesktopPreview,
         [string]$PhysicalRuntimeManifest = "",
         [string]$HeadsetMirrorCaptureDirectory = "",
         [ValidateRange(1, 600)][int]$HeadsetMirrorCaptureEveryFrames = 6,
@@ -2146,8 +2212,33 @@ function Get-FnvxrProductMinimalEnvironment {
     if ($HeadsetDemoFixture -and $HeadsetWorldOnlyCapture) {
         throw "The headset demo and world-only capture are mutually exclusive."
     }
+    if ($HeadsetFixtureWeaponDraw -and -not $HeadsetWorldOnlyCapture) {
+        throw "The headset fixture weapon draw requires world-only capture."
+    }
     if ($headsetFixtureVisualTrial -and -not $AutomateRetailFixture) {
         throw "The headset fixture visual trial requires the owned retail-fixture automation."
+    }
+    if ($HeadsetFixtureWeaponDraw -and -not $AutomateRetailFixture) {
+        throw "The headset fixture weapon draw requires the owned retail-fixture automation."
+    }
+    if ($HeadsetControllerRigVisualTrial -and -not $HeadsetFixtureWeaponDraw) {
+        throw "The headless controller visual-rig trial requires the owned fixture weapon draw."
+    }
+    if ($HeadsetControllerRigVisualTrial -and
+        [string]::IsNullOrWhiteSpace($HeadlessRuntimeManifest)) {
+        throw "The controller visual-rig trial requires the process-local headless runtime."
+    }
+    if ($HeadsetControllerRigVisualTrial -and $PhysicalHeadsetPlay) {
+        throw "The controller visual-rig trial is headless-only and cannot combine with physical headset play."
+    }
+    if ($HeadsetFixtureWeaponDraw -and $RetailFixtureAction -cne "load") {
+        throw "The headset fixture weapon draw requires an existing owned fixture load."
+    }
+    if ($HeadsetFixtureWeaponDraw -and $RetailFixtureWeapon -ceq "None") {
+        throw "The headset fixture weapon draw requires a named stock fixture weapon."
+    }
+    if (-not $HeadsetFixtureWeaponDraw -and $RetailVrFirstPersonPrivateCaller -cne "None") {
+        throw "The private first-person caller selector requires the headset fixture weapon draw."
     }
     if ($PhysicalHeadsetPlay -and -not $AutomateRetailFixture) {
         throw "Physical headset play requires an owned retail-fixture load."
@@ -2167,6 +2258,10 @@ function Get-FnvxrProductMinimalEnvironment {
     if (-not [string]::IsNullOrWhiteSpace($HeadlessRuntimeManifest) -and
         -not [string]::IsNullOrWhiteSpace($PhysicalRuntimeManifest)) {
         throw "Headless and physical OpenXR runtime manifests are mutually exclusive."
+    }
+    if ($SimulatorDesktopPreview -and
+        [string]::IsNullOrWhiteSpace($HeadlessRuntimeManifest)) {
+        throw "The simulator desktop preview requires the simulator runtime manifest."
     }
     if ($RetailVrAccumulationDiagnosticMode -cne "Full" -and
         -not $HeadsetDemoFixture) {
@@ -2231,6 +2326,22 @@ function Get-FnvxrProductMinimalEnvironment {
         # game-thread bridge. The shipping XInput/DirectInput DLL shims remain
         # transparent and are not granted production mutation authority.
         $environment.FNVXR_PHYSICAL_HEADSET_PLAY = "1"
+        # Physical retail reaches the authentic first-person weapon pass via
+        # the third audited outer caller (0x00870F74). Hold the world pair for
+        # that pass so the CPU-v8 producer can publish a complete world plus
+        # weapon image instead of leaving the OpenXR host with zero layers.
+        $environment.FNVXR_RETAIL_VR_FIRST_PERSON_PRIVATE_CALLER = "third"
+        # The physical profile owns the full compatibility-checked game-thread
+        # bridge. Its post-animation rig consumes live controller poses while
+        # the engine-center camera independently consumes the HMD pose.
+        $environment.FNVXR_RETAIL_RIG_ENABLE = "1"
+        $environment.FNVXR_RETAIL_RIG_APPLY = "1"
+        $environment.FNVXR_RETAIL_WEAPON_APPLY = "1"
+        $environment.FNVXR_RETAIL_CENTER_INTEGRATED_FIRST_PERSON = "1"
+        # Keep one post-xrEndFrame engine-center submit per transaction for
+        # the Phase 1 physical evidence verifier. This is deliberately
+        # narrower than the general telemetry hammer.
+        $environment.FNVXR_PHASE1_TRACE_TELEMETRY = "1"
         $environment.FNVXR_EXTERNAL_XINPUT_WRITER = "1"
         $environment.FNVXR_EXTERNAL_DINPUT_WRITER = "1"
         $environment.FNVXR_PLUGIN_KEYBOARD_MOVEMENT_ENABLE = "1"
@@ -2260,7 +2371,7 @@ function Get-FnvxrProductMinimalEnvironment {
         # frame.
         $environment.FNVXR_D3D9_NATIVE_APPLY_HEAD_ROTATION = "1"
         $environment.FNVXR_D3D9_NATIVE_HEAD_AXIS_MODE =
-            "openxr-camera-local"
+            "openxr-to-ni-camera"
         $environment.FNVXR_D3D9_USE_SHARED_CAMERA_VIEW = "0"
         $environment.FNVXR_D3D9_APPLY_HMD_POSE = "0"
         $environment.FNVXR_HEADSPACE_LOOK_ENABLE = "0"
@@ -2301,6 +2412,8 @@ function Get-FnvxrProductMinimalEnvironment {
         $fixtureTraits = Resolve-FnvxrProductRetailFixtureTraits `
             -TraitOne $RetailFixtureTraitOne `
             -TraitTwo $RetailFixtureTraitTwo
+        $fixtureWeapon = Resolve-FnvxrProductRetailFixtureWeapon `
+            -Weapon $RetailFixtureWeapon
         $fixtureSaveName = if ($TtwFixture) {
             Assert-FnvxrProductTtwFixtureSaveName -SaveName $RetailFixtureSaveName
         } else {
@@ -2311,6 +2424,7 @@ function Get-FnvxrProductMinimalEnvironment {
         $environment.FNVXR_RETAIL_FIXTURE_SAVE_NAME = $fixtureSaveName
         $environment.FNVXR_RETAIL_FIXTURE_TRAIT_ONE = $fixtureTraits.first
         $environment.FNVXR_RETAIL_FIXTURE_TRAIT_TWO = $fixtureTraits.second
+        $environment.FNVXR_RETAIL_FIXTURE_WEAPON = $fixtureWeapon
         # Both the base-game and exact TTW-core fixture profiles can present
         # one of four known stock pre-order-pack notices after an owned load.
         # The plugin accepts only an exact title/body pair and its unique
@@ -2355,10 +2469,55 @@ function Get-FnvxrProductMinimalEnvironment {
             # retaining the exact owned-fixture/OpenXR route above.
             $environment.FNVXR_HEADSET_WORLD_ONLY_CAPTURE = "1"
         }
+        if ($HeadsetFixtureWeaponDraw) {
+            # This is consumed only by the post-load world-only fixture
+            # finisher. It may save once to the same verified owned Load after
+            # clean gameplay, then issue JIP's one fixed SetWeaponOut command
+            # for its named, currently holstered fixture weapon.
+            $environment.FNVXR_HEADSET_FIXTURE_DRAW_WEAPON = "1"
+            # A completed stock backbuffer is not a weapon-bearing engine
+            # stereo proof. The renderer hard-fuses this producer off; keep
+            # an explicit zero in the weapon route so inherited user
+            # environment state cannot revive it.
+            $environment.FNVXR_HEADSET_FINAL_STOCK_FRAME_CAPTURE = "0"
+            $environment.FNVXR_RETAIL_FIRST_PERSON_RAW_EYE_CAPTURE = "1"
+            $environment.FNVXR_RETAIL_FIRST_PERSON_DRAW_TRACE_LIMIT = "4096"
+            if ($RetailVrFirstPersonPrivateCaller -cne "None") {
+                $environment.FNVXR_RETAIL_VR_FIRST_PERSON_PRIVATE_CALLER =
+                    $RetailVrFirstPersonPrivateCaller.ToLowerInvariant()
+            }
+        }
+        if ($HeadsetControllerRigVisualTrial) {
+            # A fixture-only visual lease. The OpenXR host still owns pose
+            # sampling and final presentation; the D3D bridge owns stereo
+            # cameras. xNVSE may only restore/apply first-person hand and
+            # weapon transforms from current grip/aim pose samples.
+            $environment.FNVXR_HEADSET_CONTROLLER_RIG_VISUAL_TRIAL = "1"
+            $environment.FNVXR_INSTALL_CAMERA_HOOK = "0"
+            $environment.FNVXR_CAMERA_HOOK = "0"
+            $environment.FNVXR_CAMERA_APPLY = "0"
+            $environment.FNVXR_RETAIL_RIG_ENABLE = "1"
+            $environment.FNVXR_RETAIL_RIG_APPLY = "1"
+            $environment.FNVXR_RETAIL_WEAPON_APPLY = "1"
+            $environment.FNVXR_RETAIL_PROJECTILE_NODE_HOOK = "0"
+            $environment.FNVXR_TRACKED_PROP_ASSIST_PROJECTILE_OR_HIT_MUTATION = "0"
+            $environment.FNVXR_NVSE_WRITES_VR_POSE = "0"
+            $environment.FNVXR_CLICK_SENDINPUT_MOUSE = "0"
+            $environment.FNVXR_PLUGIN_SENDINPUT_CLICK = "0"
+            $environment.FNVXR_EXTERNAL_XINPUT_WRITER = "0"
+            $environment.FNVXR_EXTERNAL_DINPUT_WRITER = "0"
+            $environment.FNVXR_DESKTOP_ASSIST_AUTOMATION = "0"
+            $environment.FNVXR_D3D9_STEREO_REPLAY = "0"
+            $environment.FNVXR_D3D9_NATIVE_SINGLE_TRAVERSAL_REPLAY = "0"
+            $environment.FNVXR_D3D9_WIDE_WORLD_REPLAY = "0"
+            $environment.FNVXR_DESKTOP_ASSIST_UI_CAPTURE = "0"
+        }
     }
     if (-not [string]::IsNullOrWhiteSpace($HeadlessRuntimeManifest)) {
         $environment.XR_RUNTIME_JSON = $HeadlessRuntimeManifest
-        $environment.OPENXR_SIMULATOR_HEADLESS = "1"
+        if (-not $SimulatorDesktopPreview) {
+            $environment.OPENXR_SIMULATOR_HEADLESS = "1"
+        }
         $environment.OPENXR_SIMULATOR_DATA_DIR =
             Join-Path $RunDirectory "openxr-simulator"
         $environment.OPENXR_SIMULATOR_LOG_PATH =

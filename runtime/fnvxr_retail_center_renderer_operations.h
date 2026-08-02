@@ -30,6 +30,13 @@ struct RetailEyeTargetOperations
         CenterRendererEye,
         CenterRendererEyeIsolation&) noexcept = nullptr;
     bool (*restore)(void*) noexcept = nullptr;
+    // The world transaction clears a fresh target before each eye.  A later
+    // first-person pass must bind that same target without erasing the world
+    // pixels it is meant to augment.
+    bool (*bindPreservingContents)(
+        void*,
+        CenterRendererEye,
+        CenterRendererEyeIsolation&) noexcept = nullptr;
 };
 
 constexpr bool retailEyeTargetOperationsComplete(
@@ -91,6 +98,13 @@ struct RetailCenterVisibilityDiagnostics
     std::uint32_t sealedItemCount = 0u;
     std::uint32_t queueSafeItemCount = 0u;
     std::uint32_t immediateGeometryRejectedCount = 0u;
+    std::uint32_t firstPersonTraversalVisits = 0u;
+    std::uint32_t firstPersonQueueSafeItemCount = 0u;
+    std::uint32_t firstPersonImmediateItemCount = 0u;
+    abi::RetailPointer32 firstPersonRootNode = 0u;
+    std::uint32_t firstPersonPopulateCalls = 0u;
+    std::uint32_t firstPersonRightQueueReplayCount = 0u;
+    std::uint32_t firstPersonRightImmediateCallbackCount = 0u;
     std::uint8_t privateAccumulatorMode = 0u;
     std::uint8_t collectorPhase = 0xFFu;
     std::uint8_t collectorFailure = 0xFFu;
@@ -189,6 +203,32 @@ struct RetailCenterRendererTimingDiagnostics
             + rightEndMilliseconds
             + restoreMilliseconds
             + rollbackMilliseconds;
+    }
+};
+
+// Read-only evidence that the exact per-eye accumulator and its private
+// culler consumed the same camera pointer during the audited eye transaction.
+// The stock culler remains the one conservative visibility pass; these fields
+// describe the subsequent private-eye accumulations only.
+struct RetailCenterEyeCameraDiagnostics
+{
+    abi::RetailPointer32 leftRendererCamera = 0u;
+    abi::RetailPointer32 rightRendererCamera = 0u;
+    abi::RetailPointer32 leftCullerCamera = 0u;
+    abi::RetailPointer32 rightCullerCamera = 0u;
+    bool leftRendererCameraMatches = false;
+    bool rightRendererCameraMatches = false;
+    bool leftCullerCameraMatches = false;
+    bool rightCullerCameraMatches = false;
+    bool captured = false;
+
+    bool complete() const noexcept
+    {
+        return captured
+            && leftRendererCameraMatches
+            && rightRendererCameraMatches
+            && leftCullerCameraMatches
+            && rightCullerCameraMatches;
     }
 };
 
@@ -318,6 +358,14 @@ public:
             return false;
         }
         mDiagnosticStop = stop;
+        return true;
+    }
+
+    bool setFirstPersonRootNode(abi::RetailPointer32 root) noexcept
+    {
+        if (!ready() || mEngineSnapshot.active)
+            return false;
+        mFirstPersonRootNode = root;
         return true;
     }
 
@@ -453,7 +501,22 @@ public:
         return mLastTiming;
     }
 
+    const RetailCenterEyeCameraDiagnostics& eyeCameraDiagnostics() const
+        noexcept
+    {
+        return mLastEyeCamera;
+    }
+
 private:
+    struct FirstPersonGeometryMutation
+    {
+        abi::RetailPointer32 geometry = 0u;
+        abi::RetailPointer32 property = 0u;
+        std::uint32_t geometryFlags = 0u;
+        std::uint16_t propertyFlags = 0u;
+        bool applied = false;
+    };
+
     struct EngineAccumulatorSnapshot
     {
         abi::RetailRendererAccumulatorOwnerLayout* renderer = nullptr;
@@ -508,12 +571,22 @@ private:
     StockCullerCapture mStockCapture {};
     std::array<abi::RetailPointer32, CollectorCapacity>
         mQueueSafeGeometryPointers {};
+    std::array<abi::RetailPointer32, CollectorCapacity>
+        mFirstPersonImmediateGeometryPointers {};
+    std::array<abi::RetailPointer32, CollectorCapacity>
+        mFirstPersonQueueSafeGeometryPointers {};
+    std::array<FirstPersonGeometryMutation, CollectorCapacity>
+        mFirstPersonGeometryMutations {};
+    std::uint32_t mFirstPersonImmediateGeometryCount = 0u;
+    std::uint32_t mFirstPersonQueueSafeGeometryCount = 0u;
+    abi::RetailPointer32 mFirstPersonRootNode = 0u;
     void* mFrameSceneObject = nullptr;
     abi::RetailNiCameraLayout* mActiveEyeCamera = nullptr;
     std::uint64_t mNextStockCaptureGeneration = 0u;
     RetailCenterVisibilityDiagnostics mLastVisibility {};
     RetailCenterAccumulatorSnapshotDiagnostics mLastAccumulatorSnapshot {};
     RetailCenterRendererTimingDiagnostics mLastTiming {};
+    RetailCenterEyeCameraDiagnostics mLastEyeCamera {};
     // Never replay ProcessAlt on a copied culler. The stock culler is captured
     // only during its own AccumulateScene call and restored before eye work.
 
@@ -618,6 +691,218 @@ struct RetailCenterRendererOperationsAdapter
                 || (propertyFlags & PropertyModeExcluded) == 0u);
     }
 
+    static bool geometryDescendsFrom(
+        abi::RetailPointer32 geometryAddress,
+        abi::RetailPointer32 rootAddress) noexcept
+    {
+#if defined(_MSC_VER) && defined(_M_IX86)
+        constexpr std::size_t ParentOffset = 0x18u;
+        if (geometryAddress == 0u || rootAddress == 0u)
+            return false;
+        abi::RetailPointer32 current = geometryAddress;
+        __try
+        {
+            for (std::uint32_t depth = 0u;
+                 current != 0u && depth < 64u;
+                 ++depth)
+            {
+                if (current == rootAddress)
+                    return true;
+                std::memcpy(
+                    &current,
+                    reinterpret_cast<const std::uint8_t*>(
+                        static_cast<std::uintptr_t>(current)) + ParentOffset,
+                    sizeof(current));
+            }
+        }
+        __except (1)
+        {
+            return false;
+        }
+#else
+        static_cast<void>(geometryAddress);
+        static_cast<void>(rootAddress);
+#endif
+        return false;
+    }
+
+    static int niObjectKind(abi::RetailPointer32 objectAddress) noexcept
+    {
+#if defined(_MSC_VER) && defined(_M_IX86)
+        struct NiRttiRaw
+        {
+            const char* name;
+            NiRttiRaw* parent;
+        };
+        constexpr std::uintptr_t NiRttiNiAvObjectAddress = 0x011F4280u;
+        constexpr std::uintptr_t NiRttiNiNodeAddress = 0x011F4428u;
+        if (objectAddress == 0u)
+            return 0;
+        __try
+        {
+            void* object = reinterpret_cast<void*>(
+                static_cast<std::uintptr_t>(objectAddress));
+            void** vtable = *reinterpret_cast<void***>(object);
+            if (!vtable || !vtable[2])
+                return 0;
+            using GetTypeFunction = NiRttiRaw* (__thiscall*)(void*);
+            NiRttiRaw* rtti = reinterpret_cast<GetTypeFunction>(
+                vtable[2])(object);
+            for (std::uint32_t depth = 0u; rtti && depth < 32u; ++depth)
+            {
+                const std::uintptr_t address =
+                    reinterpret_cast<std::uintptr_t>(rtti);
+                if (address == NiRttiNiNodeAddress)
+                    return 2;
+                if (address == NiRttiNiAvObjectAddress)
+                    return 1;
+                rtti = rtti->parent;
+            }
+        }
+        __except (1)
+        {
+            return 0;
+        }
+#else
+        static_cast<void>(objectAddress);
+#endif
+        return 0;
+    }
+
+    static bool isRetailNiGeometry(
+        abi::RetailPointer32 objectAddress) noexcept
+    {
+#if defined(_MSC_VER) && defined(_M_IX86)
+        constexpr std::size_t OnVisibleVtableOffset = 0xDCu;
+        constexpr std::size_t PropertyOffset = 0x9Cu;
+        constexpr std::uintptr_t RetailImageStart = 0x00400000u;
+        constexpr std::uintptr_t RetailImageEnd = 0x01200000u;
+        if (objectAddress == 0u)
+            return false;
+        __try
+        {
+            const auto* vtable = *reinterpret_cast<void* const* const*>(
+                static_cast<std::uintptr_t>(objectAddress));
+            const std::uintptr_t vtableAddress =
+                reinterpret_cast<std::uintptr_t>(vtable);
+            const std::uintptr_t onVisibleAddress = vtable
+                ? reinterpret_cast<std::uintptr_t>(
+                    vtable[OnVisibleVtableOffset / sizeof(void*)])
+                : 0u;
+            abi::RetailPointer32 propertyAddress = 0u;
+            std::memcpy(
+                &propertyAddress,
+                reinterpret_cast<const std::uint8_t*>(
+                    static_cast<std::uintptr_t>(objectAddress))
+                    + PropertyOffset,
+                sizeof(propertyAddress));
+            if (propertyAddress < 0x00010000u)
+                return false;
+            const std::uintptr_t propertyVtable =
+                static_cast<std::uintptr_t>(*reinterpret_cast<
+                    const abi::RetailPointer32*>(
+                        static_cast<std::uintptr_t>(propertyAddress)));
+            return vtableAddress >= RetailImageStart
+                && vtableAddress < RetailImageEnd
+                && onVisibleAddress >= RetailImageStart
+                && onVisibleAddress < RetailImageEnd
+                && propertyVtable >= RetailImageStart
+                && propertyVtable < RetailImageEnd;
+        }
+        __except (1)
+        {
+            return false;
+        }
+#else
+        static_cast<void>(objectAddress);
+        return false;
+#endif
+    }
+
+    static void collectFirstPersonQueueSafeLeaves(
+        Context& context,
+        abi::RetailPointer32 objectAddress,
+        std::uint32_t depth,
+        std::uint32_t& visits) noexcept
+    {
+#if defined(_MSC_VER) && defined(_M_IX86)
+        if (objectAddress == 0u || depth > 64u
+            || ++visits > 4096u
+            || context.mFirstPersonQueueSafeGeometryCount
+                >= CollectorCapacity)
+        {
+            return;
+        }
+        const int kind = niObjectKind(objectAddress);
+        if (kind == 1)
+        {
+            // NiAVObject leaves also include non-geometry render helpers.
+            // Admit only objects whose authenticated +0xDC virtual is the
+            // retail NiGeometry::OnVisible implementation.
+            if (!isRetailNiGeometry(objectAddress))
+                return;
+            if (geometryQueuesWithoutImmediateDispatch(
+                    context.mCollectionAccumulator,
+                    objectAddress))
+            {
+                context.mFirstPersonQueueSafeGeometryPointers[
+                    context.mFirstPersonQueueSafeGeometryCount++] =
+                        objectAddress;
+            }
+            else if (context.mFirstPersonImmediateGeometryCount
+                < CollectorCapacity)
+            {
+                context.mFirstPersonImmediateGeometryPointers[
+                    context.mFirstPersonImmediateGeometryCount++] =
+                        objectAddress;
+            }
+            return;
+        }
+        if (kind != 2)
+            return;
+        struct NiTArrayRaw
+        {
+            abi::RetailPointer32 vtable;
+            abi::RetailPointer32 data;
+            std::uint16_t capacity;
+            std::uint16_t firstFreeEntry;
+            std::uint16_t numObjects;
+            std::uint16_t growSize;
+        };
+        constexpr std::size_t ChildrenOffset = 0x9Cu;
+        __try
+        {
+            const auto* children = reinterpret_cast<const NiTArrayRaw*>(
+                static_cast<std::uintptr_t>(objectAddress) + ChildrenOffset);
+            if (children->data == 0u
+                || children->firstFreeEntry > children->capacity
+                || children->firstFreeEntry > 1024u)
+            {
+                return;
+            }
+            const auto* entries = reinterpret_cast<
+                const abi::RetailPointer32*>(
+                static_cast<std::uintptr_t>(children->data));
+            for (std::uint16_t index = 0u;
+                 index < children->firstFreeEntry;
+                 ++index)
+            {
+                collectFirstPersonQueueSafeLeaves(
+                    context, entries[index], depth + 1u, visits);
+            }
+        }
+        __except (1)
+        {
+            return;
+        }
+#else
+        static_cast<void>(context);
+        static_cast<void>(objectAddress);
+        static_cast<void>(depth);
+        static_cast<void>(visits);
+#endif
+    }
+
     static void captureVisibilityDiagnostics(
         Context& context,
         abi::RetailNiCameraLayout* camera,
@@ -627,7 +912,33 @@ struct RetailCenterRendererOperationsAdapter
     {
         RetailCenterVisibilityDiagnostics& diagnostics =
             context.mLastVisibility;
+        const std::uint32_t firstPersonTraversalVisits =
+            diagnostics.firstPersonTraversalVisits;
+        const std::uint32_t firstPersonQueueSafeItemCount =
+            diagnostics.firstPersonQueueSafeItemCount;
+        const std::uint32_t firstPersonImmediateItemCount =
+            diagnostics.firstPersonImmediateItemCount;
+        const abi::RetailPointer32 firstPersonRootNode =
+            diagnostics.firstPersonRootNode;
+        const std::uint32_t firstPersonPopulateCalls =
+            diagnostics.firstPersonPopulateCalls;
+        const std::uint32_t firstPersonRightQueueReplayCount =
+            diagnostics.firstPersonRightQueueReplayCount;
+        const std::uint32_t firstPersonRightImmediateCallbackCount =
+            diagnostics.firstPersonRightImmediateCallbackCount;
         diagnostics = {};
+        diagnostics.firstPersonTraversalVisits =
+            firstPersonTraversalVisits;
+        diagnostics.firstPersonQueueSafeItemCount =
+            firstPersonQueueSafeItemCount;
+        diagnostics.firstPersonImmediateItemCount =
+            firstPersonImmediateItemCount;
+        diagnostics.firstPersonRootNode = firstPersonRootNode;
+        diagnostics.firstPersonPopulateCalls = firstPersonPopulateCalls;
+        diagnostics.firstPersonRightQueueReplayCount =
+            firstPersonRightQueueReplayCount;
+        diagnostics.firstPersonRightImmediateCallbackCount =
+            firstPersonRightImmediateCallbackCount;
         diagnostics.failure = RetailCenterVisibilityFailure::None;
         diagnostics.cameraAddress = reinterpret_cast<std::uintptr_t>(camera);
         diagnostics.sceneObjectAddress =
@@ -901,6 +1212,7 @@ struct RetailCenterRendererOperationsAdapter
             return false;
         context->mLastTiming = {};
         context->mLastTiming.captured = true;
+        context->mLastEyeCamera = {};
         ScopedStageTimer timer(
             context->mLastTiming.snapshotMilliseconds);
         context->mFrameSceneObject = nullptr;
@@ -1063,6 +1375,54 @@ struct RetailCenterRendererOperationsAdapter
         context->mLastVisibility.queueSafeItemCount = queueSafeItemCount;
         context->mLastVisibility.immediateGeometryRejectedCount =
             view.itemCount - queueSafeItemCount;
+        context->mFirstPersonImmediateGeometryCount = 0u;
+        context->mFirstPersonImmediateGeometryPointers.fill(0u);
+        context->mFirstPersonQueueSafeGeometryCount = 0u;
+        context->mFirstPersonQueueSafeGeometryPointers.fill(0u);
+        if (context->mFirstPersonRootNode != 0u)
+        {
+            for (std::uint32_t index = 0u; index < view.itemCount; ++index)
+            {
+                const abi::RetailPointer32 geometry =
+                    view.geometryPointers[index];
+                const bool firstPerson = geometryDescendsFrom(
+                    geometry,
+                    context->mFirstPersonRootNode);
+                const bool queueSafe = geometryQueuesWithoutImmediateDispatch(
+                    context->mCollectionAccumulator,
+                    geometry);
+                if (firstPerson && queueSafe)
+                {
+                    context->mFirstPersonQueueSafeGeometryPointers[
+                        context->mFirstPersonQueueSafeGeometryCount++] =
+                            geometry;
+                }
+                else if (firstPerson)
+                {
+                    context->mFirstPersonImmediateGeometryPointers[
+                        context->mFirstPersonImmediateGeometryCount++] =
+                            geometry;
+                }
+            }
+            // The stock center visible list intentionally excludes the
+            // separate first-person branch. Walk that authenticated live
+            // root directly so the right eye can receive its queue-safe
+            // leaves even when the second per-frame cull stamp suppresses
+            // the branch.
+            context->mFirstPersonQueueSafeGeometryCount = 0u;
+            context->mFirstPersonQueueSafeGeometryPointers.fill(0u);
+            std::uint32_t visits = 0u;
+            collectFirstPersonQueueSafeLeaves(
+                *context,
+                context->mFirstPersonRootNode,
+                0u,
+                visits);
+            context->mLastVisibility.firstPersonTraversalVisits = visits;
+            context->mLastVisibility.firstPersonQueueSafeItemCount =
+                context->mFirstPersonQueueSafeGeometryCount;
+            context->mLastVisibility.firstPersonImmediateItemCount =
+                context->mFirstPersonImmediateGeometryCount;
+        }
         if (queueSafeItemCount == 0u)
         {
             return rejectVisibility(
@@ -1134,6 +1494,18 @@ struct RetailCenterRendererOperationsAdapter
                 isolation);
     }
 
+    static bool bindPreserving(
+        void* opaque,
+        CenterRendererEye eye,
+        CenterRendererEyeIsolation& isolation) noexcept
+    {
+        Context* context = checked(opaque);
+        return context
+            && context->mTargets.bindPreservingContents
+            && context->mTargets.bindPreservingContents(
+                context->mTargets.context, eye, isolation);
+    }
+
     static bool setCamera(
         void* opaque,
         abi::RetailBSShaderAccumulatorLayout* accumulator,
@@ -1168,6 +1540,24 @@ struct RetailCenterRendererOperationsAdapter
         context->mCalls.accumulatorSetCamera(
             reinterpret_cast<abi::RetailNiAccumulatorLayout*>(accumulator),
             camera);
+        const abi::RetailPointer32 expectedCamera =
+            static_cast<abi::RetailPointer32>(
+                reinterpret_cast<std::uintptr_t>(camera));
+        RetailCenterEyeCameraDiagnostics& diagnostics =
+            context->mLastEyeCamera;
+        diagnostics.captured = true;
+        if (accumulator == context->mCollectionAccumulator)
+        {
+            diagnostics.leftRendererCamera = accumulator->camera;
+            diagnostics.leftRendererCameraMatches =
+                accumulator->camera == expectedCamera;
+        }
+        else
+        {
+            diagnostics.rightRendererCamera = accumulator->camera;
+            diagnostics.rightRendererCameraMatches =
+                accumulator->camera == expectedCamera;
+        }
         return true;
     }
 
@@ -1216,6 +1606,30 @@ struct RetailCenterRendererOperationsAdapter
         {
             return false;
         }
+        // The production center path can consume its authenticated visible
+        // array without entering the optional sealed-visibility diagnostic.
+        // Walk xNVSE's exact live Weapon node here, in the real per-eye
+        // population function, so the right eye always has the geometry
+        // callbacks before its independent accumulator is rendered.
+        context->mFirstPersonQueueSafeGeometryCount = 0u;
+        context->mFirstPersonQueueSafeGeometryPointers.fill(0u);
+        context->mFirstPersonImmediateGeometryCount = 0u;
+        context->mFirstPersonImmediateGeometryPointers.fill(0u);
+        std::uint32_t firstPersonVisits = 0u;
+        context->mLastVisibility.firstPersonRootNode =
+            context->mFirstPersonRootNode;
+        ++context->mLastVisibility.firstPersonPopulateCalls;
+        collectFirstPersonQueueSafeLeaves(
+            *context,
+            context->mFirstPersonRootNode,
+            0u,
+            firstPersonVisits);
+        context->mLastVisibility.firstPersonTraversalVisits =
+            firstPersonVisits;
+        context->mLastVisibility.firstPersonQueueSafeItemCount =
+            context->mFirstPersonQueueSafeGeometryCount;
+        context->mLastVisibility.firstPersonImmediateItemCount =
+            context->mFirstPersonImmediateGeometryCount;
         auto* stockAccumulator = accumulatorFromAddress(
             context->mEngineSnapshot.rendererAccumulator);
         if (!stockAccumulator
@@ -1262,16 +1676,160 @@ struct RetailCenterRendererOperationsAdapter
         // stock accumulator would alias its engine-owned pass lists.
         accumulator->shadowScene = stockAccumulator->shadowScene;
         bool accumulated = false;
+        const abi::RetailPointer32 expectedCamera =
+            static_cast<abi::RetailPointer32>(
+                reinterpret_cast<std::uintptr_t>(context->mActiveEyeCamera));
         privateCuller->base.vtable = context->mStockCullerVtable;
+        std::uint32_t mutationCount = 0u;
         __try
         {
             context->mCalls.cullingProcessSetAccumulator(
                 privateCuller,
                 accumulator);
+            // First-person weapon leaves use NiAccumulator's immediate path.
+            // Fallout stamps that path during the stock traversal, so either
+            // private eye can accept a later OnVisible call while emitting no
+            // pixels. Give both private eyes the complete path that proved
+            // correct in the right eye: temporarily convert the authenticated
+            // weapon leaves to the queued branch and restore the exact bytes
+            // in the __finally block below.
+            if (context->mFirstPersonRootNode != 0u)
+            {
+                constexpr std::uint32_t GeometryImmediateDispatch = 0x40u;
+                constexpr std::uint16_t PropertyAccumulatorQueue = 0x0001u;
+                constexpr std::uint16_t PropertyModeExcluded = 0x2000u;
+                for (std::uint32_t index = 0u;
+                     index < context->mFirstPersonImmediateGeometryCount;
+                     ++index)
+                {
+                    const abi::RetailPointer32 geometryAddress =
+                        context->mFirstPersonImmediateGeometryPointers[index];
+                    auto* geometry = reinterpret_cast<std::uint8_t*>(
+                        static_cast<std::uintptr_t>(geometryAddress));
+                    abi::RetailPointer32 propertyAddress = 0u;
+                    std::memcpy(
+                        &propertyAddress,
+                        geometry + 0x9Cu,
+                        sizeof(propertyAddress));
+                    if (propertyAddress < 0x00010000u)
+                        continue;
+                    auto* property = reinterpret_cast<std::uint8_t*>(
+                        static_cast<std::uintptr_t>(propertyAddress));
+                    auto& mutation = context->mFirstPersonGeometryMutations[
+                        mutationCount];
+                    mutation.geometry = geometryAddress;
+                    mutation.property = propertyAddress;
+                    std::memcpy(
+                        &mutation.geometryFlags,
+                        geometry + 0x30u,
+                        sizeof(mutation.geometryFlags));
+                    std::memcpy(
+                        &mutation.propertyFlags,
+                        property + 0x18u,
+                        sizeof(mutation.propertyFlags));
+                    const std::uint32_t queuedGeometryFlags =
+                        mutation.geometryFlags & ~GeometryImmediateDispatch;
+                    const std::uint16_t queuedPropertyFlags =
+                        static_cast<std::uint16_t>(
+                            (mutation.propertyFlags
+                                | PropertyAccumulatorQueue)
+                            & ~PropertyModeExcluded);
+                    std::memcpy(
+                        geometry + 0x30u,
+                        &queuedGeometryFlags,
+                        sizeof(queuedGeometryFlags));
+                    std::memcpy(
+                        property + 0x18u,
+                        &queuedPropertyFlags,
+                        sizeof(queuedPropertyFlags));
+                    mutation.applied = true;
+                    ++mutationCount;
+                }
+            }
             context->mCalls.accumulateScene(
                 context->mActiveEyeCamera,
                 context->mFrameSceneObject,
                 privateCuller);
+            if (context->mFirstPersonRootNode != 0u)
+            {
+                // The view model is a distinct live scene branch. Running the
+                // authenticated wrapper with that root lets Fallout build its
+                // weapon shader passes against the right-eye camera instead of
+                // trying to smuggle view-model leaves through the world scene.
+                context->mCalls.accumulateScene(
+                    context->mActiveEyeCamera,
+                    reinterpret_cast<void*>(static_cast<std::uintptr_t>(
+                        context->mFirstPersonRootNode)),
+                    privateCuller);
+            }
+            // A second stock cull in the same retail frame may reject the
+            // first-person subtree through NiAVObject's per-frame cull stamp.
+            // The stock center traversal already proved these exact geometry
+            // pointers visible, and the ancestry check above proves they are
+            // inside xNVSE's current first-person root. Replay only that
+            // queue-safe subset into each eye's already-prepared accumulator.
+            if (context->mFirstPersonQueueSafeGeometryCount != 0u)
+            {
+                const abi::RetailNiVisibleArrayLayout firstPersonVisible {
+                    static_cast<abi::RetailPointer32>(
+                        reinterpret_cast<std::uintptr_t>(
+                            context->mFirstPersonQueueSafeGeometryPointers.data())),
+                    context->mFirstPersonQueueSafeGeometryCount,
+                    static_cast<std::uint32_t>(CollectorCapacity),
+                    0u,
+                };
+                context->mCalls.accumulatorAddVisibleArray(
+                    reinterpret_cast<abi::RetailNiAccumulatorLayout*>(
+                        accumulator),
+                    const_cast<abi::RetailNiVisibleArrayLayout*>(
+                        &firstPersonVisible));
+                context->mLastVisibility.firstPersonRightQueueReplayCount =
+                    context->mFirstPersonQueueSafeGeometryCount;
+            }
+            if (mutationCount != 0u)
+            {
+                const abi::RetailNiVisibleArrayLayout firstPersonImmediate {
+                    static_cast<abi::RetailPointer32>(
+                        reinterpret_cast<std::uintptr_t>(
+                            context->mFirstPersonImmediateGeometryPointers.data())),
+                    mutationCount,
+                    static_cast<std::uint32_t>(CollectorCapacity),
+                    0u,
+                };
+                context->mCalls.accumulatorAddVisibleArray(
+                    reinterpret_cast<abi::RetailNiAccumulatorLayout*>(
+                        accumulator),
+                    const_cast<abi::RetailNiVisibleArrayLayout*>(
+                        &firstPersonImmediate));
+                context->mLastVisibility.firstPersonRightQueueReplayCount +=
+                    mutationCount;
+            }
+            if (context->mFirstPersonRootNode != 0u)
+            {
+                // Immediate first-person meshes are emitted through the
+                // authenticated NiGeometry::OnVisible virtual, not the
+                // accumulator's queued list. Re-run that exact engine
+                // callback with the private right-eye culler so its current
+                // accumulator receives a complete independent weapon pass.
+                for (std::uint32_t index = mutationCount;
+                     index < context->mFirstPersonImmediateGeometryCount;
+                     ++index)
+                {
+                    void* geometry = reinterpret_cast<void*>(
+                        static_cast<std::uintptr_t>(
+                            context->mFirstPersonImmediateGeometryPointers[
+                                index]));
+                    void** vtable = *reinterpret_cast<void***>(geometry);
+                    auto onVisible = reinterpret_cast<
+                        abi::GeometryOnVisibleFunction>(vtable[0xDCu / 4u]);
+                    onVisible(
+                        geometry,
+                        reinterpret_cast<abi::RetailNiCullingProcessLayout*>(
+                            privateCuller));
+                    ++context->mLastVisibility
+                          .firstPersonRightImmediateCallbackCount;
+                }
+            }
             accumulated =
                 privateCuller->shaderAccumulator == accumulatorPointer
                 && context->mEngineSnapshot.renderer->accumulator
@@ -1283,7 +1841,43 @@ struct RetailCenterRendererOperationsAdapter
         }
         __finally
         {
+            while (mutationCount > 0u)
+            {
+                auto& mutation = context->mFirstPersonGeometryMutations[
+                    --mutationCount];
+                if (mutation.applied)
+                {
+                    auto* geometry = reinterpret_cast<std::uint8_t*>(
+                        static_cast<std::uintptr_t>(mutation.geometry));
+                    auto* property = reinterpret_cast<std::uint8_t*>(
+                        static_cast<std::uintptr_t>(mutation.property));
+                    std::memcpy(
+                        geometry + 0x30u,
+                        &mutation.geometryFlags,
+                        sizeof(mutation.geometryFlags));
+                    std::memcpy(
+                        property + 0x18u,
+                        &mutation.propertyFlags,
+                        sizeof(mutation.propertyFlags));
+                    mutation = {};
+                }
+            }
             privateCuller->base.vtable = cloneVtable;
+        }
+        RetailCenterEyeCameraDiagnostics& diagnostics =
+            context->mLastEyeCamera;
+        diagnostics.captured = true;
+        if (accumulator == context->mCollectionAccumulator)
+        {
+            diagnostics.leftCullerCamera = privateCuller->base.camera;
+            diagnostics.leftCullerCameraMatches =
+                privateCuller->base.camera == expectedCamera;
+        }
+        else
+        {
+            diagnostics.rightCullerCamera = privateCuller->base.camera;
+            diagnostics.rightCullerCameraMatches =
+                privateCuller->base.camera == expectedCamera;
         }
         context->mActiveEyeCamera = nullptr;
         const double populateMilliseconds =
@@ -1461,6 +2055,7 @@ struct RetailCenterRendererOperationsAdapter
         result.snapshotAuthoritativeState = &snapshot;
         result.collectConservativeVisibleSet = &collect;
         result.bindEyeTargets = &bind;
+        result.bindEyeTargetsPreservingContents = &bindPreserving;
         result.setAccumulatorCamera = &setCamera;
         result.addVisibleArray = &addVisible;
         result.renderAccumulatorWithoutFinalize = &render;

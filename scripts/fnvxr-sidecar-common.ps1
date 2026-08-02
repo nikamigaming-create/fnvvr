@@ -1396,7 +1396,7 @@ function Set-FnvxrSidecarEnvironment {
 }
 
 function Set-FnvxrStereoWorldRuntimeEnvironment {
-    throw "Legacy D3D replay/full-frame stereo environment is retired. Production WorldStereo requires the integrated engine transaction, GPU color/depth transport, product presentation controller, and weapon proof."
+    throw "Legacy D3D replay/full-frame stereo environment is retired. Production WorldStereo requires the integrated engine transaction, GPU color ABI v5 transport with render-local eye-depth validation, product presentation controller, and weapon proof."
 
     $env:FNVXR_DISABLE_STEREO_WORLD = "0"
     # The host consumes this only for the first OpenXR focus regain. Later
@@ -1443,10 +1443,10 @@ function Set-FnvxrStereoWorldRuntimeEnvironment {
     $env:FNVXR_D3D9_NATIVE_CENTER_FRUSTUM_MAX_DELTA = "0.000001"
     $env:FNVXR_D3D9_WVP_MAX_PATCH_ABS_ERROR = "0.01"
     $env:FNVXR_D3D9_WVP_MAX_PATCH_NORMALIZED_ERROR = "0.0000001"
-    # NiCamera local axes are right/up/back, the same local convention used by
-    # OpenXR poses.  The native hook composes this camera-local delta directly;
-    # actor/world-axis permutations are intentionally not selectable here.
-    $env:FNVXR_D3D9_NATIVE_HEAD_AXIS_MODE = "openxr-camera-local"
+    # OpenXR is right/up/back while retail NiCamera is forward/up/right. The
+    # native hook applies the audited proper basis conversion before it writes
+    # the temporary camera; actor/world-axis permutations stay unavailable.
+    $env:FNVXR_D3D9_NATIVE_HEAD_AXIS_MODE = "openxr-to-ni-camera"
     $env:FNVXR_D3D9_NATIVE_ASYMMETRIC_FOV = "1"
     $env:FNVXR_D3D9_NATIVE_CENTER_CAMERA_MAX_DELTA = "0.05"
     $env:FNVXR_REQUIRE_NATIVE_STEREO = "1"

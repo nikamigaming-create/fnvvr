@@ -1,6 +1,6 @@
 # FNVVR Retail Status
 
-Last updated: 2026-07-29
+Last updated: 2026-08-01
 
 ## Direction Locked
 
@@ -19,6 +19,12 @@ held until one fresh complete pose-matched stereo transaction with a strictly
 newer retail source-frame identity is ready, then the compositor changes to
 world stereo atomically. That freshness watermark remains enforced after the
 bounded quad hold expires into a safety blank.
+
+`stereo-visual-trial-v5` remains a bounded CPU-v8 visual route.
+`retail-vr-play-v1` is the separately named physical-play investigation route;
+it may collect physical evidence but cannot set `fullProductAccepted` or widen
+the visual-trial authority. The Phase 0 records in `docs/` now make that
+distinction and each capability boundary explicit.
 
 ## Proven Foundation
 
@@ -62,11 +68,13 @@ bounded quad hold expires into a safety blank.
   eye images to OpenXR and is not the production performance architecture.
   Direct plugin-only game installation remains fused; the guarded
   build/attest/supervise/restore transaction is the only live product route.
-- GPU stereo metadata uses a fixed 200-byte cross-architecture v4 ABI, one
-  fully ordered odd/even producer helper, non-aliased color/depth handles, an
-  exact runtime-state sample identity, and a frame-bound consumer-observed
-  shared-fence requirement. No GPU resource producer or consumer is implemented
-  yet, so this is a tested contract rather than a completed transport.
+- Product GPU transport v1 is the color-only ABI v5 contract: two non-aliased
+  color resources, exact producer/process/epoch and frame/pose/runtime
+  lineage, adapter identity, and a consumer-observed GPU completion/release
+  fence. Per-eye depth/stencil remains mandatory inside the retail transaction
+  but is render-local; OpenXR depth submission is not a v1 release gate. The
+  older v4 color-plus-encoded-depth ABI remains compatibility/research-only and
+  no live supported v5 producer/consumer recovery proof exists yet.
 - Retail player rig discovery searches for and logs arm-chain, hand, weapon,
   projectile, and muzzle-flash nodes; retained runs have not proved a complete
   non-null weapon/projectile/muzzle chain. FABRIK solver tests cover the arm
@@ -261,8 +269,8 @@ That is not a blanket promise that every engine behavior can be copied out and
 replayed externally. Gameplay-critical changes should remain in-process:
 weapon transforms, muzzle/projectile direction, hit tests, activation, and
 animation state must be applied or confirmed by retail FNV. The standalone
-host should publish desired poses/input, open accepted GPU resources, and
-compose only complete color/depth transactions. Unknown layouts need exact
+host should publish desired poses/input, open accepted GPU color resources, and
+compose only transactions with complete render-local depth evidence. Unknown layouts need exact
 executable checks, pointer validation, logging, and fail-closed rejection.
 
 ## Immediate Blockers
@@ -277,9 +285,10 @@ executable checks, pointer validation, logging, and fail-closed rejection.
 3. Complete the read-only live census/reference evidence for every supported
    code-mutating module. Arbitrary or unenumerated patches remain a hard
    reject.
-4. Replace bounded CPU-v8 eye transfer with GPU-native
-   D3D9Ex-to-D3D11/OpenXR color plus encoded-depth sharing, adapter identity,
-   completion sequencing, and transaction IDs.
+4. Replace bounded CPU-v8 eye transfer with GPU-native v5 color sharing from
+   D3D9Ex to D3D11/OpenXR, adapter identity, completion/release sequencing,
+   transaction IDs, and validated render-local per-eye depth/stencil. OpenXR
+   depth-layer submission is outside the v1 release gate.
 5. Prove the authoritative retail weapon, muzzle, projectile/hit, recoil, and
    reload chain against the right-controller aim pose.
 6. Pass full retail/headset acceptance and performance. Invalid gameplay

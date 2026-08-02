@@ -6,6 +6,7 @@
 namespace
 {
 using fnvxr::engine::TrackedPropAssistRequest;
+using fnvxr::engine::HeadlessStereoRigVisualTrialRequest;
 using fnvxr::engine::compatibility::RetailCompatibilityFailure;
 using fnvxr::engine::compatibility::RetailCompatibilityProof;
 
@@ -39,6 +40,22 @@ TrackedPropAssistRequest completeRequest()
     return request;
 }
 
+HeadlessStereoRigVisualTrialRequest completeHeadlessStereoRigRequest()
+{
+    HeadlessStereoRigVisualTrialRequest request {};
+    request.stereoVisualTrialProfile = true;
+    request.headlessSimulator = true;
+    request.ownedHeadsetFixture = true;
+    request.worldOnlyCapture = true;
+    request.stockWeaponDrawRequested = true;
+    request.rigHookRequested = true;
+    request.rigTransformWritesRequested = true;
+    request.weaponTransformWritesRequested = true;
+    request.rightGripAndAimRequired = true;
+    request.engineCenterStereoRequested = true;
+    return request;
+}
+
 void require(bool condition, const char* message)
 {
     if (!condition)
@@ -53,6 +70,8 @@ int main()
 {
     using fnvxr::engine::trackedPropAssistAuthorized;
     using fnvxr::engine::trackedPropAssistRequestIsNarrow;
+    using fnvxr::engine::headlessStereoRigVisualTrialAuthorized;
+    using fnvxr::engine::headlessStereoRigVisualTrialRequestIsNarrow;
 
     require(
         trackedPropAssistAuthorized(completeProof(), completeRequest()),
@@ -121,6 +140,68 @@ int main()
     require(
         !trackedPropAssistAuthorized(proof, completeRequest()),
         "incompatible process authorized tracked-prop writes");
+
+    require(
+        headlessStereoRigVisualTrialAuthorized(
+            completeProof(),
+            completeHeadlessStereoRigRequest()),
+        "complete headless stereo visual-rig request was rejected");
+    require(
+        headlessStereoRigVisualTrialRequestIsNarrow(
+            completeHeadlessStereoRigRequest()),
+        "complete headless stereo visual-rig request was not narrow");
+
+    for (int missing = 0; missing < 10; ++missing)
+    {
+        HeadlessStereoRigVisualTrialRequest candidate =
+            completeHeadlessStereoRigRequest();
+        bool* fields[] = {
+            &candidate.stereoVisualTrialProfile,
+            &candidate.headlessSimulator,
+            &candidate.ownedHeadsetFixture,
+            &candidate.worldOnlyCapture,
+            &candidate.stockWeaponDrawRequested,
+            &candidate.rigHookRequested,
+            &candidate.rigTransformWritesRequested,
+            &candidate.weaponTransformWritesRequested,
+            &candidate.rightGripAndAimRequired,
+            &candidate.engineCenterStereoRequested,
+        };
+        *fields[missing] = false;
+        require(
+            !headlessStereoRigVisualTrialAuthorized(completeProof(), candidate),
+            "incomplete headless stereo visual-rig request authorized writes");
+    }
+
+    HeadlessStereoRigVisualTrialRequest headlessRequest =
+        completeHeadlessStereoRigRequest();
+    bool* headlessForbidden[] = {
+        &headlessRequest.finalStockFrameCaptureRequested,
+        &headlessRequest.cameraHookRequested,
+        &headlessRequest.projectileNodeHookRequested,
+        &headlessRequest.projectileOrHitMutationRequested,
+        &headlessRequest.inputInjectionRequested,
+        &headlessRequest.legacyReplayRequested,
+        &headlessRequest.uiCaptureRequested,
+        &headlessRequest.physicalHeadsetRequested,
+    };
+    for (bool* field : headlessForbidden)
+    {
+        headlessRequest = completeHeadlessStereoRigRequest();
+        *field = true;
+        require(
+            !headlessStereoRigVisualTrialAuthorized(
+                completeProof(),
+                headlessRequest),
+            "headless stereo visual-rig request authorized a forbidden side effect");
+    }
+    proof = completeProof();
+    proof.evidence.protectedVtableBlocksMatched = false;
+    require(
+        !headlessStereoRigVisualTrialAuthorized(
+            proof,
+            completeHeadlessStereoRigRequest()),
+        "incomplete retail proof authorized headless stereo visual-rig writes");
 
     std::cout << "tracked-prop assist authority gate passed\n";
     return EXIT_SUCCESS;

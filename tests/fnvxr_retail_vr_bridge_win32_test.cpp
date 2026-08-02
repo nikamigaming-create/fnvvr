@@ -20,6 +20,13 @@ bool bindEyeTarget(
 {
     return false;
 }
+bool bindEyeTargetPreservingContents(
+    void*,
+    fnvxr::engine::CenterRendererEye,
+    fnvxr::engine::CenterRendererEyeIsolation&) noexcept
+{
+    return false;
+}
 bool endEyeTarget(
     void*,
     fnvxr::engine::CenterRendererEye,
@@ -59,6 +66,24 @@ bool armRenderPhaseCallRelays(
 }
 void disarmRenderPhaseCallRelays(void*) noexcept
 {
+}
+bool armFirstPersonCallRelay(void*, std::uintptr_t) noexcept
+{
+    return true;
+}
+void disarmFirstPersonCallRelay(void*) noexcept
+{
+}
+bool armFirstPersonPreparedRenderRelay(void*, std::uintptr_t) noexcept
+{
+    return true;
+}
+void disarmFirstPersonPreparedRenderRelay(void*) noexcept
+{
+}
+bool firstPersonGameplayLeaseReady(void*) noexcept
+{
+    return true;
 }
 bool publishCpuPair(
     void*,
@@ -136,12 +161,21 @@ int main()
         &endEyeTarget,
         &rollbackEyeTarget,
         &restoreEyeTargets,
+        &bindEyeTargetPreservingContents,
     };
     cpuOperations.armAccumulationCallRelay = &armAccumulationCallRelay;
     cpuOperations.disarmAccumulationCallRelay = &disarmAccumulationCallRelay;
     cpuOperations.armRenderPhaseCallRelays = &armRenderPhaseCallRelays;
     cpuOperations.disarmRenderPhaseCallRelays =
         &disarmRenderPhaseCallRelays;
+    cpuOperations.armFirstPersonCallRelay = &armFirstPersonCallRelay;
+    cpuOperations.disarmFirstPersonCallRelay = &disarmFirstPersonCallRelay;
+    cpuOperations.armFirstPersonPreparedRenderRelay =
+        &armFirstPersonPreparedRenderRelay;
+    cpuOperations.disarmFirstPersonPreparedRenderRelay =
+        &disarmFirstPersonPreparedRenderRelay;
+    cpuOperations.firstPersonGameplayLeaseReady =
+        &firstPersonGameplayLeaseReady;
     cpuOperations.prepareDistinctCameraFrame = &prepareCameraFrame;
     cpuOperations.publicationTransport =
         fnvxr::d3d9::RetailVrPublicationTransport::CpuReadback;
@@ -169,12 +203,21 @@ int main()
         &endEyeTarget,
         &rollbackEyeTarget,
         &restoreEyeTargets,
+        &bindEyeTargetPreservingContents,
     };
     gpuOperations.armAccumulationCallRelay = &armAccumulationCallRelay;
     gpuOperations.disarmAccumulationCallRelay = &disarmAccumulationCallRelay;
     gpuOperations.armRenderPhaseCallRelays = &armRenderPhaseCallRelays;
     gpuOperations.disarmRenderPhaseCallRelays =
         &disarmRenderPhaseCallRelays;
+    gpuOperations.armFirstPersonCallRelay = &armFirstPersonCallRelay;
+    gpuOperations.disarmFirstPersonCallRelay = &disarmFirstPersonCallRelay;
+    gpuOperations.armFirstPersonPreparedRenderRelay =
+        &armFirstPersonPreparedRenderRelay;
+    gpuOperations.disarmFirstPersonPreparedRenderRelay =
+        &disarmFirstPersonPreparedRenderRelay;
+    gpuOperations.firstPersonGameplayLeaseReady =
+        &firstPersonGameplayLeaseReady;
     gpuOperations.prepareDistinctCameraFrame = &prepareCameraFrame;
     gpuOperations.publicationTransport =
         fnvxr::d3d9::RetailVrPublicationTransport::GpuSharedTextures;
@@ -208,7 +251,7 @@ int main()
             && !initialDiagnostics.eyeCamera.captured,
         "bridge diagnostics did not start empty");
     require(
-        !bridge.initialize({}, 0u, 0u, 0u),
+        !bridge.initialize({}, 0u, 0u, 0u, 0u, 0u, 0u),
         "empty bridge operations unexpectedly initialized");
 #if defined(_WIN32) && defined(_M_IX86)
     require(

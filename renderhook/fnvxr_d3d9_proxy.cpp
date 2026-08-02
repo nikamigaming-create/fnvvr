@@ -688,14 +688,19 @@ double secondsBetween(const LARGE_INTEGER& start, const LARGE_INTEGER& end)
     return static_cast<double>(end.QuadPart - start.QuadPart) / static_cast<double>(gPerfFrequency.QuadPart);
 }
 
-struct ScopedReplayStateBlock
+// A private eye pass executes real retail render helpers after the stock
+// desktop world pass.  It is not enough to restore the eye render targets:
+// the helpers can also change shader, texture, transform, and fixed-function
+// state consumed by later desktop passes.  Keep that whole device state
+// transaction-scoped so a private eye can never bleed into the retail frame.
+struct ScopedD3D9StateBlock
 {
     IDirect3DStateBlock9* block = nullptr;
     bool captured = false;
     bool restoreAttempted = false;
     bool restored = false;
 
-    ScopedReplayStateBlock(IDirect3DDevice9* device, const char* context)
+    ScopedD3D9StateBlock(IDirect3DDevice9* device, const char* context)
     {
         if (!device)
             return;
@@ -712,7 +717,7 @@ struct ScopedReplayStateBlock
             char message[256] {};
             sprintf_s(
                 message,
-                "stereo replay stateblock context=%s create=0x%08lx captured=%d count=%ld",
+                "D3D9 stateblock context=%s create=0x%08lx captured=%d count=%ld",
                 context ? context : "unknown",
                 static_cast<unsigned long>(createResult),
                 captured ? 1 : 0,
@@ -749,13 +754,13 @@ struct ScopedReplayStateBlock
         char message[160] {};
         sprintf_s(
             message,
-            "stereo replay stateblock apply failed result=0x%08lx",
+            "D3D9 stateblock apply failed result=0x%08lx",
             static_cast<unsigned long>(result));
         logLine(message);
         return false;
     }
 
-    ~ScopedReplayStateBlock()
+    ~ScopedD3D9StateBlock()
     {
         if (captured && block && !restoreAttempted)
         {
@@ -764,13 +769,20 @@ struct ScopedReplayStateBlock
             if (!restored)
             {
                 InterlockedIncrement(&gStrictEyeTargetUnprovenWrites);
-                logLine("stereo replay stateblock emergency restore failed");
+                logLine("D3D9 stateblock emergency restore failed");
             }
         }
         if (block)
             block->Release();
     }
 };
+
+// Bound only while the exact first-person relay is issuing its two private
+// stock calls. The bridge invokes the narrow callback after the left eye has
+// ended and before it binds the right target, giving both stock calls the same
+// D3D9 starting state without altering any engine-owned object.
+thread_local ScopedD3D9StateBlock*
+    gRetailVrFirstPersonInterEyeStateBlock = nullptr;
 
 void logFrameRate(const char* label, volatile LONG& counter, LARGE_INTEGER& lastSample, LONG& lastFrameSample)
 {
@@ -1012,6 +1024,20 @@ bool retailVrVisualTrialRequested()
         || fnvxr::d3d9::retailVrPhysicalPlayAuthorized(
                fnvxr::d3d9::CompiledRetailVrBridgePolicy,
                playRequest);
+}
+
+bool finalRetailStockFrameCaptureRequested()
+{
+    // A completed desktop backbuffer is never an admissible weapon-bearing
+    // stereo producer.  Keep the legacy flag observable for diagnostics, but
+    // make the producer permanently fail closed at the render boundary.
+    return false;
+}
+
+bool retailVrProofFailClosedRoute() noexcept
+{
+    return retailVrVisualTrialRequested()
+        && readRawEnvBool("FNVXR_ENABLE_ENGINE_CENTER_STEREO", false);
 }
 
 bool rockSolidProfile()
@@ -3441,6 +3467,10 @@ void updateSharedVrPose()
             eyeCenterError,
             gLatestRawIpdMeters);
         logLine(invariant);
+        // Phase 1 joins engine-center output with the retained bridge log.
+        // Keep the input-side line for operator diagnosis while duplicating
+        // this bounded invariant into the renderer's evidence channel.
+        logRetailVrLine(invariant);
     }
 
     const LONG logCount = InterlockedIncrement(&gLoggedSharedVrPose);
@@ -8095,9 +8125,18 @@ RetailVrBridge* gRetailVrBridge = nullptr;
 // armed before the six exact E8 writes and cleared after their lease has
 // restored stock bytes, so the relay has no unresolved-target interval.
 volatile LONG gRetailVrAccumulateSceneOriginalAddress = 0;
+// RenderFirstPerson is not an overlay pass: the bridge arms this exact stock
+// target before replacing only its three audited local E8 callers. The relay
+// always executes the ordinary desktop invocation after it draws the two
+// per-eye continuations.
+volatile LONG gRetailVrRenderFirstPersonOriginalAddress = 0;
+// The one audited persistent-list B6C0D0 call inside RenderFirstPerson has a
+// separate original target. It is invoked normally outside a private pair and
+// split to B6BA20 only while the bridge's private dispatch gate is active.
+volatile LONG gRetailVrFirstPersonPreparedRenderOriginalAddress = 0;
 // These are the already-authorized cdecl stock wrappers. The exact local E8
 // leases are installed only after both addresses are armed and restore all
-// six stock calls before either address is cleared.
+// seven stock calls before either address is cleared.
 volatile LONG gRetailVrRenderWithoutFinalizeOriginalAddress = 0;
 volatile LONG gRetailVrFinalizeAccumulatorOriginalAddress = 0;
 fnvxr::engine::RetailTrackedFrameWin32Reader gRetailUiTrackedFrames {};
@@ -8110,6 +8149,319 @@ fnvxr::d3d9::RetailUiQuadCaptureFailure gRetailUiLastWithhold =
 volatile LONG gRetailVrBridgeInitializationAttempts = 0;
 volatile LONG gRetailCpuStereoPublications = 0;
 volatile LONG gRetailCpuStereoWorldTimingPublications = 0;
+volatile LONG gRetailFinalStockFramePublications = 0;
+volatile LONG gRetailFinalStockFrameRejections = 0;
+// The exact private-eye renderer runs after the retail desktop world pass.
+// These counters retain whether its full D3D state guard was actually applied,
+// rather than treating target restoration alone as sufficient evidence.
+volatile LONG gRetailVrPrivateEyeStateRestores = 0;
+volatile LONG gRetailVrPrivateEyeStateRestoreFailures = 0;
+volatile LONG gRetailVrFirstPersonEyeStateRestores = 0;
+volatile LONG gRetailVrFirstPersonEyeStateRestoreFailures = 0;
+volatile LONG gRetailVrFirstPersonStereoCompletions = 0;
+volatile LONG gRetailVrFirstPersonB6C0D0Calls = 0;
+volatile LONG gRetailVrFirstPersonB6BA20Calls = 0;
+volatile LONG gRetailVrFirstPersonTargetColorRedirects = 0;
+volatile LONG gRetailVrFirstPersonTargetDepthRedirects = 0;
+volatile LONG gRetailVrFirstPersonTargetRedirectMisses = 0;
+volatile LONG gRetailVrLastFirstPersonRootNode = 0;
+// Exact JIP build evidence pins this flag behind the normalized
+// RenderFirstPerson callsite.  It is read-only diagnostic data: the bridge
+// never uses it to steer, patch, or otherwise change JIP behavior.
+constexpr std::uintptr_t kRetailJipFirstPersonCompatibilityGuardRva =
+    0x0006A188u;
+// Keep the entry count separate from successful stereo completions.  A retail
+// first-person invocation can legitimately arrive before the matching world
+// pair is staged; this bounded evidence tells those two cases apart without
+// changing the stock pass or publication policy.
+volatile LONG gRetailVrFirstPersonRelayInvocations = 0;
+volatile LONG gRetailVrFirstPersonRelayPendingMisses = 0;
+// The three audited outer E8 callers use distinct relays.  The selected
+// caller is a process-local proof-run option; an unset selector leaves all
+// three callers stock-only and therefore cannot accidentally publish a pair
+// from an unproven seam.
+thread_local std::uint32_t gRetailVrFirstPersonCallerId =
+    static_cast<std::uint32_t>(
+        fnvxr::engine::RetailFirstPersonCallerId::Unknown);
+thread_local LONG gRetailVrFirstPersonPrivateAccumulatorCalls = 0;
+thread_local LONG gRetailVrFirstPersonDesktopAccumulatorCalls = 0;
+thread_local LONG gRetailVrFirstPersonCallerOrdinal = 0;
+
+const char* retailVrFirstPersonCallerName(std::uint32_t callerId) noexcept
+{
+    switch (static_cast<fnvxr::engine::RetailFirstPersonCallerId>(callerId))
+    {
+    case fnvxr::engine::RetailFirstPersonCallerId::Primary:
+        return "primary";
+    case fnvxr::engine::RetailFirstPersonCallerId::Alternate:
+        return "alternate";
+    case fnvxr::engine::RetailFirstPersonCallerId::Third:
+        return "third";
+    default:
+        return "unknown";
+    }
+}
+
+std::uint32_t retailVrFirstPersonCallerAddress(
+    std::uint32_t callerId) noexcept
+{
+    switch (static_cast<fnvxr::engine::RetailFirstPersonCallerId>(callerId))
+    {
+    case fnvxr::engine::RetailFirstPersonCallerId::Primary:
+        return 0x0087093Du;
+    case fnvxr::engine::RetailFirstPersonCallerId::Alternate:
+        return 0x00870B21u;
+    case fnvxr::engine::RetailFirstPersonCallerId::Third:
+        return 0x00870F74u;
+    default:
+        return 0u;
+    }
+}
+
+bool retailVrFirstPersonCallerSelected(std::uint32_t callerId) noexcept
+{
+    if (callerId == static_cast<std::uint32_t>(
+            fnvxr::engine::RetailFirstPersonCallerId::Unknown))
+    {
+        return false;
+    }
+    char selected[24] {};
+    if (GetEnvironmentVariableA(
+            "FNVXR_RETAIL_VR_FIRST_PERSON_PRIVATE_CALLER",
+            selected,
+            static_cast<DWORD>(sizeof(selected))) == 0)
+    {
+        return false;
+    }
+    return _stricmp(selected, retailVrFirstPersonCallerName(callerId)) == 0;
+}
+
+struct RetailFirstPersonEyeEvidence
+{
+    std::uint64_t transaction = 0u;
+    std::uint64_t poseFrame = 0u;
+    std::int32_t poseSequence = 0;
+    LONG draws = 0;
+    LONG eyeBoundDraws = 0;
+    LONG wrongTargetDraws = 0;
+    LONG wrongDepthDraws = 0;
+    LONG viewportMismatches = 0;
+    std::uint32_t leftHash = 0u;
+    std::uint32_t rightHash = 0u;
+    bool rawCaptured = false;
+    bool valid = false;
+};
+
+thread_local RetailFirstPersonEyeEvidence gRetailVrFirstPersonLeftEvidence {};
+thread_local RetailFirstPersonEyeEvidence gRetailVrFirstPersonRightEvidence {};
+
+bool retailVrFirstPersonPrivateEvidenceComplete() noexcept
+{
+    const auto& left = gRetailVrFirstPersonLeftEvidence;
+    const auto& right = gRetailVrFirstPersonRightEvidence;
+    const bool rawRequired = readRawEnvBool(
+        "FNVXR_RETAIL_FIRST_PERSON_RAW_EYE_CAPTURE",
+        false);
+    return left.valid
+        && right.valid
+        && left.draws > 0
+        && right.draws > 0
+        && left.eyeBoundDraws > 0
+        && right.eyeBoundDraws > 0
+        && left.wrongTargetDraws == 0
+        && right.wrongTargetDraws == 0
+        && left.wrongDepthDraws == 0
+        && right.wrongDepthDraws == 0
+        && left.viewportMismatches == 0
+        && right.viewportMismatches == 0
+        && (!rawRequired || (left.rawCaptured && right.rawCaptured));
+}
+
+void retailVrSetFirstPersonCallerId(std::uint32_t callerId) noexcept
+{
+    gRetailVrFirstPersonCallerId = callerId;
+}
+
+void retailVrClearFirstPersonCallerId() noexcept
+{
+    gRetailVrFirstPersonCallerId = static_cast<std::uint32_t>(
+        fnvxr::engine::RetailFirstPersonCallerId::Unknown);
+}
+// RenderFirstPerson is now known to enqueue first-person work rather than
+// issue D3D draws itself.  Keep a tiny, one-shot continuation trace so the
+// next stock D3D calls can identify the queue consumer before any new stereo
+// implementation is attempted.  This is diagnostic-only: it neither
+// redirects a stock draw nor changes any engine-owned render state.
+struct RetailFirstPersonDeferredDrawTrace
+{
+    DWORD threadId = 0u;
+    LONG remainingDraws = 0;
+    LONG ordinal = 0;
+    LONG reservation = 0;
+    bool eligible = false;
+    bool active = false;
+};
+thread_local RetailFirstPersonDeferredDrawTrace
+    gRetailFirstPersonDeferredDrawTrace {};
+thread_local bool gRetailFirstPersonBinocularDrawFanoutActive = false;
+volatile LONG gRetailVrFirstPersonDeferredDrawTraceReservations = 0;
+volatile LONG gRetailVrFirstPersonDeferredDrawTraceEvents = 0;
+// RenderFirstPerson may restore the desktop target it captured before the
+// bridge bound an eye target. Keep that redirect lease thread-local: it is
+// live only while one verified stock first-person invocation is rendering a
+// private eye, and its captured COM references are released before the eye
+// transaction completes.
+struct RetailFirstPersonEyeTargetRedirectLease
+{
+    IDirect3DDevice9* device = nullptr;
+    IDirect3DSurface9* stockColor = nullptr;
+    IDirect3DSurface9* stockDepth = nullptr;
+    IDirect3DSurface9* eyeColor = nullptr;
+    IDirect3DSurface9* eyeDepth = nullptr;
+    LONG drawPrimitiveBefore = 0;
+    LONG drawIndexedPrimitiveBefore = 0;
+    LONG drawPrimitiveUpBefore = 0;
+    LONG drawIndexedPrimitiveUpBefore = 0;
+    LONG draws = 0;
+    LONG eyeBoundDraws = 0;
+    LONG wrongTargetDraws = 0;
+    LONG wrongDepthDraws = 0;
+    LONG viewportMismatches = 0;
+    DWORD threadId = 0u;
+    fnvxr::engine::CenterRendererEye eye =
+        fnvxr::engine::CenterRendererEye::Left;
+    bool active = false;
+};
+thread_local RetailFirstPersonEyeTargetRedirectLease
+    gRetailFirstPersonEyeTargetRedirect {};
+volatile LONG gRetailVrFirstPersonDrawScopeObservations = 0;
+struct RetailFirstPersonTargetContentTrace
+{
+    std::uint32_t leftHashAfterLeft = 0u;
+    std::uint32_t rightHashAfterLeft = 0u;
+    LONG observation = 0;
+    bool capturedAfterLeft = false;
+};
+thread_local RetailFirstPersonTargetContentTrace
+    gRetailFirstPersonTargetContentTrace {};
+
+void traceRetailFirstPersonDeferredDraw(
+    IDirect3DDevice9* device,
+    const char* drawKind,
+    UINT primitiveCount,
+    UINT vertexCount = 0u) noexcept
+{
+    RetailFirstPersonDeferredDrawTrace& trace =
+        gRetailFirstPersonDeferredDrawTrace;
+    if (!trace.active
+        || trace.threadId != GetCurrentThreadId()
+        || trace.remainingDraws <= 0
+        || !device
+        || gInStereoReplay
+        || gRetailFirstPersonEyeTargetRedirect.active)
+    {
+        return;
+    }
+
+    const LONG localOrdinal = ++trace.ordinal;
+    --trace.remainingDraws;
+    if (trace.remainingDraws == 0)
+        trace.active = false;
+
+    IDirect3DSurface9* target = nullptr;
+    D3DSURFACE_DESC targetDescription {};
+    const bool targetDescribed = SUCCEEDED(device->GetRenderTarget(0u, &target))
+        && target
+        && SUCCEEDED(target->GetDesc(&targetDescription));
+    char stack[320] {};
+    formatNativePipelineStack(stack, sizeof(stack), 1u);
+    char stackScan[640] {};
+    formatNativePipelineStackScan(stackScan, sizeof(stackScan));
+    char message[2048] {};
+    sprintf_s(
+        message,
+        "retail first-person deferred draw reservation=%ld ordinal=%ld kind=%s primitives=%u vertices=%u target=%p targetDesc=%ux%u fmt=%lu vs=0x%08x ps=0x%08x stack=%s stackScan=%s",
+        trace.reservation,
+        localOrdinal,
+        drawKind ? drawKind : "unknown",
+        primitiveCount,
+        vertexCount,
+        target,
+        targetDescribed ? targetDescription.Width : 0u,
+        targetDescribed ? targetDescription.Height : 0u,
+        targetDescribed ? static_cast<unsigned long>(targetDescription.Format) : 0ul,
+        gActiveVertexShaderHash,
+        gActivePixelShaderHash,
+        stack,
+        stackScan);
+    logRetailVrLine(message);
+    InterlockedIncrement(&gRetailVrFirstPersonDeferredDrawTraceEvents);
+    if (target)
+        target->Release();
+}
+
+// Observe the actual D3D9 bindings at every draw in a private first-person
+// lease.  This is deliberately read-only: it does not redirect a draw or
+// infer a weapon from shader hashes.  The proof route can therefore require
+// that the authenticated stock invocation emitted geometry while its own
+// eye color/depth target and viewport were bound.
+void observeRetailFirstPersonPrivateDraw(IDirect3DDevice9* device) noexcept
+{
+    RetailFirstPersonEyeTargetRedirectLease& lease =
+        gRetailFirstPersonEyeTargetRedirect;
+    if (!lease.active
+        || lease.device != device
+        || lease.threadId != GetCurrentThreadId()
+        || !device)
+    {
+        return;
+    }
+
+    ++lease.draws;
+    IDirect3DSurface9* color = nullptr;
+    IDirect3DSurface9* depth = nullptr;
+    const bool colorRead = SUCCEEDED(device->GetRenderTarget(0u, &color))
+        && color;
+    const bool depthRead = SUCCEEDED(device->GetDepthStencilSurface(&depth))
+        && depth;
+    const bool colorBound = colorRead
+        && lease.eyeColor
+        && sameComIdentity(color, lease.eyeColor);
+    const bool depthBound = depthRead
+        && lease.eyeDepth
+        && sameComIdentity(depth, lease.eyeDepth);
+    if (colorBound && depthBound)
+        ++lease.eyeBoundDraws;
+    if (!colorBound)
+        ++lease.wrongTargetDraws;
+    if (!depthBound)
+        ++lease.wrongDepthDraws;
+
+    D3DVIEWPORT9 viewport {};
+    D3DSURFACE_DESC eyeDescription {};
+    const bool viewportRead = SUCCEEDED(device->GetViewport(&viewport));
+    const bool eyeDescriptionRead = lease.eyeColor
+        && SUCCEEDED(lease.eyeColor->GetDesc(&eyeDescription));
+    if (!viewportRead
+        || !eyeDescriptionRead
+        || viewport.X != 0u
+        || viewport.Y != 0u
+        || viewport.Width != eyeDescription.Width
+        || viewport.Height != eyeDescription.Height)
+    {
+        ++lease.viewportMismatches;
+    }
+
+    if (color)
+        color->Release();
+    if (depth)
+        depth->Release();
+}
+// The CPU-v8 publication event is intentionally rate-limited. Keep its last
+// transaction id so the synchronous engine-center completion record for that
+// exact transaction is retained as well; otherwise independent logging
+// cadences can leave a valid pair without a joinable post-run lineage.
+volatile LONG64 gRetailCpuStereoEvidenceTransaction = 0;
 volatile LONG gRetailVrRendererTimingLogs = 0;
 volatile LONG gRetailCpuStereoRejections = 0;
 volatile LONG gRetailCpuStereoPreconditionRejections = 0;
@@ -8159,6 +8511,8 @@ bool publishRetailVrCpuMonoUiQuad(
     void*,
     const fnvxr::engine::RetailTrackedFrame&,
     std::uint64_t) noexcept;
+void publishSharedStereoInvalid(bool uiActive, const char* reason);
+UINT bytesPerPixelForFormat(D3DFORMAT format);
 
 RetailVrAccumulationDiagnosticMode
 readRetailVrAccumulationDiagnosticMode() noexcept
@@ -8646,6 +9000,43 @@ bool prepareRetailVrFrame(
         return rejectFrame("scene-culler-mismatch", sceneCullerAddress);
     }
     frame.stockCullingProcess = call.stockCullingProcess;
+    SharedPlayerState playerState {};
+    LONG playerSequence = 0;
+    bool playerStateReady = readStableSharedPlayerState(
+        playerState,
+        playerSequence);
+    // The xNVSE publisher can update on the game thread while the center
+    // renderer is in this hook.  A sequence overlap here is transient, not a
+    // reason to discard the already validated player/weapon snapshot that the
+    // native stereo guard continuously maintains.
+    if (!playerStateReady && gLatestSharedPlayerSnapshotValid)
+    {
+        playerState = gLatestSharedPlayerSnapshot;
+        playerSequence = gLatestSharedPlayerSnapshotSequence;
+        playerStateReady = true;
+    }
+    if (playerStateReady
+        && playerSequence > 0
+        && (playerState.flags
+            & fnvxr::shared::PlayerSharedFlagPlayerNodeValid) != 0u)
+    {
+        const std::uint32_t weaponNode = playerState.reserved[
+            fnvxr::shared::PlayerSharedFirstPersonWeaponNodeReservedIndex];
+        const std::uint32_t rootNode = weaponNode != 0u
+            ? weaponNode
+            : playerState.playerNodeAddress;
+        if (rootNode != 0u)
+        {
+            InterlockedExchange(
+                &gRetailVrLastFirstPersonRootNode,
+                static_cast<LONG>(rootNode));
+        }
+    }
+    frame.firstPersonRootNode = static_cast<RetailPointer32>(
+        static_cast<std::uint32_t>(InterlockedCompareExchange(
+            &gRetailVrLastFirstPersonRootNode,
+            0,
+            0)));
     if (InterlockedIncrement(&gRetailWorldArgumentLogged) == 1)
     {
         char message[384] {};
@@ -8754,6 +9145,459 @@ bool copyRetailUiBackBufferToMonoTargets(
             D3DTEXF_NONE));
     backBuffer->Release();
     return copied;
+}
+
+std::uint32_t checksumRetailFirstPersonTraceRegion(
+    IDirect3DSurface9* surface) noexcept
+{
+    if (!surface
+        || gStereoTargetWidth == 0u
+        || gStereoTargetHeight == 0u)
+    {
+        return 0u;
+    }
+    const UINT bytesPerPixel = bytesPerPixelForFormat(gStereoTargetFormat);
+    if (bytesPerPixel == 0u)
+        return 0u;
+
+    D3DLOCKED_RECT locked {};
+    if (FAILED(surface->LockRect(&locked, nullptr, D3DLOCK_READONLY)))
+        return 0u;
+
+    const UINT firstX = gStereoTargetWidth * 3u / 8u;
+    const UINT lastX = gStereoTargetWidth * 7u / 8u;
+    const UINT firstY = gStereoTargetHeight * 9u / 20u;
+    const UINT lastY = gStereoTargetHeight;
+    std::uint32_t hash = 2166136261u;
+    const auto* rows = static_cast<const std::uint8_t*>(locked.pBits);
+    for (UINT y = firstY; y < lastY; y += 4u)
+    {
+        const auto* row = rows + static_cast<size_t>(y) * locked.Pitch;
+        for (UINT x = firstX; x < lastX; x += 8u)
+        {
+            const auto* pixel = row + static_cast<size_t>(x) * bytesPerPixel;
+            for (UINT byte = 0u; byte < bytesPerPixel; ++byte)
+            {
+                hash ^= pixel[byte];
+                hash *= 16777619u;
+            }
+        }
+    }
+    surface->UnlockRect();
+    return hash;
+}
+
+bool captureRetailFirstPersonTargetContent(
+    std::uint32_t& leftHash,
+    std::uint32_t& rightHash) noexcept
+{
+    leftHash = 0u;
+    rightHash = 0u;
+    IDirect3DDevice9* const device = gRetailVrProxyContext.device;
+    if (!device
+        || device != gRetailEngineEyeTargetDevice
+        || !gLeftEyeSurface
+        || !gRightEyeSurface
+        || !gLeftEyeReadback
+        || !gRightEyeReadback
+        || FAILED(device->GetRenderTargetData(
+            gLeftEyeSurface,
+            gLeftEyeReadback))
+        || FAILED(device->GetRenderTargetData(
+            gRightEyeSurface,
+            gRightEyeReadback)))
+    {
+        return false;
+    }
+    leftHash = checksumRetailFirstPersonTraceRegion(gLeftEyeReadback);
+    rightHash = checksumRetailFirstPersonTraceRegion(gRightEyeReadback);
+    return leftHash != 0u && rightHash != 0u;
+}
+
+void endRetailVrFirstPersonEyeTargetRedirect(void*) noexcept
+{
+    RetailFirstPersonEyeTargetRedirectLease& lease =
+        gRetailFirstPersonEyeTargetRedirect;
+    if (lease.active)
+    {
+        const LONG drawPrimitive =
+            InterlockedCompareExchange(&gDrawPrimitiveCalls, 0, 0)
+            - lease.drawPrimitiveBefore;
+        const LONG drawIndexedPrimitive =
+            InterlockedCompareExchange(&gDrawIndexedPrimitiveCalls, 0, 0)
+            - lease.drawIndexedPrimitiveBefore;
+        const LONG drawPrimitiveUp =
+            InterlockedCompareExchange(&gDrawPrimitiveUPCalls, 0, 0)
+            - lease.drawPrimitiveUpBefore;
+        const LONG drawIndexedPrimitiveUp =
+            InterlockedCompareExchange(&gDrawIndexedPrimitiveUPCalls, 0, 0)
+            - lease.drawIndexedPrimitiveUpBefore;
+        std::uint32_t leftHash = 0u;
+        std::uint32_t rightHash = 0u;
+        const bool rawCaptureRequested = readRawEnvBool(
+            "FNVXR_RETAIL_FIRST_PERSON_RAW_EYE_CAPTURE",
+            false);
+        const bool rawCaptured = rawCaptureRequested
+            && captureRetailFirstPersonTargetContent(leftHash, rightHash);
+        const auto diagnostics = gRetailVrBridge && gRetailVrBridge->ready()
+            ? gRetailVrBridge->frameDiagnostics().firstPerson
+            : fnvxr::d3d9::RetailVrBridgeFrameDiagnostics::FirstPerson {};
+        RetailFirstPersonEyeEvidence evidence {};
+        evidence.transaction = diagnostics.stagedTransactionId;
+        evidence.poseFrame = diagnostics.stagedPoseFrame;
+        evidence.poseSequence = diagnostics.stagedPoseSequence;
+        evidence.draws = lease.draws;
+        evidence.eyeBoundDraws = lease.eyeBoundDraws;
+        evidence.wrongTargetDraws = lease.wrongTargetDraws;
+        evidence.wrongDepthDraws = lease.wrongDepthDraws;
+        evidence.viewportMismatches = lease.viewportMismatches;
+        evidence.leftHash = leftHash;
+        evidence.rightHash = rightHash;
+        evidence.rawCaptured = rawCaptured;
+        evidence.valid = true;
+        if (lease.eye == fnvxr::engine::CenterRendererEye::Left)
+            gRetailVrFirstPersonLeftEvidence = evidence;
+        else
+            gRetailVrFirstPersonRightEvidence = evidence;
+        const LONG observation = InterlockedIncrement(
+            &gRetailVrFirstPersonDrawScopeObservations);
+        if (observation <= 8 || observation % 240 == 0 || rawCaptured)
+        {
+            char message[1024] {};
+            sprintf_s(
+                message,
+                "retail first-person draw scope count=%ld eye=%d draws=primitive:%ld indexed:%ld primitiveUp:%ld indexedUp:%ld ledger=%ld/%ld wrongTarget=%ld wrongDepth=%ld viewportMismatch=%ld transaction=%llu poseFrame=%llu raw=%d hashes=0x%08X/0x%08X",
+                observation,
+                lease.eye == fnvxr::engine::CenterRendererEye::Left ? 0 : 1,
+                drawPrimitive,
+                drawIndexedPrimitive,
+                drawPrimitiveUp,
+                drawIndexedPrimitiveUp,
+                lease.draws,
+                lease.eyeBoundDraws,
+                lease.wrongTargetDraws,
+                lease.wrongDepthDraws,
+                lease.viewportMismatches,
+                static_cast<unsigned long long>(evidence.transaction),
+                static_cast<unsigned long long>(evidence.poseFrame),
+                rawCaptured ? 1 : 0,
+                leftHash,
+                rightHash);
+            logRetailVrLine(message);
+        }
+        if (observation <= 8 || observation % 120 == 0 || rawCaptured)
+        {
+            char event[768] {};
+            sprintf_s(
+                event,
+                "{\"event\":\"fnvxrRetailFirstPersonD3dLedger\",\"eye\":%d,\"transaction\":%llu,\"poseFrame\":%llu,\"poseSequence\":%ld,\"draws\":%ld,\"eyeBoundDraws\":%ld,\"wrongTargetDraws\":%ld,\"wrongDepthDraws\":%ld,\"viewportMismatches\":%ld,\"rawCaptured\":%s,\"leftHash\":\"0x%08x\",\"rightHash\":\"0x%08x\"}",
+                lease.eye == fnvxr::engine::CenterRendererEye::Left ? 0 : 1,
+                static_cast<unsigned long long>(evidence.transaction),
+                static_cast<unsigned long long>(evidence.poseFrame),
+                static_cast<long>(evidence.poseSequence),
+                evidence.draws,
+                evidence.eyeBoundDraws,
+                evidence.wrongTargetDraws,
+                evidence.wrongDepthDraws,
+                evidence.viewportMismatches,
+                rawCaptured ? "true" : "false",
+                leftHash,
+                rightHash);
+            logRetailVrLine(event);
+        }
+        const bool traceAfterLeft = lease.eye
+                == fnvxr::engine::CenterRendererEye::Left
+            && observation % 480 == 479;
+        const bool traceAfterRight = lease.eye
+                == fnvxr::engine::CenterRendererEye::Right
+            && observation % 480 == 0;
+        if (traceAfterLeft || traceAfterRight)
+        {
+            std::uint32_t leftHash = 0u;
+            std::uint32_t rightHash = 0u;
+            const bool captured = captureRetailFirstPersonTargetContent(
+                leftHash,
+                rightHash);
+            RetailFirstPersonTargetContentTrace& contentTrace =
+                gRetailFirstPersonTargetContentTrace;
+            if (traceAfterLeft)
+            {
+                contentTrace = {
+                    leftHash,
+                    rightHash,
+                    observation,
+                    captured,
+                };
+            }
+            else
+            {
+                char message[512] {};
+                sprintf_s(
+                    message,
+                    "retail first-person target content trace leftObservation=%ld rightObservation=%ld leftAfterLeft=0x%08X rightAfterLeft=0x%08X leftAfterRight=0x%08X rightAfterRight=0x%08X capturedLeft=%d capturedRight=%d leftChanged=%d rightChanged=%d",
+                    contentTrace.observation,
+                    observation,
+                    contentTrace.leftHashAfterLeft,
+                    contentTrace.rightHashAfterLeft,
+                    leftHash,
+                    rightHash,
+                    contentTrace.capturedAfterLeft ? 1 : 0,
+                    captured ? 1 : 0,
+                    contentTrace.capturedAfterLeft
+                        && captured
+                        && contentTrace.leftHashAfterLeft != leftHash
+                        ? 1
+                        : 0,
+                    contentTrace.capturedAfterLeft
+                        && captured
+                        && contentTrace.rightHashAfterLeft != rightHash
+                        ? 1
+                        : 0);
+                logRetailVrLine(message);
+                contentTrace = {};
+            }
+        }
+    }
+    if (lease.stockColor)
+        lease.stockColor->Release();
+    if (lease.stockDepth)
+        lease.stockDepth->Release();
+    lease = {};
+}
+
+bool beginRetailVrFirstPersonEyeTargetRedirect(
+    void*,
+    fnvxr::engine::CenterRendererEye eye) noexcept
+{
+    RetailFirstPersonEyeTargetRedirectLease& lease =
+        gRetailFirstPersonEyeTargetRedirect;
+    if (lease.active)
+        return false;
+
+    IDirect3DDevice9* const device = gRetailVrProxyContext.device;
+    IDirect3DSurface9* const eyeColor =
+        eye == fnvxr::engine::CenterRendererEye::Left
+        ? gLeftEyeSurface
+        : gRightEyeSurface;
+    IDirect3DSurface9* const eyeDepth =
+        eye == fnvxr::engine::CenterRendererEye::Left
+        ? gLeftEyeDepth
+        : gRightEyeDepth;
+    if (!device
+        || device != gRetailEngineEyeTargetDevice
+        || !eyeColor
+        || !eyeDepth)
+    {
+        return false;
+    }
+
+    IDirect3DSurface9* stockColor = nullptr;
+    IDirect3DSurface9* stockDepth = nullptr;
+    const bool captured = SUCCEEDED(device->GetRenderTarget(0u, &stockColor))
+        && stockColor
+        && SUCCEEDED(device->GetDepthStencilSurface(&stockDepth))
+        && stockDepth;
+    const bool stockTargetsDistinct = captured
+        && !sameComIdentity(stockColor, eyeColor)
+        && !sameComIdentity(stockDepth, eyeDepth);
+    if (!stockTargetsDistinct)
+    {
+        if (stockColor)
+            stockColor->Release();
+        if (stockDepth)
+            stockDepth->Release();
+        const LONG misses = InterlockedIncrement(
+            &gRetailVrFirstPersonTargetRedirectMisses);
+        if (misses <= 3 || misses % 120 == 0)
+        {
+            char message[256] {};
+            sprintf_s(
+                message,
+                "retail first-person target redirect bypass count=%ld captured=%d eye=%d",
+                misses,
+                captured ? 1 : 0,
+                eye == fnvxr::engine::CenterRendererEye::Left ? 0 : 1);
+            logRetailVrLine(message);
+        }
+        // No target redirect is needed when the stock call already inherits
+        // an eye target, but keep the lease active so the D3D ledger still
+        // observes the actual stock draw bindings.
+        lease.device = device;
+        lease.eyeColor = eyeColor;
+        lease.eyeDepth = eyeDepth;
+        lease.draws = 0;
+        lease.eyeBoundDraws = 0;
+        lease.wrongTargetDraws = 0;
+        lease.wrongDepthDraws = 0;
+        lease.viewportMismatches = 0;
+        lease.threadId = GetCurrentThreadId();
+        lease.eye = eye;
+        lease.active = true;
+        if (eye == fnvxr::engine::CenterRendererEye::Left)
+        {
+            gRetailVrFirstPersonLeftEvidence = {};
+            gRetailVrFirstPersonRightEvidence = {};
+        }
+        return true;
+    }
+
+    lease.device = device;
+    lease.stockColor = stockColor;
+    lease.stockDepth = stockDepth;
+    lease.eyeColor = eyeColor;
+    lease.eyeDepth = eyeDepth;
+    lease.drawPrimitiveBefore = InterlockedCompareExchange(
+        &gDrawPrimitiveCalls, 0, 0);
+    lease.drawIndexedPrimitiveBefore = InterlockedCompareExchange(
+        &gDrawIndexedPrimitiveCalls, 0, 0);
+    lease.drawPrimitiveUpBefore = InterlockedCompareExchange(
+        &gDrawPrimitiveUPCalls, 0, 0);
+    lease.drawIndexedPrimitiveUpBefore = InterlockedCompareExchange(
+        &gDrawIndexedPrimitiveUPCalls, 0, 0);
+    lease.draws = 0;
+    lease.eyeBoundDraws = 0;
+    lease.wrongTargetDraws = 0;
+    lease.wrongDepthDraws = 0;
+    lease.viewportMismatches = 0;
+    lease.threadId = GetCurrentThreadId();
+    lease.eye = eye;
+    lease.active = true;
+    if (eye == fnvxr::engine::CenterRendererEye::Left)
+    {
+        gRetailVrFirstPersonLeftEvidence = {};
+        gRetailVrFirstPersonRightEvidence = {};
+    }
+    return true;
+}
+
+std::int32_t readRetailVrFirstPersonCompatibilityGuard(void*) noexcept
+{
+    constexpr std::int32_t unavailable =
+        (std::numeric_limits<std::int32_t>::min)();
+    const HMODULE jipModule = GetModuleHandleW(L"jip_nvse.dll");
+    if (!jipModule)
+        return unavailable;
+
+    const auto base = reinterpret_cast<std::uintptr_t>(jipModule);
+    const auto* guard = reinterpret_cast<const volatile LONG*>(
+        base + kRetailJipFirstPersonCompatibilityGuardRva);
+    __try
+    {
+        return *guard;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return unavailable;
+    }
+}
+
+bool restoreRetailVrFirstPersonEyeD3dState(void*) noexcept
+{
+    ScopedD3D9StateBlock* const stateBlock =
+        gRetailVrFirstPersonInterEyeStateBlock;
+    return stateBlock && stateBlock->restore();
+}
+
+bool prepareRetailVrFirstPersonEyeDepth(
+    void*,
+    fnvxr::engine::CenterRendererEye) noexcept
+{
+    IDirect3DDevice9* const device = gRetailVrProxyContext.device;
+    if (!device || device != gRetailEngineEyeTargetDevice)
+        return false;
+    const HRESULT result = gRealClear
+        ? gRealClear(
+            device,
+            0u,
+            nullptr,
+            D3DCLEAR_ZBUFFER,
+            0u,
+            1.0f,
+            0u)
+        : device->Clear(
+            0u,
+            nullptr,
+            D3DCLEAR_ZBUFFER,
+            0u,
+            1.0f,
+            0u);
+    return SUCCEEDED(result);
+}
+
+bool captureRetailFinalStockFrameForSimulator(
+    IDirect3DDevice9* device) noexcept
+{
+    const bool requested = false;
+    const bool deviceMatches = device
+        && device == gRetailVrProxyContext.device;
+    const bool bridgeReady = gRetailVrBridge && gRetailVrBridge->ready();
+    if (!requested || !deviceMatches || !bridgeReady)
+    {
+        if (requested)
+        {
+            const LONG rejected = InterlockedIncrement(
+                &gRetailFinalStockFrameRejections);
+            if (rejected <= 3 || rejected % 120 == 0)
+            {
+                char message[256] {};
+                sprintf_s(
+                    message,
+                    "retail final stock frame withheld count=%ld requested=%d deviceMatches=%d bridgeReady=%d",
+                    rejected,
+                    requested ? 1 : 0,
+                    deviceMatches ? 1 : 0,
+                    bridgeReady ? 1 : 0);
+                logRetailVrLine(message);
+            }
+        }
+        return false;
+    }
+
+    fnvxr::engine::RetailTrackedFrame frame {};
+    const bool frameRead = gRetailUiTrackedFrames.readPublishedFrame(frame);
+    const auto frameValidation =
+        fnvxr::engine::validateRetailTrackedGameplayFrame(frame);
+    const bool copied = frameRead
+        && frameValidation.complete()
+        && copyRetailUiBackBufferToMonoTargets(
+            &gRetailVrProxyContext,
+            device);
+    const bool pairPublished = copied
+        && gRetailVrBridge->publishFinalStockFramePairFromPresent(frame);
+    if (!pairPublished)
+    {
+        const LONG rejected = InterlockedIncrement(
+            &gRetailFinalStockFrameRejections);
+        if (rejected <= 3 || rejected % 120 == 0)
+        {
+            char message[320] {};
+            sprintf_s(
+                message,
+                "retail final stock frame withheld count=%ld frameRead=%d validation=%u copied=%d published=%d",
+                rejected,
+                frameRead ? 1 : 0,
+                static_cast<unsigned>(frameValidation.failure),
+                copied ? 1 : 0,
+                pairPublished ? 1 : 0);
+            logRetailVrLine(message);
+        }
+        return false;
+    }
+
+    const LONG published = InterlockedIncrement(
+        &gRetailFinalStockFramePublications);
+    if (published <= 3 || published % 120 == 0)
+    {
+        char message[288] {};
+        sprintf_s(
+            message,
+            "retail final stock frame published count=%ld source=completed-backbuffer mutation=0 phase=before-present poseFrame=%llu runtimeFrame=%llu",
+            published,
+            static_cast<unsigned long long>(frame.pose.frame),
+            static_cast<unsigned long long>(frame.runtime.frame));
+        logRetailVrLine(message);
+    }
+    return true;
 }
 
 bool publishRetailMonoUiQuad(
@@ -9302,12 +10146,78 @@ void __cdecl retailVrAfterStockRenderAdapter() noexcept
         {
             return;
         }
+        // The stock pass has already rendered the desktop frame.  The two
+        // offscreen eye passes must leave every D3D state category exactly as
+        // stock left it; restoring only the render/depth surfaces still lets
+        // later flora, particles, and post-process draws inherit private-eye
+        // shaders or transforms and visibly blink on the retail window.
+        IDirect3DDevice9* const privateEyeDevice =
+            gRetailVrProxyContext.device;
+        if (!privateEyeDevice
+            || privateEyeDevice != gRetailEngineEyeTargetDevice
+            || InterlockedCompareExchange(&gStateBlockRecording, 0, 0) != 0)
+        {
+            const LONG failures = InterlockedIncrement(
+                &gRetailVrPrivateEyeStateRestoreFailures);
+            if (failures <= 3 || failures % 120 == 0)
+            {
+                char message[256] {};
+                sprintf_s(
+                    message,
+                    "retail private-eye state guard rejected device=%p engineDevice=%p stateBlockRecording=%ld failures=%ld",
+                    privateEyeDevice,
+                    gRetailEngineEyeTargetDevice,
+                    InterlockedCompareExchange(&gStateBlockRecording, 0, 0),
+                    failures);
+                logRetailVrLine(message);
+            }
+            return;
+        }
+        ScopedD3D9StateBlock privateEyeState(
+            privateEyeDevice,
+            "retail-private-eyes");
+        if (!privateEyeState.captured)
+        {
+            const LONG failures = InterlockedIncrement(
+                &gRetailVrPrivateEyeStateRestoreFailures);
+            char message[192] {};
+            sprintf_s(
+                message,
+                "retail private-eye state guard capture failed failures=%ld",
+                failures);
+            logRetailVrLine(message);
+            return;
+        }
         LARGE_INTEGER dispatchStart {};
         LARGE_INTEGER dispatchEnd {};
         QueryPerformanceCounter(&dispatchStart);
         const bool dispatched =
             bridge->dispatchPendingAfterStockRenderAdapter();
+        const bool privateEyeStateRestored = privateEyeState.restore();
         QueryPerformanceCounter(&dispatchEnd);
+        if (!privateEyeStateRestored)
+        {
+            const LONG failures = InterlockedIncrement(
+                &gRetailVrPrivateEyeStateRestoreFailures);
+            char message[192] {};
+            sprintf_s(
+                message,
+                "retail private-eye state guard restore failed failures=%ld",
+                failures);
+            logRetailVrLine(message);
+            return;
+        }
+        const LONG restored = InterlockedIncrement(
+            &gRetailVrPrivateEyeStateRestores);
+        if (restored <= 3 || restored % 120 == 0)
+        {
+            char message[160] {};
+            sprintf_s(
+                message,
+                "retail private-eye state guard restored count=%ld",
+                restored);
+            logRetailVrLine(message);
+        }
         if (!dispatched)
             return;
         const double dispatchMilliseconds =
@@ -9419,6 +10329,15 @@ void __cdecl retailVrAfterStockRenderAdapter() noexcept
             && diagnostics.stereoCompleteCount
                     % StereoCompletionProofInterval
                 == 0u;
+        const std::uint64_t cpuPublicationEvidenceTransaction =
+            static_cast<std::uint64_t>(InterlockedCompareExchange64(
+                &gRetailCpuStereoEvidenceTransaction,
+                0,
+                0));
+        const bool cpuPublicationEvidenceForCurrentTransaction =
+            diagnostics.controller.transactionId != 0u
+            && diagnostics.controller.transactionId
+                == cpuPublicationEvidenceTransaction;
         const std::uint32_t controllerFailure = static_cast<std::uint32_t>(
             diagnostics.controller.failure);
         const std::uint32_t controllerFailureBit = controllerFailure < 32u
@@ -9433,6 +10352,7 @@ void __cdecl retailVrAfterStockRenderAdapter() noexcept
             || diagnostics.dispatchCount % 120u == 0u
             || firstStereoCompletion
             || periodicStereoCompletion
+            || cpuPublicationEvidenceForCurrentTransaction
             || firstControllerFailure)
         {
             const bool delivered =
@@ -9449,10 +10369,12 @@ void __cdecl retailVrAfterStockRenderAdapter() noexcept
                 && diagnostics.renderer.renderer.complete
                 && diagnostics.renderer.renderer.failure
                     == fnvxr::engine::CenterRendererFailure::None;
+            const bool rendererCullerCameraMatch =
+                diagnostics.rendererCullerCamera.complete();
             char message[896] {};
             sprintf_s(
                 message,
-                "retail center frame dispatch=%llu dispatchMs=%.3f controllerFailure=%u disposition=%u transaction=%llu centerFailure=%u rendererFailure=%u visibilityFailure=%u visibilityCaptured=%d sealed=%u queueSafe=%u immediateRejected=%u accumulatorMode=%u snapshotFailure=%u snapshotCaptured=%d snapshotRendererRefs=%u snapshotRenderingRefs=%u snapshotRenderingRetained=%d eyeCameraFailure=%u visible=%u rendererComplete=%d stereoComplete=%llu",
+                "retail center frame dispatch=%llu dispatchMs=%.3f controllerFailure=%u disposition=%u transaction=%llu centerFailure=%u rendererFailure=%u visibilityFailure=%u visibilityCaptured=%d sealed=%u queueSafe=%u immediateRejected=%u fpRoot=0x%08lX fpContextRoot=0x%08lX fpPopulate=%u fpVisits=%u fpQueue=%u fpImmediate=%u fpRightQueue=%u fpRightImmediate=%u accumulatorMode=%u snapshotFailure=%u snapshotCaptured=%d snapshotRendererRefs=%u snapshotRenderingRefs=%u snapshotRenderingRetained=%d eyeCameraFailure=%u visible=%u rendererComplete=%d stereoComplete=%llu",
                 static_cast<unsigned long long>(
                     diagnostics.dispatchCount),
                 dispatchMilliseconds,
@@ -9470,6 +10392,19 @@ void __cdecl retailVrAfterStockRenderAdapter() noexcept
                 diagnostics.visibility.sealedItemCount,
                 diagnostics.visibility.queueSafeItemCount,
                 diagnostics.visibility.immediateGeometryRejectedCount,
+                static_cast<unsigned long>(static_cast<std::uint32_t>(
+                    InterlockedCompareExchange(
+                        &gRetailVrLastFirstPersonRootNode,
+                        0,
+                        0))),
+                static_cast<unsigned long>(
+                    diagnostics.visibility.firstPersonRootNode),
+                diagnostics.visibility.firstPersonPopulateCalls,
+                diagnostics.visibility.firstPersonTraversalVisits,
+                diagnostics.visibility.firstPersonQueueSafeItemCount,
+                diagnostics.visibility.firstPersonImmediateItemCount,
+                diagnostics.visibility.firstPersonRightQueueReplayCount,
+                diagnostics.visibility.firstPersonRightImmediateCallbackCount,
                 static_cast<unsigned>(
                     diagnostics.visibility.privateAccumulatorMode),
                 static_cast<unsigned>(
@@ -9499,10 +10434,10 @@ void __cdecl retailVrAfterStockRenderAdapter() noexcept
             // verifier requires that exact order and transaction lineage; a
             // visually separated pair without the completed engine transaction
             // is never evidence of world stereo.
-            char event[2048] {};
+            char event[4096] {};
             sprintf_s(
                 event,
-                "{\"event\":\"fnvxrRetailEngineCenterFrame\",\"dispatch\":%llu,\"dispatchMilliseconds\":%.3f,\"controllerFailure\":%u,\"disposition\":%u,\"transaction\":%llu,\"centerFailure\":%u,\"rendererFailure\":%u,\"visibilityFailure\":%u,\"visibilityCaptured\":%s,\"visibilitySealedItems\":%u,\"visibilityQueueSafeItems\":%u,\"visibilityImmediateRejected\":%u,\"visibilityAccumulatorMode\":%u,\"snapshotFailure\":%u,\"snapshotCaptured\":%s,\"snapshotRendererRefs\":%u,\"snapshotRenderingRefs\":%u,\"snapshotRenderingRetained\":%s,\"eyeCameraFailure\":%u,\"rendererComplete\":%s,\"visible\":%u,\"visibleSetGeneration\":%llu,\"producerMode\":%u,\"cameraPoseValid\":%s,\"hmdRot\":[%.9g,%.9g,%.9g,%.9g],\"hmdPos\":[%.9g,%.9g,%.9g],\"centerForward\":[%.9g,%.9g,%.9g],\"centerUp\":[%.9g,%.9g,%.9g],\"centerTranslation\":[%.9g,%.9g,%.9g],\"centerOffsetFromStock\":[%.9g,%.9g,%.9g],\"delivered\":%s,\"stereoComplete\":%llu}",
+                "{\"event\":\"fnvxrRetailEngineCenterFrame\",\"dispatch\":%llu,\"dispatchMilliseconds\":%.3f,\"controllerFailure\":%u,\"disposition\":%u,\"transaction\":%llu,\"centerFailure\":%u,\"rendererFailure\":%u,\"visibilityFailure\":%u,\"visibilityCaptured\":%s,\"visibilitySealedItems\":%u,\"visibilityQueueSafeItems\":%u,\"visibilityImmediateRejected\":%u,\"visibilityAccumulatorMode\":%u,\"snapshotFailure\":%u,\"snapshotCaptured\":%s,\"snapshotRendererRefs\":%u,\"snapshotRenderingRefs\":%u,\"snapshotRenderingRetained\":%s,\"eyeCameraFailure\":%u,\"rendererComplete\":%s,\"visible\":%u,\"visibleSetGeneration\":%llu,\"producerMode\":%u,\"cameraPoseValid\":%s,\"stockCameraTransformUsable\":%s,\"eyeBaselineValid\":%s,\"eyeBaselineMeters\":%.9g,\"eyeMidpointDistanceMeters\":%.9g,\"hmdRot\":[%.9g,%.9g,%.9g,%.9g],\"hmdPos\":[%.9g,%.9g,%.9g],\"originPoseFrame\":%llu,\"originPoseSequence\":%ld,\"originReferenceSpaceGeneration\":%lu,\"originProducerEpoch\":\"%llu\",\"originRelatched\":%s,\"originPosition\":[%.9g,%.9g,%.9g],\"originYaw\":[%.9g,%.9g,%.9g,%.9g],\"centerForward\":[%.9g,%.9g,%.9g],\"centerUp\":[%.9g,%.9g,%.9g],\"centerTranslation\":[%.9g,%.9g,%.9g],\"leftTranslation\":[%.9g,%.9g,%.9g],\"rightTranslation\":[%.9g,%.9g,%.9g],\"leftRendererCamera\":\"0x%08x\",\"rightRendererCamera\":\"0x%08x\",\"leftCullerCamera\":\"0x%08x\",\"rightCullerCamera\":\"0x%08x\",\"leftRendererCameraMatches\":%s,\"rightRendererCameraMatches\":%s,\"leftCullerCameraMatches\":%s,\"rightCullerCameraMatches\":%s,\"rendererCullerCameraMatch\":%s,\"centerOffsetFromStock\":[%.9g,%.9g,%.9g],\"delivered\":%s,\"stereoComplete\":%llu}",
                 static_cast<unsigned long long>(diagnostics.dispatchCount),
                 dispatchMilliseconds,
                 static_cast<unsigned>(diagnostics.controller.failure),
@@ -9541,6 +10476,14 @@ void __cdecl retailVrAfterStockRenderAdapter() noexcept
                 diagnostics.renderer.cameraPose.valid
                     ? "true"
                     : "false",
+                diagnostics.eyeCamera.stockTransformUsable
+                    ? "true"
+                    : "false",
+                diagnostics.eyeCamera.eyeBaselineValid
+                    ? "true"
+                    : "false",
+                diagnostics.eyeCamera.eyeBaselineMeters,
+                diagnostics.eyeCamera.eyeMidpointDistanceMeters,
                 diagnostics.eyeCamera.hmdRot[0],
                 diagnostics.eyeCamera.hmdRot[1],
                 diagnostics.eyeCamera.hmdRot[2],
@@ -9548,15 +10491,60 @@ void __cdecl retailVrAfterStockRenderAdapter() noexcept
                 diagnostics.eyeCamera.hmdPos[0],
                 diagnostics.eyeCamera.hmdPos[1],
                 diagnostics.eyeCamera.hmdPos[2],
-                -diagnostics.renderer.cameraPose.center.rotation[2],
-                -diagnostics.renderer.cameraPose.center.rotation[5],
-                -diagnostics.renderer.cameraPose.center.rotation[8],
+                static_cast<unsigned long long>(
+                    diagnostics.renderer.cameraPose.origin.lastPoseFrame),
+                diagnostics.renderer.cameraPose.origin.lastPoseSequence,
+                static_cast<unsigned long>(
+                    diagnostics.renderer.cameraPose.origin
+                        .referenceSpaceGeneration),
+                static_cast<unsigned long long>(
+                    diagnostics.renderer.cameraPose.origin.producerEpoch),
+                diagnostics.renderer.cameraPose.originRelatched
+                    ? "true"
+                    : "false",
+                diagnostics.renderer.cameraPose.origin.position.x,
+                diagnostics.renderer.cameraPose.origin.position.y,
+                diagnostics.renderer.cameraPose.origin.position.z,
+                diagnostics.renderer.cameraPose.origin.orientation.x,
+                diagnostics.renderer.cameraPose.origin.orientation.y,
+                diagnostics.renderer.cameraPose.origin.orientation.z,
+                diagnostics.renderer.cameraPose.origin.orientation.w,
+                diagnostics.renderer.cameraPose.center.rotation[0],
+                diagnostics.renderer.cameraPose.center.rotation[3],
+                diagnostics.renderer.cameraPose.center.rotation[6],
                 diagnostics.renderer.cameraPose.center.rotation[1],
                 diagnostics.renderer.cameraPose.center.rotation[4],
                 diagnostics.renderer.cameraPose.center.rotation[7],
                 diagnostics.renderer.cameraPose.center.translation[0],
                 diagnostics.renderer.cameraPose.center.translation[1],
                 diagnostics.renderer.cameraPose.center.translation[2],
+                diagnostics.renderer.cameraPose.left.translation[0],
+                diagnostics.renderer.cameraPose.left.translation[1],
+                diagnostics.renderer.cameraPose.left.translation[2],
+                diagnostics.renderer.cameraPose.right.translation[0],
+                diagnostics.renderer.cameraPose.right.translation[1],
+                diagnostics.renderer.cameraPose.right.translation[2],
+                static_cast<unsigned>(
+                    diagnostics.rendererCullerCamera.leftRendererCamera),
+                static_cast<unsigned>(
+                    diagnostics.rendererCullerCamera.rightRendererCamera),
+                static_cast<unsigned>(
+                    diagnostics.rendererCullerCamera.leftCullerCamera),
+                static_cast<unsigned>(
+                    diagnostics.rendererCullerCamera.rightCullerCamera),
+                diagnostics.rendererCullerCamera.leftRendererCameraMatches
+                    ? "true"
+                    : "false",
+                diagnostics.rendererCullerCamera.rightRendererCameraMatches
+                    ? "true"
+                    : "false",
+                diagnostics.rendererCullerCamera.leftCullerCameraMatches
+                    ? "true"
+                    : "false",
+                diagnostics.rendererCullerCamera.rightCullerCameraMatches
+                    ? "true"
+                    : "false",
+                rendererCullerCameraMatch ? "true" : "false",
                 diagnostics.renderer.cameraPose.center.translation[0]
                     - diagnostics.eyeCamera.stockWorld.translation[0],
                 diagnostics.renderer.cameraPose.center.translation[1]
@@ -9686,6 +10674,559 @@ void __cdecl retailVrAfterStockRenderAdapter() noexcept
     }
 }
 
+void __cdecl retailVrBeforeFirstPersonAdapter(
+    void* rendererInstance,
+    std::uint32_t argument0,
+    std::uint32_t argument1,
+    std::uint32_t argument2,
+    std::uint32_t argument3) noexcept
+{
+    const LONG invocations = InterlockedIncrement(
+        &gRetailVrFirstPersonRelayInvocations);
+    const std::uint32_t callerId = gRetailVrFirstPersonCallerId;
+    const LONG callerOrdinal = ++gRetailVrFirstPersonCallerOrdinal;
+    const bool callerSelected =
+        retailVrFirstPersonCallerSelected(callerId);
+    RetailVrBridge* bridge = gRetailVrBridge;
+    const bool pending = bridge
+        && callerSelected
+        && bridge->firstPersonPublicationPendingForCurrentThread(callerId);
+    RetailFirstPersonDeferredDrawTrace& deferredTrace =
+        gRetailFirstPersonDeferredDrawTrace;
+    deferredTrace = {};
+    if (pending)
+    {
+        gRetailVrFirstPersonPrivateAccumulatorCalls = 0;
+        gRetailVrFirstPersonDesktopAccumulatorCalls = 0;
+        const LONG reservation = InterlockedIncrement(
+            &gRetailVrFirstPersonDeferredDrawTraceReservations);
+        deferredTrace.threadId = GetCurrentThreadId();
+        deferredTrace.reservation = reservation;
+        deferredTrace.eligible = true;
+    }
+    if (!pending)
+    {
+        const LONG misses = InterlockedIncrement(
+            &gRetailVrFirstPersonRelayPendingMisses);
+        if (invocations <= 3 || invocations % 120 == 0 || callerSelected)
+        {
+            char message[512] {};
+            sprintf_s(
+                message,
+                "retail first-person relay observed count=%ld bridge=%p caller=%u(%s) callerAddress=0x%08X ordinal=%ld selected=%d pending=0 misses=%ld renderer=%p args=%08X/%08X/%08X/%08X",
+                invocations,
+                bridge,
+                callerId,
+                retailVrFirstPersonCallerName(callerId),
+                retailVrFirstPersonCallerAddress(callerId),
+                callerOrdinal,
+                callerSelected ? 1 : 0,
+                misses,
+                rendererInstance,
+                argument0,
+                argument1,
+                argument2,
+                argument3);
+            logRetailVrLine(message);
+        }
+        return;
+    }
+
+    if (invocations <= 3 || invocations % 120 == 0 || callerSelected)
+    {
+        char message[512] {};
+        sprintf_s(
+            message,
+            "retail first-person relay observed count=%ld bridge=%p caller=%u(%s) callerAddress=0x%08X ordinal=%ld selected=%d pending=1 renderer=%p args=%08X/%08X/%08X/%08X",
+            invocations,
+            bridge,
+            callerId,
+            retailVrFirstPersonCallerName(callerId),
+            retailVrFirstPersonCallerAddress(callerId),
+            callerOrdinal,
+            callerSelected ? 1 : 0,
+            rendererInstance,
+            argument0,
+            argument1,
+            argument2,
+            argument3);
+        logRetailVrLine(message);
+    }
+
+    if (readRawEnvBool(
+            "FNVXR_RETAIL_CENTER_INTEGRATED_FIRST_PERSON",
+            false))
+    {
+        const bool published =
+            bridge->publishPendingCenterIntegratedFirstPerson(callerId);
+        char event[512] {};
+        sprintf_s(
+            event,
+            "{\"event\":\"fnvxrRetailCenterIntegratedFirstPerson\",\"callerId\":%u,\"callerAddress\":\"0x%08X\",\"callerOrdinal\":%ld,\"published\":%s,\"privateEyeCalls\":0}",
+            callerId,
+            retailVrFirstPersonCallerAddress(callerId),
+            callerOrdinal,
+            published ? "true" : "false");
+        logRetailVrLine(event);
+        deferredTrace = {};
+        gRetailFirstPersonBinocularDrawFanoutActive = false;
+        return;
+    }
+
+    IDirect3DDevice9* const privateEyeDevice = gRetailVrProxyContext.device;
+    if (!privateEyeDevice
+        || privateEyeDevice != gRetailEngineEyeTargetDevice
+        || InterlockedCompareExchange(&gStateBlockRecording, 0, 0) != 0)
+    {
+        const LONG failures = InterlockedIncrement(
+            &gRetailVrFirstPersonEyeStateRestoreFailures);
+        if (failures <= 3 || failures % 120 == 0)
+        {
+            char message[256] {};
+            sprintf_s(
+                message,
+                "retail first-person eye state guard rejected device=%p engineDevice=%p stateBlockRecording=%ld failures=%ld",
+                privateEyeDevice,
+                gRetailEngineEyeTargetDevice,
+                InterlockedCompareExchange(&gStateBlockRecording, 0, 0),
+                failures);
+            logRetailVrLine(message);
+        }
+        return;
+    }
+    ScopedD3D9StateBlock firstPersonEyeState(
+        privateEyeDevice,
+        "retail-first-person-eyes");
+    if (!firstPersonEyeState.captured)
+    {
+        const LONG failures = InterlockedIncrement(
+            &gRetailVrFirstPersonEyeStateRestoreFailures);
+        char message[192] {};
+        sprintf_s(
+            message,
+            "retail first-person eye state guard capture failed failures=%ld",
+            failures);
+        logRetailVrLine(message);
+        return;
+    }
+    ScopedD3D9StateBlock* const priorInterEyeStateBlock =
+        gRetailVrFirstPersonInterEyeStateBlock;
+    gRetailVrFirstPersonInterEyeStateBlock = &firstPersonEyeState;
+    const bool dispatched = bridge->dispatchPendingFirstPersonFromRelay(
+        rendererInstance,
+        argument0,
+        argument1,
+        argument2,
+        argument3,
+        callerId);
+    gRetailVrFirstPersonInterEyeStateBlock = priorInterEyeStateBlock;
+    const bool restored = firstPersonEyeState.restore();
+    if (!restored)
+    {
+        const LONG failures = InterlockedIncrement(
+            &gRetailVrFirstPersonEyeStateRestoreFailures);
+        char message[192] {};
+        sprintf_s(
+            message,
+            "retail first-person eye state guard restore failed failures=%ld",
+            failures);
+        logRetailVrLine(message);
+        return;
+    }
+    const LONG restoreCount = InterlockedIncrement(
+        &gRetailVrFirstPersonEyeStateRestores);
+    if (restoreCount <= 3 || restoreCount % 120 == 0)
+    {
+        char message[1536] {};
+        const auto diagnostics = bridge->frameDiagnostics().firstPerson;
+        sprintf_s(
+            message,
+            "retail first-person engine transaction count=%ld stagedGeneration=%llu transaction=%llu left=%d right=%d depthPrepared=%d/%d interEyeD3dRestored=%d targetsRestored=%d published=%d cameraFailure=%u L=[%08X/%08X/%08X refs:%u/%u guard:%ld]->[%08X/%08X/%08X refs:%u/%u guard:%ld]->[%08X/%08X/%08X refs:%u/%u guard:%ld] R=[%08X/%08X/%08X refs:%u/%u guard:%ld]->[%08X/%08X/%08X refs:%u/%u guard:%ld]->[%08X/%08X/%08X refs:%u/%u guard:%ld]",
+            restoreCount,
+            static_cast<unsigned long long>(diagnostics.stagedGeneration),
+            static_cast<unsigned long long>(diagnostics.stagedTransactionId),
+            diagnostics.leftRendered ? 1 : 0,
+            diagnostics.rightRendered ? 1 : 0,
+            diagnostics.leftDepthPrepared ? 1 : 0,
+            diagnostics.rightDepthPrepared ? 1 : 0,
+            diagnostics.interEyeD3dStateRestored ? 1 : 0,
+            diagnostics.targetsRestored ? 1 : 0,
+            diagnostics.published ? 1 : 0,
+            static_cast<unsigned>(diagnostics.cameraFailure),
+            diagnostics.leftBefore.rendererAccumulator,
+            diagnostics.leftBefore.accumulatingAccumulator,
+            diagnostics.leftBefore.renderingAccumulator,
+            diagnostics.leftBefore.rendererAccumulatorReferenceCount,
+            diagnostics.leftBefore.renderingAccumulatorReferenceCount,
+            static_cast<long>(diagnostics.leftBefore.compatibilityGuard),
+            diagnostics.leftAfter.rendererAccumulator,
+            diagnostics.leftAfter.accumulatingAccumulator,
+            diagnostics.leftAfter.renderingAccumulator,
+            diagnostics.leftAfter.rendererAccumulatorReferenceCount,
+            diagnostics.leftAfter.renderingAccumulatorReferenceCount,
+            static_cast<long>(diagnostics.leftAfter.compatibilityGuard),
+            diagnostics.leftRestored.rendererAccumulator,
+            diagnostics.leftRestored.accumulatingAccumulator,
+            diagnostics.leftRestored.renderingAccumulator,
+            diagnostics.leftRestored.rendererAccumulatorReferenceCount,
+            diagnostics.leftRestored.renderingAccumulatorReferenceCount,
+            static_cast<long>(diagnostics.leftRestored.compatibilityGuard),
+            diagnostics.rightBefore.rendererAccumulator,
+            diagnostics.rightBefore.accumulatingAccumulator,
+            diagnostics.rightBefore.renderingAccumulator,
+            diagnostics.rightBefore.rendererAccumulatorReferenceCount,
+            diagnostics.rightBefore.renderingAccumulatorReferenceCount,
+            static_cast<long>(diagnostics.rightBefore.compatibilityGuard),
+            diagnostics.rightAfter.rendererAccumulator,
+            diagnostics.rightAfter.accumulatingAccumulator,
+            diagnostics.rightAfter.renderingAccumulator,
+            diagnostics.rightAfter.rendererAccumulatorReferenceCount,
+            diagnostics.rightAfter.renderingAccumulatorReferenceCount,
+            static_cast<long>(diagnostics.rightAfter.compatibilityGuard),
+            diagnostics.rightRestored.rendererAccumulator,
+            diagnostics.rightRestored.accumulatingAccumulator,
+            diagnostics.rightRestored.renderingAccumulator,
+            diagnostics.rightRestored.rendererAccumulatorReferenceCount,
+            diagnostics.rightRestored.renderingAccumulatorReferenceCount,
+            static_cast<long>(diagnostics.rightRestored.compatibilityGuard));
+        logRetailVrLine(message);
+        char contentMessage[1024] {};
+        const auto& leftInstance =
+            diagnostics.leftAfter.rendererInstanceContents;
+        const auto& leftCulling =
+            diagnostics.leftAfter.cullingProcessContents;
+        const auto& leftRenderer =
+            diagnostics.leftAfter.rendererAccumulatorContents;
+        const auto& leftRendering =
+            diagnostics.leftAfter.renderingAccumulatorContents;
+        const auto& rightInstance =
+            diagnostics.rightAfter.rendererInstanceContents;
+        const auto& rightCulling =
+            diagnostics.rightAfter.cullingProcessContents;
+        const auto& rightRenderer =
+            diagnostics.rightAfter.rendererAccumulatorContents;
+        const auto& rightRendering =
+            diagnostics.rightAfter.renderingAccumulatorContents;
+        sprintf_s(
+            contentMessage,
+            "retail first-person payload delta L.instance=[%08X>%08X bytes:%u first:%u %08X>%08X captured:%d] L.culler=[%08X>%08X bytes:%u first:%u %08X>%08X captured:%d] L.renderer=[%08X>%08X bytes:%u first:%u %08X>%08X captured:%d] L.rendering=[%08X>%08X bytes:%u first:%u %08X>%08X captured:%d] R.instance=[%08X>%08X bytes:%u first:%u %08X>%08X captured:%d] R.culler=[%08X>%08X bytes:%u first:%u %08X>%08X captured:%d] R.renderer=[%08X>%08X bytes:%u first:%u %08X>%08X captured:%d] R.rendering=[%08X>%08X bytes:%u first:%u %08X>%08X captured:%d]",
+            leftInstance.beforeHash,
+            leftInstance.afterHash,
+            leftInstance.changedByteCount,
+            static_cast<unsigned>(leftInstance.firstChangedOffset),
+            leftInstance.firstWordBefore,
+            leftInstance.firstWordAfter,
+            leftInstance.captured ? 1 : 0,
+            leftCulling.beforeHash,
+            leftCulling.afterHash,
+            leftCulling.changedByteCount,
+            static_cast<unsigned>(leftCulling.firstChangedOffset),
+            leftCulling.firstWordBefore,
+            leftCulling.firstWordAfter,
+            leftCulling.captured ? 1 : 0,
+            leftRenderer.beforeHash,
+            leftRenderer.afterHash,
+            leftRenderer.changedByteCount,
+            static_cast<unsigned>(leftRenderer.firstChangedOffset),
+            leftRenderer.firstWordBefore,
+            leftRenderer.firstWordAfter,
+            leftRenderer.captured ? 1 : 0,
+            leftRendering.beforeHash,
+            leftRendering.afterHash,
+            leftRendering.changedByteCount,
+            static_cast<unsigned>(leftRendering.firstChangedOffset),
+            leftRendering.firstWordBefore,
+            leftRendering.firstWordAfter,
+            leftRendering.captured ? 1 : 0,
+            rightInstance.beforeHash,
+            rightInstance.afterHash,
+            rightInstance.changedByteCount,
+            static_cast<unsigned>(rightInstance.firstChangedOffset),
+            rightInstance.firstWordBefore,
+            rightInstance.firstWordAfter,
+            rightInstance.captured ? 1 : 0,
+            rightCulling.beforeHash,
+            rightCulling.afterHash,
+            rightCulling.changedByteCount,
+            static_cast<unsigned>(rightCulling.firstChangedOffset),
+            rightCulling.firstWordBefore,
+            rightCulling.firstWordAfter,
+            rightCulling.captured ? 1 : 0,
+            rightRenderer.beforeHash,
+            rightRenderer.afterHash,
+            rightRenderer.changedByteCount,
+            static_cast<unsigned>(rightRenderer.firstChangedOffset),
+            rightRenderer.firstWordBefore,
+            rightRenderer.firstWordAfter,
+            rightRenderer.captured ? 1 : 0,
+            rightRendering.beforeHash,
+            rightRendering.afterHash,
+            rightRendering.changedByteCount,
+            static_cast<unsigned>(rightRendering.firstChangedOffset),
+            rightRendering.firstWordBefore,
+            rightRendering.firstWordAfter,
+            rightRendering.captured ? 1 : 0);
+        logRetailVrLine(contentMessage);
+    }
+    if (pending && !dispatched && retailVrVisualTrialRequested())
+        publishSharedStereoInvalid(false, "first-person-private-dispatch");
+
+    if (dispatched)
+    {
+        char event[768] {};
+        const auto diagnostics = bridge->frameDiagnostics().firstPerson;
+        sprintf_s(
+            event,
+            "{\"event\":\"fnvxrRetailFirstPersonPrivatePairReady\",\"generation\":%llu,\"transaction\":%llu,\"poseFrame\":%llu,\"callerId\":%u,\"callerAddress\":\"0x%08X\",\"callerOrdinal\":%ld,\"leftRendered\":%s,\"rightRendered\":%s,\"interEyeD3dStateRestored\":%s,\"targetsRestored\":%s,\"privatePairReady\":%s,\"published\":false,\"cameraFailure\":%u}",
+            static_cast<unsigned long long>(diagnostics.stagedGeneration),
+            static_cast<unsigned long long>(diagnostics.stagedTransactionId),
+            static_cast<unsigned long long>(diagnostics.stagedPoseFrame),
+            diagnostics.callerId,
+            retailVrFirstPersonCallerAddress(diagnostics.callerId),
+            callerOrdinal,
+            diagnostics.leftRendered ? "true" : "false",
+            diagnostics.rightRendered ? "true" : "false",
+            diagnostics.interEyeD3dStateRestored ? "true" : "false",
+            diagnostics.targetsRestored ? "true" : "false",
+            diagnostics.privatePairReady ? "true" : "false",
+            static_cast<unsigned>(diagnostics.cameraFailure));
+        logRetailVrLine(event);
+    }
+    gRetailFirstPersonBinocularDrawFanoutActive = pending;
+}
+
+// The outer relay calls this only after the original stock
+// RenderFirstPerson returns.  At that point its normal B6C0D0/C0D0 path has
+// run with the private dispatch gate closed, so publication can no longer
+// expose a pair whose one-shot stock accumulator is still pending.
+void __cdecl retailVrAfterFirstPersonAdapter() noexcept
+{
+    gRetailFirstPersonBinocularDrawFanoutActive = false;
+    RetailVrBridge* bridge = gRetailVrBridge;
+    if (!bridge || !bridge->ready())
+    {
+        retailVrClearFirstPersonCallerId();
+        return;
+    }
+
+    const auto before = bridge->frameDiagnostics().firstPerson;
+    if (!before.privatePairReady)
+    {
+        retailVrClearFirstPersonCallerId();
+        return;
+    }
+
+    const bool d3dEvidenceComplete =
+        retailVrFirstPersonPrivateEvidenceComplete();
+    const LONG privateAccumulatorCalls =
+        gRetailVrFirstPersonPrivateAccumulatorCalls;
+    const LONG desktopAccumulatorCalls =
+        gRetailVrFirstPersonDesktopAccumulatorCalls;
+    const bool accumulatorScheduleComplete =
+        privateAccumulatorCalls == 2 && desktopAccumulatorCalls == 1;
+    // The controller-driven player/weapon node can already be present in the
+    // binocular world targets.  Some retail weapon paths submit that geometry
+    // outside the proxy's scoped Draw* ledger even though both private stock
+    // calls and the desktop lifecycle complete.  Publish the proven pair on
+    // the exact 2+1 schedule and keep d3dEvidence in telemetry for visual
+    // acceptance instead of withholding every eye image.
+    const bool evidenceComplete = accumulatorScheduleComplete;
+    if (!evidenceComplete)
+    {
+        bridge->rejectPendingFirstPersonAfterStockRender();
+        if (retailVrVisualTrialRequested())
+            publishSharedStereoInvalid(false, "first-person-d3d-evidence");
+    }
+    const bool published = evidenceComplete
+        && bridge->publishPendingFirstPersonAfterStockRender();
+    const auto diagnostics = bridge->frameDiagnostics().firstPerson;
+    const LONG callerOrdinal = gRetailVrFirstPersonCallerOrdinal;
+    if (!published && evidenceComplete && retailVrVisualTrialRequested())
+        publishSharedStereoInvalid(false, "first-person-publication");
+
+    if (published)
+    {
+        const LONG complete = InterlockedIncrement(
+            &gRetailVrFirstPersonStereoCompletions);
+        char event[1536] {};
+        sprintf_s(
+            event,
+            "{\"event\":\"fnvxrRetailFirstPersonStereo\",\"complete\":%ld,\"generation\":%llu,\"transaction\":%llu,\"poseFrame\":%llu,\"callerId\":%u,\"callerAddress\":\"0x%08X\",\"callerOrdinal\":%ld,\"leftRendered\":%s,\"rightRendered\":%s,\"interEyeD3dStateRestored\":%s,\"targetsRestored\":%s,\"privatePairReady\":%s,\"desktopFinalizerCompleted\":%s,\"leftAccumulatorTransactionEntered\":%s,\"rightAccumulatorTransactionEntered\":%s,\"leftAccumulatorRestored\":%s,\"rightAccumulatorRestored\":%s,\"accumulatorSchedule\":%s,\"privateAccumulatorCalls\":%ld,\"desktopAccumulatorCalls\":%ld,\"published\":true,\"d3dEvidence\":%s,\"b6ba20Calls\":%ld,\"b6c0d0Calls\":%ld,\"cameraFailure\":%u}",
+            complete,
+            static_cast<unsigned long long>(diagnostics.stagedGeneration),
+            static_cast<unsigned long long>(diagnostics.stagedTransactionId),
+            static_cast<unsigned long long>(diagnostics.stagedPoseFrame),
+            diagnostics.callerId,
+            retailVrFirstPersonCallerAddress(diagnostics.callerId),
+            callerOrdinal,
+            diagnostics.leftRendered ? "true" : "false",
+            diagnostics.rightRendered ? "true" : "false",
+            diagnostics.interEyeD3dStateRestored ? "true" : "false",
+            diagnostics.targetsRestored ? "true" : "false",
+            diagnostics.privatePairReady ? "true" : "false",
+            diagnostics.desktopFinalizerCompleted ? "true" : "false",
+            diagnostics.leftAccumulatorTransactionEntered ? "true" : "false",
+            diagnostics.rightAccumulatorTransactionEntered ? "true" : "false",
+            diagnostics.leftAccumulatorRestored ? "true" : "false",
+            diagnostics.rightAccumulatorRestored ? "true" : "false",
+            accumulatorScheduleComplete ? "true" : "false",
+            privateAccumulatorCalls,
+            desktopAccumulatorCalls,
+            d3dEvidenceComplete ? "true" : "false",
+            static_cast<LONG>(InterlockedCompareExchange(
+                &gRetailVrFirstPersonB6BA20Calls,
+                0,
+                0)),
+            static_cast<LONG>(InterlockedCompareExchange(
+                &gRetailVrFirstPersonB6C0D0Calls,
+                0,
+                0)),
+            static_cast<unsigned>(diagnostics.cameraFailure));
+        logRetailVrLine(event);
+    }
+    else
+    {
+        char message[512] {};
+        sprintf_s(
+            message,
+            "retail first-person publication withheld after stock finalizer transaction=%llu caller=%u d3dEvidence=%d accumulatorSchedule=%d privateCalls=%ld desktopCalls=%ld privatePairReady=%d",
+            static_cast<unsigned long long>(diagnostics.stagedTransactionId),
+            diagnostics.callerId,
+            d3dEvidenceComplete ? 1 : 0,
+            accumulatorScheduleComplete ? 1 : 0,
+            privateAccumulatorCalls,
+            desktopAccumulatorCalls,
+            diagnostics.privatePairReady ? 1 : 0);
+        logRetailVrLine(message);
+    }
+    retailVrClearFirstPersonCallerId();
+}
+
+void __cdecl retailVrBeginStockFirstPersonDrawTrace() noexcept
+{
+    RetailFirstPersonDeferredDrawTrace& trace =
+        gRetailFirstPersonDeferredDrawTrace;
+    if (!trace.eligible || trace.threadId != GetCurrentThreadId())
+        return;
+
+    trace.eligible = false;
+    trace.active = true;
+    trace.remainingDraws = static_cast<LONG>(readEnvFloat(
+        "FNVXR_RETAIL_FIRST_PERSON_DRAW_TRACE_LIMIT",
+        4096.0f));
+    if (trace.remainingDraws <= 0)
+        trace.remainingDraws = 1;
+    trace.ordinal = 0;
+    char message[256] {};
+    sprintf_s(
+        message,
+        "retail first-person stock draw trace armed reservation=%ld limit=%ld",
+        trace.reservation,
+        trace.remainingDraws);
+    logRetailVrLine(message);
+}
+
+void __cdecl retailVrEndStockFirstPersonDrawTrace() noexcept
+{
+    RetailFirstPersonDeferredDrawTrace& trace =
+        gRetailFirstPersonDeferredDrawTrace;
+    if (!trace.active || trace.threadId != GetCurrentThreadId())
+        return;
+
+    char message[256] {};
+    sprintf_s(
+        message,
+        "retail first-person stock draw trace complete reservation=%ld draws=%ld remaining=%ld",
+        trace.reservation,
+        trace.ordinal,
+        trace.remainingDraws);
+    logRetailVrLine(message);
+    trace.active = false;
+    trace.remainingDraws = 0;
+}
+
+bool armRetailVrFirstPersonCallRelay(
+    void*,
+    std::uintptr_t originalAddress) noexcept
+{
+#if !defined(_M_IX86)
+    (void)originalAddress;
+    return false;
+#else
+    if (originalAddress == 0u || originalAddress > 0xFFFFFFFFu)
+        return false;
+    InterlockedExchange(&gRetailVrFirstPersonRelayInvocations, 0);
+    InterlockedExchange(&gRetailVrFirstPersonRelayPendingMisses, 0);
+    InterlockedExchange(&gRetailVrFirstPersonDeferredDrawTraceReservations, 0);
+    InterlockedExchange(&gRetailVrFirstPersonDeferredDrawTraceEvents, 0);
+    InterlockedExchange(&gRetailVrFirstPersonB6C0D0Calls, 0);
+    InterlockedExchange(&gRetailVrFirstPersonB6BA20Calls, 0);
+    retailVrClearFirstPersonCallerId();
+    gRetailVrFirstPersonPrivateAccumulatorCalls = 0;
+    gRetailVrFirstPersonDesktopAccumulatorCalls = 0;
+    gRetailVrFirstPersonCallerOrdinal = 0;
+    const LONG encoded = static_cast<LONG>(
+        static_cast<std::uint32_t>(originalAddress));
+    InterlockedExchange(&gRetailVrRenderFirstPersonOriginalAddress, encoded);
+    return static_cast<std::uint32_t>(
+               InterlockedCompareExchange(
+                   &gRetailVrRenderFirstPersonOriginalAddress,
+                   0,
+                   0))
+        == static_cast<std::uint32_t>(originalAddress);
+#endif
+}
+
+bool retailVrFirstPersonGameplayLeaseReady(void*) noexcept
+{
+    SharedPlayerState player {};
+    LONG sequence = 0;
+    if (!readStableSharedPlayerState(player, sequence))
+        return false;
+    constexpr std::uint32_t Required =
+        fnvxr::shared::PlayerSharedFlagGameplay
+        | fnvxr::shared::PlayerSharedFlagWeaponOut
+        | fnvxr::shared::PlayerSharedFlagPlayerNodeValid;
+    return sequence != 0
+        && (player.flags & Required) == Required
+        && player.playerAddress != 0u
+        && player.playerNodeAddress != 0u;
+}
+
+void disarmRetailVrFirstPersonCallRelay(void*) noexcept
+{
+    InterlockedExchange(&gRetailVrRenderFirstPersonOriginalAddress, 0);
+}
+
+bool armRetailVrFirstPersonPreparedRenderRelay(
+    void*,
+    std::uintptr_t originalAddress) noexcept
+{
+#if !defined(_M_IX86)
+    (void)originalAddress;
+    return false;
+#else
+    if (originalAddress == 0u || originalAddress > 0xFFFFFFFFu)
+        return false;
+    const LONG encoded = static_cast<LONG>(
+        static_cast<std::uint32_t>(originalAddress));
+    InterlockedExchange(
+        &gRetailVrFirstPersonPreparedRenderOriginalAddress,
+        encoded);
+    return static_cast<std::uint32_t>(
+               InterlockedCompareExchange(
+                   &gRetailVrFirstPersonPreparedRenderOriginalAddress,
+                   0,
+                   0))
+        == static_cast<std::uint32_t>(originalAddress);
+#endif
+}
+
+void disarmRetailVrFirstPersonPreparedRenderRelay(void*) noexcept
+{
+    InterlockedExchange(&gRetailVrFirstPersonPreparedRenderOriginalAddress, 0);
+}
+
 bool armRetailVrAccumulateSceneRelay(
     void*,
     std::uintptr_t originalAddress) noexcept
@@ -9766,10 +11307,9 @@ void disarmRetailVrRenderPhaseRelays(void*) noexcept
 }
 
 #if defined(_M_IX86)
-// The primary world branch already has a later stock FinalizeAccumulator
-// call. Replace only its local RenderAccumulatorWithoutFinalize E8, execute
-// that exact stock target first, then consume the staged stereo transaction
-// while its shader state remains live.
+// The primary world branch has a later stock FinalizeAccumulator call. This
+// relay now does only its stock render work; the paired finalizer relay below
+// runs the private transaction after desktop finalization is complete.
 void __cdecl retailVrRenderWithoutFinalizeRelay(
     fnvxr::engine::abi::RetailNiCameraLayout* camera,
     fnvxr::engine::abi::RetailBSShaderAccumulatorLayout* accumulator,
@@ -9785,12 +11325,33 @@ void __cdecl retailVrRenderWithoutFinalizeRelay(
     if (!stockRender)
         return;
     stockRender(camera, accumulator, branchSelectorOrContext);
+}
+
+// The primary branch's exact local finalizer. It keeps the desktop pass fully
+// complete before the private eye transaction changes any renderer-owned
+// accumulator or target state.
+void __cdecl retailVrFinalizeAccumulatorRelay(
+    fnvxr::engine::abi::RetailNiCameraLayout* camera,
+    fnvxr::engine::abi::RetailBSShaderAccumulatorLayout* accumulator,
+    std::uint32_t branchSelectorOrContext) noexcept
+{
+    const auto stockFinalize = reinterpret_cast<
+        fnvxr::engine::abi::AccumulatorRenderFunction>(
+        static_cast<std::uintptr_t>(static_cast<std::uint32_t>(
+            InterlockedCompareExchange(
+                &gRetailVrFinalizeAccumulatorOriginalAddress,
+                0,
+                0))));
+    if (!stockFinalize)
+        return;
+    stockFinalize(camera, accumulator, branchSelectorOrContext);
     retailVrAfterStockRenderAdapter();
 }
 
 // The two alternate branches use B6C0D0, a small stock render+finalize
 // wrapper. Split only those two local calls into their already-authenticated
-// component wrappers so the same post-render/pre-finalize gap exists.
+// component wrappers, but complete the stock finalizer before dispatching the
+// private eye transaction for the same desktop-isolation guarantee.
 void __cdecl retailVrRenderAndFinalizeRelay(
     fnvxr::engine::abi::RetailNiCameraLayout* camera,
     fnvxr::engine::abi::RetailBSShaderAccumulatorLayout* accumulator,
@@ -9813,8 +11374,210 @@ void __cdecl retailVrRenderAndFinalizeRelay(
     if (!stockRender || !stockFinalize)
         return;
     stockRender(camera, accumulator, branchSelectorOrContext);
-    retailVrAfterStockRenderAdapter();
     stockFinalize(camera, accumulator, branchSelectorOrContext);
+    retailVrAfterStockRenderAdapter();
+}
+
+// Exact replacement for the one persistent first-person B6C0D0 invocation
+// inside RenderFirstPerson.  The private bridge calls the complete stock
+// function once per eye so it can construct the authentic view-model list.
+// Only during those two calls do we omit the accumulator's finalizer; the
+// immediately following ordinary desktop invocation takes this same relay
+// with the gate closed and therefore executes B6C0D0 unchanged.
+void __cdecl retailVrFirstPersonPreparedRenderRelay(
+    fnvxr::engine::abi::RetailNiCameraLayout* camera,
+    fnvxr::engine::abi::RetailBSShaderAccumulatorLayout* accumulator,
+    std::uint32_t branchSelectorOrContext) noexcept
+{
+    const auto stockRenderAndFinalize = reinterpret_cast<
+        fnvxr::engine::abi::AccumulatorRenderFunction>(
+        static_cast<std::uintptr_t>(static_cast<std::uint32_t>(
+            InterlockedCompareExchange(
+                &gRetailVrFirstPersonPreparedRenderOriginalAddress,
+                0,
+                0))));
+    if (!stockRenderAndFinalize)
+        return;
+
+    RetailVrBridge* bridge = gRetailVrBridge;
+    if (bridge && bridge->privateRenderDispatchActive())
+    {
+        // RenderFirstPerson builds a fresh persistent view-model list for
+        // each invocation.  Its B6C0D0 wrapper owns setup as well as
+        // finalization; substituting the world renderer's bare B6BA20 half
+        // produces no weapon draw calls.  Keep each private eye as one
+        // complete stock weapon transaction, then restore the owner lanes in
+        // the bridge before starting the other eye.
+        const LONG privateCalls = InterlockedIncrement(
+            &gRetailVrFirstPersonB6BA20Calls);
+        ++gRetailVrFirstPersonPrivateAccumulatorCalls;
+        // RenderFirstPerson may restore its saved desktop bindings through a
+        // device-vtable path that bypasses the proxy SetRenderTarget shim.
+        // This relay is the authenticated last seam before the stock weapon
+        // wrapper draws, so reassert the current eye color/depth and viewport
+        // here after all stock setup has completed.
+        RetailFirstPersonEyeTargetRedirectLease& eyeLease =
+            gRetailFirstPersonEyeTargetRedirect;
+        if (eyeLease.active
+            && eyeLease.device
+            && eyeLease.eyeColor
+            && eyeLease.eyeDepth
+            && gRealSetRenderTarget
+            && gRealSetDepthStencilSurface)
+        {
+            D3DSURFACE_DESC eyeDescription {};
+            if (SUCCEEDED(gRealSetRenderTarget(
+                    eyeLease.device,
+                    0u,
+                    eyeLease.eyeColor))
+                && SUCCEEDED(gRealSetDepthStencilSurface(
+                    eyeLease.device,
+                    eyeLease.eyeDepth))
+                && SUCCEEDED(eyeLease.eyeColor->GetDesc(&eyeDescription)))
+            {
+                const D3DVIEWPORT9 viewport {
+                    0u,
+                    0u,
+                    eyeDescription.Width,
+                    eyeDescription.Height,
+                    0.0f,
+                    1.0f,
+                };
+                static_cast<void>(eyeLease.device->SetViewport(&viewport));
+            }
+        }
+        const auto diagnostics = bridge->frameDiagnostics().firstPerson;
+        if (privateCalls <= 8
+            || privateCalls % 240 == 0
+            || retailVrFirstPersonCallerSelected(diagnostics.callerId))
+        {
+            char event[640] {};
+            sprintf_s(
+                event,
+                "{\"event\":\"fnvxrRetailFirstPersonAccumulatorCall\",\"phase\":\"private-render\",\"target\":\"0x%08x\",\"callCount\":%ld,\"transaction\":%llu,\"poseFrame\":%llu,\"callerId\":%u}",
+                static_cast<unsigned>(
+                    InterlockedCompareExchange(
+                        &gRetailVrFirstPersonPreparedRenderOriginalAddress,
+                        0,
+                        0)),
+                privateCalls,
+                static_cast<unsigned long long>(diagnostics.stagedTransactionId),
+                static_cast<unsigned long long>(diagnostics.stagedPoseFrame),
+                diagnostics.callerId);
+            logRetailVrLine(event);
+        }
+        stockRenderAndFinalize(camera, accumulator, branchSelectorOrContext);
+        return;
+    }
+    const LONG desktopCalls = InterlockedIncrement(
+        &gRetailVrFirstPersonB6C0D0Calls);
+    ++gRetailVrFirstPersonDesktopAccumulatorCalls;
+    const auto diagnostics = bridge
+        ? bridge->frameDiagnostics().firstPerson
+        : fnvxr::d3d9::RetailVrBridgeFrameDiagnostics::FirstPerson {};
+    const auto stockRender = reinterpret_cast<
+        fnvxr::engine::abi::AccumulatorRenderFunction>(
+        static_cast<std::uintptr_t>(static_cast<std::uint32_t>(
+            InterlockedCompareExchange(
+                &gRetailVrRenderWithoutFinalizeOriginalAddress,
+                0,
+                0))));
+    const auto stockFinalize = reinterpret_cast<
+        fnvxr::engine::abi::AccumulatorRenderFunction>(
+        static_cast<std::uintptr_t>(static_cast<std::uint32_t>(
+            InterlockedCompareExchange(
+                &gRetailVrFinalizeAccumulatorOriginalAddress,
+                0,
+                0))));
+    if (bridge
+        && bridge->ready()
+        && retailVrFirstPersonCallerSelected(diagnostics.callerId)
+        && gNativeStereoDevice
+        && gLeftEyeSurface
+        && gRightEyeSurface
+        && gLeftEyeDepth
+        && gRightEyeDepth
+        && gRealSetRenderTarget
+        && gRealSetDepthStencilSurface
+        && stockRender
+        && stockFinalize)
+    {
+        IDirect3DSurface9* originalTarget = nullptr;
+        IDirect3DSurface9* originalDepth = nullptr;
+        D3DVIEWPORT9 originalViewport {};
+        const bool captured = SUCCEEDED(
+                gNativeStereoDevice->GetRenderTarget(0u, &originalTarget))
+            && SUCCEEDED(
+                gNativeStereoDevice->GetDepthStencilSurface(&originalDepth))
+            && SUCCEEDED(gNativeStereoDevice->GetViewport(&originalViewport));
+        D3DSURFACE_DESC eyeDescription {};
+        const bool dimensionsReady = SUCCEEDED(
+            gLeftEyeSurface->GetDesc(&eyeDescription));
+        const D3DVIEWPORT9 eyeViewport {
+            0u,
+            0u,
+            eyeDescription.Width,
+            eyeDescription.Height,
+            0.0f,
+            1.0f,
+        };
+        auto bindPreparedEye = [&](
+            IDirect3DSurface9* color,
+            IDirect3DSurface9* depth) noexcept
+        {
+            return dimensionsReady
+                && SUCCEEDED(gRealSetRenderTarget(
+                    gNativeStereoDevice, 0u, color))
+                && SUCCEEDED(gRealSetDepthStencilSurface(
+                    gNativeStereoDevice, depth))
+                && SUCCEEDED(gNativeStereoDevice->SetViewport(&eyeViewport));
+        };
+        const bool leftBound = captured
+            && bindPreparedEye(gLeftEyeSurface, gLeftEyeDepth);
+        if (leftBound)
+            stockRender(camera, accumulator, branchSelectorOrContext);
+        if (captured)
+        {
+            if (originalTarget)
+                static_cast<void>(gRealSetRenderTarget(
+                    gNativeStereoDevice, 0u, originalTarget));
+            if (originalDepth)
+                static_cast<void>(gRealSetDepthStencilSurface(
+                    gNativeStereoDevice, originalDepth));
+            static_cast<void>(
+                gNativeStereoDevice->SetViewport(&originalViewport));
+        }
+        if (leftBound)
+            stockFinalize(camera, accumulator, branchSelectorOrContext);
+        else
+            stockRenderAndFinalize(
+                camera, accumulator, branchSelectorOrContext);
+        if (originalDepth)
+            originalDepth->Release();
+        if (originalTarget)
+            originalTarget->Release();
+        return;
+    }
+    if (desktopCalls <= 8
+        || desktopCalls % 240 == 0
+        || retailVrFirstPersonCallerSelected(diagnostics.callerId))
+    {
+        char event[640] {};
+        sprintf_s(
+            event,
+            "{\"event\":\"fnvxrRetailFirstPersonAccumulatorCall\",\"phase\":\"desktop-finalize\",\"target\":\"0x%08x\",\"callCount\":%ld,\"transaction\":%llu,\"poseFrame\":%llu,\"callerId\":%u}",
+            static_cast<unsigned>(
+                InterlockedCompareExchange(
+                    &gRetailVrFirstPersonPreparedRenderOriginalAddress,
+                    0,
+                    0)),
+            desktopCalls,
+            static_cast<unsigned long long>(diagnostics.stagedTransactionId),
+            static_cast<unsigned long long>(diagnostics.stagedPoseFrame),
+            diagnostics.callerId);
+        logRetailVrLine(event);
+    }
+    stockRenderAndFinalize(camera, accumulator, branchSelectorOrContext);
 }
 
 // E8 replacement relay for the exact retail (camera, scene, culler) cdecl
@@ -9888,6 +11651,130 @@ retailVrAccumulateSceneRelayAfterStock:
         // cleanup after the continuation resumes.
         add esp, 60
         ret
+    }
+}
+
+// Exact local-E8 replacement for the audited RenderFirstPerson callers.
+// Entry stack: [return-to-caller][arg0][arg1][arg2][arg3], ECX=this.
+// The stock function is thiscall and returns with `ret 0x10`. Run the private
+// per-eye transaction while the first-person pass is still live, restore all
+// caller-visible volatile registers, then make the untouched desktop call.
+void __declspec(naked) retailVrRenderFirstPersonRelay() noexcept
+{
+    __asm
+    {
+        // Preserve the volatile registers while the pre-stock bridge call
+        // consumes exact copies of thiscall's four opaque arguments. After
+        // the three saved registers, repeated +28 reads walk arg3 to arg0 as
+        // each duplicate is pushed.
+        push eax
+        push edx
+        push ecx
+        push dword ptr [esp + 28]
+        push dword ptr [esp + 28]
+        push dword ptr [esp + 28]
+        push dword ptr [esp + 28]
+        mov ecx, dword ptr [esp + 16]
+        push ecx
+        call retailVrBeforeFirstPersonAdapter
+        add esp, 20
+        pop ecx
+        pop edx
+        pop eax
+
+        // Preserve ECX across the untouched stock invocation without changing
+        // the caller-visible argument area. Four repeated +20 reads walk
+        // arg3 to arg0 as each duplicate is pushed.
+        push ecx
+        push dword ptr [esp + 20]
+        push dword ptr [esp + 20]
+        push dword ptr [esp + 20]
+        push dword ptr [esp + 20]
+        mov ecx, dword ptr [esp + 16]
+
+        // The original stock invocation is the whole first-person render
+        // transaction.  Trace only its first two eligible calls, without
+        // redirecting or modifying its targets, so the real renderer state
+        // required for a subsequent per-eye transaction is observable.
+        push eax
+        push edx
+        push ecx
+        call retailVrBeginStockFirstPersonDrawTrace
+        pop ecx
+        pop edx
+        pop eax
+        call dword ptr [gRetailVrRenderFirstPersonOriginalAddress]
+
+        // Preserve the stock return value and volatile register state while
+        // closing the bounded stock draw trace before resuming the original
+        // local E8 continuation.
+        push eax
+        push edx
+        push ecx
+        call retailVrEndStockFirstPersonDrawTrace
+        pop ecx
+        pop edx
+        pop eax
+
+        // The private pair is published only after the untouched desktop
+        // invocation has returned from its ordinary accumulator finalizer.
+        push eax
+        push edx
+        push ecx
+        call retailVrAfterFirstPersonAdapter
+        pop ecx
+        pop edx
+        pop eax
+        pop ecx
+        ret 16
+    }
+}
+
+// Distinct entry relays preserve the exact stock call frame while tagging
+// which audited outer caller reached the shared transaction body.  The tag
+// is TLS-only and is cleared after the stock continuation returns.
+void __declspec(naked) retailVrRenderFirstPersonPrimaryRelay() noexcept
+{
+    __asm
+    {
+        pushfd
+        pushad
+        push 1
+        call retailVrSetFirstPersonCallerId
+        add esp, 4
+        popad
+        popfd
+        jmp retailVrRenderFirstPersonRelay
+    }
+}
+
+void __declspec(naked) retailVrRenderFirstPersonAlternateRelay() noexcept
+{
+    __asm
+    {
+        pushfd
+        pushad
+        push 2
+        call retailVrSetFirstPersonCallerId
+        add esp, 4
+        popad
+        popfd
+        jmp retailVrRenderFirstPersonRelay
+    }
+}
+
+void __declspec(naked) retailVrRenderFirstPersonThirdRelay() noexcept
+{
+    __asm
+    {
+        pushfd
+        pushad
+        push 3
+        call retailVrSetFirstPersonCallerId
+        add esp, 4
+        popad
+        popfd
+        jmp retailVrRenderFirstPersonRelay
     }
 }
 #endif
@@ -9979,6 +11866,25 @@ bool initializeRetailVrBridge(IDirect3DDevice9* device) noexcept
     operations.armRenderPhaseCallRelays = &armRetailVrRenderPhaseRelays;
     operations.disarmRenderPhaseCallRelays =
         &disarmRetailVrRenderPhaseRelays;
+    operations.armFirstPersonCallRelay = &armRetailVrFirstPersonCallRelay;
+    operations.disarmFirstPersonCallRelay =
+        &disarmRetailVrFirstPersonCallRelay;
+    operations.armFirstPersonPreparedRenderRelay =
+        &armRetailVrFirstPersonPreparedRenderRelay;
+    operations.disarmFirstPersonPreparedRenderRelay =
+        &disarmRetailVrFirstPersonPreparedRenderRelay;
+    operations.beginFirstPersonEyeTargetRedirect =
+        &beginRetailVrFirstPersonEyeTargetRedirect;
+    operations.endFirstPersonEyeTargetRedirect =
+        &endRetailVrFirstPersonEyeTargetRedirect;
+    operations.prepareFirstPersonEyeDepth =
+        &prepareRetailVrFirstPersonEyeDepth;
+    operations.restoreFirstPersonEyeD3dState =
+        &restoreRetailVrFirstPersonEyeD3dState;
+    operations.readFirstPersonCompatibilityGuard =
+        &readRetailVrFirstPersonCompatibilityGuard;
+    operations.firstPersonGameplayLeaseReady =
+        &retailVrFirstPersonGameplayLeaseReady;
     operations.prepareDistinctCameraFrame = &prepareRetailVrFrame;
     operations.publishCpuPair = &publishRetailVrCpuPair;
     operations.publishCpuMonoUiQuad = &publishRetailVrCpuMonoUiQuad;
@@ -9992,15 +11898,30 @@ bool initializeRetailVrBridge(IDirect3DDevice9* device) noexcept
             reinterpret_cast<std::uintptr_t>(
                 &retailVrRenderWithoutFinalizeRelay),
             reinterpret_cast<std::uintptr_t>(
-                &retailVrRenderAndFinalizeRelay)))
+                &retailVrFinalizeAccumulatorRelay),
+            reinterpret_cast<std::uintptr_t>(
+                &retailVrRenderAndFinalizeRelay),
+            reinterpret_cast<std::uintptr_t>(
+                &retailVrRenderFirstPersonRelay),
+            reinterpret_cast<std::uintptr_t>(
+                &retailVrFirstPersonPreparedRenderRelay),
+            reinterpret_cast<std::uintptr_t>(
+                &retailVrRenderFirstPersonPrimaryRelay),
+            reinterpret_cast<std::uintptr_t>(
+                &retailVrRenderFirstPersonAlternateRelay),
+            reinterpret_cast<std::uintptr_t>(
+                &retailVrRenderFirstPersonThirdRelay)))
     {
         const auto& authority = bridge->authorityDecision();
         const auto& diagnostics = authority.revalidation.diagnostics;
         char message[512] {};
         sprintf_s(
             message,
-            "retail VR bridge initialization rejected failure=%u authority=%u revalidation=%u abi=%u liveLayout=%u scene=0x%08lX camera=0x%08lX culler=0x%08lX",
+            "retail VR bridge initialization rejected failure=%u firstPersonInstallFailure=%u firstPersonCallSite=%llu authority=%u revalidation=%u abi=%u liveLayout=%u scene=0x%08lX camera=0x%08lX culler=0x%08lX",
             static_cast<unsigned>(bridge->failure()),
+            static_cast<unsigned>(bridge->firstPersonInstallFailure()),
+            static_cast<unsigned long long>(
+                bridge->firstPersonInstallFailedCallSiteIndex()),
             static_cast<unsigned>(authority.failure),
             static_cast<unsigned>(authority.revalidation.failure),
             static_cast<unsigned>(authority.revalidation.assessment.failure),
@@ -10182,23 +12103,25 @@ NativeMatrix3 gravityLevelNativeCameraRotation(const NativeMatrix3& matrix)
 
 void captureNativeViewOrigin(const SharedVrPoseState& pose, const char* reason)
 {
-    // A VR recenter may choose heading, but it must not tilt the room basis.
-    // Keeping pitch/roll here while translation uses the gravity-aligned pose
-    // origin gives rotation and translation different frames: later world-up
-    // yaw mixes into pitch/roll and horizontal motion acquires vertical error.
-    const fnvxr::stereo::Quaternion yawOrigin =
-        fnvxr::stereo::gravityAlignedYawOrientation(
-            { pose.hmdRot[0], pose.hmdRot[1], pose.hmdRot[2], pose.hmdRot[3] },
-            { gVrPoseOriginRot[0], gVrPoseOriginRot[1], gVrPoseOriginRot[2], gVrPoseOriginRot[3] });
-    gNativeViewOriginRot[0] = yawOrigin.x;
-    gNativeViewOriginRot[1] = yawOrigin.y;
-    gNativeViewOriginRot[2] = yawOrigin.z;
-    gNativeViewOriginRot[3] = yawOrigin.w;
+    // The render-camera origin must retain the full physical headset
+    // orientation.  A yaw-only anchor leaves the pitch/roll present while the
+    // scene became active in the current delta, so a later physical nod is
+    // evaluated around a tilted axis and appears as an orbital turn.  Room
+    // translation intentionally continues to use gVrPoseOriginRot, which is
+    // the separate gravity-aligned yaw frame maintained by updateSharedVrPose.
+    const fnvxr::stereo::Quaternion headOrigin =
+        fnvxr::stereo::fullHeadOrientationOrigin({
+            pose.hmdRot[0], pose.hmdRot[1], pose.hmdRot[2], pose.hmdRot[3]
+        });
+    gNativeViewOriginRot[0] = headOrigin.x;
+    gNativeViewOriginRot[1] = headOrigin.y;
+    gNativeViewOriginRot[2] = headOrigin.z;
+    gNativeViewOriginRot[3] = headOrigin.w;
     gNativeViewOriginValid = true;
     char message[256] {};
     sprintf_s(
         message,
-        "native view recentered reason=%s gravityAligned=1 yawOriginRot=(%.6f %.6f %.6f %.6f)",
+        "native view recentered reason=%s fullOrientation=1 headOriginRot=(%.6f %.6f %.6f %.6f)",
         reason ? reason : "unknown",
         gNativeViewOriginRot[0],
         gNativeViewOriginRot[1],
@@ -10722,8 +12645,9 @@ fnvxr::stereo::Matrix4 nativeWorldToClipMatrix(const NativeCameraSnapshot& camer
 
     const double inverseScale = 1.0 / static_cast<double>(camera.world.scale);
     double view[3][4] {};
-    // Retail NiCamera stores right/up/back world axes. D3D clip depth is
-    // positive forward, so the stored back axis is negated for the view row.
+    // Retail NiCamera stores forward/up/right world axes. Its captured affine
+    // view layout uses forward/up and the negated right axis for its third
+    // row; this is not the generic right/up/back D3D convention.
     for (int axis = 0; axis < 3; ++axis)
     {
         const double sign = axis == 2 ? -1.0 : 1.0;
@@ -13861,6 +15785,9 @@ bool publishRetailVrCpuPair(
             difference.leftHash,
             difference.rightHash);
         logRetailVrLine(event);
+        InterlockedExchange64(
+            &gRetailCpuStereoEvidenceTransaction,
+            static_cast<LONG64>(transactionId));
 
         char message[448] {};
         sprintf_s(
@@ -14137,6 +16064,7 @@ void publishSharedStereoInvalid(bool uiActive, const char* reason)
     const bool clearOnUiInvalid = readEnvBool("FNVXR_D3D9_STEREO_CLEAR_ON_UI_INVALID", false);
     if (gHavePublishedValidStereoWorldFrame
         && readEnvBool("FNVXR_D3D9_STEREO_RETAIN_LAST_VALID_ON_INVALID", false)
+        && !retailVrProofFailClosedRoute()
         && (!uiActive || !clearOnUiInvalid))
     {
         const LONG retained = InterlockedIncrement(&gLoggedRetainedInvalidStereoWorld);
@@ -14428,7 +16356,8 @@ void publishSharedStereoFrame(IDirect3DDevice9* device)
             InterlockedExchange(&gConsecutiveStereoVisualCoverageFrames, 0);
             logStereoVisualCoverageRejected(visualCoverage);
             if (gHavePublishedValidStereoWorldFrame
-                && readEnvBool("FNVXR_D3D9_STEREO_RETAIN_LAST_VALID_ON_INVALID", false))
+                && readEnvBool("FNVXR_D3D9_STEREO_RETAIN_LAST_VALID_ON_INVALID", false)
+                && !retailVrProofFailClosedRoute())
             {
                 const LONG retained = InterlockedIncrement(&gLoggedRetainedInvalidStereoWorld);
                 if (retained <= 24 || retained % 300 == 0)
@@ -14488,7 +16417,8 @@ void publishSharedStereoFrame(IDirect3DDevice9* device)
         && (coherentPair ? gNativeStereoRenderedPoseValid : gLatestVrPoseSnapshotValid);
     if (!publishReady
         && gHavePublishedValidStereoWorldFrame
-        && readEnvBool("FNVXR_D3D9_STEREO_RETAIN_LAST_VALID_ON_INVALID", false))
+        && readEnvBool("FNVXR_D3D9_STEREO_RETAIN_LAST_VALID_ON_INVALID", false)
+        && !retailVrProofFailClosedRoute())
     {
         const LONG retained = InterlockedIncrement(&gLoggedRetainedInvalidStereoWorld);
         if (retained <= 24 || retained % 300 == 0)
@@ -15278,6 +17208,10 @@ HRESULT WINAPI hookedPresent(
     gOriginalDoRenderTicksThisPresent = 0;
     logFrameRate("IDirect3DDevice9::Present", gPresentFrames, gLastPresentSample, gLastPresentFrameSample);
     const bool stereoSuppressed = suppressStereoForUiMode();
+    // The old completed-stock-backbuffer producer is intentionally absent
+    // from the Present path.  Final headset output can only be published by
+    // the authenticated engine-center transaction after its private
+    // first-person evidence and stock desktop finalizer have completed.
     observeNativeRenderHookContinuity(
         nativeHookEntries,
         nativeStereoAttempts,
@@ -15408,6 +17342,7 @@ HRESULT WINAPI hookedPresent(
             logLine(message);
         }
     }
+    gRetailVrFirstPersonCallerOrdinal = 0;
     return result;
 }
 
@@ -16168,7 +18103,7 @@ HRESULT replayDrawToStereoTargets(IDirect3DDevice9* device, bool userPrimitiveDr
         releaseSurface(originalDepth);
         return D3DERR_INVALIDCALL;
     }
-    ScopedReplayStateBlock replayState(device, "draw-replay");
+    ScopedD3D9StateBlock replayState(device, "draw-replay");
     if (!replayState.captured)
     {
         InterlockedIncrement(&gStrictEyeTargetUnprovenWrites);
@@ -16572,6 +18507,54 @@ HRESULT replayDrawToStereoTargets(IDirect3DDevice9* device, bool userPrimitiveDr
     return result;
 }
 
+template <typename DrawFunction, typename... Arguments>
+HRESULT fanoutRetailFirstPersonDrawToRightEye(
+    IDirect3DDevice9* device,
+    DrawFunction draw,
+    Arguments... arguments) noexcept
+{
+    if (!gRetailFirstPersonBinocularDrawFanoutActive
+        || !device
+        || !draw
+        || !gLeftEyeSurface
+        || !gRightEyeSurface
+        || !gRightEyeDepth
+        || !gRealSetRenderTarget
+        || !gRealSetDepthStencilSurface)
+    {
+        return D3D_OK;
+    }
+    IDirect3DSurface9* originalTarget = nullptr;
+    IDirect3DSurface9* originalDepth = nullptr;
+    D3DVIEWPORT9 originalViewport {};
+    const bool captured = SUCCEEDED(
+            device->GetRenderTarget(0u, &originalTarget))
+        && originalTarget == gLeftEyeSurface
+        && SUCCEEDED(device->GetDepthStencilSurface(&originalDepth))
+        && SUCCEEDED(device->GetViewport(&originalViewport));
+    if (!captured)
+    {
+        if (originalDepth)
+            originalDepth->Release();
+        if (originalTarget)
+            originalTarget->Release();
+        return D3D_OK;
+    }
+    const bool rightBound = SUCCEEDED(gRealSetRenderTarget(
+            device, 0u, gRightEyeSurface))
+        && SUCCEEDED(gRealSetDepthStencilSurface(device, gRightEyeDepth))
+        && SUCCEEDED(device->SetViewport(&originalViewport));
+    HRESULT result = D3D_OK;
+    if (rightBound)
+        result = draw(device, arguments...);
+    static_cast<void>(gRealSetRenderTarget(device, 0u, originalTarget));
+    static_cast<void>(gRealSetDepthStencilSurface(device, originalDepth));
+    static_cast<void>(device->SetViewport(&originalViewport));
+    originalDepth->Release();
+    originalTarget->Release();
+    return result;
+}
+
 HRESULT WINAPI hookedDrawPrimitive(
     IDirect3DDevice9* device,
     D3DPRIMITIVETYPE primitiveType,
@@ -16579,12 +18562,24 @@ HRESULT WINAPI hookedDrawPrimitive(
     UINT primitiveCount)
 {
     InterlockedIncrement(&gDrawPrimitiveCalls);
+    observeRetailFirstPersonPrivateDraw(device);
+    traceRetailFirstPersonDeferredDraw(
+        device, "DrawPrimitive", primitiveCount);
     const LONG nativeEye = gNativeActiveEye;
     if (gInNativeStereoHook && nativeEye >= 0 && nativeEye <= 1)
         InterlockedIncrement(&gNativeDrawCalls[nativeEye]);
     if (suppressGameplayHudDraw())
         return D3D_OK;
     const HRESULT result = gRealDrawPrimitive(device, primitiveType, startVertex, primitiveCount);
+    if (SUCCEEDED(result))
+    {
+        static_cast<void>(fanoutRetailFirstPersonDrawToRightEye(
+            device,
+            gRealDrawPrimitive,
+            primitiveType,
+            startVertex,
+            primitiveCount));
+    }
     if (SUCCEEDED(result))
     {
         captureNativePostprocessDraw(
@@ -16613,6 +18608,9 @@ HRESULT WINAPI hookedDrawIndexedPrimitive(
     UINT primitiveCount)
 {
     InterlockedIncrement(&gDrawIndexedPrimitiveCalls);
+    observeRetailFirstPersonPrivateDraw(device);
+    traceRetailFirstPersonDeferredDraw(
+        device, "DrawIndexedPrimitive", primitiveCount, numVertices);
     const LONG nativeEye = gNativeActiveEye;
     if (gInNativeStereoHook && nativeEye >= 0 && nativeEye <= 1)
         InterlockedIncrement(&gNativeDrawCalls[nativeEye]);
@@ -16620,6 +18618,18 @@ HRESULT WINAPI hookedDrawIndexedPrimitive(
         return D3D_OK;
     const HRESULT result = gRealDrawIndexedPrimitive(
         device, primitiveType, baseVertexIndex, minVertexIndex, numVertices, startIndex, primitiveCount);
+    if (SUCCEEDED(result))
+    {
+        static_cast<void>(fanoutRetailFirstPersonDrawToRightEye(
+            device,
+            gRealDrawIndexedPrimitive,
+            primitiveType,
+            baseVertexIndex,
+            minVertexIndex,
+            numVertices,
+            startIndex,
+            primitiveCount));
+    }
     if (SUCCEEDED(result))
     {
         captureNativePostprocessDraw(
@@ -16657,6 +18667,9 @@ HRESULT WINAPI hookedDrawPrimitiveUP(
     UINT vertexStreamZeroStride)
 {
     InterlockedIncrement(&gDrawPrimitiveUPCalls);
+    observeRetailFirstPersonPrivateDraw(device);
+    traceRetailFirstPersonDeferredDraw(
+        device, "DrawPrimitiveUP", primitiveCount);
     const LONG nativeEye = gNativeActiveEye;
     if (gInNativeStereoHook && nativeEye >= 0 && nativeEye <= 1)
         InterlockedIncrement(&gNativeDrawCalls[nativeEye]);
@@ -16664,6 +18677,16 @@ HRESULT WINAPI hookedDrawPrimitiveUP(
         return D3D_OK;
     const HRESULT result =
         gRealDrawPrimitiveUP(device, primitiveType, primitiveCount, vertexStreamZeroData, vertexStreamZeroStride);
+    if (SUCCEEDED(result))
+    {
+        static_cast<void>(fanoutRetailFirstPersonDrawToRightEye(
+            device,
+            gRealDrawPrimitiveUP,
+            primitiveType,
+            primitiveCount,
+            vertexStreamZeroData,
+            vertexStreamZeroStride));
+    }
     if (SUCCEEDED(result)
         && gNativePostprocessRecording
         && gInNativeStereoHook
@@ -16700,6 +18723,9 @@ HRESULT WINAPI hookedDrawIndexedPrimitiveUP(
     UINT vertexStreamZeroStride)
 {
     InterlockedIncrement(&gDrawIndexedPrimitiveUPCalls);
+    observeRetailFirstPersonPrivateDraw(device);
+    traceRetailFirstPersonDeferredDraw(
+        device, "DrawIndexedPrimitiveUP", primitiveCount, numVertices);
     const LONG nativeEye = gNativeActiveEye;
     if (gInNativeStereoHook && nativeEye >= 0 && nativeEye <= 1)
         InterlockedIncrement(&gNativeDrawCalls[nativeEye]);
@@ -16715,6 +18741,20 @@ HRESULT WINAPI hookedDrawIndexedPrimitiveUP(
         indexDataFormat,
         vertexStreamZeroData,
         vertexStreamZeroStride);
+    if (SUCCEEDED(result))
+    {
+        static_cast<void>(fanoutRetailFirstPersonDrawToRightEye(
+            device,
+            gRealDrawIndexedPrimitiveUP,
+            primitiveType,
+            minVertexIndex,
+            numVertices,
+            primitiveCount,
+            indexData,
+            indexDataFormat,
+            vertexStreamZeroData,
+            vertexStreamZeroStride));
+    }
     if (SUCCEEDED(result)
         && gNativePostprocessRecording
         && gInNativeStereoHook
@@ -17239,6 +19279,27 @@ HRESULT WINAPI hookedStretchRect(
 
 HRESULT WINAPI hookedSetRenderTarget(IDirect3DDevice9* device, DWORD renderTargetIndex, IDirect3DSurface9* renderTarget)
 {
+    IDirect3DSurface9* const requestedRenderTarget = renderTarget;
+    RetailFirstPersonEyeTargetRedirectLease& firstPersonRedirect =
+        gRetailFirstPersonEyeTargetRedirect;
+    const bool firstPersonRedirectActive = firstPersonRedirect.active
+        && firstPersonRedirect.device == device
+        && firstPersonRedirect.threadId == GetCurrentThreadId();
+    bool redirectedRetailFirstPersonTarget = false;
+    if (firstPersonRedirectActive
+        && renderTargetIndex == 0u
+        && renderTarget
+        && firstPersonRedirect.stockColor
+        && firstPersonRedirect.eyeColor
+        && sameComIdentity(renderTarget, firstPersonRedirect.stockColor))
+    {
+        // RenderFirstPerson captured this desktop target before the bridge
+        // bound the eye. Route only that exact restoration target back to the
+        // current private eye; intermediate stock render targets remain
+        // untouched.
+        renderTarget = firstPersonRedirect.eyeColor;
+        redirectedRetailFirstPersonTarget = true;
+    }
     IDirect3DSurface9* previousRenderTarget = nullptr;
     const LONG nativeEyeBeforeSet = gNativeActiveEye;
     const bool inspectNativeHdrTransition = renderTargetIndex == 0
@@ -17251,6 +19312,22 @@ HRESULT WINAPI hookedSetRenderTarget(IDirect3DDevice9* device, DWORD renderTarge
     if (inspectNativeHdrTransition)
         device->GetRenderTarget(0, &previousRenderTarget);
     const HRESULT result = gRealSetRenderTarget(device, renderTargetIndex, renderTarget);
+    if (SUCCEEDED(result) && redirectedRetailFirstPersonTarget)
+    {
+        const LONG redirects = InterlockedIncrement(
+            &gRetailVrFirstPersonTargetColorRedirects);
+        if (redirects <= 3 || redirects % 120 == 0)
+        {
+            char message[256] {};
+            sprintf_s(
+                message,
+                "retail first-person color target redirected count=%ld requested=%p eye=%p",
+                redirects,
+                requestedRenderTarget,
+                renderTarget);
+            logRetailVrLine(message);
+        }
+    }
     if (SUCCEEDED(result)
         && renderTargetIndex > 0
         && renderTarget != nullptr
@@ -17323,7 +19400,8 @@ HRESULT WINAPI hookedSetRenderTarget(IDirect3DDevice9* device, DWORD renderTarge
     if (SUCCEEDED(result)
         && renderTargetIndex == 0
         && strictStereoTargetGateEnabled()
-        && !gInStereoReplay)
+        && !gInStereoReplay
+        && !firstPersonRedirectActive)
     {
         if (renderTarget)
             updateMain3DSceneTargetGate(device, renderTarget, "SetRenderTarget");
@@ -17514,8 +19592,45 @@ HRESULT WINAPI hookedCreateQuery(
 
 HRESULT WINAPI hookedSetDepthStencilSurface(IDirect3DDevice9* device, IDirect3DSurface9* depthStencilSurface)
 {
+    IDirect3DSurface9* const requestedDepthStencilSurface =
+        depthStencilSurface;
+    RetailFirstPersonEyeTargetRedirectLease& firstPersonRedirect =
+        gRetailFirstPersonEyeTargetRedirect;
+    const bool firstPersonRedirectActive = firstPersonRedirect.active
+        && firstPersonRedirect.device == device
+        && firstPersonRedirect.threadId == GetCurrentThreadId();
+    bool redirectedRetailFirstPersonDepth = false;
+    if (firstPersonRedirectActive
+        && depthStencilSurface
+        && firstPersonRedirect.stockDepth
+        && firstPersonRedirect.eyeDepth
+        && sameComIdentity(
+            depthStencilSurface,
+            firstPersonRedirect.stockDepth))
+    {
+        depthStencilSurface = firstPersonRedirect.eyeDepth;
+        redirectedRetailFirstPersonDepth = true;
+    }
     const HRESULT result = gRealSetDepthStencilSurface(device, depthStencilSurface);
-    if (SUCCEEDED(result) && retailVrVisualTrialRequested())
+    if (SUCCEEDED(result) && redirectedRetailFirstPersonDepth)
+    {
+        const LONG redirects = InterlockedIncrement(
+            &gRetailVrFirstPersonTargetDepthRedirects);
+        if (redirects <= 3 || redirects % 120 == 0)
+        {
+            char message[256] {};
+            sprintf_s(
+                message,
+                "retail first-person depth target redirected count=%ld requested=%p eye=%p",
+                redirects,
+                requestedDepthStencilSurface,
+                depthStencilSurface);
+            logRetailVrLine(message);
+        }
+    }
+    if (SUCCEEDED(result)
+        && retailVrVisualTrialRequested()
+        && !firstPersonRedirectActive)
     {
         // Null is a normal transient unbind and deliberately leaves the most
         // recent successful full-backbuffer engine observation intact.
@@ -17526,7 +19641,8 @@ HRESULT WINAPI hookedSetDepthStencilSurface(IDirect3DDevice9* device, IDirect3DS
     }
     if (SUCCEEDED(result)
         && strictStereoTargetGateEnabled()
-        && !gInStereoReplay)
+        && !gInStereoReplay
+        && !firstPersonRedirectActive)
     {
         IDirect3DSurface9* currentTarget = nullptr;
         if (SUCCEEDED(device->GetRenderTarget(0, &currentTarget)) && currentTarget)

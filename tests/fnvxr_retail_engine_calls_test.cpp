@@ -71,6 +71,8 @@ void requireAddresses(
                 == 0x00AA1460u + delta
             && functionAddress(calls.niCameraCreate)
                 == 0x00A71430u + delta
+            && functionAddress(calls.renderFirstPerson)
+                == 0x00875110u + delta
             && functionAddress(calls.cullingProcessConstruct)
                 == 0x004A0EB0u + delta
             && functionAddress(calls.cullingProcessDestroy)
@@ -279,10 +281,11 @@ int main()
                 == RelocatedBase + (0x00B6B930u - SupportedImageBase),
         "ASLR relocation must preserve the preferred-image offset");
 
-    const std::array<std::uintptr_t, 22> everyPreferredAddress {{
+    const std::array<std::uintptr_t, 23> everyPreferredAddress {{
         RetailEngineCallPreferredAddresses.niAllocate,
         RetailEngineCallPreferredAddresses.niFree,
         RetailEngineCallPreferredAddresses.niCameraCreate,
+        RetailEngineCallPreferredAddresses.renderFirstPerson,
         RetailEngineCallPreferredAddresses.cullingProcessConstruct,
         RetailEngineCallPreferredAddresses.cullingProcessDestroy,
         RetailEngineCallPreferredAddresses.cullingProcessSetAccumulator,

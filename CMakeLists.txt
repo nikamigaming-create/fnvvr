@@ -90,6 +90,14 @@ if(WIN32)
             -SourceRoot ${CMAKE_CURRENT_SOURCE_DIR}
     )
     add_test(
+        NAME fnvxr_phase1_6dof_verifier_test
+        COMMAND powershell.exe
+            -NoProfile
+            -ExecutionPolicy Bypass
+            -File ${CMAKE_CURRENT_SOURCE_DIR}/tests/fnvxr_phase1_6dof_verifier_test.ps1
+            -SourceRoot ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    add_test(
         NAME fnvxr_ttw_retail_sandbox_script_test
         COMMAND powershell.exe
             -NoProfile
@@ -481,6 +489,23 @@ add_test(NAME fnvxr_protocol_layout_test COMMAND fnvxr_protocol_layout_test)
 add_executable(fnvxr_product_contract_test tests/fnvxr_product_contract_test.cpp)
 target_link_libraries(fnvxr_product_contract_test PRIVATE fnvxr_protocol)
 add_test(NAME fnvxr_product_contract_test COMMAND fnvxr_product_contract_test)
+
+add_executable(
+    fnvxr_product_capabilities_test
+    tests/fnvxr_product_capabilities_test.cpp)
+target_link_libraries(fnvxr_product_capabilities_test PRIVATE fnvxr_protocol)
+if(MSVC)
+    target_compile_options(fnvxr_product_capabilities_test PRIVATE /W4 /WX)
+endif()
+add_test(
+    NAME fnvxr_product_capabilities_test
+    COMMAND fnvxr_product_capabilities_test)
+
+add_test(
+    NAME fnvxr_phase0_records
+    COMMAND ${CMAKE_COMMAND}
+        -DROOT=${CMAKE_CURRENT_SOURCE_DIR}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_phase0_records.cmake)
 
 add_executable(fnvxr_stereo_transaction_test tests/fnvxr_stereo_transaction_test.cpp)
 target_include_directories(fnvxr_stereo_transaction_test PRIVATE
@@ -941,6 +966,19 @@ endif()
 add_test(
     NAME fnvxr_retail_world_accumulation_hook_lease_test
     COMMAND fnvxr_retail_world_accumulation_hook_lease_test)
+
+add_executable(fnvxr_retail_first_person_hook_lease_test
+    tests/fnvxr_retail_first_person_hook_lease_test.cpp)
+target_include_directories(
+    fnvxr_retail_first_person_hook_lease_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/runtime)
+if(MSVC)
+    target_compile_options(
+        fnvxr_retail_first_person_hook_lease_test PRIVATE /W4 /WX)
+endif()
+add_test(
+    NAME fnvxr_retail_first_person_hook_lease_test
+    COMMAND fnvxr_retail_first_person_hook_lease_test)
 
 add_executable(fnvxr_retail_world_accumulation_hook_win32_test
     tests/fnvxr_retail_world_accumulation_hook_win32_test.cpp)

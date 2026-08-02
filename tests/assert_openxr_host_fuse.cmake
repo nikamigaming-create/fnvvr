@@ -109,7 +109,7 @@ foreach(retired_fuse IN ITEMS
 endforeach()
 
 foreach(required_authority_text IN ITEMS
-        "MaximumProductHostFrames = 7200u"
+        "MaximumProductHostFrames = 60000u"
         "struct ProductOpenXrInitializationProof"
         "assessProductOpenXrInitialization("
         "CompiledProductOpenXrInitializationProof"
@@ -154,7 +154,7 @@ endif()
 # A valid invocation is intentionally not executed by this test because it is
 # now authorized to touch the configured headset runtime. Parser failures must
 # still terminate before that boundary.
-foreach(bad_argument IN ITEMS "" "-1" "0" "garbage" "7201")
+foreach(bad_argument IN ITEMS "" "-1" "0" "garbage" "60001")
     if(bad_argument STREQUAL "")
         execute_process(
             COMMAND "${HOST_EXE}"

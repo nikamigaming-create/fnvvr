@@ -16,6 +16,12 @@ param(
         "HeavyHanded", "Kamikaze", "SmallFrame", "TriggerDiscipline",
         "WildWasteland")]
     [string]$TraitTwo = "None",
+    # Fixed base FalloutNV.esm visibility loadout for this owned save. It is
+    # selected before process launch and cannot carry an arbitrary command.
+    [ValidateSet(
+        "None", "Pistol", "RifleSingleHand", "RifleTwoHand", "Minigun",
+        "FragGrenade", "Knife", "ThrowingKnife")]
+    [string]$Weapon = "None",
     [ValidateRange(5, 900)][int]$ReadyTimeoutSeconds = 90,
     [switch]$UseAttestedBuild,
     [switch]$ValidateOnly
@@ -83,14 +89,17 @@ $fixtureFamily = if ($TtwCore) { "ttw" } else { "retail" }
 $traits = Resolve-FnvxrProductRetailFixtureTraits `
     -TraitOne $TraitOne `
     -TraitTwo $TraitTwo
+$weapon = Resolve-FnvxrProductRetailFixtureWeapon -Weapon $Weapon
 $saveName = if ($TtwCore) {
     Get-FnvxrProductTtwFixtureSaveName `
         -TraitOne $traits.first `
-        -TraitTwo $traits.second
+        -TraitTwo $traits.second `
+        -Weapon $weapon
 } else {
     Get-FnvxrProductRetailFixtureSaveName `
         -TraitOne $traits.first `
-        -TraitTwo $traits.second
+        -TraitTwo $traits.second `
+        -Weapon $weapon
 }
 $saveRoot = Join-Path (Get-FnvxrProductDocumentsPath) "My Games\FalloutNV\Saves"
 $savePath = Join-Path $saveRoot ($saveName + ".fos")
@@ -138,15 +147,16 @@ $plan = [ordered]@{
     schema = if ($TtwCore) { "fnvxr-ttw-fixture-v1" } else { "fnvxr-retail-fixture-v1" }
     fixtureFamily = $fixtureFamily
     scope = if ($TtwCore) {
-        "owned level-one TTW fixture in the isolated workspace sandbox only; no official-pack acknowledgement, OpenXR host, simulator, D3D9, DirectInput, XInput, desktop input, controller, camera, rig, or historical-user-save mutation"
+        "owned level-one TTW fixture in the isolated workspace sandbox only; fixed stock weapon loadout selected before launch; no official-pack acknowledgement, OpenXR host, simulator, D3D9, DirectInput, XInput, desktop input, controller, camera, rig, projectile, hit, or historical-user-save mutation"
     } else {
-        "owned level-one base-retail fixture only; exact native acknowledgement of only the four known official-pack notices when shown; no OpenXR host, simulator, D3D9, DirectInput, XInput, desktop input, controller, camera, rig, or historical-user-save mutation"
+        "owned level-one base-retail fixture only; fixed stock weapon loadout selected before launch; exact native acknowledgement of only the four known official-pack notices when shown; no OpenXR host, simulator, D3D9, DirectInput, XInput, desktop input, controller, camera, rig, projectile, hit, or historical-user-save mutation"
     }
     action = $resolvedAction
     saveName = $saveName
     savePath = $savePath
     nvsePath = $nvsePath
     traits = [ordered]@{ first = $traits.first; second = $traits.second }
+    weapon = $weapon
     runProfile = if ($TtwCore) { "ttw-fixture-v1" } else { "retail-fixture-v1" }
     stagedArtifacts = @($stagePlan | ForEach-Object { $_.key })
     fixturePlugins = if ($TtwCore) {
@@ -306,7 +316,8 @@ try {
         -RetailFixtureAction $resolvedAction `
         -RetailFixtureSaveName $saveName `
         -RetailFixtureTraitOne $traits.first `
-        -RetailFixtureTraitTwo $traits.second
+        -RetailFixtureTraitTwo $traits.second `
+        -RetailFixtureWeapon $weapon
     if ($environment.Contains("FNVXR_OPENXR_LOADER_HINT") -or
         $environment.Contains("XR_RUNTIME_JSON") -or
         $environment.Contains("OPENXR_SIMULATOR_HEADLESS")) {

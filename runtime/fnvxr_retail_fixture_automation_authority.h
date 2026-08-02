@@ -18,6 +18,11 @@ inline constexpr std::string_view SetFixturePlayerNameCommand =
     "player.SetName FNVXR_AutoRetail";
 inline constexpr std::string_view LoadCommandPrefix = "load ";
 inline constexpr std::string_view SaveCommandPrefix = "save ";
+// JIP LN NVSE's exact actor command used only to make the named, already
+// equipped fixture weapon visible after the fixture has reached clean
+// gameplay.  It is fixed here rather than derived from launcher input.
+inline constexpr std::string_view SetFixtureWeaponOutCommand =
+    "player.SetWeaponOut 1";
 // This stock command is deliberately available only to the exact official-pack
 // modal fallback below. It is never derived from launcher input or a save name.
 inline constexpr std::string_view CloseExactOfficialPackMessageCommand =
@@ -58,6 +63,22 @@ enum class Trait : std::uint8_t
     WildWasteland,
 };
 
+// The weapon fixture is intentionally a finite stock table, not a generic
+// console-command input.  Each row is a base FalloutNV.esm form that can be
+// created in an owned level-one save and later loaded without touching a
+// player's inventory or save lineage.
+enum class Weapon : std::uint8_t
+{
+    None = 0u,
+    Pistol,
+    RifleSingleHand,
+    RifleTwoHand,
+    Minigun,
+    FragGrenade,
+    Knife,
+    ThrowingKnife,
+};
+
 struct TraitCommand
 {
     Trait trait = Trait::None;
@@ -80,6 +101,42 @@ inline constexpr TraitCommand TraitCommands[] = {
     { Trait::WildWasteland, "WildWasteland", "player.AddPerk WildWasteland" },
 };
 
+struct WeaponCommand
+{
+    Weapon weapon = Weapon::None;
+    std::string_view token {};
+    std::string_view addWeaponCommand {};
+    std::string_view addAmmoCommand {};
+    std::string_view equipCommand {};
+};
+
+inline constexpr WeaponCommand WeaponCommands[] = {
+    { Weapon::None, "None", {}, {}, {} },
+    // 000E3778 WeapNV9mmPistol; 0008ED03 Ammo9mm
+    { Weapon::Pistol, "Pistol", "player.additem 000E3778 1",
+        "player.additem 0008ED03 120", "player.equipitem 000E3778" },
+    // 000E9C3B WeapNVServiceRifle; 00004240 Ammo556mm
+    { Weapon::RifleSingleHand, "RifleSingleHand",
+        "player.additem 000E9C3B 1", "player.additem 00004240 120",
+        "player.equipitem 000E9C3B" },
+    // 000CD53A WeapCaravanShotgun.  The visibility fixture does not fire,
+    // so no ammunition is needed for the two-hand long-gun render check.
+    { Weapon::RifleTwoHand, "RifleTwoHand", "player.additem 000CD53A 1",
+        {}, "player.equipitem 000CD53A" },
+    // 0000433F WeapMinigun; 0006B53D Ammo5mm
+    { Weapon::Minigun, "Minigun", "player.additem 0000433F 1",
+        "player.additem 0006B53D 240", "player.equipitem 0000433F" },
+    // 00004330 WeapGrenadeFrag
+    { Weapon::FragGrenade, "FragGrenade", "player.additem 00004330 12",
+        {}, "player.equipitem 00004330" },
+    // 00004334 WeapKnife
+    { Weapon::Knife, "Knife", "player.additem 00004334 1", {},
+        "player.equipitem 00004334" },
+    // 00161246 WeapNVThrowingKnife
+    { Weapon::ThrowingKnife, "ThrowingKnife",
+        "player.additem 00161246 12", {}, "player.equipitem 00161246" },
+};
+
 constexpr const TraitCommand* findTrait(std::string_view token) noexcept
 {
     for (const TraitCommand& candidate : TraitCommands)
@@ -95,6 +152,26 @@ constexpr const TraitCommand* findTrait(Trait trait) noexcept
     for (const TraitCommand& candidate : TraitCommands)
     {
         if (candidate.trait == trait)
+            return &candidate;
+    }
+    return nullptr;
+}
+
+constexpr const WeaponCommand* findWeapon(std::string_view token) noexcept
+{
+    for (const WeaponCommand& candidate : WeaponCommands)
+    {
+        if (candidate.token == token)
+            return &candidate;
+    }
+    return nullptr;
+}
+
+constexpr const WeaponCommand* findWeapon(Weapon weapon) noexcept
+{
+    for (const WeaponCommand& candidate : WeaponCommands)
+    {
+        if (candidate.weapon == weapon)
             return &candidate;
     }
     return nullptr;
@@ -149,6 +226,7 @@ struct Plan
     Action action = Action::None;
     Trait firstTrait = Trait::None;
     Trait secondTrait = Trait::None;
+    Weapon weapon = Weapon::None;
     std::string_view saveName {};
 };
 
@@ -159,6 +237,7 @@ enum class Failure : std::uint8_t
     SaveNameNotOwned,
     TraitUnknown,
     DuplicateTrait,
+    WeaponUnknown,
 };
 
 constexpr Failure validate(const Plan& plan) noexcept
@@ -180,12 +259,59 @@ constexpr Failure validate(const Plan& plan) noexcept
     {
         return Failure::DuplicateTrait;
     }
+    const WeaponCommand* const weapon = findWeapon(plan.weapon);
+    if (weapon == nullptr || weapon->weapon != plan.weapon)
+        return Failure::WeaponUnknown;
     return Failure::None;
 }
 
 constexpr bool authorized(const Plan& plan) noexcept
 {
     return validate(plan) == Failure::None;
+}
+
+// A world-only capture may finalize one owned loaded fixture after its stock
+// notices have cleared.  This permits one exact save to that same owned name;
+// it is not an authority to save arbitrary games or mutate a personal save.
+constexpr bool headsetWorldOnlyFixturePreparationSaveAuthorized(
+    const Plan& plan,
+    bool explicitlyRequested,
+    bool fixtureReady,
+    bool gameplay,
+    bool playerProcessAvailable,
+    bool alreadySaved) noexcept
+{
+    return explicitlyRequested
+        && fixtureReady
+        && authorized(plan)
+        && plan.action == Action::Load
+        && plan.weapon != Weapon::None
+        && gameplay
+        && playerProcessAvailable
+        && !alreadySaved;
+}
+
+// After that exact owned save has settled, a world-only capture may issue the
+// fixed JIP SetWeaponOut command for the named stock weapon already equipped
+// in the fixture.  This is not a general input or command grant: it excludes
+// creates, unarmed fixtures, menus, missing player state, and weapons already
+// out.
+constexpr bool headsetWorldOnlyFixtureWeaponDrawAuthorized(
+    const Plan& plan,
+    bool explicitlyRequested,
+    bool fixtureReady,
+    bool gameplay,
+    bool playerProcessAvailable,
+    bool weaponOut) noexcept
+{
+    return explicitlyRequested
+        && fixtureReady
+        && authorized(plan)
+        && plan.action == Action::Load
+        && plan.weapon != Weapon::None
+        && gameplay
+        && playerProcessAvailable
+        && !weaponOut;
 }
 
 // This is not general menu authority. The caller must independently prove one
@@ -233,5 +359,23 @@ constexpr std::string_view addPerkCommand(Trait trait) noexcept
             return candidate.addPerkCommand;
     }
     return {};
+}
+
+constexpr std::string_view addWeaponCommand(Weapon weapon) noexcept
+{
+    const WeaponCommand* const command = findWeapon(weapon);
+    return command ? command->addWeaponCommand : std::string_view {};
+}
+
+constexpr std::string_view addWeaponAmmoCommand(Weapon weapon) noexcept
+{
+    const WeaponCommand* const command = findWeapon(weapon);
+    return command ? command->addAmmoCommand : std::string_view {};
+}
+
+constexpr std::string_view equipWeaponCommand(Weapon weapon) noexcept
+{
+    const WeaponCommand* const command = findWeapon(weapon);
+    return command ? command->equipCommand : std::string_view {};
 }
 }

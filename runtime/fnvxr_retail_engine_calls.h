@@ -18,6 +18,7 @@ struct RetailEngineCalls
     abi::NiAllocateFunction niAllocate = nullptr;
     abi::NiFreeFunction niFree = nullptr;
     abi::NiCameraCreateFunction niCameraCreate = nullptr;
+    abi::RenderFirstPersonFunction renderFirstPerson = nullptr;
     abi::BSCullingProcessConstructorFunction cullingProcessConstruct = nullptr;
     abi::BSCullingProcessDestructorBodyFunction cullingProcessDestroy = nullptr;
     abi::CullingProcessSetAccumulatorFunction cullingProcessSetAccumulator = nullptr;
@@ -48,6 +49,7 @@ struct RetailEngineCalls
         return !niAllocate
             && !niFree
             && !niCameraCreate
+            && !renderFirstPerson
             && !cullingProcessConstruct
             && !cullingProcessDestroy
             && !cullingProcessSetAccumulator
@@ -99,6 +101,16 @@ struct RetailEngineCalls
             && renderingAccumulator;
     }
 
+    // The first-person pass is deliberately outside the generic world-render
+    // call surface.  World-resource tests and the center-world transaction
+    // must not become implicitly dependent on the later weapon render phase;
+    // the live bridge explicitly requires this capability before arming its
+    // three sealed RenderFirstPerson relays.
+    bool firstPersonRenderComplete() const noexcept
+    {
+        return renderFirstPerson != nullptr;
+    }
+
     bool privateStereoComplete() const noexcept
     {
         return complete() && privateStereoRegistrationComplete();
@@ -110,6 +122,7 @@ struct RetailEngineCallAddressTable
     std::uintptr_t niAllocate = 0u;
     std::uintptr_t niFree = 0u;
     std::uintptr_t niCameraCreate = 0u;
+    std::uintptr_t renderFirstPerson = 0u;
     std::uintptr_t cullingProcessConstruct = 0u;
     std::uintptr_t cullingProcessDestroy = 0u;
     std::uintptr_t cullingProcessSetAccumulator = 0u;
@@ -184,6 +197,15 @@ constexpr bool uniqueProductionFunctionMatches(
     }
     return matches == 1u;
 }
+
+constexpr bool renderFirstPersonAbiMatches(
+    std::uintptr_t preferredAddress) noexcept
+{
+    const abi::RetailFunctionAbiDescriptor& descriptor =
+        abi::RetailRenderFirstPersonAbi;
+    return descriptor.preferredAddress == preferredAddress
+        && abi::productionProven(descriptor);
+}
 }
 
 // The values are selected by canonical ABI-inventory name.  Exact-address
@@ -193,6 +215,7 @@ inline constexpr RetailEngineCallAddressTable RetailEngineCallPreferredAddresses
     detail::uniqueRetailFunctionPreferredAddress("Ni_Alloc"),
     detail::uniqueRetailFunctionPreferredAddress("Ni_Free"),
     detail::uniqueRetailFunctionPreferredAddress("NiCamera::Create"),
+    abi::RetailRenderFirstPersonAbi.preferredAddress,
     detail::uniqueRetailFunctionPreferredAddress(
         "BSCullingProcess::BSCullingProcess"),
     detail::uniqueRetailFunctionPreferredAddress(
@@ -236,6 +259,10 @@ constexpr bool retailEngineCallInventoryComplete() noexcept
         && detail::uniqueProductionFunctionMatches(
                "NiCamera::Create",
                RetailEngineCallPreferredAddresses.niCameraCreate)
+        // This body is verified through the normalized JIP-compatible core
+        // proof, not the generic raw-byte function inventory.
+        && detail::renderFirstPersonAbiMatches(
+            RetailEngineCallPreferredAddresses.renderFirstPerson)
         && detail::uniqueProductionFunctionMatches(
                "BSCullingProcess::BSCullingProcess",
                RetailEngineCallPreferredAddresses.cullingProcessConstruct)
@@ -293,6 +320,8 @@ constexpr bool retailEngineCallInventoryComplete() noexcept
 static_assert(RetailEngineCallPreferredAddresses.niAllocate == 0x00AA13E0u);
 static_assert(RetailEngineCallPreferredAddresses.niFree == 0x00AA1460u);
 static_assert(RetailEngineCallPreferredAddresses.niCameraCreate == 0x00A71430u);
+static_assert(
+    RetailEngineCallPreferredAddresses.renderFirstPerson == 0x00875110u);
 static_assert(
     RetailEngineCallPreferredAddresses.cullingProcessConstruct == 0x004A0EB0u);
 static_assert(
@@ -485,7 +514,7 @@ struct RetailEngineCallAuthorizationAccess
     }
 };
 
-inline constexpr std::array<std::uintptr_t, 22>
+inline constexpr std::array<std::uintptr_t, 23>
 retailEngineCallAddressesAsArray(
     const RetailEngineCallAddressTable& addresses) noexcept
 {
@@ -493,6 +522,7 @@ retailEngineCallAddressesAsArray(
         addresses.niAllocate,
         addresses.niFree,
         addresses.niCameraCreate,
+        addresses.renderFirstPerson,
         addresses.cullingProcessConstruct,
         addresses.cullingProcessDestroy,
         addresses.cullingProcessSetAccumulator,
@@ -516,7 +546,7 @@ retailEngineCallAddressesAsArray(
 }
 
 inline constexpr RetailEngineCallAddressTable retailEngineCallAddressesFromArray(
-    const std::array<std::uintptr_t, 22>& addresses) noexcept
+    const std::array<std::uintptr_t, 23>& addresses) noexcept
 {
     return {
         addresses[0],
@@ -541,6 +571,7 @@ inline constexpr RetailEngineCallAddressTable retailEngineCallAddressesFromArray
         addresses[19],
         addresses[20],
         addresses[21],
+        addresses[22],
     };
 }
 
@@ -548,9 +579,9 @@ inline RetailEngineAddressRelocationFailure relocateRetailEngineCallTable(
     std::uintptr_t loadedImageBase,
     RetailEngineCallAddressTable& relocated) noexcept
 {
-    const std::array<std::uintptr_t, 22> preferred =
+    const std::array<std::uintptr_t, 23> preferred =
         retailEngineCallAddressesAsArray(RetailEngineCallPreferredAddresses);
-    std::array<std::uintptr_t, 22> candidate {};
+    std::array<std::uintptr_t, 23> candidate {};
     for (std::size_t index = 0u; index < preferred.size(); ++index)
     {
         const RetailEngineAddressRelocation result =
@@ -650,6 +681,9 @@ inline RetailEngineCallResolution resolveRetailEngineCalls(
             reinterpret_cast<abi::NiFreeFunction>(addresses.niFree);
         calls.niCameraCreate =
             reinterpret_cast<abi::NiCameraCreateFunction>(addresses.niCameraCreate);
+        calls.renderFirstPerson =
+            reinterpret_cast<abi::RenderFirstPersonFunction>(
+                addresses.renderFirstPerson);
         calls.cullingProcessConstruct =
             reinterpret_cast<abi::BSCullingProcessConstructorFunction>(
                 addresses.cullingProcessConstruct);

@@ -493,6 +493,69 @@ int main()
         });
         require(state.sets == expected,
             "left, right, and restore did not use the exact target-state order");
+
+        state.sets.clear();
+        require(operations.snapshot(operations.context),
+            "preserving-content snapshot failed");
+        require(operations.bindPreservingContents(
+                    operations.context,
+                    CenterRendererEye::Left,
+                    isolation)
+                && isolation.active(),
+            "first-person target bind did not preserve the rendered world");
+        require(operations.end(
+                    operations.context,
+                    CenterRendererEye::Left,
+                    isolation),
+            "first-person left target did not remain bound");
+        require(operations.bindPreservingContents(
+                    operations.context,
+                    CenterRendererEye::Right,
+                    isolation)
+                && isolation.active(),
+            "second first-person target bind did not preserve the rendered world");
+        require(operations.end(
+                    operations.context,
+                    CenterRendererEye::Right,
+                    isolation),
+            "first-person right target did not remain bound");
+        require(operations.bindPreservingContents(
+                    operations.context,
+                    CenterRendererEye::Left,
+                    isolation)
+                && isolation.active(),
+            "completed binocular pair could not reopen left preserving pixels");
+        require(operations.end(
+                    operations.context,
+                    CenterRendererEye::Left,
+                    isolation),
+            "reopened left target did not remain bound");
+        require(operations.restore(operations.context),
+            "preserving-content target state did not restore");
+        const std::vector<SetCall> preservingExpected {
+            SetCall::Color,
+            SetCall::Depth,
+            SetCall::Viewport,
+            SetCall::Scissor,
+            SetCall::ScissorEnable,
+            SetCall::Color,
+            SetCall::Depth,
+            SetCall::Viewport,
+            SetCall::Scissor,
+            SetCall::ScissorEnable,
+            SetCall::Color,
+            SetCall::Depth,
+            SetCall::Viewport,
+            SetCall::Scissor,
+            SetCall::ScissorEnable,
+            SetCall::Color,
+            SetCall::Depth,
+            SetCall::Viewport,
+            SetCall::Scissor,
+            SetCall::ScissorEnable,
+        };
+        require(state.sets == preservingExpected,
+            "first-person eye binds unexpectedly cleared the world targets");
     }
 
     {

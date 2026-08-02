@@ -1,6 +1,7 @@
 #define WIN32_LEAN_AND_MEAN
 
 #include "fnvxr_protocol.h"
+#include "fnvxr_product_capabilities.h"
 #include "fnvxr_shared_state.h"
 #include "fnvxr_fabrik.h"
 #include "fnvxr_desktop_assist_authority.h"
@@ -36,6 +37,11 @@
 
 namespace
 {
+static_assert(
+    fnvxr::product::SelectedProductInputOwner
+        == fnvxr::product::InputOwner::NvseMainGameLoop,
+    "FNVVR product input is consumed only on the xNVSE main game loop");
+
 using UInt32 = std::uint32_t;
 using UInt16 = std::uint16_t;
 using UInt64 = std::uint64_t;
@@ -427,15 +433,24 @@ struct RetailHandCalibration
 {
     bool valid {};
     bool usesAimOrientation {};
+    // The headless stage-local fixture begins with a controller coordinate
+    // origin that is intentionally unrelated to Gamebryo's first-person
+    // wrist. Keep that one-time positional difference in the body frame, so
+    // later controller translations move the real wrist by the same delta
+    // without turning a controller rotation into a large orbital motion.
+    bool usesStageLocalBodyPositionAnchor {};
     Matrix33 controllerToHandRotation {};
     Vec3 controllerToWristLocal {};
+    Vec3 controllerToWristBodyLocal {};
 };
 
 struct RetailWeaponCalibration
 {
     bool valid {};
+    bool usesStageLocalBodyPositionAnchor {};
     Matrix33 controllerToWeaponRotation {};
     Vec3 controllerToWeaponPosition {};
+    Vec3 controllerToWeaponBodyLocal {};
 };
 
 struct ShowroomScene
@@ -485,6 +500,7 @@ enum class RetailRigOriginSource : UInt8
     None = 0,
     NativeStereo = 1,
     TrackedPropAssist = 2,
+    HeadlessStereoRigVisualTrial = 3,
 };
 
 PluginHandle g_pluginHandle = InvalidPluginHandle;
@@ -500,6 +516,8 @@ bool g_desktopAssistBridgeStarted = false;
 UInt32 g_desktopAssistAuthorityAttempts = 0;
 bool g_trackedPropAssistBridgeStarted = false;
 UInt32 g_trackedPropAssistAuthorityAttempts = 0;
+bool g_headlessStereoRigVisualTrialBridgeStarted = false;
+UInt32 g_headlessStereoRigVisualTrialAuthorityAttempts = 0;
 CameraHookAuthorization g_cameraHookAuthorization = CameraHookAuthorization::None;
 bool g_authorizedRuntimeObservationStarted = false;
 bool g_headsetDemoFixtureReady = false;
@@ -828,6 +846,8 @@ const char* retailRigOriginSourceName()
         return "d3d9-native-camera";
     case RetailRigOriginSource::TrackedPropAssist:
         return "tracked-prop-assist-body";
+    case RetailRigOriginSource::HeadlessStereoRigVisualTrial:
+        return "headless-stereo-rig-body";
     default:
         return "unlatched";
     }
@@ -840,6 +860,7 @@ const char* retailRigAnchorSourceName()
     case RetailRigOriginSource::NativeStereo:
         return "exact-d3d9-render-camera";
     case RetailRigOriginSource::TrackedPropAssist:
+    case RetailRigOriginSource::HeadlessStereoRigVisualTrial:
         return "first-person-rig-root-at-latch";
     default:
         return "unlatched";
@@ -941,6 +962,13 @@ bool physicalHeadsetPlayProfileSelected()
     return runProfileIs("retail-vr-play-v1");
 }
 
+bool physicalHeadsetEngineCenterRigRequested()
+{
+    return physicalHeadsetPlayProfileSelected()
+        && envEnabled("FNVXR_PHYSICAL_HEADSET_PLAY", false)
+        && envEnabled("FNVXR_ENABLE_ENGINE_CENTER_STEREO", false);
+}
+
 bool retailFixtureProfileSelected()
 {
     // These profiles exist solely for command-line-owned save fixtures. They
@@ -964,7 +992,8 @@ bool headsetDemoFixtureProfileSelected()
     // in a bounded headless OpenXR visual run. The separate world-only key
     // below can close the demo UI gate while retaining this exact fixture
     // route. Neither mode enables the normal input, camera, rig, weapon, or
-    // simulator-control bridge.
+    // simulator-control bridge. A separate world-only key can request one
+    // verified stock-weapon draw for the named owned fixture only.
     return stereoVisualTrialProfileSelected()
         && envEnabled("FNVXR_HEADSET_DEMO_FIXTURE", false);
 }
@@ -973,6 +1002,29 @@ bool headsetWorldOnlyCaptureProfileSelected()
 {
     return headsetDemoFixtureProfileSelected()
         && envEnabled("FNVXR_HEADSET_WORLD_ONLY_CAPTURE", false);
+}
+
+bool headsetWorldOnlyFixtureWeaponDrawRequested()
+{
+    return headsetWorldOnlyCaptureProfileSelected()
+        && envEnabled("FNVXR_HEADSET_FIXTURE_DRAW_WEAPON", false);
+}
+
+bool headsetControllerRigVisualTrialRequested()
+{
+    // This is intentionally headless-only and fixture-only. It adds the
+    // controller-driven visual first-person rig to the bounded stereo trial;
+    // it does not grant a physical headset, input, firing, or projectile path.
+    return headsetWorldOnlyFixtureWeaponDrawRequested()
+        && envEnabled("FNVXR_HEADSET_CONTROLLER_RIG_VISUAL_TRIAL", false)
+        && envEnabled("OPENXR_SIMULATOR_HEADLESS", false)
+        && !envEnabled("FNVXR_PHYSICAL_HEADSET_PLAY", false);
+}
+
+bool retailRigVisualOnlyTrialRequested()
+{
+    return trackedPropAssistProfileRequested()
+        || headsetControllerRigVisualTrialRequested();
 }
 
 bool headsetDemoUiProfileSelected()
@@ -1036,6 +1088,25 @@ bool retailFixtureAutomationRequested()
         && envEnabled("FNVXR_RETAIL_FIXTURE_AUTOMATION", false);
 }
 
+bool physicalHeadsetFixtureMessageAcknowledgementRequested()
+{
+    // Physical play uses the full game-loop bridge to consume its owned
+    // fixture-load command.  It deliberately does not enter the fixture
+    // lifecycle state machine, but it may need to acknowledge one of the
+    // exact, versioned retail fixture notices that otherwise blocks the
+    // loaded owned save.  Keep this independently and explicitly gated so it
+    // grants no general physical-play menu authority.
+    return physicalHeadsetPlayProfileSelected()
+        && envEnabled("FNVXR_PHYSICAL_HEADSET_PLAY", false)
+        && envEnabled("FNVXR_RETAIL_FIXTURE_AUTOMATION", false);
+}
+
+bool ownedRetailFixtureMessageAcknowledgementRequested()
+{
+    return retailFixtureAutomationRequested()
+        || physicalHeadsetFixtureMessageAcknowledgementRequested();
+}
+
 struct RetailFixtureAutomationPlan
 {
     fnvxr::engine::retail_fixture_automation::Plan plan {};
@@ -1049,13 +1120,16 @@ bool readRetailFixtureAutomationPlan(RetailFixtureAutomationPlan& output)
     constexpr char saveEnvironmentName[] = "FNVXR_RETAIL_FIXTURE_SAVE_NAME";
     constexpr char firstTraitEnvironmentName[] = "FNVXR_RETAIL_FIXTURE_TRAIT_ONE";
     constexpr char secondTraitEnvironmentName[] = "FNVXR_RETAIL_FIXTURE_TRAIT_TWO";
+    constexpr char weaponEnvironmentName[] = "FNVXR_RETAIL_FIXTURE_WEAPON";
     char action[16] {};
     char firstTrait[32] {};
     char secondTrait[32] {};
+    char weapon[32] {};
     size_t actionRequired = 0u;
     size_t saveRequired = 0u;
     size_t firstTraitRequired = 0u;
     size_t secondTraitRequired = 0u;
+    size_t weaponRequired = 0u;
     if (getenv_s(&actionRequired, action, sizeof(action), actionEnvironmentName) != 0
         || actionRequired == 0u || actionRequired > sizeof(action)
         || getenv_s(&saveRequired, output.saveName, sizeof(output.saveName), saveEnvironmentName) != 0
@@ -1063,7 +1137,9 @@ bool readRetailFixtureAutomationPlan(RetailFixtureAutomationPlan& output)
         || getenv_s(&firstTraitRequired, firstTrait, sizeof(firstTrait), firstTraitEnvironmentName) != 0
         || firstTraitRequired == 0u || firstTraitRequired > sizeof(firstTrait)
         || getenv_s(&secondTraitRequired, secondTrait, sizeof(secondTrait), secondTraitEnvironmentName) != 0
-        || secondTraitRequired == 0u || secondTraitRequired > sizeof(secondTrait))
+        || secondTraitRequired == 0u || secondTraitRequired > sizeof(secondTrait)
+        || getenv_s(&weaponRequired, weapon, sizeof(weapon), weaponEnvironmentName) != 0
+        || weaponRequired == 0u || weaponRequired > sizeof(weapon))
     {
         return false;
     }
@@ -1072,18 +1148,21 @@ bool readRetailFixtureAutomationPlan(RetailFixtureAutomationPlan& output)
         std::string_view { firstTrait, firstTraitRequired - 1u });
     const fixture::TraitCommand* const second = fixture::findTrait(
         std::string_view { secondTrait, secondTraitRequired - 1u });
+    const fixture::WeaponCommand* const selectedWeapon = fixture::findWeapon(
+        std::string_view { weapon, weaponRequired - 1u });
     fixture::Action requestedAction = fixture::Action::None;
     if (std::strcmp(action, "create") == 0)
         requestedAction = fixture::Action::Create;
     else if (std::strcmp(action, "load") == 0)
         requestedAction = fixture::Action::Load;
-    if (first == nullptr || second == nullptr)
+    if (first == nullptr || second == nullptr || selectedWeapon == nullptr)
         return false;
 
     output.plan = {
         requestedAction,
         first->trait,
         second->trait,
+        selectedWeapon->weapon,
         std::string_view { output.saveName, saveRequired - 1u },
     };
     return fixture::authorized(output.plan);
@@ -1108,7 +1187,7 @@ bool retailFixtureOfficialPackAcknowledgementRequested()
     // to the same exact native acknowledgement only for the known title/body
     // pairs and their unique stock first-button OK tile. This is not desktop,
     // keyboard, mouse, controller, or simulator input.
-    return retailFixtureAutomationRequested()
+    return ownedRetailFixtureMessageAcknowledgementRequested()
         && envEnabled(
             "FNVXR_RETAIL_FIXTURE_ACK_OFFICIAL_PACK_POPUP",
             false);
@@ -1125,7 +1204,7 @@ bool retailFixtureTtwStewieDependencyAcknowledgementRequested()
     // This opt-in is emitted only for the owned TTW fixture family. The
     // decision point still requires the complete, versioned title/body pair
     // and one native first-button OK tile; it grants no general menu input.
-    return retailFixtureAutomationRequested()
+    return ownedRetailFixtureMessageAcknowledgementRequested()
         && envEnabled(
             "FNVXR_RETAIL_FIXTURE_ACK_TTW_STEWIE_DEPENDENCY_WARNING",
             false);
@@ -1542,6 +1621,38 @@ Matrix33 xrDeltaToGamebryoMatrix(Quat xrDelta)
                 * xr.m[xrAxisForGameAxis[row]][xrAxisForGameAxis[column]];
         }
     }
+    return result;
+}
+
+Matrix33 xrDeltaToNiCameraMatrix(Quat xrDelta)
+{
+    // OpenXR local axes are right/up/back. The audited retail NiCamera
+    // transform stores forward/up/right, so convert the rotation with the
+    // corresponding proper basis change before composing it with a camera.
+    const Quat xr = normalizeQuat(xrDelta);
+    return matrixFromQuat({ -xr.z, xr.y, xr.x, xr.w });
+}
+
+Vec3 xrDeltaToNiCameraVector(Vec3 xrDelta)
+{
+    // Vector form of the same right/up/back -> forward/up/right conversion.
+    return { -xrDelta.z, xrDelta.y, xrDelta.x };
+}
+
+Matrix33 yawOnlyNiCameraMatrix(Matrix33 matrix)
+{
+    // NiCamera's local Y axis is up. Its X/Z axes are forward/right, unlike
+    // the actor matrix handled by yawOnlyMatrix above.
+    const float yaw = std::atan2(matrix.m[0][2], matrix.m[0][0])
+        * getFloatFromEnv("FNVXR_CAMERA_YAW_SCALE", 1.0f);
+    const float c = std::cos(yaw);
+    const float s = std::sin(yaw);
+    Matrix33 result {};
+    result.m[0][0] = c;
+    result.m[0][2] = s;
+    result.m[1][1] = 1.0f;
+    result.m[2][0] = -s;
+    result.m[2][2] = c;
     return result;
 }
 
@@ -4164,6 +4275,13 @@ void updateSharedPlayer(UInt64 frame, RuntimePhase phase)
     g_playerState->reserved[fnvxr::shared::PlayerSharedWeaponClassReservedIndex] = weaponClass;
     g_playerState->reserved[fnvxr::shared::PlayerSharedEquippedWeaponFormIdReservedIndex] = g_lastKnownWeaponFormId;
     g_playerState->reserved[fnvxr::shared::PlayerSharedEquippedFavoriteSlotReservedIndex] = g_lastKnownWeaponFavoriteSlot;
+    void* firstPersonSceneRoot = g_retailRigNodes.weapon;
+    if (looksLikeNiObject(firstPersonSceneRoot))
+    {
+        g_playerState->reserved[
+            fnvxr::shared::PlayerSharedFirstPersonWeaponNodeReservedIndex] =
+                sharedPointerAddress(firstPersonSceneRoot);
+    }
 
     void* playerNode = player
         ? readPointer(reinterpret_cast<std::uintptr_t>(player) + PlayerCharacterFirstPersonNodeOffset)
@@ -4549,6 +4667,113 @@ bool trackedPropAssistLeaseCurrent()
             trackedPropAssistRequest());
 }
 
+fnvxr::engine::HeadlessStereoRigVisualTrialRequest
+headlessStereoRigVisualTrialRequest()
+{
+    fnvxr::engine::HeadlessStereoRigVisualTrialRequest request {};
+    request.stereoVisualTrialProfile = headsetControllerRigVisualTrialRequested();
+    request.headlessSimulator = envEnabled("OPENXR_SIMULATOR_HEADLESS", false);
+    request.ownedHeadsetFixture = headsetDemoFixtureProfileSelected()
+        && retailFixtureAutomationRequested();
+    request.worldOnlyCapture = headsetWorldOnlyCaptureProfileSelected();
+    request.stockWeaponDrawRequested =
+        headsetWorldOnlyFixtureWeaponDrawRequested();
+    request.finalStockFrameCaptureRequested =
+        envEnabled("FNVXR_HEADSET_FINAL_STOCK_FRAME_CAPTURE", false);
+    request.cameraHookRequested =
+        envEnabled("FNVXR_INSTALL_CAMERA_HOOK", false)
+        || envEnabled("FNVXR_CAMERA_HOOK", false)
+        || envEnabled("FNVXR_CAMERA_APPLY", false);
+    request.rigHookRequested = envEnabled("FNVXR_RETAIL_RIG_ENABLE", false);
+    request.rigTransformWritesRequested =
+        envEnabled("FNVXR_RETAIL_RIG_APPLY", false);
+    request.weaponTransformWritesRequested =
+        envEnabled("FNVXR_RETAIL_WEAPON_APPLY", false);
+    request.rightGripAndAimRequired = true;
+    request.engineCenterStereoRequested =
+        envEnabled("FNVXR_ENABLE_ENGINE_CENTER_STEREO", false)
+        && !envEnabled("FNVXR_DISABLE_STEREO_WORLD", false);
+    request.projectileNodeHookRequested =
+        envEnabled("FNVXR_RETAIL_PROJECTILE_NODE_HOOK", false);
+    request.projectileOrHitMutationRequested =
+        envEnabled("FNVXR_TRACKED_PROP_ASSIST_PROJECTILE_OR_HIT_MUTATION", false);
+    request.inputInjectionRequested =
+        envEnabled("FNVXR_NVSE_WRITES_VR_POSE", false)
+        || envEnabled("FNVXR_CLICK_SENDINPUT_MOUSE", false)
+        || envEnabled("FNVXR_PLUGIN_SENDINPUT_CLICK", false)
+        || envEnabled("FNVXR_EXTERNAL_XINPUT_WRITER", false)
+        || envEnabled("FNVXR_EXTERNAL_DINPUT_WRITER", false)
+        || envEnabled("FNVXR_DESKTOP_ASSIST_AUTOMATION", false);
+    request.legacyReplayRequested =
+        envEnabled("FNVXR_D3D9_STEREO_REPLAY", false)
+        || envEnabled("FNVXR_D3D9_NATIVE_SINGLE_TRAVERSAL_REPLAY", false)
+        || envEnabled("FNVXR_D3D9_WIDE_WORLD_REPLAY", false);
+    request.uiCaptureRequested =
+        envEnabled("FNVXR_DESKTOP_ASSIST_UI_CAPTURE", false);
+    request.physicalHeadsetRequested =
+        envEnabled("FNVXR_PHYSICAL_HEADSET_PLAY", false);
+    return request;
+}
+
+bool headlessStereoRigVisualTrialMutationAllowedAtDecision()
+{
+    const fnvxr::engine::HeadlessStereoRigVisualTrialRequest request =
+        headlessStereoRigVisualTrialRequest();
+    const fnvxr::engine::compatibility::RetailCompatibilityProof proof =
+        fnvxr::engine::compatibility::proveCurrentRetailCompatibilityAtDecisionPoint();
+    const bool authorized = fnvxr::engine::headlessStereoRigVisualTrialAuthorized(
+        proof,
+        request);
+    if (!authorized)
+    {
+        static UInt32 rejected = 0;
+        ++rejected;
+        if (rejected <= 12u || (rejected % 300u) == 0u)
+        {
+            logTelemetry(
+                "headlessStereoRig authority rejected count=%lu profile=%d headless=%d fixture=%d worldOnly=%d weapon=%d stockCapture=%d camera=%d rig=%d rigApply=%d weaponApply=%d gripAim=%d centerStereo=%d projectile=%d input=%d replay=%d ui=%d physical=%d compatibility=%d failure=%u\n",
+                static_cast<unsigned long>(rejected),
+                static_cast<int>(request.stereoVisualTrialProfile),
+                static_cast<int>(request.headlessSimulator),
+                static_cast<int>(request.ownedHeadsetFixture),
+                static_cast<int>(request.worldOnlyCapture),
+                static_cast<int>(request.stockWeaponDrawRequested),
+                static_cast<int>(request.finalStockFrameCaptureRequested),
+                static_cast<int>(request.cameraHookRequested),
+                static_cast<int>(request.rigHookRequested),
+                static_cast<int>(request.rigTransformWritesRequested),
+                static_cast<int>(request.weaponTransformWritesRequested),
+                static_cast<int>(request.rightGripAndAimRequired),
+                static_cast<int>(request.engineCenterStereoRequested),
+                static_cast<int>(
+                    request.projectileNodeHookRequested
+                    || request.projectileOrHitMutationRequested),
+                static_cast<int>(request.inputInjectionRequested),
+                static_cast<int>(request.legacyReplayRequested),
+                static_cast<int>(request.uiCaptureRequested),
+                static_cast<int>(request.physicalHeadsetRequested),
+                static_cast<int>(proof.compatible),
+                static_cast<unsigned>(proof.failure));
+        }
+    }
+    return authorized;
+}
+
+bool headlessStereoRigVisualTrialLeaseCurrent()
+{
+    return g_retailRigHookInstalled
+        && fnvxr::engine::headlessStereoRigVisualTrialRequestIsNarrow(
+            headlessStereoRigVisualTrialRequest());
+}
+
+bool retailRigVisualOnlyTrialLeaseCurrent()
+{
+    return trackedPropAssistProfileRequested()
+        ? trackedPropAssistLeaseCurrent()
+        : (headsetControllerRigVisualTrialRequested()
+            && headlessStereoRigVisualTrialLeaseCurrent());
+}
+
 bool cameraHookUsesAssistAuthority()
 {
     return g_cameraHookAuthorization == CameraHookAuthorization::DesktopAssist
@@ -4682,39 +4907,39 @@ void applyVrPoseToGameCamera()
         }
         return;
     }
-    Matrix33 gameRotationDelta = xrDeltaToGamebryoMatrix(xrRotationDelta);
+    Matrix33 cameraRotationDelta = xrDeltaToNiCameraMatrix(xrRotationDelta);
     const bool yawOnly = envEnabled("FNVXR_CAMERA_YAW_ONLY", false);
     if (yawOnly)
-        gameRotationDelta = yawOnlyMatrix(gameRotationDelta);
+        cameraRotationDelta = yawOnlyNiCameraMatrix(cameraRotationDelta);
     const bool preMultiply = envEnabled("FNVXR_CAMERA_PREMULTIPLY", false);
     const bool applyRotation = envEnabled("FNVXR_CAMERA_APPLY_ROTATION", true);
     const bool applyTranslation = envEnabled("FNVXR_CAMERA_APPLY_TRANSLATION", false);
     if (applyRotation)
     {
         const Matrix33 localRotated = preMultiply
-            ? multiplyMatrix33(gameRotationDelta, g_cameraBaseLocalRotation)
-            : multiplyMatrix33(g_cameraBaseLocalRotation, gameRotationDelta);
+            ? multiplyMatrix33(cameraRotationDelta, g_cameraBaseLocalRotation)
+            : multiplyMatrix33(g_cameraBaseLocalRotation, cameraRotationDelta);
         writeMatrix33(base + NiAvObjectLocalRotationOffset, localRotated);
     }
 
     const float positionScale = getFloatFromEnv("FNVXR_CAMERA_POSITION_SCALE", 0.0f);
     if (applyTranslation && positionScale != 0.0f)
     {
-        // NiCamera local axes already match OpenXR right/up/back. Actor-world
-        // right/forward/up permutation is only valid for gameplay world data.
-        const Vec3 gameDelta = xrPositionDelta;
+        // NiCamera is forward/up/right, unlike OpenXR right/up/back. Actor
+        // right/forward/up is a third, separate basis used only for gameplay.
+        const Vec3 cameraDelta = xrDeltaToNiCameraVector(xrPositionDelta);
         Vec3 localTranslate = g_cameraBaseLocalTranslation;
-        localTranslate.x += gameDelta.x * positionScale;
-        localTranslate.y += gameDelta.y * positionScale;
-        localTranslate.z += gameDelta.z * positionScale;
+        localTranslate.x += cameraDelta.x * positionScale;
+        localTranslate.y += cameraDelta.y * positionScale;
+        localTranslate.z += cameraDelta.z * positionScale;
         writeVec3(base + NiAvObjectLocalTranslationOffset, localTranslate);
     }
 
     if (envEnabled("FNVXR_CAMERA_WRITE_WORLD", false))
     {
         const Matrix33 worldRotated = preMultiply
-            ? multiplyMatrix33(gameRotationDelta, g_cameraBaseWorldRotation)
-            : multiplyMatrix33(g_cameraBaseWorldRotation, gameRotationDelta);
+            ? multiplyMatrix33(cameraRotationDelta, g_cameraBaseWorldRotation)
+            : multiplyMatrix33(g_cameraBaseWorldRotation, cameraRotationDelta);
         writeMatrix33(base + NiAvObjectWorldRotationOffset, worldRotated);
     }
 
@@ -5801,7 +6026,8 @@ bool captureRetailRigOrigin(
 bool captureTrackedPropAssistRigOrigin(
     const VrRigPoseSnapshot& pose,
     void* bodyRoot,
-    void* firstPersonRigRoot)
+    void* firstPersonRigRoot,
+    bool headlessStereoRigVisualTrial)
 {
     if (!bodyRoot || !firstPersonRigRoot
         || !looksLikeNiObject(bodyRoot)
@@ -5845,7 +6071,9 @@ bool captureTrackedPropAssistRigOrigin(
     g_retailRigOriginPoseSequence = static_cast<UInt32>(pose.sequence);
     g_retailRigOriginAuthoritySequence = pose.sequence;
     g_retailRigOriginBodyRoot = bodyRoot;
-    g_retailRigOriginSource = RetailRigOriginSource::TrackedPropAssist;
+    g_retailRigOriginSource = headlessStereoRigVisualTrial
+        ? RetailRigOriginSource::HeadlessStereoRigVisualTrial
+        : RetailRigOriginSource::TrackedPropAssist;
     g_retailRigBodyAnchorLocal = transformVec3(
         transposeMatrix33(bodyWorldRotation),
         subtractVec3(firstPersonRigRootWorld, bodyWorldPosition));
@@ -5857,7 +6085,7 @@ bool captureTrackedPropAssistRigOrigin(
 
     g_haveRetailRigOrigin = true;
     logTelemetry(
-        "trackedPropAssist origin latched seq=%ld frame=%llu referenceGeneration=%lu hmdPos=(%.4f %.4f %.4f) bodyRoot=%p firstPersonRigRoot=%p bodyAnchorLocal=(%.3f %.3f %.3f) anchorSource=first-person-rig-root-at-latch originSource=tracked-prop-assist-body projectile=0 input=0 renderer=0 openxr=0\n",
+        "retailRigVisualTrial origin latched seq=%ld frame=%llu referenceGeneration=%lu hmdPos=(%.4f %.4f %.4f) bodyRoot=%p firstPersonRigRoot=%p bodyAnchorLocal=(%.3f %.3f %.3f) anchorSource=first-person-rig-root-at-latch originSource=%s projectile=0 input=0 renderer=0 headlessStereo=%d\n",
         pose.sequence,
         static_cast<unsigned long long>(pose.frame),
         static_cast<unsigned long>(pose.referenceSpaceGeneration),
@@ -5868,7 +6096,11 @@ bool captureTrackedPropAssistRigOrigin(
         firstPersonRigRoot,
         g_retailRigBodyAnchorLocal.x,
         g_retailRigBodyAnchorLocal.y,
-        g_retailRigBodyAnchorLocal.z);
+        g_retailRigBodyAnchorLocal.z,
+        headlessStereoRigVisualTrial
+            ? "headless-stereo-rig-body"
+            : "tracked-prop-assist-body",
+        static_cast<int>(headlessStereoRigVisualTrial));
     return true;
 }
 
@@ -6168,6 +6400,7 @@ void ensureRetailHandCalibration(
     RetailHandCalibration& calibration,
     const RetailArmNodes& arm,
     const RetailControllerWorldPose& controller,
+    const Matrix33& bodyWorldRotation,
     bool left)
 {
     if (calibration.valid)
@@ -6183,7 +6416,19 @@ void ensureRetailHandCalibration(
         handWorldRotation);
     calibration.usesAimOrientation = false;
     calibration.controllerToWristLocal = configuredControllerToWristOffset(left);
-    if (envEnabled("FNVXR_RETAIL_RIG_AUTO_CALIBRATE_POSITION", false))
+    const bool bodyAnchoredControllerRig =
+        (headsetControllerRigVisualTrialRequested()
+            && headlessStereoRigVisualTrialLeaseCurrent())
+        || physicalHeadsetEngineCenterRigRequested();
+    if (bodyAnchoredControllerRig)
+    {
+        calibration.controllerToWristBodyLocal = transformVec3(
+            transposeMatrix33(bodyWorldRotation),
+            subtractVec3(handWorldPosition, controller.wristPosition));
+        calibration.usesStageLocalBodyPositionAnchor =
+            finiteVec3(calibration.controllerToWristBodyLocal);
+    }
+    else if (envEnabled("FNVXR_RETAIL_RIG_AUTO_CALIBRATE_POSITION", false))
     {
         const Vec3 measured = transformVec3(
             transposeMatrix33(controller.wristRotation),
@@ -6193,15 +6438,23 @@ void ensureRetailHandCalibration(
             calibration.controllerToWristLocal = measured;
     }
     calibration.valid = finiteMatrix33(calibration.controllerToHandRotation)
-        && finiteVec3(calibration.controllerToWristLocal);
+        && (calibration.usesStageLocalBodyPositionAnchor
+            ? finiteVec3(calibration.controllerToWristBodyLocal)
+            : finiteVec3(calibration.controllerToWristLocal));
     logTelemetry(
-        "retailRig calibration side=%s valid=%d orientationSource=%s wristLocal=(%.3f %.3f %.3f) autoPosition=%d\n",
+        "retailRig calibration side=%s valid=%d orientationSource=%s wristLocal=(%.3f %.3f %.3f) wristBodyLocal=(%.3f %.3f %.3f) positionAnchor=%s autoPosition=%d\n",
         left ? "left" : "right",
         calibration.valid ? 1 : 0,
         calibration.usesAimOrientation ? "aim" : "grip",
         calibration.controllerToWristLocal.x,
         calibration.controllerToWristLocal.y,
         calibration.controllerToWristLocal.z,
+        calibration.controllerToWristBodyLocal.x,
+        calibration.controllerToWristBodyLocal.y,
+        calibration.controllerToWristBodyLocal.z,
+        calibration.usesStageLocalBodyPositionAnchor
+            ? "stage-local-body"
+            : "controller-local",
         envEnabled("FNVXR_RETAIL_RIG_AUTO_CALIBRATE_POSITION", false) ? 1 : 0);
 }
 
@@ -6217,7 +6470,12 @@ bool applyRetailArmFabrik(
     finalError = 0.0f;
     if (!arm.upperArm || !arm.forearm || !arm.hand)
         return false;
-    ensureRetailHandCalibration(calibration, arm, controller, left);
+    ensureRetailHandCalibration(
+        calibration,
+        arm,
+        controller,
+        bodyWorldRotation,
+        left);
     if (!calibration.valid)
         return false;
 
@@ -6238,9 +6496,17 @@ bool applyRetailArmFabrik(
         return false;
     }
 
-    const Vec3 target = addVec3(
-        controller.wristPosition,
-        transformVec3(controller.wristRotation, calibration.controllerToWristLocal));
+    const Vec3 target = calibration.usesStageLocalBodyPositionAnchor
+        ? addVec3(
+            controller.wristPosition,
+            transformVec3(
+                bodyWorldRotation,
+                calibration.controllerToWristBodyLocal))
+        : addVec3(
+            controller.wristPosition,
+            transformVec3(
+                controller.wristRotation,
+                calibration.controllerToWristLocal));
     const float poleOut = getFloatFromEnv("FNVXR_RETAIL_RIG_ELBOW_POLE_OUT", 20.0f) * (left ? -1.0f : 1.0f);
     const Vec3 poleLocal {
         poleOut,
@@ -6342,6 +6608,7 @@ struct RetailWeaponApplyResult
 
 RetailWeaponApplyResult applyRetailWeaponAim(
     const RetailControllerWorldPose& controller,
+    const Matrix33& bodyWorldRotation,
     bool applyWrites)
 {
     RetailWeaponApplyResult result {};
@@ -6358,24 +6625,76 @@ RetailWeaponApplyResult applyRetailWeaponAim(
 
     if (!g_retailWeaponCalibration.valid)
     {
-        g_retailWeaponCalibration.controllerToWeaponRotation = multiplyMatrix33(
-            transposeMatrix33(controller.rotation),
-            weaponWorldRotation);
+        const bool bodyAnchoredControllerRig =
+            (headsetControllerRigVisualTrialRequested()
+                && headlessStereoRigVisualTrialLeaseCurrent())
+            || physicalHeadsetEngineCenterRigRequested();
+        void* endpoint = g_retailRigNodes.projectileNode
+            ? g_retailRigNodes.projectileNode
+            : g_retailRigNodes.muzzleFlash;
+        const bool endpointUsable = endpoint
+            && niObjectDescendsFrom(endpoint, weapon)
+            && niObjectKind(endpoint) != 0;
+        const Matrix33 endpointWorldRotation = endpointUsable
+            ? readMatrix33(
+                reinterpret_cast<std::uintptr_t>(endpoint)
+                    + NiAvObjectWorldRotationOffset)
+            : Matrix33 {};
+        // In the headless stage-local trial the controller aim transform is
+        // the muzzle aim contract. The stock Weapon node's +Y is not the
+        // projectile node's +Y (the rejected run measured a 0.51-rad offset),
+        // so calibrate the root through the real endpoint relationship rather
+        // than preserving that stock-axis mismatch.
+        const bool endpointAxisCalibration = bodyAnchoredControllerRig
+            && endpointUsable
+            && finiteMatrix33(endpointWorldRotation);
+        g_retailWeaponCalibration.controllerToWeaponRotation =
+            endpointAxisCalibration
+            ? transposeMatrix33(multiplyMatrix33(
+                transposeMatrix33(weaponWorldRotation),
+                endpointWorldRotation))
+            : multiplyMatrix33(
+                transposeMatrix33(controller.rotation),
+                weaponWorldRotation);
         g_retailWeaponCalibration.controllerToWeaponPosition = transformVec3(
             transposeMatrix33(controller.rotation),
             subtractVec3(weaponWorldPosition, controller.position));
+        if (bodyAnchoredControllerRig)
+        {
+            g_retailWeaponCalibration.controllerToWeaponBodyLocal =
+                transformVec3(
+                    transposeMatrix33(bodyWorldRotation),
+                    subtractVec3(weaponWorldPosition, controller.position));
+            g_retailWeaponCalibration.usesStageLocalBodyPositionAnchor =
+                finiteVec3(
+                    g_retailWeaponCalibration.controllerToWeaponBodyLocal);
+        }
         g_retailWeaponCalibration.valid = finiteMatrix33(
                 g_retailWeaponCalibration.controllerToWeaponRotation)
-            && finiteVec3(g_retailWeaponCalibration.controllerToWeaponPosition)
-            && lengthVec3(g_retailWeaponCalibration.controllerToWeaponPosition)
-                <= getFloatFromEnv("FNVXR_RETAIL_WEAPON_MAX_CALIBRATION_UNITS", 48.0f);
+            && (g_retailWeaponCalibration.usesStageLocalBodyPositionAnchor
+                ? finiteVec3(
+                    g_retailWeaponCalibration.controllerToWeaponBodyLocal)
+                : (finiteVec3(g_retailWeaponCalibration.controllerToWeaponPosition)
+                    && lengthVec3(
+                        g_retailWeaponCalibration.controllerToWeaponPosition)
+                        <= getFloatFromEnv(
+                            "FNVXR_RETAIL_WEAPON_MAX_CALIBRATION_UNITS",
+                            48.0f)));
         logTelemetry(
-            "retailWeapon calibration valid=%d source=right-aim fullSE3=1 weapon=%p localPosition=(%.4f %.4f %.4f)\n",
+            "retailWeapon calibration valid=%d source=right-aim fullSE3=1 weapon=%p localPosition=(%.4f %.4f %.4f) bodyPosition=(%.4f %.4f %.4f) positionAnchor=%s endpointAxisCalibration=%d endpoint=%p\n",
             g_retailWeaponCalibration.valid ? 1 : 0,
             weapon,
             g_retailWeaponCalibration.controllerToWeaponPosition.x,
             g_retailWeaponCalibration.controllerToWeaponPosition.y,
-            g_retailWeaponCalibration.controllerToWeaponPosition.z);
+            g_retailWeaponCalibration.controllerToWeaponPosition.z,
+            g_retailWeaponCalibration.controllerToWeaponBodyLocal.x,
+            g_retailWeaponCalibration.controllerToWeaponBodyLocal.y,
+            g_retailWeaponCalibration.controllerToWeaponBodyLocal.z,
+            g_retailWeaponCalibration.usesStageLocalBodyPositionAnchor
+                ? "stage-local-body"
+                : "controller-local",
+            endpointAxisCalibration ? 1 : 0,
+            endpoint);
     }
     if (!g_retailWeaponCalibration.valid)
         return result;
@@ -6383,11 +6702,18 @@ RetailWeaponApplyResult applyRetailWeaponAim(
     const Matrix33 desiredWorldRotation = multiplyMatrix33(
         controller.rotation,
         g_retailWeaponCalibration.controllerToWeaponRotation);
-    const Vec3 desiredWorldPosition = addVec3(
-        controller.position,
-        transformVec3(
-            controller.rotation,
-            g_retailWeaponCalibration.controllerToWeaponPosition));
+    const Vec3 desiredWorldPosition =
+        g_retailWeaponCalibration.usesStageLocalBodyPositionAnchor
+        ? addVec3(
+            controller.position,
+            transformVec3(
+                bodyWorldRotation,
+                g_retailWeaponCalibration.controllerToWeaponBodyLocal))
+        : addVec3(
+            controller.position,
+            transformVec3(
+                controller.rotation,
+                g_retailWeaponCalibration.controllerToWeaponPosition));
     void* parent = readPointer(weaponBase + NiAvObjectParentOffset);
     if (!parent || !finiteMatrix33(desiredWorldRotation) || !finiteVec3(desiredWorldPosition))
         return result;
@@ -6653,14 +6979,26 @@ void onRetailPostAnimation(void* animData)
     if (!envEnabled("FNVXR_RETAIL_RIG_ENABLE", false))
         return;
     const bool trackedPropAssist = trackedPropAssistProfileRequested();
-    if (trackedPropAssist && !trackedPropAssistLeaseCurrent())
+    const bool headlessStereoRigVisualTrial =
+        headsetControllerRigVisualTrialRequested();
+    const bool visualOnlyRigTrial = trackedPropAssist
+        || headlessStereoRigVisualTrial;
+    // Engine-center physical play does not use the retired native
+    // single-traversal camera path that publishes SharedVrOriginState.  Its
+    // HMD camera transaction is owned by the retail D3D bridge, so anchor the
+    // controller rig once to the engine-authored body/first-person roots just
+    // like the proven headless engine-center route.  Subsequent hand targets
+    // remain body-relative and cannot inherit the moving HMD camera.
+    const bool bodyAnchoredEngineCenterRig = visualOnlyRigTrial
+        || physicalHeadsetEngineCenterRigRequested();
+    if (visualOnlyRigTrial && !retailRigVisualOnlyTrialLeaseCurrent())
     {
         static LONG rejectedLease = 0;
         const LONG count = InterlockedIncrement(&rejectedLease);
         if (count <= 12 || count % 300 == 0)
         {
             logTelemetry(
-                "trackedPropAssist rig skipped count=%ld reason=lease-not-current; no visual rig write performed\n",
+                "retailRigVisualTrial rig skipped count=%ld reason=lease-not-current; no visual rig write performed\n",
                 count);
         }
         return;
@@ -6684,17 +7022,23 @@ void onRetailPostAnimation(void* animData)
     // not configurable: the retail view-model pass is the sole IK owner.
     if (animData == thirdPersonAnimData)
         return;
+    // Keep the tracked-prop exclusion explicit: that lease must never reach
+    // projectile-node mutation. The separate headless stereo lease is also
+    // visual-only, so it remains inside the same outer exclusion.
     if (!trackedPropAssist)
     {
-        void* playerProcess = player
-            ? readPointer(reinterpret_cast<std::uintptr_t>(player) + MobileObjectBaseProcessOffset)
-            : nullptr;
-        installProjectileNodeConsumeHook(playerProcess);
+        if (!headlessStereoRigVisualTrial)
+        {
+            void* playerProcess = player
+                ? readPointer(reinterpret_cast<std::uintptr_t>(player) + MobileObjectBaseProcessOffset)
+                : nullptr;
+            installProjectileNodeConsumeHook(playerProcess);
+        }
     }
 
     VrRigPoseSnapshot pose {};
     SharedVrOriginState authoritativeOrigin {};
-    if (trackedPropAssist)
+    if (bodyAnchoredEngineCenterRig)
     {
         if (!readLatestRetailRigPose(pose))
         {
@@ -6702,7 +7046,7 @@ void onRetailPostAnimation(void* animData)
             if (count <= 12 || count % 300 == 0)
             {
                 logTelemetry(
-                    "trackedPropAssist rig skipped count=%ld reason=pose-unavailable\n",
+                    "retailRigVisualTrial rig skipped count=%ld reason=pose-unavailable\n",
                     count);
             }
             return;
@@ -6728,7 +7072,7 @@ void onRetailPostAnimation(void* animData)
     {
         resetRetailRigOrigin("reference-space-generation-changed");
     }
-    if (!trackedPropAssist
+    if (!bodyAnchoredEngineCenterRig
         && g_haveRetailRigOrigin
         && (authoritativeOrigin.generation != g_retailRigReferenceSpaceGeneration
             || authoritativeOrigin.producerEpoch != g_retailRigProducerEpoch
@@ -6754,7 +7098,8 @@ void onRetailPostAnimation(void* animData)
     const bool rightAimUsable =
         (pose.trackingFlags & fnvxr::shared::VrPoseTrackingRightAimActive) != 0
         && (pose.trackingFlags & fnvxr::shared::VrPoseTrackingRightAimCurrent) != 0;
-    if (trackedPropAssist && (!rightControllerUsable || !rightAimUsable))
+    if (bodyAnchoredEngineCenterRig
+        && (!rightControllerUsable || !rightAimUsable))
     {
         logRetailRigGateSkip(
             g_retailRigNoCurrentControllerCount,
@@ -6779,9 +7124,8 @@ void onRetailPostAnimation(void* animData)
         logRetailRigGateSkip(g_retailRigNoRootCount, "first-person-root-unavailable", pose);
         return;
     }
-    if (trackedPropAssist
+    if (bodyAnchoredEngineCenterRig
         && g_haveRetailRigOrigin
-        && g_retailRigOriginSource == RetailRigOriginSource::TrackedPropAssist
         && g_retailRigNodes.root
         && root != g_retailRigNodes.root)
     {
@@ -6827,7 +7171,7 @@ void onRetailPostAnimation(void* animData)
     const float bodyWorldScale = readFloat(
         reinterpret_cast<std::uintptr_t>(bodyRoot) + NiAvObjectWorldScaleOffset,
         0.0f);
-    const Vec3 stableCameraWorld = trackedPropAssist
+    const Vec3 stableCameraWorld = bodyAnchoredEngineCenterRig
         ? readVec3(
             reinterpret_cast<std::uintptr_t>(root)
                 + NiAvObjectWorldTranslationOffset)
@@ -6841,7 +7185,7 @@ void onRetailPostAnimation(void* animData)
         || !finiteVec3(stableCameraWorld)
         || !std::isfinite(bodyWorldScale)
         || std::fabs(bodyWorldScale) < 0.0001f
-        || (!trackedPropAssist
+        || (!bodyAnchoredEngineCenterRig
             && reinterpret_cast<std::uintptr_t>(bodyRoot)
                 != authoritativeOrigin.bodyRootAddress))
     {
@@ -6853,10 +7197,10 @@ void onRetailPostAnimation(void* animData)
                 "retailRig skipped count=%ld reason=stable-body-anchor-unavailable bodyRoot=%p renderCamera=0x%08lx renderCameraWorldValid=%lu\n",
                 count,
                 bodyRoot,
-                trackedPropAssist
+                bodyAnchoredEngineCenterRig
                     ? static_cast<unsigned long>(reinterpret_cast<std::uintptr_t>(root))
                     : static_cast<unsigned long>(authoritativeOrigin.renderCameraAddress),
-                trackedPropAssist
+                bodyAnchoredEngineCenterRig
                     ? 1ul
                     : static_cast<unsigned long>(authoritativeOrigin.renderCameraWorldValid));
         }
@@ -6867,8 +7211,12 @@ void onRetailPostAnimation(void* animData)
         resetRetailRigOrigin("body-root-changed");
     if (!g_haveRetailRigOrigin)
     {
-        const bool originCaptured = trackedPropAssist
-            ? captureTrackedPropAssistRigOrigin(pose, bodyRoot, root)
+        const bool originCaptured = bodyAnchoredEngineCenterRig
+            ? captureTrackedPropAssistRigOrigin(
+                pose,
+                bodyRoot,
+                root,
+                headlessStereoRigVisualTrial)
             : captureRetailRigOrigin(pose, authoritativeOrigin, bodyRoot);
         if (!originCaptured)
             return;
@@ -6909,7 +7257,10 @@ void onRetailPostAnimation(void* animData)
         applyWrites,
         leftError);
     const RetailWeaponApplyResult weaponResult = rightSolved
-        ? applyRetailWeaponAim(rightController, applyWrites)
+        ? applyRetailWeaponAim(
+            rightController,
+            bodyWorldRotation,
+            applyWrites)
         : RetailWeaponApplyResult {};
     if (weaponResult.endpointMeasured)
     {
@@ -6949,11 +7300,18 @@ void onRetailPostAnimation(void* animData)
         const Vec3 rightHandWorld = readVec3(
             reinterpret_cast<std::uintptr_t>(g_retailRigNodes.right.hand)
                 + NiAvObjectWorldTranslationOffset);
-        const Vec3 rightHandTargetWorld = addVec3(
-            rightController.wristPosition,
-            transformVec3(
-                rightController.wristRotation,
-                g_retailRightCalibration.controllerToWristLocal));
+        const Vec3 rightHandTargetWorld =
+            g_retailRightCalibration.usesStageLocalBodyPositionAnchor
+            ? addVec3(
+                rightController.wristPosition,
+                transformVec3(
+                    bodyWorldRotation,
+                    g_retailRightCalibration.controllerToWristBodyLocal))
+            : addVec3(
+                rightController.wristPosition,
+                transformVec3(
+                    rightController.wristRotation,
+                    g_retailRightCalibration.controllerToWristLocal));
         const Vec3 rightHandLocalUnits = transformVec3(
             inverseBodyRotation,
             subtractVec3(rightHandWorld, bodyAnchorWorld));
@@ -7102,7 +7460,7 @@ void onRetailPostAnimation(void* animData)
                 static_cast<unsigned long>(g_retailRigReferenceSpaceGeneration),
                 static_cast<unsigned long>(g_retailRigOriginPoseSequence),
                 g_retailRigOriginAuthoritySequence,
-                trackedPropAssist
+                visualOnlyRigTrial
                     ? static_cast<unsigned long>(pose.sequence)
                     : static_cast<unsigned long>(authoritativeOrigin.renderPoseSequence),
                 1.0f - 2.0f * (
@@ -7276,11 +7634,16 @@ __declspec(naked) void hookedRetailAnimationApply()
 
 bool installRetailRigHook()
 {
+    const bool headlessStereoRigVisualTrial =
+        headsetControllerRigVisualTrialRequested();
     if (stereoVisualTrialProfileSelected())
     {
-        logTelemetry(
-            "retailRig hook hard-blocked: stereo visual trial is publication-only in the plugin\n");
-        return false;
+        if (!headlessStereoRigVisualTrial)
+        {
+            logTelemetry(
+                "retailRig hook hard-blocked: stereo visual trial is publication-only in the plugin\n");
+            return false;
+        }
     }
     if (g_retailRigHookInstalled)
         return true;
@@ -7297,6 +7660,33 @@ bool installRetailRigHook()
         {
             logTelemetry(
                 "retailRig hook hard-blocked: tracked-prop visual-only compatibility/configuration proof incomplete\n");
+            return true;
+        }
+    }
+    else if (headlessStereoRigVisualTrial)
+    {
+        if (!headlessStereoRigVisualTrialMutationAllowedAtDecision())
+        {
+            logTelemetry(
+                "retailRig hook hard-blocked: headless stereo visual-rig compatibility/configuration proof incomplete\n");
+            return true;
+        }
+    }
+    else if (physicalHeadsetPlayProfileSelected()
+        && envEnabled("FNVXR_PHYSICAL_HEADSET_PLAY", false))
+    {
+        // Physical play reaches this decision only after the full bridge has
+        // synchronously acquired the process-bound retail runtime authority.
+        // That authority revalidates the loaded executable, complete protected
+        // function/vtable inventory, live ABI objects, compatibility modules,
+        // process identity, and generation at the current decision point.
+        // Use it for this exact retail post-animation hook instead of the
+        // retired RetailMutationEvidenceToken, which is intentionally never
+        // populated and otherwise makes the physical rig impossible to arm.
+        if (!g_retailRuntimeAuthority.complete())
+        {
+            logTelemetry(
+                "retailRig hook hard-blocked: physical retail runtime authority is not current\n");
             return true;
         }
     }
@@ -7342,12 +7732,19 @@ bool installRetailRigHook()
     }
     g_retailRigHookInstalled = true;
     logTelemetry(
-        "retailRig hook installed site=%p hook=%p original=%p apply=%d authority=%s projectile=0-for-tracked-prop\n",
+        "retailRig hook installed site=%p hook=%p original=%p apply=%d authority=%s projectile=%s\n",
         pointerFromAddress32<void*>(PlayerAnimationApplyCallSiteAddress),
         reinterpret_cast<void*>(hookedRetailAnimationApply),
         pointerFromAddress32<void*>(ApplyActorAnimDataAddress),
         envEnabled("FNVXR_RETAIL_RIG_APPLY", false) ? 1 : 0,
-        trackedPropAssist ? "tracked-prop-assist" : "full-retail");
+        trackedPropAssist
+            ? "tracked-prop-assist"
+            : (headlessStereoRigVisualTrial
+                ? "headless-stereo-rig-visual-trial"
+                : "full-retail"),
+        (trackedPropAssist || headlessStereoRigVisualTrial)
+            ? "0-for-visual-rig-trial"
+            : "managed-by-full-retail");
     return true;
 #endif
 }
@@ -11688,6 +12085,301 @@ bool realRetailFixtureFreshGameplayState(
             == 0u;
 }
 
+// The world-only fixture finisher lives before the general fixture lifecycle
+// implementation below, so keep this exact owned-name builder visible here.
+bool buildRetailFixtureNamedCommand(
+    std::string_view prefix,
+    const fnvxr::engine::retail_fixture_automation::Plan& plan,
+    char* output,
+    std::size_t outputSize);
+
+// Set only after the exact stock MessageMenu handler has returned. Both the
+// fixed-close fallback and the one-time fixture finalizer use this to avoid
+// immediately competing with the native acknowledgement in the same frame.
+UInt64 g_lastExactOfficialPackNativeAcknowledgementFrame = 0u;
+// Updated for every fully re-proven stock DLC notice, including a notice
+// whose native acknowledgement happens to fail closed. The final owned save
+// must occur after this notice drain rather than before it.
+UInt64 g_lastExactOfficialPackObservationFrame = 0u;
+
+enum class HeadsetWorldOnlyFixtureWeaponDrawStage : UInt8
+{
+    AwaitingFixture = 0u,
+    AwaitingDrawResult,
+    AwaitingFinalSaveSettle,
+    Complete,
+};
+
+// This intentionally sits outside the fixture creation lifecycle below.  A
+// loaded owned fixture may still have its stock DLC notice state pending, so
+// this one-time finisher drains known stock notices, makes the already-equipped
+// named weapon visible through JIP's fixed SetWeaponOut command, verifies it,
+// then saves that clean weapon-out state back to the exact owned fixture name.
+// It never sends desktop, keyboard, mouse, controller, or simulator input, and
+// it never retries either command.
+void processHeadsetWorldOnlyFixtureWeaponDraw(
+    const RuntimeObservation& observation)
+{
+    namespace fixture = fnvxr::engine::retail_fixture_automation;
+    if (!headsetWorldOnlyFixtureWeaponDrawRequested())
+        return;
+
+    static HeadsetWorldOnlyFixtureWeaponDrawStage stage =
+        HeadsetWorldOnlyFixtureWeaponDrawStage::AwaitingFixture;
+    static UInt64 firstGameplayFrame = 0u;
+    static UInt64 quietGameplaySinceFrame = 0u;
+    static UInt64 saveFrame = 0u;
+    static UInt64 drawFrame = 0u;
+    static UInt64 weaponOutStableSinceFrame = 0u;
+    static bool weaponWasAlreadyOut = false;
+    static bool loggedInvalidPlan = false;
+    if (stage == HeadsetWorldOnlyFixtureWeaponDrawStage::Complete)
+        return;
+
+    RetailFixtureAutomationPlan fixturePlan {};
+    if (!readRetailFixtureAutomationPlan(fixturePlan)
+        || !fixture::authorized(fixturePlan.plan))
+    {
+        if (!loggedInvalidPlan)
+        {
+            loggedInvalidPlan = true;
+            logTelemetry(
+                "{\"event\":\"fnvxrHeadsetFixtureWeaponDrawBlocked\",\"reason\":\"invalid-owned-fixture-plan\",\"frame\":%llu}\n",
+                static_cast<unsigned long long>(observation.frame));
+        }
+        stage = HeadsetWorldOnlyFixtureWeaponDrawStage::Complete;
+        return;
+    }
+
+    void* player = readPointer(PlayerCharacterAddress);
+    void* playerProcess = player
+        ? readPointer(
+            reinterpret_cast<std::uintptr_t>(player)
+            + MobileObjectBaseProcessOffset)
+        : nullptr;
+    const bool playerProcessAvailable = player != nullptr && playerProcess != nullptr;
+    const bool gameplay = realRetailFixtureFreshGameplayState(observation);
+    const bool weaponOut = playerProcessAvailable && playerWeaponOut();
+    const fixture::WeaponCommand* const selectedWeapon =
+        fixture::findWeapon(fixturePlan.plan.weapon);
+    const char* const weaponToken = selectedWeapon
+        ? selectedWeapon->token.data()
+        : "invalid";
+
+    if (!gameplay)
+    {
+        quietGameplaySinceFrame = 0u;
+        return;
+    }
+    if (firstGameplayFrame == 0u)
+    {
+        firstGameplayFrame = observation.frame;
+    }
+    if (quietGameplaySinceFrame == 0u)
+    {
+        quietGameplaySinceFrame = observation.frame;
+    }
+
+    if (stage == HeadsetWorldOnlyFixtureWeaponDrawStage::AwaitingFixture)
+    {
+        // Gun Runners' Arsenal and the pre-order notices may be scheduled
+        // after the first apparently clean gameplay frame. Leave a bounded
+        // initial drain window, then require both a menu-free gameplay window
+        // and a grace interval after the last exact known notice before we
+        // change or save the owned fixture.
+        // A freshly created fixture receives the full stock-notice drain.
+        // A previously finalized, weapon-out owned fixture has already saved
+        // past those notices, so it only needs a short menu-free re-entry
+        // check before the demo can start again.
+        constexpr UInt64 FixtureInitialOfficialNoticeDrainFrames = 900u;
+        constexpr UInt64 FixturePersistedCleanSaveDrainFrames = 120u;
+        constexpr UInt64 FixturePopupSettlingFrames = 180u;
+        constexpr UInt64 FixtureQuietGameplayFrames = 180u;
+        constexpr UInt64 FixturePersistedCleanSaveQuietGameplayFrames = 60u;
+        const UInt64 latestKnownNoticeFrame =
+            g_lastExactOfficialPackObservationFrame
+                > g_lastExactOfficialPackNativeAcknowledgementFrame
+            ? g_lastExactOfficialPackObservationFrame
+            : g_lastExactOfficialPackNativeAcknowledgementFrame;
+        const bool knownNoticeStillSettling =
+            latestKnownNoticeFrame != 0u
+            && observation.frame
+                >= latestKnownNoticeFrame
+            && observation.frame
+                - latestKnownNoticeFrame
+                < FixturePopupSettlingFrames;
+        const bool persistedCleanWeaponOut = weaponOut
+            && latestKnownNoticeFrame == 0u;
+        const UInt64 requiredInitialNoticeDrainFrames =
+            persistedCleanWeaponOut
+                ? FixturePersistedCleanSaveDrainFrames
+                : FixtureInitialOfficialNoticeDrainFrames;
+        const UInt64 requiredQuietGameplayFrames =
+            persistedCleanWeaponOut
+                ? FixturePersistedCleanSaveQuietGameplayFrames
+                : FixtureQuietGameplayFrames;
+        const bool initialNoticeDrainIncomplete =
+            observation.frame < firstGameplayFrame
+            || observation.frame - firstGameplayFrame
+                < requiredInitialNoticeDrainFrames;
+        if (initialNoticeDrainIncomplete
+            || knownNoticeStillSettling
+            || observation.frame < quietGameplaySinceFrame
+            || observation.frame - quietGameplaySinceFrame
+                < requiredQuietGameplayFrames)
+        {
+            return;
+        }
+
+        // A previous owned run may already have persisted this exact weapon
+        // state. Preserve it rather than issuing SetWeaponOut again, because
+        // that command would holster the weapon.
+        if (weaponOut)
+        {
+            weaponWasAlreadyOut = true;
+            drawFrame = observation.frame;
+            stage = HeadsetWorldOnlyFixtureWeaponDrawStage::AwaitingDrawResult;
+            return;
+        }
+
+        if (!fixture::headsetWorldOnlyFixtureWeaponDrawAuthorized(
+                fixturePlan.plan,
+                true,
+                g_headsetDemoFixtureReady,
+                gameplay,
+                playerProcessAvailable,
+                false))
+        {
+            return;
+        }
+
+        weaponWasAlreadyOut = false;
+        const bool submitted = runPluginConsoleCommand(
+            "fnvxrHeadsetFixtureWeaponDraw",
+            fixture::SetFixtureWeaponOutCommand.data());
+        logTelemetry(
+            "{\"event\":\"fnvxrHeadsetFixtureWeaponDraw\",\"action\":\"set-weapon-out\",\"source\":\"JIP\",\"weapon\":\"%s\",\"submitted\":%s,\"weaponOutBefore\":false,\"frame\":%llu}\n",
+            weaponToken,
+            submitted ? "true" : "false",
+            static_cast<unsigned long long>(observation.frame));
+        if (!submitted)
+        {
+            logTelemetry(
+                "{\"event\":\"fnvxrHeadsetFixtureWeaponDrawBlocked\",\"reason\":\"jip-set-weapon-out-failed\",\"weapon\":\"%s\",\"frame\":%llu}\n",
+                weaponToken,
+                static_cast<unsigned long long>(observation.frame));
+            stage = HeadsetWorldOnlyFixtureWeaponDrawStage::Complete;
+            return;
+        }
+
+        drawFrame = observation.frame;
+        stage = HeadsetWorldOnlyFixtureWeaponDrawStage::AwaitingDrawResult;
+        return;
+    }
+
+    if (stage == HeadsetWorldOnlyFixtureWeaponDrawStage::AwaitingDrawResult)
+    {
+        constexpr UInt64 DrawResultSettlingFrames = 60u;
+        constexpr UInt64 DrawResultTimeoutFrames = 600u;
+        constexpr UInt64 WeaponOutStableFrames = 30u;
+        if (observation.frame <= drawFrame
+            || observation.frame - drawFrame < DrawResultSettlingFrames)
+        {
+            return;
+        }
+        const bool drawSucceeded = playerProcessAvailable && playerWeaponOut();
+        if (!drawSucceeded)
+        {
+            weaponOutStableSinceFrame = 0u;
+            if (observation.frame >= drawFrame
+                && observation.frame - drawFrame < DrawResultTimeoutFrames)
+            {
+                return;
+            }
+            logTelemetry(
+                "{\"event\":\"fnvxrHeadsetFixtureWeaponDrawResult\",\"weapon\":\"%s\",\"success\":false,\"alreadyReady\":%s,\"weaponOut\":false,\"saveFrame\":0,\"issuedFrame\":%llu,\"frame\":%llu}\n",
+                weaponToken,
+                weaponWasAlreadyOut ? "true" : "false",
+                static_cast<unsigned long long>(drawFrame),
+                static_cast<unsigned long long>(observation.frame));
+            stage = HeadsetWorldOnlyFixtureWeaponDrawStage::Complete;
+            return;
+        }
+
+        // SetWeaponOut changes animation state asynchronously.  Do not persist
+        // the first true sample: require a continuous weapon-out window so a
+        // one-frame process flag cannot produce a save that reloads holstered.
+        if (weaponOutStableSinceFrame == 0u)
+            weaponOutStableSinceFrame = observation.frame;
+        if (observation.frame < weaponOutStableSinceFrame
+            || observation.frame - weaponOutStableSinceFrame
+                < WeaponOutStableFrames)
+        {
+            return;
+        }
+
+        if (!fixture::headsetWorldOnlyFixturePreparationSaveAuthorized(
+                fixturePlan.plan,
+                true,
+                g_headsetDemoFixtureReady,
+                gameplay,
+                playerProcessAvailable,
+                false))
+        {
+            return;
+        }
+
+        char saveCommand[64] {};
+        const bool commandBuilt = buildRetailFixtureNamedCommand(
+            fixture::SaveCommandPrefix,
+            fixturePlan.plan,
+            saveCommand,
+            sizeof(saveCommand));
+        const bool submitted = commandBuilt && runPluginConsoleCommand(
+            "fnvxrHeadsetFixtureFinalizeSave",
+            saveCommand);
+        logTelemetry(
+            "{\"event\":\"fnvxrHeadsetFixtureFinalizeSave\",\"saveName\":\"%s\",\"weapon\":\"%s\",\"weaponOut\":true,\"commandBuilt\":%s,\"submitted\":%s,\"frame\":%llu}\n",
+            fixturePlan.saveName,
+            weaponToken,
+            commandBuilt ? "true" : "false",
+            submitted ? "true" : "false",
+            static_cast<unsigned long long>(observation.frame));
+        if (!submitted)
+        {
+            logTelemetry(
+                "{\"event\":\"fnvxrHeadsetFixtureWeaponDrawBlocked\",\"reason\":\"owned-fixture-finalize-save-failed\",\"weapon\":\"%s\",\"frame\":%llu}\n",
+                weaponToken,
+                static_cast<unsigned long long>(observation.frame));
+            stage = HeadsetWorldOnlyFixtureWeaponDrawStage::Complete;
+            return;
+        }
+
+        saveFrame = observation.frame;
+        stage = HeadsetWorldOnlyFixtureWeaponDrawStage::AwaitingFinalSaveSettle;
+        return;
+    }
+
+    constexpr UInt64 FixtureSaveSettlingFrames = 60u;
+    if (!playerProcessAvailable
+        || observation.frame <= saveFrame
+        || observation.frame - saveFrame < FixtureSaveSettlingFrames)
+    {
+        return;
+    }
+    const bool drawSucceeded = playerWeaponOut();
+    logTelemetry(
+        "{\"event\":\"fnvxrHeadsetFixtureWeaponDrawResult\",\"weapon\":\"%s\",\"success\":%s,\"alreadyReady\":%s,\"weaponOut\":%s,\"saveFrame\":%llu,\"issuedFrame\":%llu,\"frame\":%llu}\n",
+        weaponToken,
+        drawSucceeded ? "true" : "false",
+        weaponWasAlreadyOut ? "true" : "false",
+        drawSucceeded ? "true" : "false",
+        static_cast<unsigned long long>(saveFrame),
+        static_cast<unsigned long long>(drawFrame),
+        static_cast<unsigned long long>(observation.frame));
+    stage = HeadsetWorldOnlyFixtureWeaponDrawStage::Complete;
+}
+
 // The retail GUI normally assigns these two fields before dispatching a menu
 // click. In the headless visual-trial run there is deliberately no desktop
 // cursor, keyboard, controller, or simulator input to make that assignment.
@@ -11760,6 +12452,12 @@ void acknowledgeExactOfficialPackMessageMenu(
             &exactlyOneFirstButtonOk);
     }
     const bool visibleMessageMenu = expectedMessageMenuState && menu != nullptr;
+    if (visibleMessageMenu
+        && officialPackNotificationMask != 0u
+        && exactlyOneFirstButtonOk)
+    {
+        g_lastExactOfficialPackObservationFrame = observation.frame;
+    }
     const bool alreadyAttempted = officialPackNotificationMask != 0u
         && (acknowledgedOfficialPackNotificationMask
             & officialPackNotificationMask) != 0u;
@@ -11821,6 +12519,10 @@ void acknowledgeExactOfficialPackMessageMenu(
     __except (EXCEPTION_EXECUTE_HANDLER)
     {
         invoked = false;
+    }
+    if (invoked)
+    {
+        g_lastExactOfficialPackNativeAcknowledgementFrame = observation.frame;
     }
     logTelemetry(
         "{\"event\":\"fnvxrStereoVisualTrialOfficialPackAcknowledgement\",\"attempted\":true,\"officialPackMask\":%lu,\"exactFirstButtonOk\":true,\"nativeTileArmed\":%s,\"buttonIndex\":0,\"invoked\":%s,\"frame\":%llu}\n",
@@ -11968,6 +12670,20 @@ void closeExactRetailFixtureOfficialPackMessageMenu(
     if (!explicitlyOptedIn)
         return;
 
+    // The native exact-OK dispatch above and this stock CloseAllMenus fallback
+    // must never run back-to-back in one frame.  Give the game time to commit
+    // its own acknowledgement first; the fallback remains available only for
+    // a still-visible, independently re-proven stock prompt after that grace.
+    constexpr UInt64 NativeAcknowledgementSettlingFrames = 90u;
+    if (g_lastExactOfficialPackNativeAcknowledgementFrame != 0u
+        && observation.frame >= g_lastExactOfficialPackNativeAcknowledgementFrame
+        && observation.frame
+            - g_lastExactOfficialPackNativeAcknowledgementFrame
+            < NativeAcknowledgementSettlingFrames)
+    {
+        return;
+    }
+
     void* menu = nullptr;
     void* okTile = nullptr;
     UInt32 officialPackNotificationMask = 0u;
@@ -11996,6 +12712,7 @@ void closeExactRetailFixtureOfficialPackMessageMenu(
         visibleOfficialPackNotificationMask = 0u;
         return;
     }
+    g_lastExactOfficialPackObservationFrame = observation.frame;
 
     // The retail message queue can show the same exact stock pack notice more
     // than once after a successful close. Permit one fixed command per new
@@ -12098,6 +12815,18 @@ void closeExactRetailFixtureTtwStewieDependencyMessageMenu(
         static_cast<unsigned long long>(observation.frame));
 }
 
+void processOwnedRetailFixtureMessageMenuAcknowledgements(
+    const RuntimeObservation& observation)
+{
+    // Each helper independently matches one complete, versioned MessageMenu
+    // and its unique native first-button OK tile.  This deliberately does not
+    // dispatch controller, pointer, keyboard, mouse, or arbitrary menu input.
+    acknowledgeExactOfficialPackMessageMenu(observation);
+    closeExactRetailFixtureOfficialPackMessageMenu(observation);
+    acknowledgeExactTtwStewieDependencyMessageMenu(observation);
+    closeExactRetailFixtureTtwStewieDependencyMessageMenu(observation);
+}
+
 enum class RetailFixtureAutomationStage : UInt8
 {
     AwaitingStartMenu = 0u,
@@ -12105,6 +12834,9 @@ enum class RetailFixtureAutomationStage : UInt8
     AwaitingGameplayName,
     AwaitingFirstTrait,
     AwaitingSecondTrait,
+    AwaitingWeaponAdd,
+    AwaitingWeaponAmmo,
+    AwaitingWeaponEquip,
     AwaitingSave,
     Complete,
 };
@@ -12202,15 +12934,12 @@ void processRetailFixtureAutomation(const RuntimeObservation& observation)
     // the bounded demo so that one of those modals cannot cover the Pip-Boy.
     // Neither helper accepts arbitrary UI: each revalidates the known title,
     // body, unique first-button OK tile, and per-pack/attempt limits.
-    acknowledgeExactOfficialPackMessageMenu(observation);
-    closeExactRetailFixtureOfficialPackMessageMenu(observation);
-    acknowledgeExactTtwStewieDependencyMessageMenu(observation);
-    closeExactRetailFixtureTtwStewieDependencyMessageMenu(observation);
+    processOwnedRetailFixtureMessageMenuAcknowledgements(observation);
 
     // This owned fixture path intentionally contains no menu traversal or
     // device input. It accepts a single start-menu command, then uses only the
-    // static Goodsprings/name/trait commands and a validated owned fixture
-    // save name. A player's historical saves cannot pass the gate.
+    // static Goodsprings/name/trait/loadout commands and a validated owned
+    // fixture save name. A player's historical saves cannot pass the gate.
     static RetailFixtureAutomationStage stage =
         RetailFixtureAutomationStage::AwaitingStartMenu;
     static RetailFixtureAutomationPlan fixturePlan {};
@@ -12428,7 +13157,68 @@ void processRetailFixtureAutomation(const RuntimeObservation& observation)
     {
         trait = fixturePlan.plan.secondTrait;
         stageName = "trait-two";
-        nextStage = RetailFixtureAutomationStage::AwaitingSave;
+        nextStage = fixturePlan.plan.weapon == fixture::Weapon::None
+            ? RetailFixtureAutomationStage::AwaitingSave
+            : RetailFixtureAutomationStage::AwaitingWeaponAdd;
+    }
+    else if (stage == RetailFixtureAutomationStage::AwaitingWeaponAdd
+        || stage == RetailFixtureAutomationStage::AwaitingWeaponAmmo
+        || stage == RetailFixtureAutomationStage::AwaitingWeaponEquip)
+    {
+        std::string_view weaponCommand {};
+        if (stage == RetailFixtureAutomationStage::AwaitingWeaponAdd)
+        {
+            weaponCommand = fixture::addWeaponCommand(fixturePlan.plan.weapon);
+            stageName = "weapon-add";
+            nextStage = RetailFixtureAutomationStage::AwaitingWeaponAmmo;
+        }
+        else if (stage == RetailFixtureAutomationStage::AwaitingWeaponAmmo)
+        {
+            weaponCommand = fixture::addWeaponAmmoCommand(fixturePlan.plan.weapon);
+            stageName = "weapon-ammo";
+            nextStage = RetailFixtureAutomationStage::AwaitingWeaponEquip;
+        }
+        else
+        {
+            weaponCommand = fixture::equipWeaponCommand(fixturePlan.plan.weapon);
+            stageName = "weapon-equip";
+            nextStage = RetailFixtureAutomationStage::AwaitingSave;
+        }
+
+        char command[96] {};
+        const bool commandBuilt = weaponCommand.empty()
+            || copyRetailFixtureStaticCommand(
+                weaponCommand,
+                command,
+                sizeof(command));
+        const bool ok = commandBuilt && (weaponCommand.empty()
+            || runPluginConsoleCommand(
+                "fnvxrRetailFixtureWeaponLoadout",
+                command));
+        const fixture::WeaponCommand* const weapon =
+            fixture::findWeapon(fixturePlan.plan.weapon);
+        logTelemetry(
+            "{\"event\":\"fnvxrRetailFixtureWeapon\",\"requestId\":%lu,\"stage\":\"%s\",\"weapon\":\"%s\",\"hasStaticCommand\":%s,\"ok\":%s,\"frame\":%llu}\n",
+            static_cast<unsigned long>(requestId),
+            stageName,
+            weapon ? weapon->token.data() : "invalid",
+            weaponCommand.empty() ? "false" : "true",
+            ok ? "true" : "false",
+            static_cast<unsigned long long>(observation.frame));
+        if (!ok)
+        {
+            stage = RetailFixtureAutomationStage::Complete;
+            completeRetailFixtureAutomationRequest(
+                requestId,
+                observation.frame,
+                false,
+                commandBuilt ? command : "",
+                stageName);
+            return;
+        }
+        lastMutationFrame = observation.frame;
+        stage = nextStage;
+        return;
     }
     else if (stage == RetailFixtureAutomationStage::AwaitingSave)
     {
@@ -12942,6 +13732,73 @@ bool ensureAuthorizedTrackedPropAssistBridgeStarted()
     return true;
 }
 
+bool ensureAuthorizedHeadlessStereoRigVisualTrialBridgeStarted()
+{
+    if (!headsetControllerRigVisualTrialRequested())
+        return false;
+
+    if (g_headlessStereoRigVisualTrialBridgeStarted)
+    {
+        return gamePluginProducerLeaseHeldByCurrentThread()
+            && g_vrPoseState
+            && g_cameraState
+            && g_runtimeState
+            && g_playerState
+            && g_retailRigHookInstalled
+            && headlessStereoRigVisualTrialLeaseCurrent();
+    }
+
+    ++g_headlessStereoRigVisualTrialAuthorityAttempts;
+    const fnvxr::engine::compatibility::RetailCompatibilityProof proof =
+        fnvxr::engine::compatibility::proveCurrentRetailCompatibilityAtDecisionPoint();
+    const fnvxr::engine::HeadlessStereoRigVisualTrialRequest request =
+        headlessStereoRigVisualTrialRequest();
+    if (!fnvxr::engine::headlessStereoRigVisualTrialAuthorized(proof, request))
+    {
+        if (g_headlessStereoRigVisualTrialAuthorityAttempts <= 12u
+            || (g_headlessStereoRigVisualTrialAuthorityAttempts % 300u) == 0u)
+        {
+            logTelemetry(
+                "headlessStereoRig bridge deferred attempt=%lu compatible=%d failure=%u; no input, projectile, hit, camera-hook, replay, UI, or physical-headset authority performed\n",
+                static_cast<unsigned long>(
+                    g_headlessStereoRigVisualTrialAuthorityAttempts),
+                static_cast<int>(proof.compatible),
+                static_cast<unsigned>(proof.failure));
+        }
+        return false;
+    }
+    if (!acquireGamePluginProducerLease())
+        return false;
+
+    // The host owns the OpenXR pose mapping and the D3D bridge owns camera and
+    // same-tick stereo publication. The plugin maps only the pose plus
+    // read-only runtime records needed by the post-animation visual rig.
+    initSharedVrPose();
+    initSharedCamera();
+    initSharedPlayer();
+    if (!g_vrPoseState || !g_cameraState || !g_runtimeState || !g_playerState)
+    {
+        logTelemetry(
+            "headlessStereoRig bridge initialization deferred: required mapping unavailable\n");
+        return false;
+    }
+
+    if (!installRetailRigHook()
+        || !g_retailRigHookInstalled
+        || !headlessStereoRigVisualTrialLeaseCurrent())
+    {
+        logTelemetry(
+            "headlessStereoRig bridge deferred: visual-rig hook was not authorized or installed\n");
+        return false;
+    }
+
+    g_headlessStereoRigVisualTrialBridgeStarted = true;
+    logTelemetry(
+        "headlessStereoRig bridge ready attempt=%lu mode=body-anchored-controller-weapon-visual-rig input=0 projectile=0 hit=0 cameraHook=0 replay=0 ui=0 physical=0 engineCenterStereo=external\n",
+        static_cast<unsigned long>(g_headlessStereoRigVisualTrialAuthorityAttempts));
+    return true;
+}
+
 bool ensureAuthorizedSharedBridgeStarted()
 {
     // Assist profiles have deliberately smaller authority paths. Do not let a
@@ -13132,6 +13989,17 @@ void processTrackedPropAssistMainLoop(const RuntimeObservation& observation)
     logCameraTelemetry(observation.frame, observation.menuBits);
 }
 
+void processHeadlessStereoRigVisualTrialMainLoop(
+    const RuntimeObservation& observation)
+{
+    // The D3D bridge retains camera and same-tick eye authority. This
+    // fixture-only path publishes observations solely for the separately
+    // leased post-animation controller/weapon visual rig.
+    updateSharedCamera(observation.frame, observation.menuBits);
+    updateSharedPlayer(observation.frame, observation.phase);
+    logCameraTelemetry(observation.frame, observation.menuBits);
+}
+
 void handleNvseMessage(NVSEMessagingInterface::Message* message)
 {
     if (!message)
@@ -13242,19 +14110,51 @@ void handleNvseMessage(NVSEMessagingInterface::Message* message)
         if (headsetDemoFixtureProfileSelected())
         {
             processRetailFixtureAutomation(observation);
+            processHeadsetWorldOnlyFixtureWeaponDraw(observation);
             recoverFocusLossPause(
                 observation.frame,
                 observation.menuBits,
                 observation.phase);
             processHeadsetDemoFixtureUi(observation);
+            if (headsetControllerRigVisualTrialRequested())
+            {
+                if (!ensureAuthorizedHeadlessStereoRigVisualTrialBridgeStarted())
+                {
+                    static bool loggedHeadlessStereoRig = false;
+                    if (!loggedHeadlessStereoRig)
+                    {
+                        loggedHeadlessStereoRig = true;
+                        logTelemetry(
+                            "headlessStereoRig bridge deferred until exact compatibility proof and visual-rig lease are ready\n");
+                    }
+                    return;
+                }
+                processHeadlessStereoRigVisualTrialMainLoop(observation);
+            }
             static bool loggedHeadsetFixturePublicationOnly = false;
             if (!loggedHeadsetFixturePublicationOnly)
             {
                 loggedHeadsetFixturePublicationOnly = true;
                 if (headsetWorldOnlyCaptureProfileSelected())
                 {
-                    logTelemetry(
-                        "headset world-only fixture runtime publication ready; OpenXR display remains host-owned and no Pip-Boy, controller, keyboard, mouse, weapon, or simulator input is enabled\n");
+                    if (headsetWorldOnlyFixtureWeaponDrawRequested())
+                    {
+                        if (headsetControllerRigVisualTrialRequested())
+                        {
+                            logTelemetry(
+                                "headset world-only fixture runtime publication ready; engine-center stereo and host display remain separately owned, while the fixture-only lease may apply controller-driven hand/weapon visual transforms; no input, firing, projectile, hit, camera-hook, replay, UI, or physical-headset path is enabled\n");
+                        }
+                        else
+                        {
+                            logTelemetry(
+                                "headset world-only fixture runtime publication ready; OpenXR display remains host-owned and the fixture finisher is limited to one save of the same owned loaded fixture after exact stock-notice settlement plus one fixed JIP SetWeaponOut command for its named weapon; no Pip-Boy, desktop, keyboard, controller, mouse, simulator, camera, or rig input is enabled\n");
+                        }
+                    }
+                    else
+                    {
+                        logTelemetry(
+                            "headset world-only fixture runtime publication ready; OpenXR display remains host-owned and no Pip-Boy, controller, keyboard, mouse, weapon, or simulator input is enabled\n");
+                    }
                 }
                 else
                 {
@@ -13308,6 +14208,14 @@ void handleNvseMessage(NVSEMessagingInterface::Message* message)
             }
             processTrackedPropAssistMainLoop(observation);
             return;
+        }
+        if (physicalHeadsetPlayProfileSelected()
+            && physicalHeadsetFixtureMessageAcknowledgementRequested())
+        {
+            // The physical profile retains its game-loop bridge and ordinary
+            // controller ownership.  Only the independently bounded exact
+            // fixture-message handler runs before that bridge starts.
+            processOwnedRetailFixtureMessageMenuAcknowledgements(observation);
         }
         if (!ensureAuthorizedSharedBridgeStarted())
         {

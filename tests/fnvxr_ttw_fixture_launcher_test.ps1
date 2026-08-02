@@ -124,6 +124,26 @@ foreach ($required in @(
         throw "Plugin lost exact TTW dependency-warning acknowledgement: $required"
     }
 }
+foreach ($required in @(
+    'bool physicalHeadsetFixtureMessageAcknowledgementRequested()',
+    'FNVXR_PHYSICAL_HEADSET_PLAY',
+    'bool ownedRetailFixtureMessageAcknowledgementRequested()',
+    'void processOwnedRetailFixtureMessageMenuAcknowledgements(',
+    'processOwnedRetailFixtureMessageMenuAcknowledgements(observation);')) {
+    if (-not $plugin.Contains($required)) {
+        throw "Physical fixture run lost its bounded TTW warning acknowledgement: $required"
+    }
+}
+$physicalAcknowledgementBlock = [regex]::Match(
+    $plugin,
+    '(?s)if \(physicalHeadsetPlayProfileSelected\(\)\s*&&\s*physicalHeadsetFixtureMessageAcknowledgementRequested\(\)\)\s*\{.*?processOwnedRetailFixtureMessageMenuAcknowledgements\(observation\);.*?\}').Value
+if ([string]::IsNullOrWhiteSpace($physicalAcknowledgementBlock) -or
+    $physicalAcknowledgementBlock.Contains('processMainGameLoop(') -or
+    $physicalAcknowledgementBlock.Contains('consumeSharedCommand(') -or
+    $physicalAcknowledgementBlock.Contains('SendInput(') -or
+    $physicalAcknowledgementBlock.Contains('dispatchMenuClick(')) {
+    throw "Physical fixture acknowledgement must remain an exact native-message handler only."
+}
 
 # The visual headset route has a separate fixture-load helper. It must select
 # the AutoTTW authority after -TtwCore has constrained the root/profile;

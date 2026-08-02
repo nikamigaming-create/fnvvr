@@ -22,6 +22,7 @@ int main()
     using fixture::Action;
     using fixture::Failure;
     using fixture::Trait;
+    using fixture::Weapon;
 
     static_assert(fixture::isOwnedFixtureSaveName(
         "FNVXR_AutoRetail_L1_Base"));
@@ -40,6 +41,24 @@ int main()
         == "player.AddPerk BuiltToDestroy");
     static_assert(fixture::addPerkCommand(Trait::GoodNatured)
         == "player.AddPerk GoodNatured");
+    static_assert(fixture::findWeapon("Pistol") != nullptr);
+    static_assert(fixture::findWeapon("RifleSingleHand") != nullptr);
+    static_assert(fixture::findWeapon("RifleTwoHand") != nullptr);
+    static_assert(fixture::findWeapon("Minigun") != nullptr);
+    static_assert(fixture::findWeapon("FragGrenade") != nullptr);
+    static_assert(fixture::findWeapon("Knife") != nullptr);
+    static_assert(fixture::findWeapon("ThrowingKnife") != nullptr);
+    static_assert(fixture::findWeapon("NotAWeapon") == nullptr);
+    static_assert(fixture::addWeaponCommand(Weapon::Pistol)
+        == "player.additem 000E3778 1");
+    static_assert(fixture::addWeaponAmmoCommand(Weapon::Pistol)
+        == "player.additem 0008ED03 120");
+    static_assert(fixture::equipWeaponCommand(Weapon::Pistol)
+        == "player.equipitem 000E3778");
+    static_assert(fixture::addWeaponCommand(Weapon::Minigun)
+        == "player.additem 0000433F 1");
+    static_assert(fixture::equipWeaponCommand(Weapon::ThrowingKnife)
+        == "player.equipitem 00161246");
     static_assert(fixture::CloseExactOfficialPackMessageCommand
         == "CloseAllMenus");
     static_assert(fixture::MaxExactOfficialPackCloseAttemptsPerRun == 8u);
@@ -74,6 +93,7 @@ int main()
         Action::Create,
         Trait::BuiltToDestroy,
         Trait::GoodNatured,
+        Weapon::None,
         "FNVXR_AutoRetail_L1_BuiltToDestroy_GoodNatured",
     };
     require(fixture::authorized(create),
@@ -83,6 +103,7 @@ int main()
         Action::Load,
         Trait::None,
         Trait::None,
+        Weapon::None,
         "FNVXR_AutoRetail_L1_Base",
     };
     require(fixture::authorized(load),
@@ -92,10 +113,67 @@ int main()
         Action::Load,
         Trait::FastShot,
         Trait::WildWasteland,
+        Weapon::None,
         "FNVXR_AutoTTW_L1_FastShot_WildWasteland",
     };
     require(fixture::authorized(ttwLoad),
         "valid owned TTW fixture load was rejected");
+
+    fixture::Plan pistolCreate {
+        Action::Create,
+        Trait::None,
+        Trait::None,
+        Weapon::Pistol,
+        "FNVXR_AutoRetail_L1_Pistol",
+    };
+    require(fixture::authorized(pistolCreate),
+        "valid owned pistol fixture was rejected");
+
+    fixture::Plan pistolLoad {
+        Action::Load,
+        Trait::None,
+        Trait::None,
+        Weapon::Pistol,
+        "FNVXR_AutoRetail_L1_Pistol",
+    };
+    require(fixture::SetFixtureWeaponOutCommand == "player.SetWeaponOut 1",
+        "fixture weapon command was not the fixed JIP draw command");
+    require(fixture::headsetWorldOnlyFixturePreparationSaveAuthorized(
+        pistolLoad, true, true, true, true, false),
+        "owned pistol load was not authorized for its one final fixture save");
+    require(!fixture::headsetWorldOnlyFixturePreparationSaveAuthorized(
+        pistolLoad, true, true, true, true, true),
+        "fixture final save was admitted more than once");
+    require(!fixture::headsetWorldOnlyFixturePreparationSaveAuthorized(
+        pistolCreate, true, true, true, true, false),
+        "fixture final save was admitted while creating a fixture");
+    require(fixture::headsetWorldOnlyFixtureWeaponDrawAuthorized(
+        pistolLoad, true, true, true, true, false),
+        "owned holstered pistol load was not authorized for its one draw");
+    require(!fixture::headsetWorldOnlyFixtureWeaponDrawAuthorized(
+        pistolLoad, false, true, true, true, false),
+        "weapon draw was admitted without the explicit request");
+    require(!fixture::headsetWorldOnlyFixtureWeaponDrawAuthorized(
+        pistolLoad, true, false, true, true, false),
+        "weapon draw was admitted before the fixture was ready");
+    require(!fixture::headsetWorldOnlyFixtureWeaponDrawAuthorized(
+        pistolLoad, true, true, false, true, false),
+        "weapon draw was admitted outside gameplay");
+    require(!fixture::headsetWorldOnlyFixtureWeaponDrawAuthorized(
+        pistolLoad, true, true, true, false, false),
+        "weapon draw was admitted without the player process");
+    require(!fixture::headsetWorldOnlyFixtureWeaponDrawAuthorized(
+        pistolLoad, true, true, true, true, true),
+        "weapon draw was admitted for an already-ready weapon");
+    require(!fixture::headsetWorldOnlyFixtureWeaponDrawAuthorized(
+        pistolCreate, true, true, true, true, false),
+        "weapon draw was admitted while creating a fixture");
+
+    fixture::Plan unarmedLoad = pistolLoad;
+    unarmedLoad.weapon = Weapon::None;
+    require(!fixture::headsetWorldOnlyFixtureWeaponDrawAuthorized(
+        unarmedLoad, true, true, true, true, false),
+        "weapon draw was admitted for an unarmed fixture");
 
     fixture::Plan personalSave = create;
     personalSave.saveName = "FNVXR_StereoTest";
@@ -116,6 +194,11 @@ int main()
     invalidTrait.firstTrait = static_cast<Trait>(0xffu);
     require(fixture::validate(invalidTrait) == Failure::TraitUnknown,
         "fixture authority admitted an unknown trait enum");
+
+    fixture::Plan invalidWeapon = pistolCreate;
+    invalidWeapon.weapon = static_cast<Weapon>(0xffu);
+    require(fixture::validate(invalidWeapon) == Failure::WeaponUnknown,
+        "fixture authority admitted an unknown weapon enum");
 
     std::cout << "retail fixture automation authority gate passed\n";
     return EXIT_SUCCESS;

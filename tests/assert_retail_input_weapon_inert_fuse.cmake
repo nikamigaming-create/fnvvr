@@ -4,8 +4,9 @@ endif()
 
 set(input_safety "${SOURCE_ROOT}/renderhook/fnvxr_input_proxy_safety.h")
 set(retail_safety "${SOURCE_ROOT}/runtime/fnvxr_retail_safety.h")
+set(product_capabilities "${SOURCE_ROOT}/protocol/fnvxr_product_capabilities.h")
 set(plugin "${SOURCE_ROOT}/plugin/fnvxr_nvse_plugin.cpp")
-foreach(path IN LISTS input_safety retail_safety plugin)
+foreach(path IN LISTS input_safety retail_safety product_capabilities plugin)
     if(NOT EXISTS "${path}")
         message(FATAL_ERROR "required retail mutation source is missing: ${path}")
     endif()
@@ -13,6 +14,7 @@ endforeach()
 
 file(READ "${input_safety}" input_safety_text)
 file(READ "${retail_safety}" retail_safety_text)
+file(READ "${product_capabilities}" product_capabilities_text)
 file(READ "${plugin}" plugin_text)
 
 function(require_source_text text_value needle failure)
@@ -30,6 +32,14 @@ require_source_text(
     "${input_safety_text}"
     "inline constexpr bool ProductInputControllerIntegrated = false;"
     "The experimental proxy mapper is being represented as the product controller")
+require_source_text(
+    "${product_capabilities_text}"
+    "InputOwner::NvseMainGameLoop"
+    "The selected product input owner must remain the xNVSE game-loop consumer")
+require_source_text(
+    "${input_safety_text}"
+    "!product::inputOwnerIsProxy(product::SelectedProductInputOwner)"
+    "The input proxies can no longer prove that they are transparent")
 require_source_text(
     "${retail_safety_text}"
     "inline constexpr bool RetailMutationProofComplete = false;"

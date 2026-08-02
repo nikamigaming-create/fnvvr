@@ -41,7 +41,10 @@ struct StereoFrameProof
     std::uint64_t poseSequence = 0;
     std::uint64_t runtimeStateSample = 0;
     bool colorPairComplete = false;
-    bool depthPairComplete = false;
+    // Both eye depth/stencil targets must be complete for retail rendering, but
+    // Product GPU transport v1 keeps them in the retail process. This is not
+    // an OpenXR depth-layer submission claim.
+    bool renderLocalDepthPairComplete = false;
     bool sameSimulationTick = false;
     bool poseMatched = false;
     bool conservativeVisibilityComplete = false;
@@ -63,7 +66,7 @@ struct StereoFrameProof
             && poseSequence != 0
             && runtimeStateSample != 0
             && colorPairComplete
-            && depthPairComplete
+            && renderLocalDepthPairComplete
             && sameSimulationTick
             && poseMatched
             && conservativeVisibilityComplete

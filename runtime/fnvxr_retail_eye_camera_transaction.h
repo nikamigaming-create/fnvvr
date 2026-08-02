@@ -78,7 +78,12 @@ enum class RetailEyeCameraFailure : std::uint8_t
 
 struct RetailVrOrigin
 {
+    // Movement remains in a gravity-aligned yaw frame so room translation
+    // cannot acquire a vertical component.  View rotation has a separate
+    // full-orientation anchor: at recenter, the headset's current pitch and
+    // roll are neutral rather than remaining as an accidental camera tilt.
     stereo::Quaternion orientation {};
+    stereo::Quaternion headOrientation {};
     stereo::Vector3 position {};
     std::uint64_t producerEpoch = 0u;
     std::uint32_t referenceSpaceGeneration = 0u;
@@ -292,8 +297,9 @@ inline bool buildRetailWorldToCamera(
 
     const double inverseScale = 1.0 / static_cast<double>(world.scale);
     double view[3][4] {};
-    // Camera columns are right, up, back. D3D clip depth is positive in the
-    // forward direction, hence the negated third column.
+    // Retail camera columns are forward, up, right. Its captured affine view
+    // layout consumes forward/up and the negated right column; keep that
+    // engine-specific layout instead of substituting a generic D3D basis.
     for (std::size_t axis = 0u; axis < 3u; ++axis)
     {
         const double sign = axis == 2u ? -1.0 : 1.0;
@@ -583,6 +589,11 @@ inline RetailVrOriginCandidate prepareRetailVrOriginCandidate(
         const stereo::Quaternion fallback = current.valid
             ? current.orientation
             : stereo::Quaternion {};
+        // Keep the full physical headset pose for camera-local rotation.
+        // Do not use this as the room-motion basis: origin.orientation below
+        // deliberately stays gravity aligned for translation.
+        result.origin.headOrientation = stereo::fullHeadOrientationOrigin(
+            detail::poseQuaternion(frame.pose.hmdRot));
         result.origin.orientation = stereo::gravityAlignedYawOrientation(
             detail::poseQuaternion(frame.pose.hmdRot),
             fallback);
@@ -667,28 +678,55 @@ inline RetailDerivedEyeCameraRig deriveRetailEyeCameraRig(
     }
 
     const stereo::Vector3 midpoint = detail::eyeMidpoint(frame.pose);
-    const stereo::Vector3 centerLocal = stereo::positionInOriginFrame(
+    // Keep culling in OpenXR's right/up/back local frame. The written
+    // NiCamera transform uses a different forward/up/right basis, so its
+    // positions and rotations are converted separately below.
+    const stereo::Vector3 centerLocalXr = stereo::positionInOriginFrame(
         origin.orientation,
         origin.position,
         midpoint);
-    const stereo::Vector3 leftLocal = stereo::positionInOriginFrame(
+    const stereo::Vector3 leftLocalXr = stereo::positionInOriginFrame(
         origin.orientation,
         origin.position,
         leftPosition);
-    const stereo::Vector3 rightLocal = stereo::positionInOriginFrame(
+    const stereo::Vector3 rightLocalXr = stereo::positionInOriginFrame(
         origin.orientation,
         origin.position,
         rightPosition);
+    const stereo::Vector3 centerLocal = stereo::xrVectorToNiCameraLocal(
+        centerLocalXr);
+    const stereo::Vector3 leftLocal = stereo::xrVectorToNiCameraLocal(
+        leftLocalXr);
+    const stereo::Vector3 rightLocal = stereo::xrVectorToNiCameraLocal(
+        rightLocalXr);
+    // `orientation` is the yaw-only room frame for physical translation;
+    // `headOrientation` is the full recenter anchor for camera-local rotation.
+    // Sharing one yaw-only origin for both leaves any resting headset pitch in
+    // the camera and makes a later vertical look appear to orbit.
+    const stereo::Quaternion centerRelativeOrientation =
+        stereo::relativeOrientation(origin.headOrientation, hmd);
+    const stereo::Quaternion leftRelativeOrientation =
+        stereo::relativeOrientation(
+            origin.headOrientation,
+            detail::poseQuaternion(frame.pose.leftEyeRot));
+    const stereo::Quaternion rightRelativeOrientation =
+        stereo::relativeOrientation(
+            origin.headOrientation,
+            detail::poseQuaternion(frame.pose.rightEyeRot));
     const stereo::Matrix3 centerRotation = stereo::cameraLocalHeadRotation(
-        stereo::relativeOrientation(origin.orientation, hmd));
+        centerRelativeOrientation);
     const stereo::Matrix3 leftRotation = stereo::cameraLocalHeadRotation(
-        stereo::relativeOrientation(
-            origin.orientation,
-            detail::poseQuaternion(frame.pose.leftEyeRot)));
+        leftRelativeOrientation);
     const stereo::Matrix3 rightRotation = stereo::cameraLocalHeadRotation(
-        stereo::relativeOrientation(
-            origin.orientation,
-            detail::poseQuaternion(frame.pose.rightEyeRot)));
+        rightRelativeOrientation);
+    // conservativeCenterCullFrustum receives OpenXR body-local data and
+    // OpenXR FOV tangents. Do not pass the converted NiCamera matrices here.
+    const stereo::Matrix3 centerCullRotation =
+        stereo::columnRotationFromQuaternion(centerRelativeOrientation);
+    const stereo::Matrix3 leftCullRotation =
+        stereo::columnRotationFromQuaternion(leftRelativeOrientation);
+    const stereo::Matrix3 rightCullRotation =
+        stereo::columnRotationFromQuaternion(rightRelativeOrientation);
     const stereo::Matrix3 bodyWorldRotation =
         stereo::gravityLevelCameraWorldRotation(
             detail::retailMatrix3(stock.world.rotation));
@@ -700,34 +738,34 @@ inline RetailDerivedEyeCameraRig deriveRetailEyeCameraRig(
         stock.frustum,
         frame.pose.rightFov);
     stereo::EyeCullFrustum cullEyes[2] {};
-    cullEyes[0].rotation = leftRotation;
+    cullEyes[0].rotation = leftCullRotation;
     cullEyes[0].position = {
-        leftLocal.x * gameUnitsPerMeter,
-        leftLocal.y * gameUnitsPerMeter,
-        leftLocal.z * gameUnitsPerMeter,
+        leftLocalXr.x * gameUnitsPerMeter,
+        leftLocalXr.y * gameUnitsPerMeter,
+        leftLocalXr.z * gameUnitsPerMeter,
     };
     cullEyes[0].left = leftFrustum.left;
     cullEyes[0].right = leftFrustum.right;
     cullEyes[0].top = leftFrustum.top;
     cullEyes[0].bottom = leftFrustum.bottom;
-    cullEyes[1].rotation = rightRotation;
+    cullEyes[1].rotation = rightCullRotation;
     cullEyes[1].position = {
-        rightLocal.x * gameUnitsPerMeter,
-        rightLocal.y * gameUnitsPerMeter,
-        rightLocal.z * gameUnitsPerMeter,
+        rightLocalXr.x * gameUnitsPerMeter,
+        rightLocalXr.y * gameUnitsPerMeter,
+        rightLocalXr.z * gameUnitsPerMeter,
     };
     cullEyes[1].left = rightFrustum.left;
     cullEyes[1].right = rightFrustum.right;
     cullEyes[1].top = rightFrustum.top;
     cullEyes[1].bottom = rightFrustum.bottom;
     const stereo::Vector3 centerCullPosition {
-        centerLocal.x * gameUnitsPerMeter,
-        centerLocal.y * gameUnitsPerMeter,
-        centerLocal.z * gameUnitsPerMeter,
+        centerLocalXr.x * gameUnitsPerMeter,
+        centerLocalXr.y * gameUnitsPerMeter,
+        centerLocalXr.z * gameUnitsPerMeter,
     };
     const stereo::PerspectiveCullFrustum centerCull =
         stereo::conservativeCenterCullFrustum(
-            centerRotation,
+            centerCullRotation,
             centerCullPosition,
             cullEyes,
             stock.frustum.nearDistance,
@@ -942,5 +980,82 @@ private:
     RetailCameraMutableState mSaved[3] {};
     RetailEyeCameraFailure mFailure =
         RetailEyeCameraFailure::PrivateCameraRejected;
+};
+
+// RenderFirstPerson runs after the world transaction and uses the live stock
+// scene camera rather than the private world-cull cameras.  Keep its camera
+// swap as a separate, tiny RAII transaction: each eye receives the exact rig
+// derived for its matching world target, then the stock desktop state is
+// restored before the next retail render phase can observe it.
+class RetailScopedStockEyeCameraTransaction final
+{
+public:
+    RetailScopedStockEyeCameraTransaction() noexcept = default;
+    RetailScopedStockEyeCameraTransaction(
+        const RetailScopedStockEyeCameraTransaction&) = delete;
+    RetailScopedStockEyeCameraTransaction& operator=(
+        const RetailScopedStockEyeCameraTransaction&) = delete;
+
+    ~RetailScopedStockEyeCameraTransaction() noexcept
+    {
+        restore();
+    }
+
+    bool begin(
+        abi::RetailNiCameraLayout* stockCamera,
+        const RetailCameraMutableState& eye,
+        bool allowUninitializedSavedState = false) noexcept
+    {
+        if (mActive
+            || !stockCamera
+            || detail::retailCameraReadPointer32(stockCamera, 0u) == 0u
+            || !detail::retailTransformUsable(eye.local)
+            || !detail::retailTransformUsable(eye.world)
+            || !detail::retailFrustumUsable(eye.frustum))
+        {
+            mFailure = RetailEyeCameraFailure::StockCameraRejected;
+            return false;
+        }
+        mCamera = stockCamera;
+        mSaved = detail::retailCameraMutableState(stockCamera);
+        if ((!detail::retailTransformUsable(mSaved.world)
+                || !detail::retailFrustumUsable(mSaved.frustum))
+            && !allowUninitializedSavedState)
+        {
+            mCamera = nullptr;
+            mFailure = RetailEyeCameraFailure::StockCameraRejected;
+            return false;
+        }
+        detail::writeRetailCameraMutableState(mCamera, eye);
+        mActive = true;
+        mFailure = RetailEyeCameraFailure::None;
+        return true;
+    }
+
+    bool active() const noexcept
+    {
+        return mActive;
+    }
+
+    RetailEyeCameraFailure failure() const noexcept
+    {
+        return mFailure;
+    }
+
+    void restore() noexcept
+    {
+        if (!mActive)
+            return;
+        detail::writeRetailCameraMutableState(mCamera, mSaved);
+        mCamera = nullptr;
+        mSaved = {};
+        mActive = false;
+    }
+
+private:
+    bool mActive = false;
+    abi::RetailNiCameraLayout* mCamera = nullptr;
+    RetailCameraMutableState mSaved {};
+    RetailEyeCameraFailure mFailure = RetailEyeCameraFailure::StockCameraRejected;
 };
 }

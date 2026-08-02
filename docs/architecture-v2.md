@@ -1,6 +1,6 @@
 # FNVVR Production Architecture v2
 
-Decision date: 2026-07-18
+Decision date: 2026-07-18; GPU transport reconciled: 2026-08-01
 
 ## Technical Decision
 
@@ -9,7 +9,7 @@ hard architectural correction:
 
 - **GO:** an exact-version, engine-level stereo renderer using one conservative
   visible set and two fresh eye accumulators, followed by GPU-native OpenXR
-  color/depth transport;
+  color ABI v5 transport with validated render-local eye depth/stencil;
 - **NO-GO:** replaying individual D3D9 draws for both eyes, running the full
   Gamebryo frame twice, or moving eye pixels through a CPU readback/ring.
 
@@ -99,12 +99,12 @@ One accepted gameplay frame is a fail-closed transaction:
 4. Build one explicit conservative `NiVisibleArray` without advancing the game
    a second time.
 5. Create fresh, non-aliased left and right accumulators.
-6. For the left eye, bind its exact camera plus isolated color, encoded-depth,
-   and auxiliary targets before adding the shared visible array; render and
+6. For the left eye, bind its exact camera plus isolated color, render-local
+   depth/stencil, and auxiliary targets before adding the shared visible array; render and
    finalize that accumulator exactly once.
 7. Repeat step 6 for the right eye with a separate accumulator and the exact
    same visible-array identity.
-8. Validate complete color/depth/resource-graph coverage, pose identity,
+8. Validate complete color/render-local-depth/resource-graph coverage, pose identity,
    transaction identity, and GPU completion.
 9. Restore every authoritative retail state item before publication.
 10. Publish both eyes atomically. Any failure restores state, discards isolated
@@ -116,22 +116,22 @@ enabled only after that passes.
 
 ## GPU Transport
 
-Eye pixels remain GPU-native. The retail producer publishes only versioned
-metadata: adapter LUID, shared color/depth handles, dimensions/formats, a GPU
-completion sequence or fence, transaction ID, source frame, pose sequence, and
-rendered display time. The host opens the resources on the matching adapter and
-submits color plus matching depth to OpenXR.
+Eye pixels remain GPU-native. Product v1 uses
+`protocol/fnvxr_gpu_color_transport.h` ABI v5: the retail producer publishes
+only a non-aliased left/right color pair plus adapter LUID, dimensions/formats,
+completion/release fence metadata, transaction ID, source frame, pose sequence,
+runtime-state sample, producer identity, and rendered display time. The host
+opens the color resources on the matching adapter and submits color projection
+views to OpenXR.
 
-The v3 transport contract is defined in
-`protocol/fnvxr_gpu_frame_transport.h`.
-Its sole producer helper acquires an odd sequence with fully ordered atomic
-operations, writes the complete payload, and commits one even sequence. A
-failed producer stays odd and is unusable. The host must independently open
-and observe the declared shared D3D11 fence value for the exact producer epoch,
-adapter, frame identities, and runtime-state sample; producer metadata is not
-GPU completion evidence. CPU eye-image arrays, missing depth, aliased eye
-resources, unstable metadata, or incomplete GPU work are explicit architecture
-failures.
+Each eye's depth/stencil target is still a required retail render resource. It
+is validated as local transaction evidence and never fabricated, exported, or
+interpreted as an ABI-v5 texture. The host does not submit an OpenXR depth layer
+in product v1. ABI v4's encoded-depth contract is retained only for
+compatibility/research tests and cannot be mixed with v5 publication metadata.
+A failed producer remains unusable; CPU eye-image arrays, aliased colors,
+unstable metadata, incomplete GPU work, or missing render-local depth are
+explicit architecture failures.
 
 ## Weapon and UI Commit Rules
 
@@ -154,7 +154,8 @@ evidence is insufficient:
 - exact loaded-runtime identity/hash validation and both stock world branches;
 - deterministic center/center, then distinct-eye engine transactions with full
   state restoration and no resource aliasing;
-- GPU-native per-eye color and depth through D3D9Ex/D3D11/OpenXR;
+- GPU-native per-eye color through D3D9Ex/D3D11/OpenXR with validated
+  render-local per-eye depth/stencil; OpenXR depth submission is not a v1 gate;
 - authoritative weapon, muzzle, projectile/hit, recoil, and reload alignment;
 - UI entry/exit coverage with stable pointer input and no gameplay HUD;
 - signed translation X/Y/Z and yaw/pitch/roll evidence tied to the exact

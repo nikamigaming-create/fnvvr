@@ -229,6 +229,17 @@ using NiFreeFunction = void (FNVXR_RETAIL_CDECL*)(
     void* allocation,
     std::uint32_t byteCount);
 using NiCameraCreateFunction = RetailNiCameraLayout* (FNVXR_RETAIL_CDECL*)();
+// RenderFirstPerson is called through three sealed local E8 callsites in the
+// exact retail frame.  ECX carries the renderer-owned instance and the callee
+// pops the four dword stack arguments (`ret 0x10`).  The argument meanings are
+// intentionally opaque here: the stereo relay preserves and reuses the exact
+// stock call frame instead of synthesizing gameplay values.
+using RenderFirstPersonFunction = void (FNVXR_RETAIL_THISCALL*)(
+    void* rendererInstance,
+    std::uint32_t argument0,
+    std::uint32_t argument1,
+    std::uint32_t argument2,
+    std::uint32_t argument3);
 using BSCullingProcessConstructorFunction = RetailBSCullingProcessLayout*
     (FNVXR_RETAIL_THISCALL*)(
         RetailBSCullingProcessLayout* storage,
@@ -331,10 +342,30 @@ struct RetailFunctionAbiDescriptor
     std::uint8_t independentLoadedSamples = 0;
 };
 
-// Every callable range below matched in two independent loaded retail process
-// samples.  The second sample also captured the stock constructor call sites
-// and both world-branch/wrapper call frames, establishing the argument
-// semantics recorded here.  Runtime use still requires a synchronous match in
+// RenderFirstPerson has an exact ABI contract, but its body cannot join the
+// generic raw-hash inventory: the supported JIP compatibility module replaces
+// one local call inside that body.  The compatibility proof verifies its
+// normalized body separately before an authority is issued.  Keep the call
+// frame descriptor here so callers remain typed without accidentally making a
+// known normalized function fail the generic byte inventory.
+inline constexpr RetailFunctionAbiDescriptor RetailRenderFirstPersonAbi {
+    "RenderFirstPerson",
+    FirstPersonRenderAddress,
+    3361u,
+    sha256FromHex("7F734D69C1C74C2099BE684FB4FE682BF84B3F75A108F109CCF1DF74EF9D55F2"),
+    RetailX86CallingConvention::Thiscall,
+    4u,
+    16u,
+    true,
+    true,
+    true,
+    2u,
+};
+
+// Every generic callable range below matched in two independent loaded retail
+// process samples.  The second sample also captured the stock constructor call
+// sites and both world-branch/wrapper call frames, establishing the argument
+// semantics recorded here. Runtime use still requires a synchronous match in
 // the exact target process; this static inventory is never sufficient alone.
 inline constexpr std::array<RetailFunctionAbiDescriptor, 28>
     RetailFunctionAbiInventory {{

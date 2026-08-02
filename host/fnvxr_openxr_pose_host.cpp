@@ -1210,6 +1210,13 @@ HRESULT writeHeadsetMirrorPng(
         return E_INVALIDARG;
     }
 
+    // A supervised host can stop while WIC is flushing an eye image.  Encode
+    // to an owned sibling first and publish the final PNG only after every
+    // encoder handle is closed, so a partial image can never masquerade as a
+    // completed stereo pair in the launcher or recording pipeline.
+    const std::wstring temporaryPath = path + L".tmp";
+    static_cast<void>(DeleteFileW(temporaryPath.c_str()));
+
     const HeadsetMirrorPixelLayout sourceLayout = headsetMirrorPixelLayout(desc.Format);
     if (sourceLayout == HeadsetMirrorPixelLayout::Unsupported)
         return WINCODEC_ERR_UNSUPPORTEDPIXELFORMAT;
@@ -1277,7 +1284,9 @@ HRESULT writeHeadsetMirrorPng(
     ComPtr<IPropertyBag2> properties;
     result = factory->CreateStream(&stream);
     if (SUCCEEDED(result))
-        result = stream->InitializeFromFilename(path.c_str(), GENERIC_WRITE);
+        result = stream->InitializeFromFilename(
+            temporaryPath.c_str(),
+            GENERIC_WRITE);
     if (SUCCEEDED(result))
         result = factory->CreateEncoder(GUID_ContainerFormatPng, nullptr, &encoder);
     if (SUCCEEDED(result))
@@ -1308,7 +1317,27 @@ HRESULT writeHeadsetMirrorPng(
         result = frame->Commit();
     if (SUCCEEDED(result))
         result = encoder->Commit();
-    return result;
+    // Close WIC's source handle before the atomic same-volume rename.
+    frame.Reset();
+    properties.Reset();
+    encoder.Reset();
+    stream.Reset();
+    factory.Reset();
+    if (FAILED(result))
+    {
+        static_cast<void>(DeleteFileW(temporaryPath.c_str()));
+        return result;
+    }
+    if (!MoveFileExW(
+            temporaryPath.c_str(),
+            path.c_str(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+    {
+        const HRESULT moveError = HRESULT_FROM_WIN32(GetLastError());
+        static_cast<void>(DeleteFileW(temporaryPath.c_str()));
+        return moveError;
+    }
+    return S_OK;
 }
 
 std::wstring headsetMirrorFramePath(
@@ -9074,6 +9103,12 @@ int main(int argc, char** argv)
     }
 
     const HostMode mode = hostMode();
+    // The regular submit event is intentionally sampled.  A physical Phase 1
+    // evidence run needs one retained submit for every accepted engine-center
+    // transaction, but must not turn ordinary production logging into a
+    // per-frame firehose.
+    const bool phase1TraceTelemetry =
+        envEnabled("FNVXR_PHASE1_TRACE_TELEMETRY", false);
     std::cout << "hostMode=" << hostModeName(mode) << "\n";
     // Deliberately visible safety background: missing retail imagery must look
     // like an explicit host fallback, never an ambiguous black-screen hang.
@@ -9160,6 +9195,7 @@ int main(int argc, char** argv)
     fnvxr::host::gpu_color::RoutedContent previousGpuColorContent =
         fnvxr::host::gpu_color::RoutedContent::SafetyBlank;
     std::uint64_t previousGpuColorTransaction = 0u;
+    std::uint64_t lastPhase1TraceCpuTransaction = 0u;
     std::uint64_t activeGpuColorProducerEpoch = 0u;
     std::uint32_t activeGpuColorProducerProcessId = 0u;
     fnvxr::product::PresentationController presentationController;
@@ -11137,8 +11173,11 @@ int main(int argc, char** argv)
                     || cpuEngineUiQuadActive)
                 && displayGamePlane
                 && renderer.retainedUiTextureView;
+            // A demo recording is evidence for WorldStereo only. Retain no
+            // menu, splash, or fallback-quad frame merely because it happened
+            // to be visible while capture was enabled.
             const bool headsetMirrorCaptureEligible =
-                presentedBinocularWorld || cpuEngineStereoActive || uiQuadVisible;
+                presentedBinocularWorld || cpuEngineStereoActive;
             HeadsetMirrorCapture* const activeHeadsetMirrorCapture =
                 headsetMirrorCapture.enabled && headsetMirrorCaptureEligible
                 ? &headsetMirrorCapture
@@ -11292,6 +11331,51 @@ int main(int argc, char** argv)
             endInfo.layers = nullptr;
         }
         const XrResult endResult = xr.endFrame(session, &endInfo);
+        const std::uint64_t cpuEngineTransaction =
+            fnvxr::shared::sequencedValueBits(
+                renderer.stereoGameRenderPairSequence);
+        // Retain an exact engine-center-to-OpenXR join only after the runtime
+        // accepted the projection layer.  This remains separately opt-in and
+        // emits at most once per CPU-v8 transaction.
+        if (phase1TraceTelemetry
+            && endResult == XR_SUCCESS
+            && submitProjectionLayer
+            && cpuEngineStereoActive
+            && renderer.stereoProducerMode == static_cast<LONG>(
+                fnvxr::shared::StereoProducerEngineCenter)
+            && cpuEngineTransaction != 0u
+            && cpuEngineTransaction != lastPhase1TraceCpuTransaction)
+        {
+            lastPhase1TraceCpuTransaction = cpuEngineTransaction;
+            std::cout
+                << "{\"event\":\"fnvxrPhase1OpenXrEngineCenterSubmit\",\"frame\":"
+                << frameIndex
+                << ",\"cpuEngineStereoActive\":true"
+                << ",\"cpuEngineProducerMode\":"
+                << renderer.stereoProducerMode
+                << ",\"cpuEngineTransaction\":"
+                << cpuEngineTransaction
+                << ",\"sourceStereoSequence\":"
+                << renderer.stereoGameFrameSequence
+                << ",\"sourceRenderPairSequence\":"
+                << renderer.stereoGameRenderPairSequence
+                << ",\"sourcePoseSequence\":"
+                << renderer.stereoGamePoseSequence
+                << ",\"sourceReferenceSpaceGeneration\":"
+                << renderer.stereoReferenceSpaceGeneration
+                << ",\"sourcePoseProducerEpoch\":\""
+                << renderer.stereoProducerEpoch
+                << "\",\"sourceRendererProducerEpoch\":\""
+                << renderer.stereoRendererProducerEpoch
+                << "\",\"sourceProducerProcessId\":"
+                << renderer.stereoProducerProcessId
+                << ",\"sourceRenderedDisplayTime\":"
+                << renderer.stereoGameRenderedDisplayTime
+                << ",\"projectionLayerSubmitted\":true"
+                << ",\"xrEndFrame\":\"XR_SUCCESS\"}"
+                << "\n";
+            std::cout.flush();
+        }
         if (envEnabled("FNVXR_TELEMETRY_HAMMER", false)
             || frameIndex <= 12
             || frameIndex % 60 == 0

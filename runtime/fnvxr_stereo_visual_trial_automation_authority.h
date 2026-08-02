@@ -32,10 +32,10 @@ inline constexpr std::string_view FreshCharacterSetNameCommand =
     "player.SetName FNVXR_StereoTest";
 inline constexpr std::string_view FreshCharacterSaveCommand =
     "save FNVXR_StereoTest";
-// This is intentionally not a general MessageMenu capability.  It names the
-// four official pre-order pack notifications observed or expected from the
-// verified Goodsprings save's temporary official-master profile, and is used
-// only with a separate, explicit launcher opt-in.
+// This is intentionally not a general MessageMenu capability. It names only
+// the exact stock DLC notifications observed from the verified Goodsprings
+// fixture's temporary official-master profile, and is used only with a
+// separate, explicit launcher opt-in.
 struct OfficialPackNotification
 {
     std::string_view title {};
@@ -47,6 +47,12 @@ inline constexpr OfficialPackNotification OfficialPackNotifications[] = {
     { "Classic Pack", "Classic Pack items added to inventory." },
     { "Mercenary Pack", "Mercenary Pack items added to inventory." },
     { "Caravan Pack", "Caravan Pack items added to inventory." },
+    { "Gun Runners' Arsenal",
+      "The ongoing conflict in the Mojave Wasteland has kicked weapon "
+      "manufacturers into high gear! All major and minor weapon dealers in "
+      "the region are rolling in new weapons, ammunition types, and "
+      "modifications. Head to your nearest participating vendor to peruse "
+      "the merchandise!" },
 };
 inline constexpr std::string_view TribalPackNotificationText =
     OfficialPackNotifications[0].body;
