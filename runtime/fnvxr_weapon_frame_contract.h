@@ -57,4 +57,19 @@ inline bool transformMatches(
     }
     return true;
 }
+
+constexpr bool preserveCommittedPose(
+    std::uint32_t status,
+    std::uint32_t committedStatus,
+    std::uint32_t committedPoseSequence,
+    std::uint64_t committedPoseFrame,
+    std::uint32_t candidatePoseSequence,
+    std::uint64_t candidatePoseFrame,
+    bool candidateComplete) noexcept
+{
+    return !candidateComplete
+        && status == committedStatus
+        && committedPoseSequence == candidatePoseSequence
+        && committedPoseFrame == candidatePoseFrame;
+}
 }

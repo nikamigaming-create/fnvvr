@@ -2431,37 +2431,12 @@ bool consumeWeaponFrameForFirstPerson(
                 poseFrame,
                 snapshot.rightHandAddress,
                 snapshot.weaponAddress));
-        if (failure == 0u)
-        {
-            bool transformsMatch = true;
-            __try
-            {
-                constexpr std::uintptr_t WorldRotationOffset = 0x68u;
-                constexpr std::uintptr_t WorldTranslationOffset = 0x8Cu;
-                const float* hand = reinterpret_cast<const float*>(
-                    static_cast<std::uintptr_t>(snapshot.rightHandAddress)
-                        + WorldTranslationOffset);
-                const float* weaponPosition = reinterpret_cast<const float*>(
-                    static_cast<std::uintptr_t>(snapshot.weaponAddress)
-                        + WorldTranslationOffset);
-                const float* weaponRotation = reinterpret_cast<const float*>(
-                    static_cast<std::uintptr_t>(snapshot.weaponAddress)
-                        + WorldRotationOffset);
-                transformsMatch = fnvxr::weapon_frame::transformMatches(
-                        hand, snapshot.rightHandWorldPos, 3, 0.02f)
-                    && fnvxr::weapon_frame::transformMatches(
-                        weaponPosition, snapshot.weaponWorldPos, 3, 0.02f)
-                    && fnvxr::weapon_frame::transformMatches(
-                        weaponRotation, snapshot.weaponWorldRot, 9, 0.002f);
-            }
-            __except (EXCEPTION_EXECUTE_HANDLER)
-            {
-                transformsMatch = false;
-            }
-            if (!transformsMatch)
-                failure = static_cast<std::uint32_t>(
-                    fnvxr::weapon_frame::Failure::TransformOverwritten);
-        }
+        // The exact committed transform was applied before renderStereoWorld
+        // drew both eye targets. Fallout's later desktop animation callback is
+        // allowed to mutate the live scene tree before this publication seam;
+        // re-reading that mutable tree here rejects already-complete binocular
+        // pixels and produces the visible blink. Identity, required flags,
+        // pose sequence, pose frame, and node addresses remain mandatory.
     }
 
     SharedWeaponFrameState* state = gSharedWeaponFrame;

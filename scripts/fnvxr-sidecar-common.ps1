@@ -1155,6 +1155,9 @@ function Set-FnvxrSidecarEnvironment {
     $env:FNVXR_XINPUT_RIGHT_GRIP_MENU_ENABLE = "0"
     $env:FNVXR_XINPUT_GRIP_MENU_THRESHOLD = "0.55"
     $env:FNVXR_XINPUT_PHYSICAL_MENU_BUTTONS_ENABLE = "1"
+    # Fallout layer: left menu pauses by itself; left grip + left menu toggles
+    # the Pip-Boy. Both natural grips remain available for hand interaction.
+    $env:FNVXR_PIPBOY_MENU_CHORD_ENABLE = "1"
     # Meta's left menu/click remains the primary pause button. L3 is an
     # independent emergency Escape edge because the runtime can expose the
     # Touch Plus path as active while never reporting a value transition.

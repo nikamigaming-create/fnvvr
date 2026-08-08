@@ -725,6 +725,20 @@ if ([string]$physicalHeadsetEnvironment.FNVXR_RETAIL_VR_FIRST_PERSON_PRIVATE_CAL
     [string]$physicalHeadsetEnvironment.FNVXR_RETAIL_CENTER_INTEGRATED_FIRST_PERSON -cne "1") {
     throw "Physical headset play must select one product mode and the observed center-integrated publication seam."
 }
+if (-not $pluginSource.Contains(
+        'calibration.controllerToWristBodyLocal = configuredControllerToWristOffset(left);') -or
+    $pluginSource.Contains(
+        'calibration.controllerToWristBodyLocal = transformVec3(')) {
+    throw "Controller-owned wrist attachment must use the absolute tracked pose, not preserve the initial animated-hand gap."
+}
+if (-not $pluginSource.Contains(
+        '? weaponWorldPosition') -or
+    -not $pluginSource.Contains(
+        'pose.handLocalTranslation = readVec3(') -or
+    -not $pluginSource.Contains(
+        'pose.handLocalTranslation)')) {
+    throw "Physical weapon continuity must retain the tracked hand translation and keep the weapon attached as its child."
+}
 foreach ($retiredPhysicalSubfeatureFlag in @(
     "FNVXR_RETAIL_RIG_ENABLE",
     "FNVXR_RETAIL_RIG_APPLY",
@@ -1059,7 +1073,9 @@ foreach ($headsetDemoContract in @(
     '$left.Name -replace ''_left\.png$'', ''_right.png''',
     'Get-FnvxrProductStereoContinuityProof',
     'rejectedGameplaySubmitFrames',
-    '$rejectedGameplaySubmits.Count -ne 0',
+    '$transactions = [ordered]@{}',
+    '$gameplaySubmitFrames = 0',
+    'A rejected startup submit must',
     'FNVXR_STEREO_RETAIN_LAST_VALID_ON_REJECT = "1"',
     'FNVXR_STEREO_STALE_FRAME_LIMIT = "30"',
     'FNVXR_CPU_STEREO_MAX_SOURCE_POSE_AGE_MS = "250"',
@@ -1079,11 +1095,16 @@ foreach ($headsetDemoContract in @(
         throw "Product launcher lost headset demo/recording contract: $headsetDemoContract"
     }
 }
+if (-not (Get-Content -LiteralPath (Join-Path $SourceRoot `
+            "scripts\invoke-openxr-simulator-combat-demo.ps1") -Raw).Contains(
+        '$ticksPerShot = 15')) {
+    throw "The simulator combat harness must leave a full semi-auto animation/recovery window between confirmed shots."
+}
 foreach ($physicalPlayContract in @(
     'retail-vr-play-v1',
     'physical-headset-interactive-play',
-    '[ValidateRange(1280, 4096)][int]$PhysicalGameWidth = 1920',
-    '[ValidateRange(720, 2560)][int]$PhysicalGameHeight = 1200',
+    '[ValidateRange(1280, 4096)][int]$PhysicalGameWidth = 1600',
+    '[ValidateRange(720, 2560)][int]$PhysicalGameHeight = 1728',
     'FNVXR_PHYSICAL_HEADSET_PLAY = "1"',
     'FNVXR_PHASE1_TRACE_TELEMETRY = "1"',
     'FNVXR_PLUGIN_KEYBOARD_MOVEMENT_ENABLE = "1"',
@@ -1141,7 +1162,7 @@ if (([regex]::Matches(
 Require-Throws -Fragment "aspect" -Action {
     Assert-FnvxrProductPhysicalDisplaySize `
         -Width 1280 `
-        -Height 1100
+        -Height 2000
 }
 $poseProofLog = [System.IO.Path]::GetTempFileName()
 try {

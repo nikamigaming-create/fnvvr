@@ -9,8 +9,8 @@ param(
     [switch]$PhysicalHeadsetPlay,
     # Temporary per-eye retail source resolution for interactive headset play.
     # The user's Fallout INIs are backed up and restored byte-for-byte.
-    [ValidateRange(1280, 4096)][int]$PhysicalGameWidth = 1920,
-    [ValidateRange(720, 2560)][int]$PhysicalGameHeight = 1200,
+    [ValidateRange(1280, 4096)][int]$PhysicalGameWidth = 1600,
+    [ValidateRange(720, 2560)][int]$PhysicalGameHeight = 1728,
     # Optional workspace-staged Meta XR Operator API layer. It is observed
     # only: FNVXR neither starts its MCP proxy nor invokes pose/controller tools.
     [string]$MetaXrOperatorLayerDirectory = "",
@@ -576,7 +576,7 @@ if ($retailFixtureRequested) {
 }
 $physicalDisplayProfilePlan = [ordered]@{
     requested = [bool]$PhysicalHeadsetPlay
-    scope = "temporary 1920x1200-class retail source profile; both Fallout INIs are restored byte-for-byte after owned processes stop"
+    scope = "temporary headset-aspect retail source profile; both Fallout INIs are restored byte-for-byte after owned processes stop"
     size = $physicalDisplaySize
     paths = @(Get-FnvxrProductPhysicalDisplayIniPaths)
     status = if ($PhysicalHeadsetPlay) {
@@ -1034,7 +1034,7 @@ $manifest = [ordered]@{
     }
     headsetCombatVisualTrial = [ordered]@{
         requested = [bool]$HeadsetCombatVisualTrial
-        scope = "owned headless fixture only: smooth multi-target controller motion with gentle concurrent head look, fourteen shots to empty, one left-controller X reload, and two confirmation shots; no desktop, window, keyboard, mouse, or simulator UI control"
+        scope = "owned headless fixture only: smooth multi-target controller motion with gentle concurrent head look, thirteen shots to empty, one left-controller X reload, and two confirmation shots; no desktop, window, keyboard, mouse, or simulator UI control"
         status = if ($HeadsetCombatVisualTrial) { "pending-ready-weapon" } else { "disabled" }
         evidence = $null
     }
@@ -2121,19 +2121,37 @@ function Get-FnvxrProductStereoContinuityProof {
     if (-not (Test-Path -LiteralPath $LogPath -PathType Leaf)) {
         return $null
     }
+    # Certify a contiguous recovered window. A rejected startup submit must
+    # invalidate the candidate that contains it, but it must not poison every
+    # clean transaction that follows for the remainder of the process.
     $transactions = [ordered]@{}
     $poseSequences = @{}
-    $gameplaySubmits = New-Object System.Collections.Generic.List[object]
+    $first = $null
+    $last = $null
+    $gameplaySubmitFrames = 0
+    $qualifiedProof = $null
     foreach ($line in @(Get-Content -LiteralPath $LogPath -Tail 5000)) {
         if (-not $line.StartsWith('{"event":"fnvxrOpenXrSubmit"')) {
             continue
         }
         try {
             $frame = $line | ConvertFrom-Json -ErrorAction Stop
-            if ([bool]$frame.runtimeGameplay -and
-                [bool]$frame.runtimeShouldRender) {
-                $gameplaySubmits.Add($frame)
+            if (-not ([bool]$frame.runtimeGameplay -and
+                    [bool]$frame.runtimeShouldRender)) {
+                continue
             }
+            if (-not [bool]$frame.projectionLayerSubmitted -or
+                [int]$frame.layerCount -ne 1 -or
+                [string]$frame.xrEndFrame -ne "XR_SUCCESS") {
+                $transactions = [ordered]@{}
+                $poseSequences = @{}
+                $first = $null
+                $last = $null
+                $gameplaySubmitFrames = 0
+                $qualifiedProof = $null
+                continue
+            }
+            ++$gameplaySubmitFrames
             $proof = ConvertTo-FnvxrProductStereoOutputProof -Frame $frame
             if (-not $proof) { continue }
             $transactionKey = "{0}:{1}" -f
@@ -2143,47 +2161,35 @@ function Get-FnvxrProductStereoContinuityProof {
                 $transactions[$transactionKey] = $proof
             }
             $poseSequences[[string]$proof.poseSequence] = $true
+            if (-not $first) { $first = $proof }
+            $last = $proof
+            if ($transactions.Count -lt $MinimumTransactions -or
+                $poseSequences.Count -lt $MinimumTransactions) {
+                continue
+            }
+            $durationMilliseconds =
+                [uint64]$last.hostWallClockUnixMilliseconds -
+                [uint64]$first.hostWallClockUnixMilliseconds
+            if ($durationMilliseconds -lt $MinimumDurationMilliseconds -or
+                [uint64]$last.frame -le [uint64]$first.frame -or
+                $gameplaySubmitFrames -lt $MinimumTransactions) {
+                continue
+            }
+            $qualifiedProof = [ordered]@{
+                uniqueTransactions = $transactions.Count
+                uniquePoseSequences = $poseSequences.Count
+                durationMilliseconds = $durationMilliseconds
+                gameplaySubmitFrames = $gameplaySubmitFrames
+                rejectedGameplaySubmitFrames = 0
+                first = $first
+                last = $last
+                observedAtUtc = [DateTime]::UtcNow.ToString("o")
+            }
         } catch {
             continue
         }
     }
-    if ($transactions.Count -lt $MinimumTransactions -or
-        $poseSequences.Count -lt $MinimumTransactions) {
-        return $null
-    }
-    $proofs = @($transactions.Values)
-    $first = $proofs[0]
-    $last = $proofs[$proofs.Count - 1]
-    $durationMilliseconds =
-        [uint64]$last.hostWallClockUnixMilliseconds -
-        [uint64]$first.hostWallClockUnixMilliseconds
-    if ($durationMilliseconds -lt $MinimumDurationMilliseconds -or
-        [uint64]$last.frame -le [uint64]$first.frame) {
-        return $null
-    }
-    $windowSubmits = @($gameplaySubmits | Where-Object {
-            [uint64]$_.frame -ge [uint64]$first.frame -and
-            [uint64]$_.frame -le [uint64]$last.frame
-        })
-    $rejectedGameplaySubmits = @($windowSubmits | Where-Object {
-            -not [bool]$_.projectionLayerSubmitted -or
-            [int]$_.layerCount -ne 1 -or
-            [string]$_.xrEndFrame -ne "XR_SUCCESS"
-        })
-    if ($windowSubmits.Count -lt $MinimumTransactions -or
-        $rejectedGameplaySubmits.Count -ne 0) {
-        return $null
-    }
-    return [ordered]@{
-        uniqueTransactions = $transactions.Count
-        uniquePoseSequences = $poseSequences.Count
-        durationMilliseconds = $durationMilliseconds
-        gameplaySubmitFrames = $windowSubmits.Count
-        rejectedGameplaySubmitFrames = $rejectedGameplaySubmits.Count
-        first = $first
-        last = $last
-        observedAtUtc = [DateTime]::UtcNow.ToString("o")
-    }
+    return $qualifiedProof
 }
 
 function Get-FnvxrProductPipBoyOutputProof {

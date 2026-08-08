@@ -51,7 +51,7 @@ foreach(required IN ITEMS
     "bool ensureAuthorizedTrackedPropAssistBridgeStarted()"
     "void processTrackedPropAssistMainLoop"
     "captureTrackedPropAssistRigOrigin"
-    "first-person-rig-root-at-latch"
+    "first-person-camera-at-latch"
     "right-grip-or-aim-not-current"
     "projectile=0 hit=0 renderer=0 replay=0 openxr=0")
     require_source_text(

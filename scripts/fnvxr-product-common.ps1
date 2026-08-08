@@ -371,8 +371,11 @@ function Assert-FnvxrProductPhysicalDisplaySize {
     )
 
     $aspect = [double]$Width / [double]$Height
-    if ($aspect -lt 1.25 -or $aspect -gt 2.0) {
-        throw "Physical-play source aspect must be between 1.25 and 2.0: ${Width}x${Height}"
+    # Headset projection views are close to square (the attached Quest run
+    # reported 1872x2016 per eye).  Accept headset-shaped sources as well as
+    # desktop-shaped diagnostic sources; reject only extreme aspect ratios.
+    if ($aspect -lt 0.80 -or $aspect -gt 2.0) {
+        throw "Physical-play source aspect must be between 0.80 and 2.0: ${Width}x${Height}"
     }
     return [pscustomobject][ordered]@{
         width = $Width
@@ -2155,8 +2158,8 @@ function Get-FnvxrProductMinimalEnvironment {
         [switch]$HeadsetControllerRigVisualTrial,
         [switch]$HeadsetCombatVisualTrial,
         [switch]$PhysicalHeadsetPlay,
-        [ValidateRange(1280, 4096)][int]$PhysicalGameWidth = 1920,
-        [ValidateRange(720, 2560)][int]$PhysicalGameHeight = 1200,
+        [ValidateRange(1280, 4096)][int]$PhysicalGameWidth = 1600,
+        [ValidateRange(720, 2560)][int]$PhysicalGameHeight = 1728,
         [ValidateRange(1, 1200)]
         [int]$HeadsetDemoGameplayWarmupFrames = 90,
         [ValidateSet(

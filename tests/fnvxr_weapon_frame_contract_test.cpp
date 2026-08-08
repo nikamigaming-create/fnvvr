@@ -47,5 +47,14 @@ int main()
     if (fnvxr::weapon_frame::transformMatches(
             invalidTransform, committedTransform, 3, 0.02f))
         return fail();
+    if (!fnvxr::weapon_frame::preserveCommittedPose(
+            committed, committed, 42u, 900u, 42u, 900u, false))
+        return fail();
+    if (fnvxr::weapon_frame::preserveCommittedPose(
+            committed, committed, 42u, 900u, 44u, 901u, false))
+        return fail();
+    if (fnvxr::weapon_frame::preserveCommittedPose(
+            committed, committed, 42u, 900u, 42u, 900u, true))
+        return fail();
     return 0;
 }

@@ -15,6 +15,7 @@
 #include "fnvxr_headset_demo_authority.h"
 #include "fnvxr_physical_input_authority.h"
 #include "fnvxr_stereo_visual_trial_automation_authority.h"
+#include "fnvxr_weapon_frame_contract.h"
 
 #include <windows.h>
 #include <dbghelp.h>
@@ -462,11 +463,10 @@ struct RetailHandCalibration
 {
     bool valid {};
     bool usesAimOrientation {};
-    // The headless stage-local fixture begins with a controller coordinate
-    // origin that is intentionally unrelated to Gamebryo's first-person
-    // wrist. Keep that one-time positional difference in the body frame, so
-    // later controller translations move the real wrist by the same delta
-    // without turning a controller rotation into a large orbital motion.
+    // Controller-owned rigs place the wrist from the controller's absolute
+    // pose in the recentered body frame.  Never retain the stock wrist's
+    // initial gap from the controller: doing so cancels the absolute pose and
+    // reduces tracking to a small delta sphere around the stock animation.
     bool usesStageLocalBodyPositionAnchor {};
     Matrix33 controllerToHandRotation {};
     Vec3 controllerToWristLocal {};
@@ -495,6 +495,7 @@ struct RetailRigContinuityPose
     Matrix33 upperArmLocalRotation {};
     Matrix33 forearmLocalRotation {};
     Matrix33 handLocalRotation {};
+    Vec3 handLocalTranslation {};
     Matrix33 weaponLocalRotation {};
     Vec3 weaponLocalTranslation {};
     float weaponLocalScale {};
@@ -6116,21 +6117,28 @@ bool captureTrackedPropAssistRigOrigin(
     const float bodyWorldScale = readFloat(
         bodyBase + NiAvObjectWorldScaleOffset,
         0.0f);
-    const Vec3 firstPersonRigRootWorld = readVec3(
-        rigBase + NiAvObjectWorldTranslationOffset);
+    void* firstPersonCamera = readPointer(Camera1stNodeAddress);
+    const bool firstPersonCameraUsable = firstPersonCamera
+        && looksLikeNiObject(firstPersonCamera);
+    const Vec3 controllerAnchorWorld = firstPersonCameraUsable
+        ? readVec3(
+            reinterpret_cast<std::uintptr_t>(firstPersonCamera)
+                + NiAvObjectWorldTranslationOffset)
+        : readVec3(rigBase + NiAvObjectWorldTranslationOffset);
     if (!finiteMatrix33(bodyWorldRotation)
         || !finiteVec3(bodyWorldPosition)
-        || !finiteVec3(firstPersonRigRootWorld)
+        || !finiteVec3(controllerAnchorWorld)
         || !std::isfinite(bodyWorldScale)
         || std::fabs(bodyWorldScale) < 0.0001f)
     {
         return false;
     }
 
-    // Latch the first-person rig's engine-authored place in the body frame
-    // once.  Later controller targets are derived from that body anchor, not
-    // from the current camera/HMD transform, so head movement cannot drag the
-    // weapon along after this point.
+    // Latch Fallout's engine-authored first-person camera height in the body
+    // frame once. Controller poses are recentered around the HMD, so anchoring
+    // them at the rig root placed an absolute tracked hand at the player's
+    // feet. The one-time Camera1st anchor keeps seated and standing hands in
+    // view without allowing later HMD motion to drag the weapon.
     g_retailRigOriginHmdRot = normalizeQuat(pose.hmdRot);
     g_retailRigOriginHmdPos = pose.hmdPos;
     g_retailRigReferenceSpaceGeneration = pose.referenceSpaceGeneration;
@@ -6143,7 +6151,7 @@ bool captureTrackedPropAssistRigOrigin(
         : RetailRigOriginSource::TrackedPropAssist;
     g_retailRigBodyAnchorLocal = transformVec3(
         transposeMatrix33(bodyWorldRotation),
-        subtractVec3(firstPersonRigRootWorld, bodyWorldPosition));
+        subtractVec3(controllerAnchorWorld, bodyWorldPosition));
     g_retailRigBodyAnchorLocal = scaleVec3(
         g_retailRigBodyAnchorLocal,
         1.0f / bodyWorldScale);
@@ -6152,7 +6160,7 @@ bool captureTrackedPropAssistRigOrigin(
 
     g_haveRetailRigOrigin = true;
     logTelemetry(
-        "retailRigVisualTrial origin latched seq=%ld frame=%llu referenceGeneration=%lu hmdPos=(%.4f %.4f %.4f) bodyRoot=%p firstPersonRigRoot=%p bodyAnchorLocal=(%.3f %.3f %.3f) anchorSource=first-person-rig-root-at-latch originSource=%s projectile=0 input=0 renderer=0 headlessStereo=%d\n",
+        "retailRigVisualTrial origin latched seq=%ld frame=%llu referenceGeneration=%lu hmdPos=(%.4f %.4f %.4f) bodyRoot=%p firstPersonRigRoot=%p bodyAnchorLocal=(%.3f %.3f %.3f) anchorSource=%s originSource=%s projectile=0 input=0 renderer=0 headlessStereo=%d\n",
         pose.sequence,
         static_cast<unsigned long long>(pose.frame),
         static_cast<unsigned long>(pose.referenceSpaceGeneration),
@@ -6164,6 +6172,9 @@ bool captureTrackedPropAssistRigOrigin(
         g_retailRigBodyAnchorLocal.x,
         g_retailRigBodyAnchorLocal.y,
         g_retailRigBodyAnchorLocal.z,
+        firstPersonCameraUsable
+            ? "first-person-camera-at-latch"
+            : "first-person-rig-root-fallback",
         headlessStereoRigVisualTrial
             ? "headless-stereo-rig-body"
             : "tracked-prop-assist-body",
@@ -6491,9 +6502,12 @@ void ensureRetailHandCalibration(
         || physicalHeadsetEngineCenterRigRequested();
     if (bodyAnchoredControllerRig)
     {
-        calibration.controllerToWristBodyLocal = transformVec3(
-            transposeMatrix33(bodyWorldRotation),
-            subtractVec3(handWorldPosition, controller.wristPosition));
+        // The controller position is already an absolute, meter-scaled pose
+        // in the stable body frame.  Only an explicit ergonomic offset may be
+        // added here.  Calibrating from the animated hand would preserve a
+        // seated/standing-dependent gap and leave the hand orbiting the stock
+        // first-person pose instead of attaching it to the tracked wrist.
+        calibration.controllerToWristBodyLocal = configuredControllerToWristOffset(left);
         calibration.usesStageLocalBodyPositionAnchor =
             finiteVec3(calibration.controllerToWristBodyLocal);
     }
@@ -6522,7 +6536,7 @@ void ensureRetailHandCalibration(
         calibration.controllerToWristBodyLocal.y,
         calibration.controllerToWristBodyLocal.z,
         calibration.usesStageLocalBodyPositionAnchor
-            ? "stage-local-body"
+            ? "absolute-controller-body"
             : "controller-local",
         envEnabled("FNVXR_RETAIL_RIG_AUTO_CALIBRATE_POSITION", false) ? 1 : 0);
 }
@@ -6740,7 +6754,6 @@ struct RetailWeaponApplyResult
 
 RetailWeaponApplyResult applyRetailWeaponAim(
     const RetailControllerWorldPose& controller,
-    const Matrix33& bodyWorldRotation,
     bool applyWrites)
 {
     RetailWeaponApplyResult result {};
@@ -6793,13 +6806,13 @@ RetailWeaponApplyResult applyRetailWeaponAim(
             subtractVec3(weaponWorldPosition, controller.position));
         if (bodyAnchoredControllerRig)
         {
-            g_retailWeaponCalibration.controllerToWeaponBodyLocal =
-                transformVec3(
-                    transposeMatrix33(bodyWorldRotation),
-                    subtractVec3(weaponWorldPosition, controller.position));
-            g_retailWeaponCalibration.usesStageLocalBodyPositionAnchor =
-                finiteVec3(
-                    g_retailWeaponCalibration.controllerToWeaponBodyLocal);
+            // The weapon is a child of the tracked hand.  Its translation is
+            // therefore inherited from the newly attached hand, while this
+            // lane owns only the aim rotation.  Preserving the initial
+            // weapon/controller gap was the same delta-only calibration bug
+            // as the wrist path (149 units in the first physical recording).
+            g_retailWeaponCalibration.controllerToWeaponBodyLocal = {};
+            g_retailWeaponCalibration.usesStageLocalBodyPositionAnchor = true;
         }
         g_retailWeaponCalibration.valid = finiteMatrix33(
                 g_retailWeaponCalibration.controllerToWeaponRotation)
@@ -6823,7 +6836,7 @@ RetailWeaponApplyResult applyRetailWeaponAim(
             g_retailWeaponCalibration.controllerToWeaponBodyLocal.y,
             g_retailWeaponCalibration.controllerToWeaponBodyLocal.z,
             g_retailWeaponCalibration.usesStageLocalBodyPositionAnchor
-                ? "stage-local-body"
+                ? "tracked-hand-child"
                 : "controller-local",
             endpointAxisCalibration ? 1 : 0,
             endpoint);
@@ -6836,11 +6849,9 @@ RetailWeaponApplyResult applyRetailWeaponAim(
         g_retailWeaponCalibration.controllerToWeaponRotation);
     const Vec3 desiredWorldPosition =
         g_retailWeaponCalibration.usesStageLocalBodyPositionAnchor
-        ? addVec3(
-            controller.position,
-            transformVec3(
-                bodyWorldRotation,
-                g_retailWeaponCalibration.controllerToWeaponBodyLocal))
+        // applyRetailArmFabrik has already updated the hand and propagated
+        // its child transforms. Retain that attached weapon translation.
+        ? weaponWorldPosition
         : addVec3(
             controller.position,
             transformVec3(
@@ -7113,6 +7124,8 @@ void captureRetailRigContinuityPose()
         reinterpret_cast<std::uintptr_t>(arm.forearm) + NiAvObjectLocalRotationOffset);
     pose.handLocalRotation = readMatrix33(
         reinterpret_cast<std::uintptr_t>(arm.hand) + NiAvObjectLocalRotationOffset);
+    pose.handLocalTranslation = readVec3(
+        reinterpret_cast<std::uintptr_t>(arm.hand) + NiAvObjectLocalTranslationOffset);
     pose.weaponLocalRotation = readMatrix33(
         reinterpret_cast<std::uintptr_t>(weapon) + NiAvObjectLocalRotationOffset);
     pose.weaponLocalTranslation = readVec3(
@@ -7123,6 +7136,7 @@ void captureRetailRigContinuityPose()
     pose.valid = finiteMatrix33(pose.upperArmLocalRotation)
         && finiteMatrix33(pose.forearmLocalRotation)
         && finiteMatrix33(pose.handLocalRotation)
+        && finiteVec3(pose.handLocalTranslation)
         && finiteMatrix33(pose.weaponLocalRotation)
         && finiteVec3(pose.weaponLocalTranslation)
         && std::isfinite(pose.weaponLocalScale)
@@ -7154,6 +7168,9 @@ bool replayRetailRigContinuityPose()
         && writeMatrix33(
             reinterpret_cast<std::uintptr_t>(arm.hand) + NiAvObjectLocalRotationOffset,
             pose.handLocalRotation)
+        && writeVec3(
+            reinterpret_cast<std::uintptr_t>(arm.hand) + NiAvObjectLocalTranslationOffset,
+            pose.handLocalTranslation)
         && writeMatrix33(
             reinterpret_cast<std::uintptr_t>(pose.weapon) + NiAvObjectLocalRotationOffset,
             pose.weaponLocalRotation)
@@ -7248,7 +7265,7 @@ void publishWeaponFrameCommit(
     const Matrix33& weaponWorldRotation)
 {
     SharedWeaponFrameState* state = sharedWeaponFrameState();
-    if (!state || !fnvxr::shared::beginSequencedSharedWrite(state->producerSequence))
+    if (!state)
         return;
     UInt32 flags = 0;
     if (rightControllerUsable)
@@ -7270,6 +7287,38 @@ void publishWeaponFrameCommit(
         && finiteVec3(rightHandWorld)
         && finiteVec3(weaponWorld)
         && finiteMatrix33(weaponWorldRotation);
+    // Fallout invokes the animation seam more than once for one OpenXR pose.
+    // A later cull/stock callback can temporarily hide the arm branch after an
+    // earlier callback already committed the exact current controller pose.
+    // Do not let that transient callback erase the valid same-pose handoff
+    // before the first-person renderer consumes it. A genuinely newer pose
+    // still has to produce a new complete commit.
+    const LONG publishedSequence = InterlockedCompareExchange(
+        &state->producerSequence, 0, 0);
+    if (fnvxr::shared::sequencedValueIsPublished(publishedSequence))
+    {
+        MemoryBarrier();
+        const UInt32 publishedStatus = state->status;
+        const UInt32 publishedPoseSequence = state->poseSequence;
+        const UInt64 publishedPoseFrame = state->poseFrame;
+        MemoryBarrier();
+        const LONG confirmedSequence = InterlockedCompareExchange(
+            &state->producerSequence, 0, 0);
+        if (publishedSequence == confirmedSequence
+            && fnvxr::weapon_frame::preserveCommittedPose(
+                publishedStatus,
+                fnvxr::shared::WeaponFramePoseCommitted,
+                publishedPoseSequence,
+                publishedPoseFrame,
+                static_cast<UInt32>(pose.sequence),
+                pose.frame,
+                complete))
+        {
+            return;
+        }
+    }
+    if (!fnvxr::shared::beginSequencedSharedWrite(state->producerSequence))
+        return;
     state->magic = fnvxr::shared::WeaponFrameSharedMagic;
     state->version = fnvxr::shared::WeaponFrameSharedVersion;
     state->status = complete
@@ -7600,7 +7649,6 @@ void onRetailPostAnimation(void* animData)
     RetailWeaponApplyResult weaponResult = rightControllerUsable
         ? applyRetailWeaponAim(
             rightController,
-            bodyWorldRotation,
             applyWrites)
         : RetailWeaponApplyResult {};
     bool continuityReplayed = false;
@@ -11809,13 +11857,24 @@ LONG externalDInputRightGrip()
     return readSharedDInputSnapshot(snapshot) ? static_cast<LONG>(snapshot.rightGrip) : 0;
 }
 
+bool externalLeftGripHeld()
+{
+    if (!externalDInputSharedReady())
+        return false;
+
+    const float threshold = std::clamp(
+        getFloatFromEnv("FNVXR_PIPBOY_GRIP_THRESHOLD", 0.55f),
+        0.0f,
+        1.0f);
+    return externalDInputLeftGrip() > sharedStickValue(threshold);
+}
+
 bool externalLeftGripPipBoyHeld()
 {
     if (!envEnabled("FNVXR_LEFT_GRIP_PIPBOY_MODE", false) || !externalDInputSharedReady())
         return false;
 
-    const float threshold = std::clamp(getFloatFromEnv("FNVXR_PIPBOY_GRIP_THRESHOLD", 0.55f), 0.0f, 1.0f);
-    return externalDInputLeftGrip() > sharedStickValue(threshold);
+    return externalLeftGripHeld();
 }
 
 float rightGripMenuThreshold()
@@ -12103,6 +12162,12 @@ void consumeExternalXInputGameplayControls(
         && leftTriggerHeld
         && (pressed & XInputBack) != 0
         && envEnabled("FNVXR_GAMEPLAY_WAIT_CHORD_ENABLE", true);
+    const bool pipBoyMenuChordPressed =
+        keyboardGameplayFallback
+        && !leftTriggerHeld
+        && externalLeftGripHeld()
+        && (pressed & XInputBack) != 0
+        && envEnabled("FNVXR_PIPBOY_MENU_CHORD_ENABLE", true);
     const UInt16 combatChordPressed = combatChordHeld ? pressed : 0;
     const bool combatChordFaceHeld =
         combatChordHeld
@@ -12256,6 +12321,14 @@ void consumeExternalXInputGameplayControls(
     if (waitChordPressed)
     {
         tapWaitKey("externalXInput:LT+Back", frame);
+    }
+    else if (pipBoyMenuChordPressed)
+    {
+        tapDirectInputKey(DIK_TAB);
+        logTelemetry(
+            "pipboyToggle fire frame=%llu source=externalXInput:LG+LeftMenu key=0x%02lx gameplay=1\n",
+            static_cast<unsigned long long>(frame),
+            static_cast<unsigned long>(DIK_TAB));
     }
     else if (keyboardGameplayFallback && (pressed & XInputBack))
     {
@@ -12574,6 +12647,10 @@ void consumeExternalXInputBridge(
     }
 
     const UInt16 pressed = state.buttons & ~g_lastExternalXInputButtons;
+    const bool pipBoyMenuChordPressed =
+        externalLeftGripHeld()
+        && (pressed & XInputBack) != 0
+        && envEnabled("FNVXR_PIPBOY_MENU_CHORD_ENABLE", true);
     const UInt32 navMask = uiInputAllowed ? externalXInputNavMask(state, menuBits) : 0;
     const UInt64 nowMs = GetTickCount64();
     const bool navChanged = navMask != 0 && navMask != g_lastExternalXInputNavMask;
@@ -12773,7 +12850,16 @@ void consumeExternalXInputBridge(
                 postMenuKey(hwnd, uiInputAllowed ? VK_RETURN : uiBackVirtualKeyForMenu(menuBits));
         }
     }
-    if (menuKeyboardFallback && uiInputAllowed && (pressed & XInputBack))
+    if (menuKeyboardFallback && uiInputAllowed && pipBoyMenuChordPressed)
+    {
+        tapDirectInputKey(DIK_TAB);
+        logTelemetry(
+            "pipboyToggle fire frame=%llu source=externalXInput:LG+LeftMenu key=0x%02lx ui=1 menuBits=0x%02lx\n",
+            static_cast<unsigned long long>(externalDInputFrame()),
+            static_cast<unsigned long>(DIK_TAB),
+            static_cast<unsigned long>(menuBits));
+    }
+    else if (menuKeyboardFallback && uiInputAllowed && (pressed & XInputBack))
     {
         // The physical left Quest/Oculus menu button is the one reliable
         // Fallout pause-menu escape hatch. Keep it independent from the

@@ -44,7 +44,13 @@ $commands = 0
 # Hold each trigger edge long enough for the retail input/animation pipeline
 # and leave a full semi-auto recovery interval between shots. The old two-tick
 # pulse was acknowledged by IPC but was too short to remain visible in-game.
-$ticksPerShot = 9
+# A force-fire acknowledgement precedes the animation/ammo commit. At the old
+# 750 ms edge spacing the next edge could arrive while the semi-auto animation
+# still owned the weapon; telemetry then showed duplicate loadedBefore values
+# even though both input edges reached HighProcess. Give every shot a complete
+# 1.25 s fire/animation/recovery window so the following edge is also an
+# engine-level confirmation that the prior round was consumed.
+$ticksPerShot = 15
 $triggerHeldTicks = 4
 $reloadTicks = 24
 $settleTicks = 10

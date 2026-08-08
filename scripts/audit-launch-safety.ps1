@@ -857,6 +857,8 @@ Require-Text -Path $commonScript -Text 'player.equipitem 000E3778' -Reason "The 
 Require-Text -Path $commonScript -Text 'FNVXR_GAMEPLAY_RIGHT_GRIP_GRAB_ENABLE = "1"' -Reason "Plain right grip must hold the native object grab lane in gameplay"
 Require-Text -Path $commonScript -Text 'FNVXR_GAMEPLAY_GRAB_DIK = "44"' -Reason "Gameplay object grab must default to the native Z DirectInput key"
 Require-Text -Path $commonScript -Text 'FNVXR_LEFT_GRIP_COMBAT_CHORD_SUPPRESSES_PIPBOY = "1"' -Reason "Left grip must become a protected combat modifier whenever LT is held instead of toggling Pip-Boy"
+Require-Text -Path $commonScript -Text 'FNVXR_PIPBOY_MENU_CHORD_ENABLE = "1"' -Reason "Physical play must expose an intentional left-grip plus left-menu Pip-Boy chord"
+Require-Text -Path $pluginCode -Text 'source=externalXInput:LG+LeftMenu' -Reason "The Pip-Boy chord must inject and telemeter the Fallout Tab action"
 Require-Text -Path $commonScript -Text 'FNVXR_RIGHT_GRIP_COMBAT_CHORD_SUPPRESSES_MENU = "1"' -Reason "Right grip must become a VATS modifier whenever LT is held instead of opening the regular menu"
 Require-Text -Path $commonScript -Text 'FNVXR_GAMEPLAY_STIMPAK_DIK = "2"' -Reason "Protected heal must use native favorite slot 1"
 Require-Text -Path $commonScript -Text 'FNVXR_GAMEPLAY_AMMO_SWAP_DIK = "3"' -Reason "Ammo swap must use the retail New Vegas ammo-swap key, DIK_2"
