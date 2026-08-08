@@ -24,6 +24,28 @@ inline constexpr char VrOriginSharedMappingName[] = "Local\\FNVXR_VR_Origin_Stat
 constexpr std::uint32_t VrOriginStateInvalid = 0;
 constexpr std::uint32_t VrOriginStateRenderLease = 1;
 constexpr std::uint32_t VrOriginStateCommitted = 2;
+// One producer (xNVSE post-animation) publishes the controller-driven
+// first-person rig, and one consumer (the D3D9 first-person seam) acknowledges
+// that exact commit.  Keeping this separate from camera/origin state prevents
+// unrelated stereo and weapon events from being joined into a false proof.
+constexpr std::uint32_t WeaponFrameSharedMagic = 0x57585646; // FVXW
+constexpr std::uint32_t WeaponFrameSharedVersion = 1;
+inline constexpr char WeaponFrameSharedMappingName[] =
+    "Local\\FNVXR_Weapon_Frame_v1";
+constexpr std::uint32_t WeaponFrameInvalid = 0;
+constexpr std::uint32_t WeaponFramePoseCommitted = 1;
+constexpr std::uint32_t WeaponFrameRenderConsumed = 2;
+constexpr std::uint32_t WeaponFramePresented = 3;
+constexpr std::uint32_t WeaponFrameFlagRightGripCurrent = 1u << 0;
+constexpr std::uint32_t WeaponFrameFlagRightAimCurrent = 1u << 1;
+constexpr std::uint32_t WeaponFrameFlagArmSolved = 1u << 2;
+constexpr std::uint32_t WeaponFrameFlagWeaponWritten = 1u << 3;
+constexpr std::uint32_t WeaponFrameFlagWeaponAligned = 1u << 4;
+constexpr std::uint32_t WeaponFrameRequiredFlags =
+    WeaponFrameFlagRightGripCurrent
+    | WeaponFrameFlagRightAimCurrent
+    | WeaponFrameFlagArmSolved
+    | WeaponFrameFlagWeaponWritten;
 constexpr std::uint32_t CameraSharedMagic = 0x43585646; // FNXC
 constexpr std::uint32_t CameraSharedVersion = 1;
 // This mapping exists only for the deliberately narrow desktop-assist camera
@@ -593,6 +615,34 @@ struct SharedVrOriginState
     std::uint32_t reserved2;
 };
 
+struct SharedWeaponFrameState
+{
+    std::uint32_t magic;
+    std::uint32_t version;
+    // Producer lane. Only xNVSE writes fields through weaponWorldRot.
+    volatile LONG producerSequence;
+    std::uint32_t status;
+    std::uint64_t commitId;
+    std::uint32_t poseSequence;
+    std::uint32_t referenceSpaceGeneration;
+    std::uint64_t poseFrame;
+    std::uint64_t producerEpoch;
+    std::uint32_t flags;
+    std::uint32_t rootAddress;
+    std::uint32_t rightHandAddress;
+    std::uint32_t weaponAddress;
+    float rightHandWorldPos[3];
+    float weaponWorldPos[3];
+    float weaponWorldRot[9];
+    // Consumer lane. Only the D3D9 first-person seam writes this lane.
+    volatile LONG consumerSequence;
+    std::uint32_t consumedStatus;
+    std::uint64_t consumedCommitId;
+    std::uint32_t consumedPoseSequence;
+    std::uint32_t consumerFailure;
+    std::uint64_t consumedPoseFrame;
+};
+
 struct SharedCameraState
 {
     std::uint32_t magic;
@@ -805,6 +855,7 @@ static_assert(sizeof(SharedXInputState) == 32, "SharedXInputState layout changed
 static_assert(sizeof(SharedDInputState) == 100, "SharedDInputState layout changed unexpectedly");
 static_assert(sizeof(SharedVrPoseState) == 288, "SharedVrPoseState layout changed unexpectedly");
 static_assert(sizeof(SharedVrOriginState) == 216, "SharedVrOriginState layout changed unexpectedly");
+static_assert(sizeof(SharedWeaponFrameState) == 160, "SharedWeaponFrameState layout changed unexpectedly");
 static_assert(sizeof(SharedCameraState) == 80, "SharedCameraState layout changed");
 static_assert(sizeof(SharedRuntimeState) == 88, "SharedRuntimeState layout changed");
 static_assert(sizeof(SharedDesktopAssistUiQuadHeader) == 96, "SharedDesktopAssistUiQuadHeader layout changed");

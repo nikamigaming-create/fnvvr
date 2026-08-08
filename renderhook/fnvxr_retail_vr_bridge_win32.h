@@ -88,6 +88,11 @@ struct RetailVrBridgeOperations
     // xNVSE publishes the authoritative gameplay + weapon-out state.  The
     // outer first-person lease stays stock until that state is stable.
     bool (*firstPersonGameplayLeaseReady)(void*) noexcept = nullptr;
+    // The controller rig is finalized against this exact tracked frame at
+    // the renderer preparation boundary, after stock animation and before
+    // either eye traverses the first-person branch.
+    bool (*prepareControllerRigForRender)(
+        void*, const engine::RetailTrackedFrame&) noexcept = nullptr;
     bool (*prepareDistinctCameraFrame)(
         void*,
         const engine::RetailWorldAccumulationCallFrame&,
@@ -635,6 +640,34 @@ public:
             && mPendingFirstPerson.publicationStaged
             && mPendingFirstPerson.threadId == GetCurrentThreadId()
             && callerId != 0u;
+    }
+
+    std::uint32_t pendingFirstPersonPoseSequence() const noexcept
+    {
+        return firstPersonPublicationPendingForCurrentThread(1u)
+            ? mPendingFirstPerson.tracked.poseSequence : 0u;
+    }
+
+    std::uint64_t pendingFirstPersonPoseFrame() const noexcept
+    {
+        return firstPersonPublicationPendingForCurrentThread(1u)
+            ? mPendingFirstPerson.tracked.pose.frame : 0u;
+    }
+
+    bool preparePendingControllerRigForRender() noexcept
+    {
+        return firstPersonPublicationPendingForCurrentThread(1u)
+            && (!mOperations.prepareControllerRigForRender
+                || mOperations.prepareControllerRigForRender(
+                    mOperations.context,
+                    mPendingFirstPerson.tracked));
+    }
+
+    void discardPendingFirstPerson() noexcept
+    {
+        mPendingFirstPerson = {};
+        mDeferredFirstPerson = {};
+        mFrameDiagnostics.firstPerson = {};
     }
 
     // Physical engine-center rendering already builds the live, calibrated
@@ -2057,6 +2090,20 @@ private:
             };
             bridge->mFrameDiagnostics.renderer = result;
             return result;
+        }
+        if (bridge->mOperations.prepareControllerRigForRender
+            && !bridge->mOperations.prepareControllerRigForRender(
+                bridge->mOperations.context,
+                frame.tracked))
+        {
+            bridge->mPrivateRenderDispatchGate.leave();
+            const engine::RetailCenterRuntimeFrameResult rejected {
+                engine::RetailWorldHookDisposition::RejectGameplayFrame,
+                engine::RetailCenterRuntimeFailure::StereoRenderRejected,
+                {},
+            };
+            bridge->mFrameDiagnostics.renderer = rejected;
+            return rejected;
         }
         const engine::RetailCenterRuntimeFrameResult result =
             bridge->mCenterRuntime.renderWorld(

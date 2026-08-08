@@ -721,11 +721,21 @@ $physicalHeadsetEnvironment = Get-FnvxrProductMinimalEnvironment `
     -PhysicalHeadsetPlay `
     -PhysicalRuntimeManifest "C:\fnvxr-physical-headset-play-contract\oculus_openxr_64.json"
 if ([string]$physicalHeadsetEnvironment.FNVXR_RETAIL_VR_FIRST_PERSON_PRIVATE_CALLER -cne "third" -or
-    [string]$physicalHeadsetEnvironment.FNVXR_RETAIL_RIG_ENABLE -cne "1" -or
-    [string]$physicalHeadsetEnvironment.FNVXR_RETAIL_RIG_APPLY -cne "1" -or
-    [string]$physicalHeadsetEnvironment.FNVXR_RETAIL_WEAPON_APPLY -cne "1" -or
+    [string]$physicalHeadsetEnvironment.FNVXR_PHYSICAL_HEADSET_PLAY -cne "1" -or
     [string]$physicalHeadsetEnvironment.FNVXR_RETAIL_CENTER_INTEGRATED_FIRST_PERSON -cne "1") {
-    throw "Physical headset play must select the observed publication seam and enable its center-integrated controller/weapon rig."
+    throw "Physical headset play must select one product mode and the observed center-integrated publication seam."
+}
+foreach ($retiredPhysicalSubfeatureFlag in @(
+    "FNVXR_RETAIL_RIG_ENABLE",
+    "FNVXR_RETAIL_RIG_APPLY",
+    "FNVXR_RETAIL_WEAPON_APPLY",
+    "FNVXR_RIGHT_STICK_SNAP_TURN_ENABLE",
+    "FNVXR_RIGHT_STICK_SNAP_DEGREES",
+    "FNVXR_GAMEPLAY_ANALOG_RUN_ENABLE",
+    "FNVXR_HEAD_RELATIVE_LOCOMOTION_ENABLE")) {
+    if ($physicalHeadsetEnvironment.Keys -ccontains $retiredPhysicalSubfeatureFlag) {
+        throw "Physical product behavior must not depend on subfeature flag: $retiredPhysicalSubfeatureFlag"
+    }
 }
 foreach ($forbiddenWeaponDrawAuthorityKey in @(
     "FNVXR_DESKTOP_ASSIST_ENABLE",
@@ -1048,6 +1058,11 @@ foreach ($headsetDemoContract in @(
     'Get-FnvxrProductHeadsetMirrorCaptureProof',
     '$left.Name -replace ''_left\.png$'', ''_right.png''',
     'Get-FnvxrProductStereoContinuityProof',
+    'rejectedGameplaySubmitFrames',
+    '$rejectedGameplaySubmits.Count -ne 0',
+    'FNVXR_STEREO_RETAIN_LAST_VALID_ON_REJECT = "1"',
+    'FNVXR_STEREO_STALE_FRAME_LIMIT = "30"',
+    'FNVXR_CPU_STEREO_MAX_SOURCE_POSE_AGE_MS = "250"',
     'Get-FnvxrProductRetailCameraPoseSweepProof',
     'invoke-openxr-simulator-head-sweep.ps1',
     '"rendered-six-dof-cardinal-proven-centered"',

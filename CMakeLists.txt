@@ -75,6 +75,17 @@ add_test(
     NAME fnvxr_physical_input_authority_test
     COMMAND fnvxr_physical_input_authority_test)
 
+add_executable(fnvxr_weapon_frame_contract_test
+    tests/fnvxr_weapon_frame_contract_test.cpp)
+target_include_directories(fnvxr_weapon_frame_contract_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/runtime)
+if(MSVC)
+    target_compile_options(fnvxr_weapon_frame_contract_test PRIVATE /W4 /WX)
+endif()
+add_test(
+    NAME fnvxr_weapon_frame_contract_test
+    COMMAND fnvxr_weapon_frame_contract_test)
+
 if(WIN32)
     add_test(
         NAME fnvxr_build_attestation_test

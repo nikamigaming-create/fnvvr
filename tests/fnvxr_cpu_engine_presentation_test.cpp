@@ -136,6 +136,46 @@ int main()
             uiBoundary),
         "the first new post-menu world pair did not resume binocular presentation");
 
+    // Source-pose freshness controls advancing proof, not whether the verified
+    // world layer remains visible between exact producer updates.
+    const presentation::WorldPresentationDecision staleWorldDecision =
+        presentation::assessBinocularWorldFrame(
+            resumedWorld,
+            gameplayRuntime(42u),
+            gameplayRuntime(99u),
+            uiBoundary,
+            false);
+    require(
+        staleWorldDecision.present && !staleWorldDecision.advancesFreshProof,
+        "a stale verified world frame caused a presentation dropout");
+    const presentation::WorldPresentationDecision freshWorldDecision =
+        presentation::assessBinocularWorldFrame(
+            resumedWorld,
+            gameplayRuntime(42u),
+            gameplayRuntime(99u),
+            uiBoundary,
+            true);
+    require(
+        freshWorldDecision.present && freshWorldDecision.advancesFreshProof,
+        "a fresh verified world frame did not advance producer evidence");
+    const presentation::RuntimeSample missingSourceRuntime {};
+    const presentation::WorldPresentationDecision historyMissDecision =
+        presentation::assessBinocularWorldFrame(
+            resumedWorld,
+            missingSourceRuntime,
+            gameplayRuntime(99u),
+            uiBoundary,
+            false);
+    require(
+        historyMissDecision.present
+            && !historyMissDecision.advancesFreshProof,
+        "a transient source-runtime history miss blanked retained gameplay");
+    require(
+        presentation::preserveVerifiedWorldAcrossCellChange(true, true)
+            && !presentation::preserveVerifiedWorldAcrossCellChange(false, true)
+            && !presentation::preserveVerifiedWorldAcrossCellChange(true, false),
+        "cell transition retention escaped the verified CPU-world boundary");
+
     presentation::FrameIdentity wrongSampleUi = ui;
     wrongSampleUi.runtimeStateSample = 39u;
     require(

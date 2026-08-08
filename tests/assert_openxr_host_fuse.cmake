@@ -44,7 +44,7 @@ foreach(required_cpu_transition_text IN ITEMS
         "readSharedD3D9MonoUiFrame("
         "uploadCpuEngineUiTexture("
         "flatUiFrameEligible("
-        "binocularWorldFrameEligible("
+        "assessBinocularWorldFrame("
         "cpuUiBoundaryTransactionId"
         "#include \"fnvxr_game_plane_surface.h\""
         "game_plane_surface::select("

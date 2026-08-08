@@ -57,8 +57,11 @@ foreach ($contract in @(
 }
 
 foreach ($contract in @(
-    'ThumbstickY = 1.0',
-    'ThumbstickY = 0.0',
+    'pattern = "forward, noisy-hard-left, backward, right, neutral"',
+    'expected = "left-only"',
+    'ThumbstickY = $leftY',
+    'heldStickRepeatForbidden = $true',
+    'expectedTurns = 2',
     '[string]$candidate.command -ceq "head_pose"',
     'retail player world-position delta required')) {
     if (-not $combatDemoDriver.Contains($contract)) {

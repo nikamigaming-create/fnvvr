@@ -139,6 +139,9 @@ constexpr std::uintptr_t TESFormRefIdOffset = 0x0C;
 constexpr std::uintptr_t TESFormTypeIdOffset = 0x04;
 constexpr std::uintptr_t InterfaceManagerCrosshairRefOffset = 0x0FC;
 constexpr std::uintptr_t TESObjectRefrBaseFormOffset = 0x20;
+// xNVSE TESObjectREFR layout: Euler rotation is stored in radians at 0x24,
+// 0x28, 0x2C; Z is the actor heading used by SetAngle.
+constexpr std::uintptr_t TESObjectRefrRotationZOffset = 0x2C;
 constexpr std::uintptr_t TESObjectRefrParentCellOffset = 0x40;
 constexpr std::uintptr_t MobileObjectBaseProcessOffset = 0x68;
 constexpr std::uintptr_t ActorActorMoverOffset = 0x190;
@@ -243,6 +246,7 @@ using fnvxr::shared::SharedXInputState;
 using fnvxr::shared::SharedDInputState;
 using fnvxr::shared::SharedVrPoseState;
 using fnvxr::shared::SharedVrOriginState;
+using fnvxr::shared::SharedWeaponFrameState;
 using fnvxr::shared::SharedCameraState;
 using fnvxr::shared::SharedDesktopAssistState;
 using fnvxr::shared::SharedRuntimeState;
@@ -579,6 +583,7 @@ bool g_physicalLocomotionDirectInputUnavailableLogged[MaxDirectInputMacros] {};
 std::atomic<UInt32> g_physicalPlayerMoverDirections { 0u };
 std::atomic<bool> g_physicalPlayerMoverAllowed { false };
 std::atomic<bool> g_physicalPlayerMoverRun { false };
+fnvxr::physical_input::SnapTurnLatch g_physicalSnapTurnLatch {};
 void** g_physicalPlayerMoverVtable = nullptr;
 void* g_physicalPlayerMoverOriginalSetMovementFlags = nullptr;
 bool g_physicalPlayerMoverHookInstalled = false;
@@ -643,6 +648,9 @@ HANDLE g_vrPoseMapping = nullptr;
 SharedVrPoseState* g_vrPoseState = nullptr;
 HANDLE g_vrOriginMapping = nullptr;
 SharedVrOriginState* g_vrOriginState = nullptr;
+HANDLE g_weaponFrameMapping = nullptr;
+SharedWeaponFrameState* g_weaponFrameState = nullptr;
+UInt64 g_weaponFrameCommitId = 0;
 HANDLE g_cameraMapping = nullptr;
 SharedCameraState* g_cameraState = nullptr;
 HANDLE g_desktopAssistMapping = nullptr;
@@ -711,6 +719,8 @@ Vec3 g_previousRetailRigBodyAnchorWorld {};
 Vec3 g_previousRetailRigCameraWorld {};
 UInt64 g_retailRigHeadOnlySamples = 0;
 UInt64 g_retailRigControllerOnlySamples = 0;
+bool g_renderRigPoseOverrideActive = false;
+VrRigPoseSnapshot g_renderRigPoseOverride {};
 LONG g_retailRigPoseOriginUnavailableCount = 0;
 LONG g_retailRigPoseOriginSkewCount = 0;
 LONG g_retailRigNoHmdCount = 0;
@@ -6577,12 +6587,14 @@ bool applyRetailArmFabrik(
     const float maximumReach = lengths[0] + lengths[1];
     const float minimumReach = std::fabs(lengths[0] - lengths[1]);
     const float reachTolerance = getFloatFromEnv("FNVXR_RETAIL_RIG_REACH_TOLERANCE", 0.10f);
-    const bool physicalRightHand =
-        !left && physicalHeadsetEngineCenterRigRequested();
+    const bool controllerOwnedRightHand = !left
+        && (physicalHeadsetEngineCenterRigRequested()
+            || (headsetControllerRigVisualTrialRequested()
+                && headlessStereoRigVisualTrialLeaseCurrent()));
     const bool targetOutsideArmReach =
         shoulderTargetDistance > maximumReach + reachTolerance
         || shoulderTargetDistance < minimumReach - reachTolerance;
-    if (targetOutsideArmReach && !physicalRightHand)
+    if (targetOutsideArmReach && !controllerOwnedRightHand)
     {
         return false;
     }
@@ -6627,12 +6639,12 @@ bool applyRetailArmFabrik(
     const bool solverResultUsable =
         result.solved && std::isfinite(result.error)
         && result.error <= maximumFinalError;
-    if (!solverResultUsable && !physicalRightHand)
+    if (!solverResultUsable && !controllerOwnedRightHand)
         return false;
 
     finalError = solverResultUsable ? result.error : shoulderTargetDistance;
     if (!applyWrites)
-        return solverResultUsable || physicalRightHand;
+        return solverResultUsable || controllerOwnedRightHand;
 
     const Vec3 solvedShoulder { joints[0].x, joints[0].y, joints[0].z };
     const Vec3 solvedElbow { joints[1].x, joints[1].y, joints[1].z };
@@ -6647,7 +6659,7 @@ bool applyRetailArmFabrik(
             arm.forearm,
             arm.hand,
             subtractVec3(solvedWrist, solvedElbow));
-    if ((!upperAligned || !forearmAligned) && !physicalRightHand)
+    if ((!upperAligned || !forearmAligned) && !controllerOwnedRightHand)
         return false;
 
     void* handParent = readPointer(
@@ -6663,7 +6675,7 @@ bool applyRetailArmFabrik(
         desiredHandWorldRotation);
     if (!finiteMatrix33(desiredHandLocalRotation))
         return false;
-    if (physicalRightHand && handParent)
+    if (controllerOwnedRightHand && handParent)
     {
         const auto parentBase = reinterpret_cast<std::uintptr_t>(handParent);
         const Vec3 parentWorldPosition = readVec3(
@@ -6862,7 +6874,9 @@ RetailWeaponApplyResult applyRetailWeaponAim(
     result.targetValid = true;
     result.desiredWorldPosition = desiredWorldPosition;
     result.desiredWorldRotation = desiredWorldRotation;
-    result.writeRequested = applyWrites && envEnabled("FNVXR_RETAIL_WEAPON_APPLY", false);
+    result.writeRequested = applyWrites
+        && (physicalHeadsetPlayRequested()
+            || envEnabled("FNVXR_RETAIL_WEAPON_APPLY", false));
     if (result.writeRequested)
     {
         result.writeAttempted = true;
@@ -7185,9 +7199,116 @@ void logRetailRigGateSkip(
     }
 }
 
+SharedWeaponFrameState* sharedWeaponFrameState()
+{
+    if (g_weaponFrameState)
+        return g_weaponFrameState;
+    g_weaponFrameMapping = CreateFileMappingA(
+        INVALID_HANDLE_VALUE,
+        nullptr,
+        PAGE_READWRITE,
+        0,
+        sizeof(SharedWeaponFrameState),
+        fnvxr::shared::WeaponFrameSharedMappingName);
+    if (!g_weaponFrameMapping)
+        return nullptr;
+    const bool created = GetLastError() != ERROR_ALREADY_EXISTS;
+    g_weaponFrameState = static_cast<SharedWeaponFrameState*>(MapViewOfFile(
+        g_weaponFrameMapping,
+        FILE_MAP_ALL_ACCESS,
+        0,
+        0,
+        sizeof(SharedWeaponFrameState)));
+    if (!g_weaponFrameState)
+    {
+        CloseHandle(g_weaponFrameMapping);
+        g_weaponFrameMapping = nullptr;
+        return nullptr;
+    }
+    if (created
+        || g_weaponFrameState->magic != fnvxr::shared::WeaponFrameSharedMagic
+        || g_weaponFrameState->version != fnvxr::shared::WeaponFrameSharedVersion)
+    {
+        std::memset(g_weaponFrameState, 0, sizeof(*g_weaponFrameState));
+        g_weaponFrameState->magic = fnvxr::shared::WeaponFrameSharedMagic;
+        g_weaponFrameState->version = fnvxr::shared::WeaponFrameSharedVersion;
+    }
+    return g_weaponFrameState;
+}
+
+void publishWeaponFrameCommit(
+    const VrRigPoseSnapshot& pose,
+    bool rightControllerUsable,
+    bool rightAimUsable,
+    bool rightSolved,
+    bool weaponWritten,
+    bool weaponAligned,
+    const Vec3& rightHandWorld,
+    const Vec3& weaponWorld,
+    const Matrix33& weaponWorldRotation)
+{
+    SharedWeaponFrameState* state = sharedWeaponFrameState();
+    if (!state || !fnvxr::shared::beginSequencedSharedWrite(state->producerSequence))
+        return;
+    UInt32 flags = 0;
+    if (rightControllerUsable)
+        flags |= fnvxr::shared::WeaponFrameFlagRightGripCurrent;
+    if (rightAimUsable)
+        flags |= fnvxr::shared::WeaponFrameFlagRightAimCurrent;
+    if (rightSolved)
+        flags |= fnvxr::shared::WeaponFrameFlagArmSolved;
+    if (weaponWritten)
+        flags |= fnvxr::shared::WeaponFrameFlagWeaponWritten;
+    if (weaponAligned)
+        flags |= fnvxr::shared::WeaponFrameFlagWeaponAligned;
+    const bool complete =
+        (flags & fnvxr::shared::WeaponFrameRequiredFlags)
+            == fnvxr::shared::WeaponFrameRequiredFlags
+        && g_retailRigNodes.root
+        && g_retailRigNodes.right.hand
+        && g_retailRigNodes.weapon
+        && finiteVec3(rightHandWorld)
+        && finiteVec3(weaponWorld)
+        && finiteMatrix33(weaponWorldRotation);
+    state->magic = fnvxr::shared::WeaponFrameSharedMagic;
+    state->version = fnvxr::shared::WeaponFrameSharedVersion;
+    state->status = complete
+        ? fnvxr::shared::WeaponFramePoseCommitted
+        : fnvxr::shared::WeaponFrameInvalid;
+    state->commitId = complete ? ++g_weaponFrameCommitId : 0u;
+    state->poseSequence = complete ? static_cast<UInt32>(pose.sequence) : 0u;
+    state->referenceSpaceGeneration = complete
+        ? pose.referenceSpaceGeneration : 0u;
+    state->poseFrame = complete ? pose.frame : 0u;
+    state->producerEpoch = complete ? pose.producerEpoch : 0u;
+    state->flags = flags;
+    state->rootAddress = complete
+        ? static_cast<UInt32>(reinterpret_cast<std::uintptr_t>(g_retailRigNodes.root)) : 0u;
+    state->rightHandAddress = complete
+        ? static_cast<UInt32>(reinterpret_cast<std::uintptr_t>(g_retailRigNodes.right.hand)) : 0u;
+    state->weaponAddress = complete
+        ? static_cast<UInt32>(reinterpret_cast<std::uintptr_t>(g_retailRigNodes.weapon)) : 0u;
+    const float hand[3] { rightHandWorld.x, rightHandWorld.y, rightHandWorld.z };
+    const float weapon[3] { weaponWorld.x, weaponWorld.y, weaponWorld.z };
+    const float rotation[9] {
+        weaponWorldRotation.m[0][0], weaponWorldRotation.m[0][1], weaponWorldRotation.m[0][2],
+        weaponWorldRotation.m[1][0], weaponWorldRotation.m[1][1], weaponWorldRotation.m[1][2],
+        weaponWorldRotation.m[2][0], weaponWorldRotation.m[2][1], weaponWorldRotation.m[2][2],
+    };
+    for (int i = 0; i < 3; ++i)
+    {
+        state->rightHandWorldPos[i] = complete ? hand[i] : 0.0f;
+        state->weaponWorldPos[i] = complete ? weapon[i] : 0.0f;
+    }
+    for (int i = 0; i < 9; ++i)
+        state->weaponWorldRot[i] = complete ? rotation[i] : 0.0f;
+    fnvxr::shared::endSequencedSharedWrite(state->producerSequence);
+}
+
 void onRetailPostAnimation(void* animData)
 {
-    if (!envEnabled("FNVXR_RETAIL_RIG_ENABLE", false))
+    if (!physicalHeadsetPlayRequested()
+        && !envEnabled("FNVXR_RETAIL_RIG_ENABLE", false))
         return;
     const bool trackedPropAssist = trackedPropAssistProfileRequested();
     const bool headlessStereoRigVisualTrial =
@@ -7251,7 +7372,9 @@ void onRetailPostAnimation(void* animData)
     SharedVrOriginState authoritativeOrigin {};
     if (bodyAnchoredEngineCenterRig)
     {
-        if (!readLatestRetailRigPose(pose))
+        if (g_renderRigPoseOverrideActive)
+            pose = g_renderRigPoseOverride;
+        else if (!readLatestRetailRigPose(pose))
         {
             const LONG count = InterlockedIncrement(&g_retailRigPoseOriginUnavailableCount);
             if (count <= 12 || count % 300 == 0)
@@ -7293,7 +7416,9 @@ void onRetailPostAnimation(void* animData)
     }
     // The animation call site runs several times for one OpenXR frame. The
     // first-person rig has one owner and is solved once per stable pose.
-    if (pose.sequence == g_lastRetailRigPoseSequence)
+    if (pose.sequence == g_lastRetailRigPoseSequence
+        && !physicalHeadsetEngineCenterRigRequested()
+        && !g_renderRigPoseOverrideActive)
         return;
     if ((pose.trackingFlags & fnvxr::shared::VrPoseTrackingHmd) == 0)
     {
@@ -7448,7 +7573,8 @@ void onRetailPostAnimation(void* animData)
         pose, true, bodyAnchorWorld, bodyWorldRotation);
     const RetailControllerWorldPose rightController = retailControllerWorldPose(
         pose, false, bodyAnchorWorld, bodyWorldRotation);
-    const bool applyWrites = envEnabled("FNVXR_RETAIL_RIG_APPLY", false);
+    const bool applyWrites = physicalHeadsetPlayRequested()
+        || envEnabled("FNVXR_RETAIL_RIG_APPLY", false);
     float leftError = 0.0f;
     float rightError = 0.0f;
     const bool rightSolved = rightControllerUsable && applyRetailArmFabrik(
@@ -7478,7 +7604,8 @@ void onRetailPostAnimation(void* animData)
             applyWrites)
         : RetailWeaponApplyResult {};
     bool continuityReplayed = false;
-    if (headlessStereoRigVisualTrial && applyWrites)
+    if ((headlessStereoRigVisualTrial || physicalHeadsetEngineCenterRigRequested())
+        && applyWrites)
     {
         if (rightSolved && weaponResult.writeVerified)
             captureRetailRigContinuityPose();
@@ -7510,6 +7637,36 @@ void onRetailPostAnimation(void* animData)
     g_lastRetailRigAnimData = animData;
     ++g_retailRigSolveCount;
 
+    const Vec3 committedRightHandWorld = g_retailRigNodes.right.hand
+        ? readVec3(
+            reinterpret_cast<std::uintptr_t>(g_retailRigNodes.right.hand)
+                + NiAvObjectWorldTranslationOffset)
+        : Vec3 {};
+    const Vec3 committedWeaponWorld = g_retailRigNodes.weapon
+        ? readVec3(
+            reinterpret_cast<std::uintptr_t>(g_retailRigNodes.weapon)
+                + NiAvObjectWorldTranslationOffset)
+        : Vec3 {};
+    const Matrix33 committedWeaponWorldRotation = g_retailRigNodes.weapon
+        ? readMatrix33(
+            reinterpret_cast<std::uintptr_t>(g_retailRigNodes.weapon)
+                + NiAvObjectWorldRotationOffset)
+        : Matrix33 {};
+    if (physicalHeadsetEngineCenterRigRequested()
+        || headlessStereoRigVisualTrial)
+    {
+        publishWeaponFrameCommit(
+            pose,
+            rightControllerUsable,
+            rightAimUsable,
+            rightSolved,
+            weaponResult.writeVerified,
+            weaponAligned,
+            committedRightHandWorld,
+            committedWeaponWorld,
+            committedWeaponWorldRotation);
+    }
+
     if (rightControllerUsable && g_retailRigNodes.right.hand)
     {
         const Vec3 headLocalMeters = xrPositionInOriginFrame(
@@ -7520,9 +7677,7 @@ void onRetailPostAnimation(void* animData)
             conjugateQuat(g_retailRigOriginHmdRot),
             pose.hmdRot);
         const Matrix33 inverseBodyRotation = transposeMatrix33(bodyWorldRotation);
-        const Vec3 rightHandWorld = readVec3(
-            reinterpret_cast<std::uintptr_t>(g_retailRigNodes.right.hand)
-                + NiAvObjectWorldTranslationOffset);
+        const Vec3 rightHandWorld = committedRightHandWorld;
         const Vec3 rightHandTargetWorld =
             g_retailRightCalibration.usesStageLocalBodyPositionAnchor
             ? addVec3(
@@ -7538,16 +7693,8 @@ void onRetailPostAnimation(void* animData)
         const Vec3 rightHandLocalUnits = transformVec3(
             inverseBodyRotation,
             subtractVec3(rightHandWorld, bodyAnchorWorld));
-        const Vec3 weaponWorld = g_retailRigNodes.weapon
-            ? readVec3(
-                reinterpret_cast<std::uintptr_t>(g_retailRigNodes.weapon)
-                    + NiAvObjectWorldTranslationOffset)
-            : Vec3 {};
-        const Matrix33 weaponWorldRotation = g_retailRigNodes.weapon
-            ? readMatrix33(
-                reinterpret_cast<std::uintptr_t>(g_retailRigNodes.weapon)
-                    + NiAvObjectWorldRotationOffset)
-            : Matrix33 {};
+        const Vec3 weaponWorld = committedWeaponWorld;
+        const Matrix33 weaponWorldRotation = committedWeaponWorldRotation;
         const UInt32 firstPersonRootFlags = readUInt32(
             reinterpret_cast<std::uintptr_t>(g_retailRigNodes.root) + NiAvObjectFlagsOffset);
         const UInt32 rightHandFlags = readUInt32(
@@ -7813,7 +7960,8 @@ void onRetailPostAnimation(void* animData)
             leftSolved ? 1 : 0,
             rightSolved ? 1 : 0,
             weaponAligned ? 1 : 0,
-            envEnabled("FNVXR_RETAIL_WEAPON_APPLY", false) ? 1 : 0,
+            (physicalHeadsetPlayRequested()
+                || envEnabled("FNVXR_RETAIL_WEAPON_APPLY", false)) ? 1 : 0,
             leftError,
             rightError,
             leftController.position.x,
@@ -7871,7 +8019,8 @@ bool installRetailRigHook()
     }
     if (g_retailRigHookInstalled)
         return true;
-    const bool requested = envEnabled("FNVXR_RETAIL_RIG_ENABLE", false);
+    const bool requested = physicalHeadsetPlayRequested()
+        || envEnabled("FNVXR_RETAIL_RIG_ENABLE", false);
     if (!requested)
     {
         logTelemetry("retailRig hook install disabled\n");
@@ -7960,7 +8109,8 @@ bool installRetailRigHook()
         pointerFromAddress32<void*>(PlayerAnimationApplyCallSiteAddress),
         reinterpret_cast<void*>(hookedRetailAnimationApply),
         pointerFromAddress32<void*>(ApplyActorAnimDataAddress),
-        envEnabled("FNVXR_RETAIL_RIG_APPLY", false) ? 1 : 0,
+        (physicalHeadsetPlayRequested()
+            || envEnabled("FNVXR_RETAIL_RIG_APPLY", false)) ? 1 : 0,
         trackedPropAssist
             ? "tracked-prop-assist"
             : (headlessStereoRigVisualTrial
@@ -9955,18 +10105,32 @@ void publishGameplayMovementFlags()
 
 float gameplayAnalogRunThreshold()
 {
+    if (physicalHeadsetPlayRequested()
+        || headsetControllerRigVisualTrialRequested())
+        return 0.68f;
     return std::clamp(getFloatFromEnv("FNVXR_GAMEPLAY_ANALOG_RUN_THRESHOLD", 0.92f), 0.0f, 1.0f);
 }
 
-bool gameplayAnalogRunHeld(float leftThumbY)
+bool gameplayAnalogRunHeld(float leftThumbX, float leftThumbY)
 {
-    return envEnabled("FNVXR_GAMEPLAY_ANALOG_RUN_ENABLE", false)
-        && leftThumbY >= gameplayAnalogRunThreshold();
+    const float magnitude = (std::max)(std::fabs(leftThumbX), std::fabs(leftThumbY));
+    return (physicalHeadsetPlayRequested()
+            || headsetControllerRigVisualTrialRequested()
+            || envEnabled("FNVXR_GAMEPLAY_ANALOG_RUN_ENABLE", false))
+        && magnitude >= gameplayAnalogRunThreshold();
 }
 
-bool gameplayAnalogRunHeld(std::int16_t leftThumbY)
+bool gameplayAnalogRunHeld(std::int16_t leftThumbX, std::int16_t leftThumbY)
 {
-    return gameplayAnalogRunHeld(static_cast<float>(leftThumbY) / 32767.0f);
+    const std::int32_t threshold = static_cast<std::int32_t>(
+        gameplayAnalogRunThreshold() * 32767.0f);
+    return (physicalHeadsetPlayRequested()
+            || headsetControllerRigVisualTrialRequested()
+            || envEnabled("FNVXR_GAMEPLAY_ANALOG_RUN_ENABLE", false))
+        && fnvxr::physical_input::radialAnalogRunHeld(
+            leftThumbX,
+            leftThumbY,
+            threshold);
 }
 
 void setGameplayAutoRun(bool enabled, const char* source, UInt64 frame)
@@ -10099,7 +10263,9 @@ void updateControllerAxes(const fnvxr::PoseFrame& pose)
     const bool upMove = pose.leftThumbstickY > deadzone;
     const bool leftTurn = pose.rightThumbstickX < -deadzone;
     const bool rightTurn = pose.rightThumbstickX > deadzone;
-    const bool analogRun = gameplayAnalogRunHeld(pose.leftThumbstickY);
+    const bool analogRun = gameplayAnalogRunHeld(
+        pose.leftThumbstickX,
+        pose.leftThumbstickY);
     const bool uiInputAllowed = allowUiInput();
     const bool keyboardMovement = pluginKeyboardMovementEnabled();
 
@@ -11380,6 +11546,7 @@ void tapExternalXInputNav(UInt32 navMask)
 
 void releaseExternalXInputGameplayHolds()
 {
+    g_physicalSnapTurnLatch.reset();
     setGameplayRunMode(false, "externalXInput:release", 0);
     setGameplayAutoRun(false, "externalXInput:release", 0);
     holdDirectInputKey(MouseButtonOffset, false);
@@ -11755,6 +11922,112 @@ void updateExternalRightGripMenuMode(bool held, bool& previousHeld)
     previousHeld = held;
 }
 
+bool applyControllerSnapTurn(
+    std::int16_t rightThumbX,
+    UInt64 frame,
+    const char* source)
+{
+    constexpr std::int32_t pressThreshold = 22000;
+    constexpr std::int32_t releaseThreshold = 9000;
+    const int snapDirection = g_physicalSnapTurnLatch.update(
+        rightThumbX,
+        pressThreshold,
+        releaseThreshold);
+    if (snapDirection == 0)
+        return false;
+
+    void* player = readPointer(PlayerCharacterAddress);
+    const float currentYawRadians = player
+        ? readFloat(
+            reinterpret_cast<std::uintptr_t>(player)
+                + TESObjectRefrRotationZOffset,
+            std::numeric_limits<float>::quiet_NaN())
+        : std::numeric_limits<float>::quiet_NaN();
+    constexpr float degrees = 30.0f;
+    bool applied = false;
+    float targetDegrees = 0.0f;
+    if (std::isfinite(currentYawRadians))
+    {
+        constexpr float RadiansToDegrees = 57.29577951308232f;
+        targetDegrees = std::fmod(
+            currentYawRadians * RadiansToDegrees
+                + static_cast<float>(snapDirection) * degrees
+                + 360.0f,
+            360.0f);
+        char command[96] {};
+        sprintf_s(command, "player.setangle z %.6f", targetDegrees);
+        applied = runPluginConsoleCommand("fnvxrControllerSnapTurn", command);
+    }
+    logTelemetry(
+        "controllerSnapTurn frame=%llu source=%s direction=%d degrees=%.3f targetDegrees=%.3f stickX=%d applied=%d consumer=player.setangle-z\n",
+        static_cast<unsigned long long>(frame),
+        source ? source : "unknown",
+        snapDirection,
+        degrees,
+        targetDegrees,
+        static_cast<int>(rightThumbX),
+        static_cast<int>(applied));
+    return applied;
+}
+
+void applyHeadRelativeLocomotion(SharedXInputState& state, UInt64 frame)
+{
+    if (!g_haveRetailRigOrigin
+        || (state.leftThumbX == 0 && state.leftThumbY == 0))
+    {
+        return;
+    }
+    VrRigPoseSnapshot pose {};
+    if (!readLatestRetailRigPose(pose)
+        || (pose.trackingFlags & fnvxr::shared::VrPoseTrackingHmd) == 0)
+    {
+        return;
+    }
+    const Quat relativeHead = multiplyQuat(
+        conjugateQuat(g_retailRigOriginHmdRot),
+        pose.hmdRot);
+    const Quat headYaw = gravityAlignedYawQuat(relativeHead);
+    const float yaw = 2.0f * std::atan2(headYaw.y, headYaw.w);
+    const float cosine = std::cos(yaw);
+    const float sine = std::sin(yaw);
+    const float inputX = static_cast<float>(state.leftThumbX);
+    const float inputY = static_cast<float>(state.leftThumbY);
+    const auto clampAxis = [](float value) -> std::int16_t {
+        return static_cast<std::int16_t>(std::lround(std::clamp(
+            value,
+            -32767.0f,
+            32767.0f)));
+    };
+    const std::int16_t rotatedX = clampAxis(
+        inputX * cosine + inputY * sine);
+    const std::int16_t rotatedY = clampAxis(
+        inputY * cosine - inputX * sine);
+    static std::int16_t previousRawX = 0;
+    static std::int16_t previousRawY = 0;
+    static std::int16_t previousRotatedX = 0;
+    static std::int16_t previousRotatedY = 0;
+    if (state.leftThumbX != previousRawX
+        || state.leftThumbY != previousRawY
+        || rotatedX != previousRotatedX
+        || rotatedY != previousRotatedY)
+    {
+        logTelemetry(
+            "headRelativeLocomotion frame=%llu yawDegrees=%.3f raw=(%d,%d) rotated=(%d,%d)\n",
+            static_cast<unsigned long long>(frame),
+            yaw * 57.29577951308232f,
+            static_cast<int>(state.leftThumbX),
+            static_cast<int>(state.leftThumbY),
+            static_cast<int>(rotatedX),
+            static_cast<int>(rotatedY));
+        previousRawX = state.leftThumbX;
+        previousRawY = state.leftThumbY;
+        previousRotatedX = rotatedX;
+        previousRotatedY = rotatedY;
+    }
+    state.leftThumbX = rotatedX;
+    state.leftThumbY = rotatedY;
+}
+
 void consumeExternalXInputGameplayControls(
     const SharedXInputState& state,
     const SharedDInputState& hostInput,
@@ -11775,7 +12048,9 @@ void consumeExternalXInputGameplayControls(
         : externalDInputFrame();
     const bool rightTriggerHeld = state.rightTrigger > triggerThreshold;
     const bool leftTriggerHeld = state.leftTrigger > triggerThreshold;
-    const bool analogRun = gameplayAnalogRunHeld(state.leftThumbY);
+    const bool analogRun = gameplayAnalogRunHeld(
+        state.leftThumbX,
+        state.leftThumbY);
     const bool keyboardMovement = pluginKeyboardMovementEnabled();
     const bool keyboardGameplayFallback = pluginGameplayKeyboardFallbackEnabled();
     const bool physicalLocomotionRoute = physicalHeadsetPlayRequested();
@@ -11795,13 +12070,17 @@ void consumeExternalXInputGameplayControls(
     const bool moveRight = locomotionKeyboardMovement && requestedLocomotion.right;
     const bool moveBackward = locomotionKeyboardMovement && requestedLocomotion.backward;
     const bool moveForward = locomotionKeyboardMovement && requestedLocomotion.forward;
+    const bool snapTurnEnabled = physicalLocomotionRoute;
     const bool keyTurnEnabled =
         keyboardMovement
+        && !snapTurnEnabled
         && envEnabled("FNVXR_RIGHT_STICK_KEY_TURN", true);
     const bool turnLeft =
         keyTurnEnabled && state.rightThumbX < -movementDeadzone;
     const bool turnRight =
         keyTurnEnabled && state.rightThumbX > movementDeadzone;
+    if (snapTurnEnabled)
+        applyControllerSnapTurn(state.rightThumbX, frame, "physical:right-stick");
     const bool thirdPersonChordHeld =
         thirdPersonL3ControlsEnabled()
         && (state.buttons & XInputLeftThumb) != 0;
@@ -12104,6 +12383,9 @@ void consumeExternalXInputBridge(
             fnvxr::shared::RuntimeControllerMode::Unknown;
         return;
     }
+
+    if (physicalHeadsetPlayRequested())
+        applyHeadRelativeLocomotion(state, observation.frame);
 
     const UInt32 menuBits = observation.menuBits;
     const fnvxr::shared::RuntimeControllerMode controllerMode =
@@ -14706,6 +14988,8 @@ void consumeHeadlessCombatVisualTrialInput(
     const bool haveInput = authorized
         && readSharedXInputFrameSnapshot(state)
         && state.connected != 0u;
+    if (haveInput)
+        applyHeadRelativeLocomotion(state, observation.frame);
     const bool rightTriggerHeld =
         haveInput && state.rightTrigger > 64u;
     const bool reloadHeld =
@@ -14733,8 +15017,15 @@ void consumeHeadlessCombatVisualTrialInput(
     const bool playerMoverApplied = drivePhysicalPlayerMovement(
         requestedLocomotion,
         haveInput,
-        gameplayAnalogRunHeld(state.leftThumbY),
+        gameplayAnalogRunHeld(state.leftThumbX, state.leftThumbY),
         observation.frame);
+    if (haveInput)
+        applyControllerSnapTurn(
+            state.rightThumbX,
+            observation.frame,
+            "headless-simulator:right-stick");
+    else
+        g_physicalSnapTurnLatch.reset();
     if (locomotionMask != previousLocomotionMask)
     {
         previousLocomotionMask = locomotionMask;
@@ -15545,6 +15836,73 @@ void stopBridge()
 {
     releaseControllerHolds();
 }
+}
+
+extern "C" __declspec(dllexport) bool __cdecl
+FNVXR_ApplyWeaponFrameForRender(
+    const fnvxr::shared::SharedVrPoseState* source,
+    LONG poseSequence)
+{
+    if (!source
+        || poseSequence == 0
+        || (!physicalHeadsetEngineCenterRigRequested()
+            && !headsetControllerRigVisualTrialRequested())
+        || !g_lastRetailRigAnimData)
+    {
+        return false;
+    }
+    VrRigPoseSnapshot pose {};
+    __try
+    {
+        pose.sequence = poseSequence;
+        pose.frame = source->frame;
+        pose.predictedDisplayTime = source->predictedDisplayTime;
+        pose.trackingFlags = source->trackingFlags;
+        pose.referenceSpaceGeneration = source->referenceSpaceGeneration;
+        pose.producerEpoch = source->producerEpoch;
+        pose.recenterRequestId = source->recenterRequestId;
+        pose.hmdRot = { source->hmdRot[0], source->hmdRot[1], source->hmdRot[2], source->hmdRot[3] };
+        pose.hmdPos = { source->hmdPos[0], source->hmdPos[1], source->hmdPos[2] };
+        pose.leftRot = { source->leftRot[0], source->leftRot[1], source->leftRot[2], source->leftRot[3] };
+        pose.leftPos = { source->leftPos[0], source->leftPos[1], source->leftPos[2] };
+        pose.rightRot = { source->rightRot[0], source->rightRot[1], source->rightRot[2], source->rightRot[3] };
+        pose.rightPos = { source->rightPos[0], source->rightPos[1], source->rightPos[2] };
+        pose.leftAimRot = { source->leftAimRot[0], source->leftAimRot[1], source->leftAimRot[2], source->leftAimRot[3] };
+        pose.leftAimPos = { source->leftAimPos[0], source->leftAimPos[1], source->leftAimPos[2] };
+        pose.rightAimRot = { source->rightAimRot[0], source->rightAimRot[1], source->rightAimRot[2], source->rightAimRot[3] };
+        pose.rightAimPos = { source->rightAimPos[0], source->rightAimPos[1], source->rightAimPos[2] };
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+    if (pose.referenceSpaceGeneration == 0
+        || pose.producerEpoch == 0
+        || pose.predictedDisplayTime <= 0
+        || !finiteVec3(pose.hmdPos)
+        || !finiteVec3(pose.rightPos)
+        || !finiteVec3(pose.rightAimPos)
+        || !finiteUsableQuat(pose.hmdRot)
+        || !finiteUsableQuat(pose.rightRot)
+        || !finiteUsableQuat(pose.rightAimRot))
+    {
+        return false;
+    }
+    pose.hmdRot = normalizeQuat(pose.hmdRot);
+    pose.leftRot = normalizeQuat(pose.leftRot);
+    pose.rightRot = normalizeQuat(pose.rightRot);
+    pose.leftAimRot = normalizeQuat(pose.leftAimRot);
+    pose.rightAimRot = normalizeQuat(pose.rightAimRot);
+    g_renderRigPoseOverride = pose;
+    g_renderRigPoseOverrideActive = true;
+    onRetailPostAnimation(g_lastRetailRigAnimData);
+    g_renderRigPoseOverrideActive = false;
+
+    SharedWeaponFrameState* committed = sharedWeaponFrameState();
+    return committed
+        && committed->status == fnvxr::shared::WeaponFramePoseCommitted
+        && committed->poseSequence == static_cast<UInt32>(poseSequence)
+        && committed->poseFrame == pose.frame;
 }
 
 extern "C" __declspec(dllexport) bool NVSEPlugin_Query(const NVSEInterface* nvse, PluginInfo* info)

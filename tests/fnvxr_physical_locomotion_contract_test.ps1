@@ -87,7 +87,7 @@ foreach ($required in @(
 foreach ($required in @(
         'FNVXR_XINPUT_NATIVE_LOCOMOTION = "1"',
         'FNVXR_XINPUT_MASK_PLUGIN_OWNED_TRIGGERS = "1"',
-        'FNVXR_CPU_STEREO_MAX_SOURCE_POSE_AGE_MS = "150"')) {
+        'FNVXR_CPU_STEREO_MAX_SOURCE_POSE_AGE_MS = "250"')) {
     Require-Text -Text $productCommon -Required $required -Reason "physical launcher input split"
 }
 
@@ -95,8 +95,10 @@ foreach ($required in @(
         'drivePhysicalGameplayPrimaryAttack',
         'HighProcessForceFireWeaponOffset',
         'finalConsumer=HighProcess::forceFireWeapon',
-        'physicalRightHand',
-        'solverResultUsable || physicalRightHand',
+        'controllerOwnedRightHand',
+        'solverResultUsable || controllerOwnedRightHand',
+        'applyHeadRelativeLocomotion',
+        'applyControllerSnapTurn',
         'desiredHandLocalPosition')) {
     Require-Text -Text $plugin -Required $required -Reason "physical tracked weapon and trigger consumer"
 }

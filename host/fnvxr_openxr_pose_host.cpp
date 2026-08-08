@@ -4676,11 +4676,8 @@ bool updateStereoGameTextures(ID3D11Device* device, Renderer& renderer)
         }
 
         ++renderer.stereoFrameMisses;
-        const uint64_t staleLimit =
-            static_cast<uint64_t>(std::max(1, envInt("FNVXR_STEREO_STALE_FRAME_LIMIT", 2)));
         if (renderer.hasStereoGameFrame
-            && envEnabled("FNVXR_STEREO_RETAIN_LAST_VALID_ON_REJECT", false)
-            && renderer.stereoFrameMisses <= staleLimit)
+            && envEnabled("FNVXR_STEREO_RETAIN_LAST_VALID_ON_REJECT", false))
         {
             return true;
         }
@@ -4713,11 +4710,8 @@ bool updateStereoGameTextures(ID3D11Device* device, Renderer& renderer)
     if (!separated || !contentCandidate || (requireWorldStereo && !worldCandidate))
     {
         ++renderer.stereoFrameMisses;
-        const uint64_t staleLimit =
-            static_cast<uint64_t>(std::max(1, envInt("FNVXR_STEREO_STALE_FRAME_LIMIT", 2)));
         if (renderer.hasStereoGameFrame
-            && envEnabled("FNVXR_STEREO_RETAIN_LAST_VALID_ON_REJECT", false)
-            && renderer.stereoFrameMisses <= staleLimit)
+            && envEnabled("FNVXR_STEREO_RETAIN_LAST_VALID_ON_REJECT", false))
         {
             if (renderer.stereoFrameMisses <= 5 || renderer.stereoFrameMisses % 120 == 0)
             {
@@ -9815,35 +9809,46 @@ int main(int argc, char** argv)
         else if (cellAcquired || cellChanged)
         {
             const std::uint32_t previousCellFormId = stereoCellFormId;
+            const bool preservePresentedWorld = cellChanged
+                && fnvxr::host::cpu_engine_presentation::
+                    preserveVerifiedWorldAcrossCellChange(
+                        productionCpuEngineStereo,
+                        renderer.hasStereoGameFrame);
             stereoCellKnown = true;
             stereoCellFormId = currentCellFormId;
             stereoCellStableFrames = 1;
             stereoCellEpochPlayerFrame = playerSnapshot.frame;
             stereoCellLastPlayerFrame = playerSnapshot.frame;
-            renderer.hasStereoGameFrame = false;
-            renderer.stereoGameFrameSeparated = false;
-            renderer.stereoGameFrameWorldCandidate = false;
-            renderer.stereoGameFrameSequence = 0;
-            renderer.stereoGamePublicationGeneration = 0u;
-            renderer.stereoGameRenderPairSequence = 0;
-            renderer.stereoGameTransactionId = 0u;
-            renderer.stereoGameSourceFrame = 0u;
-            renderer.stereoGameRuntimeStateSample = 0u;
-            renderer.stereoGamePoseSequence = 0;
-            renderer.stereoGameRenderedDisplayTime = 0;
-            renderer.stereoStableFrameCount = 0;
-            renderer.stereoFrameMisses = 0;
-            renderer.stereoTransientReadMisses = 0;
-            renderer.stereoAcceptedAt = {};
-            missingStereoFrames = 0;
-            cachedSharedStereoWorldReady = false;
-            lastSharedStereoWorldReadyFrame = 0;
+            if (!preservePresentedWorld)
+            {
+                renderer.hasStereoGameFrame = false;
+                renderer.stereoGameFrameSeparated = false;
+                renderer.stereoGameFrameWorldCandidate = false;
+                renderer.stereoGameFrameSequence = 0;
+                renderer.stereoGamePublicationGeneration = 0u;
+                renderer.stereoGameRenderPairSequence = 0;
+                renderer.stereoGameTransactionId = 0u;
+                renderer.stereoGameSourceFrame = 0u;
+                renderer.stereoGameRuntimeStateSample = 0u;
+                renderer.stereoGamePoseSequence = 0;
+                renderer.stereoGameRenderedDisplayTime = 0;
+                renderer.stereoStableFrameCount = 0;
+                renderer.stereoFrameMisses = 0;
+                renderer.stereoTransientReadMisses = 0;
+                renderer.stereoAcceptedAt = {};
+                missingStereoFrames = 0;
+                cachedSharedStereoWorldReady = false;
+                lastSharedStereoWorldReadyFrame = 0;
+            }
             std::cout << "stereoCellEpoch frame=" << frame.frame
                       << " previous=0x" << std::hex << previousCellFormId
                       << " current=0x" << currentCellFormId << std::dec
                       << " acquired=" << static_cast<int>(cellAcquired)
                       << " changed=" << static_cast<int>(cellChanged)
-                      << "; stereo handoff reset\n";
+                      << " preserved=" << static_cast<int>(preservePresentedWorld)
+                      << (preservePresentedWorld
+                            ? "; exact CPU world retained until next transaction\n"
+                            : "; stereo handoff reset\n");
         }
         else
         {
@@ -10948,7 +10953,11 @@ int main(int argc, char** argv)
                 renderer.stereoFrameMisses = 0;
             }
             if ((allowStereoFullscreen || allowCpuEngineStereo)
-                && renderer.stereoFrameMisses > stereoStaleFrameLimit)
+                && renderer.stereoFrameMisses > stereoStaleFrameLimit
+                && !(renderer.hasStereoGameFrame
+                    && envEnabled(
+                        "FNVXR_STEREO_RETAIN_LAST_VALID_ON_REJECT",
+                        false)))
             {
                 renderer.hasStereoGameFrame = false;
                 renderer.stereoGameFrameSeparated = false;
@@ -11010,6 +11019,14 @@ int main(int argc, char** argv)
                 cpuWorldRuntimeEvidence.cameraActive,
                 cpuWorldRuntimeEvidence.fresh,
             };
+            const cpu_presentation::WorldPresentationDecision
+                cpuWorldPresentation =
+                    cpu_presentation::assessBinocularWorldFrame(
+                        cpuWorldIdentity,
+                        cpuWorldRuntime,
+                        renderer.cpuPresentationRuntime,
+                        cpuUiBoundary,
+                        cpuSourcePoseAgeValid);
             cpuEngineStereoActive =
                 allowCpuEngineStereo
                 && renderer.hasStereoGameFrame
@@ -11025,12 +11042,14 @@ int main(int argc, char** argv)
                     == referenceSpaceGeneration
                 && renderer.stereoProducerEpoch
                     == sharedBridge.producerEpoch
-                && cpuEngineRuntimeLineageFound
-                && cpu_presentation::binocularWorldFrameEligible(
-                    cpuWorldIdentity,
-                    cpuWorldRuntime,
-                    cpuUiBoundary)
-                && cpuSourcePoseAgeValid;
+                && cpuWorldPresentation.present;
+            // A verified world texture is a latched presentation resource.
+            // Pose age decides whether the source is fresh enough to count as
+            // a newly advancing proof frame; it must not turn an already
+            // accepted layer off.  OpenXR can reproject the source views while
+            // the D3D9 producer finishes the next exact engine transaction.
+            // Semantic transitions (UI/runtime/producer identity) still clear
+            // or reject the resource through the gates above.
             const bool legacyStereoFullscreenActive =
                 allowStereoFullscreen
                 && renderer.hasStereoGameFrame
@@ -11592,17 +11611,17 @@ int main(int argc, char** argv)
                 << ",\"sourceProducerProcessId\":" << renderer.stereoProducerProcessId
                 << ",\"sourceRenderedDisplayTime\":" << renderer.stereoGameRenderedDisplayTime
                 << ",\"sourcePoseAgeNanoseconds\":"
-                << (cpuEngineStereoActive
+                << (productionCpuEngineStereo
                     ? cpuSourcePoseAgeNanoseconds
                     : sourcePoseAgeNanoseconds)
                 << ",\"sourcePoseAgeValid\":"
-                << ((cpuEngineStereoActive
+                << ((productionCpuEngineStereo
                         ? cpuSourcePoseAgeValid
                         : sourcePoseAgeValid)
                     ? "true"
                     : "false")
                 << ",\"sourcePoseAgeLimitNanoseconds\":"
-                << (cpuEngineStereoActive
+                << (productionCpuEngineStereo
                     ? maximumCpuSourcePoseAgeNanoseconds
                     : maximumSourcePoseAgeNanoseconds)
                 << ",\"sourcePoseFutureToleranceNanoseconds\":" << sourcePoseFutureToleranceNanoseconds

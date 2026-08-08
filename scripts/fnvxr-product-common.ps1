@@ -2314,6 +2314,14 @@ function Get-FnvxrProductMinimalEnvironment {
         FNVXR_ALLOW_STEREO_WORLD_2D_FALLBACK = "0"
         FNVXR_SHOW_GAME_PLANE_ON_STEREO_LOSS = "0"
         FNVXR_STEREO_FALLBACK_MONO_FULLSCREEN = "0"
+        # The CPU producer replaces a sequenced stereo pair while the OpenXR
+        # host polls independently. A read that lands inside that atomic
+        # replacement is not stereo loss: retain the last identity-validated
+        # pair until the bounded pose-age gate expires. Clearing it caused the
+        # observed alternating gun/HUD and zero-layer pulse.
+        FNVXR_STEREO_RETAIN_LAST_VALID_ON_REJECT = "1"
+        FNVXR_STEREO_STALE_FRAME_LIMIT = "30"
+        FNVXR_CPU_STEREO_MAX_SOURCE_POSE_AGE_MS = "250"
         FNVXR_TELEMETRY_HAMMER = "0"
         FNVXR_D3D9_TELEMETRY_HAMMER = "0"
     }
@@ -2338,9 +2346,6 @@ function Get-FnvxrProductMinimalEnvironment {
         # The physical profile owns the full compatibility-checked game-thread
         # bridge. Its post-animation rig consumes live controller poses while
         # the engine-center camera independently consumes the HMD pose.
-        $environment.FNVXR_RETAIL_RIG_ENABLE = "1"
-        $environment.FNVXR_RETAIL_RIG_APPLY = "1"
-        $environment.FNVXR_RETAIL_WEAPON_APPLY = "1"
         $environment.FNVXR_RETAIL_CENTER_INTEGRATED_FIRST_PERSON = "1"
         # Keep one post-xrEndFrame engine-center submit per transaction for
         # the Phase 1 physical evidence verifier. This is deliberately
@@ -2355,7 +2360,7 @@ function Get-FnvxrProductMinimalEnvironment {
         # CPU-v8 frames can arrive one game-frame late during controller and
         # weapon animation bursts. Retain that proven stereo pair briefly so
         # the compositor does not alternate between stereo and zero layers.
-        $environment.FNVXR_CPU_STEREO_MAX_SOURCE_POSE_AGE_MS = "150"
+        $environment.FNVXR_CPU_STEREO_MAX_SOURCE_POSE_AGE_MS = "250"
         $environment.FNVXR_PLUGIN_KEYBOARD_MOVEMENT_ENABLE = "1"
         $environment.FNVXR_PLUGIN_MOVEMENT_DEADZONE = "9000"
         $environment.FNVXR_PLUGIN_MENU_KEYBOARD_FALLBACK = "1"
@@ -2363,7 +2368,11 @@ function Get-FnvxrProductMinimalEnvironment {
         $environment.FNVXR_PLUGIN_ACCEPT_ON_EXTERNAL_DINPUT_CLICK = "1"
         $environment.FNVXR_XINPUT_PHYSICAL_MENU_BUTTONS_ENABLE = "1"
         $environment.FNVXR_L3_MENU_FALLBACK = "1"
-        $environment.FNVXR_RIGHT_STICK_KEY_TURN = "1"
+        # Physical gameplay owns discrete comfort turning: one exact 30-degree
+        # actor-heading change per deflection, with neutral required to rearm.
+        $environment.FNVXR_RIGHT_STICK_KEY_TURN = "0"
+        # Full stick magnitude selects Fallout's native running movement flag
+        # in every direction; shallow input remains walking speed.
         $environment.FNVXR_GAMEPLAY_RIGHT_GRIP_GRAB_ENABLE = "1"
         $environment.FNVXR_DIRECT_UI_CLICK = "0"
         $environment.FNVXR_UI_SHARED_WIDTH = "1280"

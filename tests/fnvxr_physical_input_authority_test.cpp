@@ -100,6 +100,33 @@ int main()
     const auto neutral = fnvxr::physical_input::classifyLocomotion(9000, -9000, 9000);
     expect(!neutral.any(), "deadzone boundary is neutral");
 
+    const auto noisyHardLeft =
+        fnvxr::physical_input::classifyLocomotion(-31356, 9508, 9000);
+    expect(noisyHardLeft.left && !noisyHardLeft.forward
+            && !noisyHardLeft.backward && !noisyHardLeft.right,
+        "dominant cardinal input suppresses minor orthogonal stick noise");
+    const auto deliberateDiagonal =
+        fnvxr::physical_input::classifyLocomotion(24000, 20000, 9000);
+    expect(deliberateDiagonal.forward && deliberateDiagonal.right,
+        "comparable axes retain deliberate diagonal movement");
+
+    expect(fnvxr::physical_input::radialAnalogRunHeld(-30000, 0, 22000),
+        "full left strafe reaches analog run");
+    expect(fnvxr::physical_input::radialAnalogRunHeld(0, -30000, 22000),
+        "full backward reaches analog run");
+    expect(!fnvxr::physical_input::radialAnalogRunHeld(12000, 12000, 22000),
+        "partial stick remains walking speed");
+
+    fnvxr::physical_input::SnapTurnLatch snap;
+    expect(snap.update(24000, 22000, 9000) == 1,
+        "right-stick deflection requests one right snap");
+    expect(snap.update(30000, 22000, 9000) == 0,
+        "held right stick cannot repeat snap turns");
+    expect(snap.update(0, 22000, 9000) == 0,
+        "neutral rearms without turning");
+    expect(snap.update(-24000, 22000, 9000) == -1,
+        "rearmed left deflection requests one left snap");
+
     if (g_failures == 0)
     {
         std::cout << "physical input authority tests passed\n";

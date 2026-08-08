@@ -36,6 +36,20 @@ $DataDirectory = (Resolve-Path -LiteralPath $DataDirectory).Path
 $commandPath = Join-Path $DataDirectory "controller_pose_command.json"
 $ackPath = Join-Path $DataDirectory "command_ack.json"
 
+function Test-SimulatorIpcLeaf {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    for ($attempt = 1; $attempt -le 5; ++$attempt) {
+        try {
+            return Test-Path -LiteralPath $Path -PathType Leaf
+        } catch [System.UnauthorizedAccessException] {
+            if ($attempt -ge 5) { throw }
+        } catch [System.IO.IOException] {
+            if ($attempt -ge 5) { throw }
+        }
+        Start-Sleep -Milliseconds (10 * $attempt)
+    }
+}
+
 # The sequence is an integer so the runtime can echo it without timestamp
 # ambiguity. It is unique enough for one bounded local driver invocation.
 $sequence = [DateTime]::UtcNow.Ticks
@@ -95,7 +109,7 @@ if ($command.Count -le 2) {
 }
 
 $deadline = [DateTime]::UtcNow.AddMilliseconds($WaitMilliseconds)
-while (Test-Path -LiteralPath $commandPath -PathType Leaf) {
+while (Test-SimulatorIpcLeaf -Path $commandPath) {
     if ([DateTime]::UtcNow -ge $deadline) {
         throw "A previous simulator command was not consumed: $commandPath"
     }
@@ -106,7 +120,15 @@ $json = $command | ConvertTo-Json -Compress
 $temporaryPath = Join-Path $DataDirectory (
     "controller_pose_command.{0}.{1}.tmp" -f $PID, $sequence)
 $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-[System.IO.File]::WriteAllText($temporaryPath, $json, $utf8NoBom)
+for ($attempt = 1; $attempt -le 5; ++$attempt) {
+    try {
+        [System.IO.File]::WriteAllText($temporaryPath, $json, $utf8NoBom)
+        break
+    } catch [System.UnauthorizedAccessException] {
+        if ($attempt -ge 5) { throw }
+        Start-Sleep -Milliseconds (20 * $attempt)
+    }
+}
 $published = $false
 while (-not $published -and [DateTime]::UtcNow -lt $deadline) {
     try {
@@ -125,11 +147,11 @@ if (-not $published) {
 $acknowledgement = $null
 $consumedAt = $null
 while ([DateTime]::UtcNow -lt $deadline) {
-    $commandConsumed = -not (Test-Path -LiteralPath $commandPath -PathType Leaf)
+    $commandConsumed = -not (Test-SimulatorIpcLeaf -Path $commandPath)
     if ($commandConsumed -and $null -eq $consumedAt) {
         $consumedAt = [DateTime]::UtcNow
     }
-    if ($commandConsumed -and (Test-Path -LiteralPath $ackPath -PathType Leaf)) {
+    if ($commandConsumed -and (Test-SimulatorIpcLeaf -Path $ackPath)) {
         try {
             $candidate = Get-Content -LiteralPath $ackPath -Raw |
                 ConvertFrom-Json -ErrorAction Stop

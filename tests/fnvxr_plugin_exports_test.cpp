@@ -61,6 +61,8 @@ int main(int argc, char** argv)
     auto load = reinterpret_cast<LoadFn>(GetProcAddress(plugin, "NVSEPlugin_Load"));
     auto retailMutationProof = reinterpret_cast<RetailMutationProofFn>(
         GetProcAddress(plugin, "FNVXR_RetailMutationProofComplete"));
+    auto applyWeaponFrame = GetProcAddress(
+        plugin, "FNVXR_ApplyWeaponFrameForRender");
 
     if (!query)
         return fail("missing NVSEPlugin_Query export");
@@ -70,6 +72,8 @@ int main(int argc, char** argv)
 
     if (!retailMutationProof)
         return fail("missing retail mutation proof export");
+    if (!applyWeaponFrame)
+        return fail("missing renderer-bound weapon frame export");
 
     if (retailMutationProof())
         return fail("retail mutation proof must remain source-blocked");

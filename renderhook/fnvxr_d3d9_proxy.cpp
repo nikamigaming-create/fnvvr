@@ -10,6 +10,7 @@
 #include "../runtime/fnvxr_desktop_assist_ui_evidence.h"
 #include "../runtime/fnvxr_retail_engine_manifest.h"
 #include "../runtime/fnvxr_retail_runtime_publication_win32.h"
+#include "../runtime/fnvxr_weapon_frame_contract.h"
 #include "fnvxr_d3d9_activation.h"
 #include "fnvxr_d3d9_eye_targets.h"
 #include "fnvxr_d3d9ex_color_transport_win32.h"
@@ -541,6 +542,7 @@ using DesktopAssistUiQuadHeader =
     fnvxr::shared::SharedDesktopAssistUiQuadHeader;
 using fnvxr::shared::SharedVrPoseState;
 using fnvxr::shared::SharedVrOriginState;
+using fnvxr::shared::SharedWeaponFrameState;
 using fnvxr::shared::SharedCameraState;
 using fnvxr::shared::SharedRuntimeState;
 using fnvxr::shared::SharedPlayerState;
@@ -578,6 +580,8 @@ HANDLE gSharedVrPoseMapping = nullptr;
 SharedVrPoseState* gSharedVrPose = nullptr;
 HANDLE gSharedVrOriginMapping = nullptr;
 SharedVrOriginState* gSharedVrOrigin = nullptr;
+HANDLE gSharedWeaponFrameMapping = nullptr;
+SharedWeaponFrameState* gSharedWeaponFrame = nullptr;
 NamedProducerLease gSharedVrOriginProducerLease {};
 HANDLE gSharedCameraMapping = nullptr;
 SharedCameraState* gSharedCamera = nullptr;
@@ -2347,6 +2351,134 @@ SharedVrPoseState* sharedVrPoseState()
 
     logLine("shared VR pose mapped");
     return gSharedVrPose;
+}
+
+SharedWeaponFrameState* sharedWeaponFrameState()
+{
+    if (gSharedWeaponFrame)
+        return gSharedWeaponFrame;
+    gSharedWeaponFrameMapping = OpenFileMappingA(
+        FILE_MAP_READ | FILE_MAP_WRITE,
+        FALSE,
+        fnvxr::shared::WeaponFrameSharedMappingName);
+    if (!gSharedWeaponFrameMapping)
+        return nullptr;
+    gSharedWeaponFrame = static_cast<SharedWeaponFrameState*>(MapViewOfFile(
+        gSharedWeaponFrameMapping,
+        FILE_MAP_READ | FILE_MAP_WRITE,
+        0,
+        0,
+        sizeof(SharedWeaponFrameState)));
+    if (!gSharedWeaponFrame)
+    {
+        CloseHandle(gSharedWeaponFrameMapping);
+        gSharedWeaponFrameMapping = nullptr;
+        return nullptr;
+    }
+    logLine("shared weapon frame consumer mapped");
+    return gSharedWeaponFrame;
+}
+
+bool readCommittedWeaponFrame(SharedWeaponFrameState& snapshot)
+{
+    SharedWeaponFrameState* state = sharedWeaponFrameState();
+    if (!state)
+        return false;
+    for (int attempt = 0; attempt < 4; ++attempt)
+    {
+        const LONG before = InterlockedCompareExchange(
+            &state->producerSequence, 0, 0);
+        if (!fnvxr::shared::sequencedValueIsPublished(before))
+            continue;
+        MemoryBarrier();
+        std::memcpy(&snapshot, state, sizeof(snapshot));
+        MemoryBarrier();
+        const LONG after = InterlockedCompareExchange(
+            &state->producerSequence, 0, 0);
+        if (before == after
+            && fnvxr::shared::sequencedValueIsPublished(after)
+            && snapshot.magic == fnvxr::shared::WeaponFrameSharedMagic
+            && snapshot.version == fnvxr::shared::WeaponFrameSharedVersion)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool consumeWeaponFrameForFirstPerson(
+    std::uint32_t poseSequence,
+    std::uint64_t poseFrame,
+    std::uint32_t& failure,
+    std::uint64_t& commitId)
+{
+    failure = 0u;
+    commitId = 0u;
+    SharedWeaponFrameState snapshot {};
+    if (!readCommittedWeaponFrame(snapshot))
+        failure = 1u;
+    else
+    {
+        failure = static_cast<std::uint32_t>(
+            fnvxr::weapon_frame::validateIdentity(
+                snapshot.status,
+                fnvxr::shared::WeaponFramePoseCommitted,
+                snapshot.flags,
+                fnvxr::shared::WeaponFrameRequiredFlags,
+                snapshot.poseSequence,
+                snapshot.poseFrame,
+                poseSequence,
+                poseFrame,
+                snapshot.rightHandAddress,
+                snapshot.weaponAddress));
+        if (failure == 0u)
+        {
+            bool transformsMatch = true;
+            __try
+            {
+                constexpr std::uintptr_t WorldRotationOffset = 0x68u;
+                constexpr std::uintptr_t WorldTranslationOffset = 0x8Cu;
+                const float* hand = reinterpret_cast<const float*>(
+                    static_cast<std::uintptr_t>(snapshot.rightHandAddress)
+                        + WorldTranslationOffset);
+                const float* weaponPosition = reinterpret_cast<const float*>(
+                    static_cast<std::uintptr_t>(snapshot.weaponAddress)
+                        + WorldTranslationOffset);
+                const float* weaponRotation = reinterpret_cast<const float*>(
+                    static_cast<std::uintptr_t>(snapshot.weaponAddress)
+                        + WorldRotationOffset);
+                transformsMatch = fnvxr::weapon_frame::transformMatches(
+                        hand, snapshot.rightHandWorldPos, 3, 0.02f)
+                    && fnvxr::weapon_frame::transformMatches(
+                        weaponPosition, snapshot.weaponWorldPos, 3, 0.02f)
+                    && fnvxr::weapon_frame::transformMatches(
+                        weaponRotation, snapshot.weaponWorldRot, 9, 0.002f);
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                transformsMatch = false;
+            }
+            if (!transformsMatch)
+                failure = static_cast<std::uint32_t>(
+                    fnvxr::weapon_frame::Failure::TransformOverwritten);
+        }
+    }
+
+    SharedWeaponFrameState* state = gSharedWeaponFrame;
+    if (state && fnvxr::shared::beginSequencedSharedWrite(state->consumerSequence))
+    {
+        state->consumedStatus = failure == 0u
+            ? fnvxr::shared::WeaponFrameRenderConsumed
+            : fnvxr::shared::WeaponFrameInvalid;
+        state->consumedCommitId = failure == 0u ? snapshot.commitId : 0u;
+        state->consumedPoseSequence = failure == 0u ? poseSequence : 0u;
+        state->consumerFailure = failure;
+        state->consumedPoseFrame = failure == 0u ? poseFrame : 0u;
+        fnvxr::shared::endSequencedSharedWrite(state->consumerSequence);
+    }
+    if (failure == 0u)
+        commitId = snapshot.commitId;
+    return failure == 0u;
 }
 
 bool namedProducerLeaseHeldByCurrentThread(const NamedProducerLease& lease)
@@ -10757,15 +10889,45 @@ void __cdecl retailVrBeforeFirstPersonAdapter(
             "FNVXR_RETAIL_CENTER_INTEGRATED_FIRST_PERSON",
             false))
     {
-        const bool published =
-            bridge->publishPendingCenterIntegratedFirstPerson(callerId);
-        char event[512] {};
+        const std::uint32_t pendingPoseSequence =
+            bridge->pendingFirstPersonPoseSequence();
+        const std::uint64_t pendingPoseFrame =
+            bridge->pendingFirstPersonPoseFrame();
+        std::uint32_t weaponFrameFailure = 0u;
+        std::uint64_t weaponFrameCommitId = 0u;
+        const bool controllerRigRequired = readRawEnvBool(
+                "FNVXR_PHYSICAL_HEADSET_PLAY", false)
+            || (readRawEnvBool("OPENXR_SIMULATOR_HEADLESS", false)
+                && readRawEnvBool(
+                    "FNVXR_HEADSET_CONTROLLER_RIG_VISUAL_TRIAL", false));
+        const bool weaponFramePrepared = !controllerRigRequired
+            || bridge->preparePendingControllerRigForRender();
+        if (!weaponFramePrepared)
+            weaponFrameFailure = static_cast<std::uint32_t>(
+                fnvxr::weapon_frame::Failure::Unavailable);
+        const bool weaponFrameConsumed = weaponFramePrepared
+            && (!controllerRigRequired
+                || consumeWeaponFrameForFirstPerson(
+                    pendingPoseSequence,
+                    pendingPoseFrame,
+                    weaponFrameFailure,
+                    weaponFrameCommitId));
+        const bool published = weaponFrameConsumed
+            && bridge->publishPendingCenterIntegratedFirstPerson(callerId);
+        if (!weaponFrameConsumed)
+            bridge->discardPendingFirstPerson();
+        char event[768] {};
         sprintf_s(
             event,
-            "{\"event\":\"fnvxrRetailCenterIntegratedFirstPerson\",\"callerId\":%u,\"callerAddress\":\"0x%08X\",\"callerOrdinal\":%ld,\"published\":%s,\"privateEyeCalls\":0}",
+            "{\"event\":\"fnvxrRetailCenterIntegratedFirstPerson\",\"callerId\":%u,\"callerAddress\":\"0x%08X\",\"callerOrdinal\":%ld,\"poseSequence\":%u,\"poseFrame\":%llu,\"weaponFrameConsumed\":%s,\"weaponFrameCommitId\":%llu,\"weaponFrameFailure\":%u,\"published\":%s,\"privateEyeCalls\":0}",
             callerId,
             retailVrFirstPersonCallerAddress(callerId),
             callerOrdinal,
+            pendingPoseSequence,
+            static_cast<unsigned long long>(pendingPoseFrame),
+            weaponFrameConsumed ? "true" : "false",
+            static_cast<unsigned long long>(weaponFrameCommitId),
+            weaponFrameFailure,
             published ? "true" : "false");
         logRetailVrLine(event);
         deferredTrace = {};
@@ -11191,6 +11353,48 @@ bool retailVrFirstPersonGameplayLeaseReady(void*) noexcept
         && (player.flags & Required) == Required
         && player.playerAddress != 0u
         && player.playerNodeAddress != 0u;
+}
+
+bool prepareRetailVrControllerRigForRender(
+    void*,
+    const fnvxr::engine::RetailTrackedFrame& tracked) noexcept
+{
+    const bool required = readRawEnvBool(
+            "FNVXR_PHYSICAL_HEADSET_PLAY", false)
+        || (readRawEnvBool("OPENXR_SIMULATOR_HEADLESS", false)
+            && readRawEnvBool(
+                "FNVXR_HEADSET_CONTROLLER_RIG_VISUAL_TRIAL", false));
+    if (!required)
+        return true;
+#if !defined(_M_IX86)
+    (void)tracked;
+    return false;
+#else
+    using ApplyWeaponFrameFn = bool (__cdecl*)(
+        const fnvxr::shared::SharedVrPoseState*, LONG);
+    static ApplyWeaponFrameFn apply = nullptr;
+    if (!apply)
+    {
+        HMODULE plugin = GetModuleHandleA("nvse_fnvxr.dll");
+        if (plugin)
+        {
+            apply = reinterpret_cast<ApplyWeaponFrameFn>(GetProcAddress(
+                plugin,
+                "FNVXR_ApplyWeaponFrameForRender"));
+            if (!apply)
+            {
+                apply = reinterpret_cast<ApplyWeaponFrameFn>(GetProcAddress(
+                    plugin,
+                    "_FNVXR_ApplyWeaponFrameForRender"));
+            }
+        }
+    }
+    return apply
+        && tracked.poseSequence != 0u
+        && apply(
+            &tracked.pose,
+            static_cast<LONG>(tracked.poseSequence));
+#endif
 }
 
 void disarmRetailVrFirstPersonCallRelay(void*) noexcept
@@ -11885,6 +12089,8 @@ bool initializeRetailVrBridge(IDirect3DDevice9* device) noexcept
         &readRetailVrFirstPersonCompatibilityGuard;
     operations.firstPersonGameplayLeaseReady =
         &retailVrFirstPersonGameplayLeaseReady;
+    operations.prepareControllerRigForRender =
+        &prepareRetailVrControllerRigForRender;
     operations.prepareDistinctCameraFrame = &prepareRetailVrFrame;
     operations.publishCpuPair = &publishRetailVrCpuPair;
     operations.publishCpuMonoUiQuad = &publishRetailVrCpuMonoUiQuad;

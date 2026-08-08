@@ -39,6 +39,12 @@ struct UiBoundary
     std::uint64_t sourceFrame = 0u;
 };
 
+struct WorldPresentationDecision
+{
+    bool present = false;
+    bool advancesFreshProof = false;
+};
+
 enum class RuntimeMode : std::uint8_t
 {
     Unknown,
@@ -163,5 +169,49 @@ constexpr bool binocularWorldFrameEligible(
         && runtimeGameplayConfirmed(runtime)
         && frame.runtimeStateSample == runtime.sample
         && worldFollowsUiBoundary(frame, lastUiBoundary);
+}
+
+constexpr bool retainedBinocularWorldFrameEligible(
+    const FrameIdentity& frame,
+    const RuntimeSample& currentRuntime,
+    const UiBoundary& lastUiBoundary) noexcept
+{
+    return identityComplete(frame)
+        && frame.producerMode == shared::StereoProducerEngineCenter
+        && frame.separated
+        && frame.worldCandidate
+        && !frame.uiActive
+        && frame.pixelsComplete
+        && runtimeGameplayConfirmed(currentRuntime)
+        && worldFollowsUiBoundary(frame, lastUiBoundary);
+}
+
+// Keep presentation continuity independent from producer freshness. A stale
+// but semantically valid pair remains safe to reproject and present; only a
+// fresh pair advances evidence that the producer itself is still rendering.
+constexpr WorldPresentationDecision assessBinocularWorldFrame(
+    const FrameIdentity& frame,
+    const RuntimeSample& sourceRuntime,
+    const RuntimeSample& currentRuntime,
+    const UiBoundary& lastUiBoundary,
+    bool sourcePoseFresh) noexcept
+{
+    const bool freshEligible = binocularWorldFrameEligible(
+        frame,
+        sourceRuntime,
+        lastUiBoundary);
+    const bool present = freshEligible
+        || retainedBinocularWorldFrameEligible(
+            frame,
+            currentRuntime,
+            lastUiBoundary);
+    return { present, freshEligible && sourcePoseFresh };
+}
+
+constexpr bool preserveVerifiedWorldAcrossCellChange(
+    bool productionCpuEngineStereo,
+    bool hasVerifiedWorldFrame) noexcept
+{
+    return productionCpuEngineStereo && hasVerifiedWorldFrame;
 }
 }

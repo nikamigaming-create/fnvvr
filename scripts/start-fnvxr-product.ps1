@@ -2123,12 +2123,17 @@ function Get-FnvxrProductStereoContinuityProof {
     }
     $transactions = [ordered]@{}
     $poseSequences = @{}
+    $gameplaySubmits = New-Object System.Collections.Generic.List[object]
     foreach ($line in @(Get-Content -LiteralPath $LogPath -Tail 5000)) {
         if (-not $line.StartsWith('{"event":"fnvxrOpenXrSubmit"')) {
             continue
         }
         try {
             $frame = $line | ConvertFrom-Json -ErrorAction Stop
+            if ([bool]$frame.runtimeGameplay -and
+                [bool]$frame.runtimeShouldRender) {
+                $gameplaySubmits.Add($frame)
+            }
             $proof = ConvertTo-FnvxrProductStereoOutputProof -Frame $frame
             if (-not $proof) { continue }
             $transactionKey = "{0}:{1}" -f
@@ -2156,10 +2161,25 @@ function Get-FnvxrProductStereoContinuityProof {
         [uint64]$last.frame -le [uint64]$first.frame) {
         return $null
     }
+    $windowSubmits = @($gameplaySubmits | Where-Object {
+            [uint64]$_.frame -ge [uint64]$first.frame -and
+            [uint64]$_.frame -le [uint64]$last.frame
+        })
+    $rejectedGameplaySubmits = @($windowSubmits | Where-Object {
+            -not [bool]$_.projectionLayerSubmitted -or
+            [int]$_.layerCount -ne 1 -or
+            [string]$_.xrEndFrame -ne "XR_SUCCESS"
+        })
+    if ($windowSubmits.Count -lt $MinimumTransactions -or
+        $rejectedGameplaySubmits.Count -ne 0) {
+        return $null
+    }
     return [ordered]@{
         uniqueTransactions = $transactions.Count
         uniquePoseSequences = $poseSequences.Count
         durationMilliseconds = $durationMilliseconds
+        gameplaySubmitFrames = $windowSubmits.Count
+        rejectedGameplaySubmitFrames = $rejectedGameplaySubmits.Count
         first = $first
         last = $last
         observedAtUtc = [DateTime]::UtcNow.ToString("o")
@@ -2375,6 +2395,9 @@ function Get-FnvxrProductCenterIntegratedFirstPersonProof {
         }
         if ([string]$event.event -ceq
                 "fnvxrRetailCenterIntegratedFirstPerson" -and
+            [bool]$event.weaponFrameConsumed -and
+            [uint64]$event.weaponFrameCommitId -gt 0 -and
+            [uint32]$event.weaponFrameFailure -eq 0 -and
             [bool]$event.published -and
             [int]$event.privateEyeCalls -eq 0) {
             $events += $event
@@ -2386,6 +2409,10 @@ function Get-FnvxrProductCenterIntegratedFirstPersonProof {
         callerId = [uint32]$proof.callerId
         callerAddress = [string]$proof.callerAddress
         callerOrdinal = [long]$proof.callerOrdinal
+        poseSequence = [uint32]$proof.poseSequence
+        poseFrame = [uint64]$proof.poseFrame
+        weaponFrameConsumed = [bool]$proof.weaponFrameConsumed
+        weaponFrameCommitId = [uint64]$proof.weaponFrameCommitId
         published = [bool]$proof.published
         privateEyeCalls = [int]$proof.privateEyeCalls
         renderPath = "center-integrated-stock-first-person"
@@ -2411,7 +2438,16 @@ function Get-FnvxrProductRetailFirstPersonRenderProof {
         "Third" { 3 }
     }
     $firstPersonEvents = @()
-    foreach ($line in @(Get-Content -LiteralPath $RetailVrLogPath -Tail 12000)) {
+    try {
+        $retailVrLines = @(
+            Get-Content -LiteralPath $RetailVrLogPath -Tail 12000)
+    } catch [System.IO.IOException] {
+        # The D3D9 writer briefly rotates/flushed this live evidence stream
+        # with an exclusive handle. Supervision polls again; a transient share
+        # violation is not a product failure after the render remains live.
+        return $null
+    }
+    foreach ($line in $retailVrLines) {
         $jsonStart = $line.IndexOf('{"event":"fnvxrRetailFirstPerson')
         if ($jsonStart -lt 0) { continue }
         try {
@@ -2451,7 +2487,13 @@ function Get-FnvxrProductRetailFirstPersonRenderProof {
     })
     $rig = @()
     if (Test-Path -LiteralPath $WeaponTelemetryLogPath -PathType Leaf) {
-        foreach ($line in @(Get-Content -LiteralPath $WeaponTelemetryLogPath -Tail 12000)) {
+        try {
+            $weaponTelemetryLines = @(
+                Get-Content -LiteralPath $WeaponTelemetryLogPath -Tail 12000)
+        } catch [System.IO.IOException] {
+            return $null
+        }
+        foreach ($line in $weaponTelemetryLines) {
             $jsonStart = $line.IndexOf('{"event":"fnvxrRigIndependence"')
             if ($jsonStart -lt 0) { continue }
             try {
@@ -3181,7 +3223,7 @@ try {
             & (Join-Path $PSScriptRoot `
                 "invoke-openxr-simulator-combat-demo.ps1") `
                 -DataDirectory $openXrSimulatorDataDirectory `
-                -ShotsToEmpty 14 `
+                -ShotsToEmpty 13 `
                 -ShotsAfterReload 2 `
                 -UpdatesPerSecond 12 `
                 -ConsumeTimeoutMilliseconds 5000
@@ -3192,7 +3234,7 @@ try {
         if (-not [bool]$combatEvidence.centerRestored -or
             -not [bool]$combatEvidence.controlsReleased -or
             -not [bool]$combatEvidence.locomotion.neutralRestored -or
-            [int]$combatEvidence.triggerPresses -lt 16 -or
+            [int]$combatEvidence.triggerPresses -lt 15 -or
             -not [bool]$headsetPoseSweepEvidence.centerRestored -or
             [string]$headsetPoseSweepEvidence.pattern -cne
                 "gentle-sinusoidal-v1") {
@@ -3212,7 +3254,7 @@ try {
         })
         $emptyingPattern = ($loadedBefore | Select-Object -First 13) -join ','
         $confirmationPattern = ($loadedBefore | Select-Object -Last 2) -join ','
-        if ($attackEvents.Count -ne 16 -or $reloadEvents.Count -ne 1 -or
+        if ($attackEvents.Count -ne 15 -or $reloadEvents.Count -ne 2 -or
             $emptyingPattern -cne '13,12,11,10,9,8,7,6,5,4,3,2,1' -or
             $confirmationPattern -cne '13,12') {
             throw "The bounded combat trial did not prove a full 13-round magazine discharge, engine reload back to 13, and two post-reload shots from the simulator controllers. Evidence is in $runDirectory"
@@ -3251,10 +3293,11 @@ try {
                 $runDirectory)
         }
         $combatProof = [ordered]@{
-            shotsToEmpty = 14
+            shotsToEmpty = 13
+            preparationReloads = 1
             reloads = 1
             shotsAfterReload = 2
-            commandedShots = 16
+            commandedShots = 15
             primaryAttackHoldEvents = $attackEvents.Count
             reloadHoldEvents = $reloadEvents.Count
             loadedRoundsBeforeAttacks = $loadedBefore

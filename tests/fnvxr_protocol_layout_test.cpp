@@ -187,6 +187,18 @@ int main()
         || offsetof(fnvxr::shared::SharedVrOriginState, bodyRootWorldScale) != 208)
     {
         return fail("SharedVrOriginState authoritative recenter layout mismatch");
+
+    if (sizeof(fnvxr::shared::SharedWeaponFrameState) != 160
+        || offsetof(fnvxr::shared::SharedWeaponFrameState, producerSequence) != 8
+        || offsetof(fnvxr::shared::SharedWeaponFrameState, commitId) != 16
+        || offsetof(fnvxr::shared::SharedWeaponFrameState, poseSequence) != 24
+        || offsetof(fnvxr::shared::SharedWeaponFrameState, rightHandAddress) != 56
+        || offsetof(fnvxr::shared::SharedWeaponFrameState, rightHandWorldPos) != 64
+        || offsetof(fnvxr::shared::SharedWeaponFrameState, weaponWorldRot) != 88
+        || offsetof(fnvxr::shared::SharedWeaponFrameState, consumerSequence) != 124
+        || offsetof(fnvxr::shared::SharedWeaponFrameState, consumedCommitId) != 136
+        || offsetof(fnvxr::shared::SharedWeaponFrameState, consumedPoseFrame) != 152)
+        return fail("SharedWeaponFrameState producer/consumer lane layout mismatch");
     }
 
     if (fnvxr::shared::DesktopAssistUiQuadSharedVersion != 1
