@@ -12,6 +12,7 @@
 #include "fnvxr_host_ui_capture_gate.h"
 #include "fnvxr_headset_mirror_capture.h"
 #include "fnvxr_openxr_live_authority.h"
+#include "fnvxr_physical_input_authority.h"
 #include "fnvxr_shared_state.h"
 #include "fnvxr_stereo_visual_trial.h"
 #include "fnvxr_stereo_math.h"
@@ -1030,6 +1031,11 @@ bool physicalHeadsetPlayRequested()
 bool interactiveControllerRouteRequested()
 {
     return physicalHeadsetPlayRequested()
+        || (envEqualsIgnoreCase("FNVXR_RUN_PROFILE", "stereo-visual-trial-v5")
+            && envEnabled("FNVXR_HEADSET_COMBAT_VISUAL_TRIAL", false)
+            && envEnabled("FNVXR_HEADSET_CONTROLLER_RIG_VISUAL_TRIAL", false)
+            && envEnabled("FNVXR_RETAIL_FIXTURE_AUTOMATION", false)
+            && envEnabled("OPENXR_SIMULATOR_HEADLESS", false))
         || envEqualsIgnoreCase("FNVXR_RUN_PROFILE", "retail-sidecar")
         || envEqualsIgnoreCase("FNVXR_RUN_PROFILE", "openxr-sidecar");
 }
@@ -3943,6 +3949,7 @@ std::uint64_t publishHostSharedBridge(
     bool controllerInputAuthorized,
     bool menuInputActive,
     bool gameplayControlsActive,
+    bool locomotionControlsActive,
     bool weaponOut,
     std::uint32_t runtimeMenuBits,
     std::uint32_t poseTrackingFlags,
@@ -4115,7 +4122,7 @@ std::uint64_t publishHostSharedBridge(
         bridge.dinputState->menuInputActive =
             controllerInputAuthorized && menuInputActive ? 1u : 0u;
         bridge.dinputState->gameplayControlsActive =
-            controllerInputAuthorized && gameplayControlsActive ? 1u : 0u;
+            controllerInputAuthorized && locomotionControlsActive ? 1u : 0u;
         bridge.dinputState->leftStickX = controllerInputAuthorized
             ? static_cast<std::int32_t>(std::lround(
                 std::clamp(frame.leftThumbstickX, -1.0f, 1.0f)
@@ -10469,6 +10476,22 @@ int main(int argc, char** argv)
             && controllerConsumerAcknowledged
             && controllerMode
                 != fnvxr::shared::RuntimeControllerMode::Unknown;
+        const bool physicalGameplayInputRequested =
+            physicalHeadsetPlayRequested();
+        const bool physicalMenuOwnsInput =
+            controllerMode == fnvxr::shared::RuntimeControllerMode::Ui
+            || (runtimeMenuBits
+                & fnvxr::shared::RuntimeBlockingMenuBits) != 0u;
+        const auto physicalGameplayAuthority =
+            fnvxr::physical_input::assessGameplayAuthority({
+                physicalGameplayInputRequested,
+                shouldReadInput,
+                controllerConsumerAcknowledged,
+                physicalMenuOwnsInput,
+                runtimeGameplayActive,
+                controllerMode
+                    == fnvxr::shared::RuntimeControllerMode::Gameplay,
+            });
         const bool menuPointerInputActive =
             shouldReadInput
             && controllerMutationAuthorized
@@ -10482,6 +10505,10 @@ int main(int argc, char** argv)
                 : (productionUiQuadActive
                     && productComposition.pointerEnabled)
                     || cpuEngineUiQuadActive);
+        // Preserve the renderer-dependent gameplay-control boundary for
+        // headspace/weapon behavior. Physical locomotion receives its own
+        // runtime-authoritative gate below, so presentation readiness cannot
+        // delay an otherwise valid player movement input.
         const bool gameplayControlsActive =
             shouldReadInput
             && controllerMutationAuthorized
@@ -10492,6 +10519,10 @@ int main(int argc, char** argv)
                 : (haveRuntimeUiState
                     ? (!runtimeUiActive || runtimeGameplayActive)
                     : !gameUiMode));
+        const bool locomotionControlsActive =
+            physicalGameplayInputRequested
+            ? physicalGameplayAuthority.granted()
+            : gameplayControlsActive;
         const float headspaceAimTrigger = std::clamp(envFloat("FNVXR_HEADSPACE_LOOK_AIM_TRIGGER", 0.35f), 0.0f, 1.0f);
         const bool headspaceAimHeld = gameplayControlsActive && frame.leftTrigger >= headspaceAimTrigger;
         const bool weaponOut = gameplayControlsActive && lastSharedPlayerWeaponOut;
@@ -10725,6 +10756,7 @@ int main(int argc, char** argv)
             controllerMutationAuthorized,
             menuPointerInputActive,
             gameplayControlsActive,
+            locomotionControlsActive,
             weaponOut,
             runtimeMenuBits,
             poseTrackingFlags,
@@ -10734,6 +10766,74 @@ int main(int argc, char** argv)
             rawRightAimPose,
             (result == XR_SUCCESS && viewCountOutput >= 2 && viewsValid) ? views.data() : nullptr,
             (result == XR_SUCCESS && viewCountOutput >= 2 && viewsValid) ? viewCountOutput : 0);
+        if (physicalGameplayInputRequested)
+        {
+            const int physicalMovementDeadzone = std::clamp(
+                envInt("FNVXR_PLUGIN_MOVEMENT_DEADZONE", 9000),
+                1000,
+                30000);
+            const std::int32_t sharedLeftThumbX = controllerMutationAuthorized
+                ? static_cast<std::int32_t>(thumbValue(frame.leftThumbstickX))
+                : 0;
+            const std::int32_t sharedLeftThumbY = controllerMutationAuthorized
+                ? static_cast<std::int32_t>(thumbValue(frame.leftThumbstickY))
+                : 0;
+            const auto physicalLocomotionIntent =
+                fnvxr::physical_input::classifyLocomotion(
+                    sharedLeftThumbX,
+                    sharedLeftThumbY,
+                    physicalMovementDeadzone);
+            const unsigned int physicalLocomotionIntentMask =
+                (physicalLocomotionIntent.forward ? 0x1u : 0u)
+                | (physicalLocomotionIntent.backward ? 0x2u : 0u)
+                | (physicalLocomotionIntent.left ? 0x4u : 0u)
+                | (physicalLocomotionIntent.right ? 0x8u : 0u);
+            static bool physicalLocomotionTelemetryInitialized = false;
+            static fnvxr::physical_input::GameplayAuthorityBlocker
+                previousPhysicalLocomotionBlocker =
+                    fnvxr::physical_input::GameplayAuthorityBlocker::PhysicalPlayNotRequested;
+            static unsigned int previousPhysicalLocomotionIntentMask = 0u;
+            if (!physicalLocomotionTelemetryInitialized
+                || physicalGameplayAuthority.blocker
+                    != previousPhysicalLocomotionBlocker
+                || physicalLocomotionIntentMask
+                    != previousPhysicalLocomotionIntentMask)
+            {
+                physicalLocomotionTelemetryInitialized = true;
+                previousPhysicalLocomotionBlocker =
+                    physicalGameplayAuthority.blocker;
+                previousPhysicalLocomotionIntentMask =
+                    physicalLocomotionIntentMask;
+                std::cout << "physicalLocomotionHostAuthority"
+                          << " poseFrame=" << frame.frame
+                          << " poseSequence=" << publishedPoseSequence
+                          << " xinputPacket=" << sharedBridge.xinputPacket
+                          << " dinputFrame=" << frame.frame
+                          << " rawLs=(" << frame.leftThumbstickX
+                          << "," << frame.leftThumbstickY << ")"
+                          << " sharedLs=(" << sharedLeftThumbX
+                          << "," << sharedLeftThumbY << ")"
+                          << " intent=0x" << std::hex
+                          << physicalLocomotionIntentMask << std::dec
+                          << " runtimeGameplay="
+                          << static_cast<int>(runtimeGameplayActive)
+                          << " controllerMode="
+                          << fnvxr::shared::runtimeControllerModeName(
+                              controllerMode)
+                          << " menuOwnsInput="
+                          << static_cast<int>(physicalMenuOwnsInput)
+                          << " consumerAck="
+                          << static_cast<int>(controllerConsumerAcknowledged)
+                          << " rendererGameplay="
+                          << static_cast<int>(gameplayControlsActive)
+                          << " locomotionAuthorized="
+                          << static_cast<int>(locomotionControlsActive)
+                          << " blocker="
+                          << fnvxr::physical_input::gameplayAuthorityBlockerName(
+                              physicalGameplayAuthority.blocker)
+                          << "\n";
+            }
+        }
         if (publishedPoseSequence != 0u
             && (poseTrackingFlags & fnvxr::shared::VrPoseTrackingHmd) != 0u
             && result == XR_SUCCESS
@@ -10769,6 +10869,7 @@ int main(int argc, char** argv)
                           << " shouldReadInput=" << static_cast<int>(shouldReadInput)
                           << " menuInput=" << static_cast<int>(menuPointerInputActive)
                           << " gameplayControls=" << static_cast<int>(gameplayControlsActive)
+                          << " locomotionControls=" << static_cast<int>(locomotionControlsActive)
                           << " ls=(" << frame.leftThumbstickX << "," << frame.leftThumbstickY << ")"
                           << " rs=(" << frame.rightThumbstickX << "," << frame.rightThumbstickY << ")"
                           << " lt=" << frame.leftTrigger

@@ -13,6 +13,7 @@
 #include "fnvxr_retail_safety.h"
 #include "fnvxr_retail_fixture_automation_authority.h"
 #include "fnvxr_headset_demo_authority.h"
+#include "fnvxr_physical_input_authority.h"
 #include "fnvxr_stereo_visual_trial_automation_authority.h"
 
 #include <windows.h>
@@ -453,6 +454,24 @@ struct RetailWeaponCalibration
     Vec3 controllerToWeaponBodyLocal {};
 };
 
+struct RetailRigContinuityPose
+{
+    bool valid {};
+    void* root {};
+    void* upperArm {};
+    void* forearm {};
+    void* hand {};
+    void* weapon {};
+    UInt32 referenceSpaceGeneration {};
+    UInt32 consecutiveReplays {};
+    Matrix33 upperArmLocalRotation {};
+    Matrix33 forearmLocalRotation {};
+    Matrix33 handLocalRotation {};
+    Matrix33 weaponLocalRotation {};
+    Vec3 weaponLocalTranslation {};
+    float weaponLocalScale {};
+};
+
 struct ShowroomScene
 {
     const char* name;
@@ -531,6 +550,8 @@ bool g_publishedDirectInputHoldKnown[MaxDirectInputMacros] {};
 bool g_publishedDirectInputHoldState[MaxDirectInputMacros] {};
 bool g_publishedDirectInputHoldViaHook[MaxDirectInputMacros] {};
 UInt64 g_publishedDirectInputHoldHeartbeatMs[MaxDirectInputMacros] {};
+bool g_physicalLocomotionDirectInputApplied[MaxDirectInputMacros] {};
+bool g_physicalLocomotionDirectInputUnavailableLogged[MaxDirectInputMacros] {};
 constexpr UInt64 DirectInputHoldHeartbeatMilliseconds = 200;
 constexpr bool LegacyInProcessDirectInputHoldFallbackEnabled = false;
 using BufferedKeyTapFn = void (__thiscall*)(void*, UInt32);
@@ -632,6 +653,7 @@ RetailRigNodes g_retailRigNodes {};
 RetailHandCalibration g_retailLeftCalibration {};
 RetailHandCalibration g_retailRightCalibration {};
 RetailWeaponCalibration g_retailWeaponCalibration {};
+RetailRigContinuityPose g_retailRigContinuityPose {};
 bool g_haveRetailRigOrigin = false;
 Quat g_retailRigOriginHmdRot { 0.0f, 0.0f, 0.0f, 1.0f };
 Vec3 g_retailRigOriginHmdPos {};
@@ -962,10 +984,15 @@ bool physicalHeadsetPlayProfileSelected()
     return runProfileIs("retail-vr-play-v1");
 }
 
-bool physicalHeadsetEngineCenterRigRequested()
+bool physicalHeadsetPlayRequested()
 {
     return physicalHeadsetPlayProfileSelected()
-        && envEnabled("FNVXR_PHYSICAL_HEADSET_PLAY", false)
+        && envEnabled("FNVXR_PHYSICAL_HEADSET_PLAY", false);
+}
+
+bool physicalHeadsetEngineCenterRigRequested()
+{
+    return physicalHeadsetPlayRequested()
         && envEnabled("FNVXR_ENABLE_ENGINE_CENTER_STEREO", false);
 }
 
@@ -6153,6 +6180,7 @@ bool discoverRetailRigNodes(void* root)
     g_retailLeftCalibration = {};
     g_retailRightCalibration = {};
     g_retailWeaponCalibration = {};
+    g_retailRigContinuityPose = {};
     ++g_retailRigDiscoveryCount;
 
     logTelemetry(
@@ -6194,6 +6222,7 @@ void refreshRetailWeaponNodes()
     if (g_retailRigNodes.weapon != previousWeapon)
     {
         g_retailWeaponCalibration = {};
+        g_retailRigContinuityPose = {};
         logTelemetry(
             "retailWeapon node changed previous=%p current=%p calibrationReset=1\n",
             previousWeapon,
@@ -6949,9 +6978,100 @@ void resetRetailRigOrigin(const char* reason)
     g_retailRigOriginAuthoritySequence = 0;
     g_retailRigOriginSource = RetailRigOriginSource::None;
     g_lastRetailRigPoseSequence = 0;
+    g_retailRigContinuityPose = {};
     g_haveRetailRigMotionSample = false;
     g_retailRigHeadOnlySamples = 0;
     g_retailRigControllerOnlySamples = 0;
+}
+
+void captureRetailRigContinuityPose()
+{
+    const RetailArmNodes& arm = g_retailRigNodes.right;
+    void* weapon = g_retailRigNodes.weapon;
+    if (!g_retailRigNodes.root || !arm.upperArm || !arm.forearm || !arm.hand
+        || !weapon || niObjectKind(weapon) == 0)
+    {
+        g_retailRigContinuityPose = {};
+        return;
+    }
+
+    RetailRigContinuityPose pose {};
+    pose.root = g_retailRigNodes.root;
+    pose.upperArm = arm.upperArm;
+    pose.forearm = arm.forearm;
+    pose.hand = arm.hand;
+    pose.weapon = weapon;
+    pose.referenceSpaceGeneration = g_retailRigReferenceSpaceGeneration;
+    pose.upperArmLocalRotation = readMatrix33(
+        reinterpret_cast<std::uintptr_t>(arm.upperArm) + NiAvObjectLocalRotationOffset);
+    pose.forearmLocalRotation = readMatrix33(
+        reinterpret_cast<std::uintptr_t>(arm.forearm) + NiAvObjectLocalRotationOffset);
+    pose.handLocalRotation = readMatrix33(
+        reinterpret_cast<std::uintptr_t>(arm.hand) + NiAvObjectLocalRotationOffset);
+    pose.weaponLocalRotation = readMatrix33(
+        reinterpret_cast<std::uintptr_t>(weapon) + NiAvObjectLocalRotationOffset);
+    pose.weaponLocalTranslation = readVec3(
+        reinterpret_cast<std::uintptr_t>(weapon) + NiAvObjectLocalTranslationOffset);
+    pose.weaponLocalScale = readFloat(
+        reinterpret_cast<std::uintptr_t>(weapon) + NiAvObjectLocalScaleOffset,
+        0.0f);
+    pose.valid = finiteMatrix33(pose.upperArmLocalRotation)
+        && finiteMatrix33(pose.forearmLocalRotation)
+        && finiteMatrix33(pose.handLocalRotation)
+        && finiteMatrix33(pose.weaponLocalRotation)
+        && finiteVec3(pose.weaponLocalTranslation)
+        && std::isfinite(pose.weaponLocalScale)
+        && std::fabs(pose.weaponLocalScale) >= 0.0001f;
+    g_retailRigContinuityPose = pose;
+}
+
+bool replayRetailRigContinuityPose()
+{
+    constexpr UInt32 MaximumConsecutiveReplays = 3u;
+    RetailRigContinuityPose& pose = g_retailRigContinuityPose;
+    const RetailArmNodes& arm = g_retailRigNodes.right;
+    if (!pose.valid || pose.consecutiveReplays >= MaximumConsecutiveReplays
+        || pose.referenceSpaceGeneration != g_retailRigReferenceSpaceGeneration
+        || pose.root != g_retailRigNodes.root
+        || pose.upperArm != arm.upperArm || pose.forearm != arm.forearm
+        || pose.hand != arm.hand || pose.weapon != g_retailRigNodes.weapon)
+    {
+        pose = {};
+        return false;
+    }
+
+    const bool wrote = writeMatrix33(
+            reinterpret_cast<std::uintptr_t>(arm.upperArm) + NiAvObjectLocalRotationOffset,
+            pose.upperArmLocalRotation)
+        && writeMatrix33(
+            reinterpret_cast<std::uintptr_t>(arm.forearm) + NiAvObjectLocalRotationOffset,
+            pose.forearmLocalRotation)
+        && writeMatrix33(
+            reinterpret_cast<std::uintptr_t>(arm.hand) + NiAvObjectLocalRotationOffset,
+            pose.handLocalRotation)
+        && writeMatrix33(
+            reinterpret_cast<std::uintptr_t>(pose.weapon) + NiAvObjectLocalRotationOffset,
+            pose.weaponLocalRotation)
+        && writeVec3(
+            reinterpret_cast<std::uintptr_t>(pose.weapon) + NiAvObjectLocalTranslationOffset,
+            pose.weaponLocalTranslation)
+        && writeFloat(
+            reinterpret_cast<std::uintptr_t>(pose.weapon) + NiAvObjectLocalScaleOffset,
+            pose.weaponLocalScale);
+    if (!wrote)
+    {
+        pose = {};
+        return false;
+    }
+
+    forwardKinematics(arm.upperArm);
+    forwardKinematics(pose.weapon);
+    ++pose.consecutiveReplays;
+    logTelemetry(
+        "retailRig continuity replay count=%lu max=%lu reason=transient-right-solve-failure\n",
+        static_cast<unsigned long>(pose.consecutiveReplays),
+        static_cast<unsigned long>(MaximumConsecutiveReplays));
+    return true;
 }
 
 void logRetailRigGateSkip(
@@ -7256,12 +7376,24 @@ void onRetailPostAnimation(void* animData)
         true,
         applyWrites,
         leftError);
-    const RetailWeaponApplyResult weaponResult = rightSolved
+    // Weapon aim is controller-owned and remains valid even when the visual
+    // arm chain is momentarily outside its FABRIK reach envelope. Coupling
+    // these writes made the stock animation flash through during wide firing
+    // motions despite a current, usable aim pose.
+    RetailWeaponApplyResult weaponResult = rightControllerUsable
         ? applyRetailWeaponAim(
             rightController,
             bodyWorldRotation,
             applyWrites)
         : RetailWeaponApplyResult {};
+    bool continuityReplayed = false;
+    if (headlessStereoRigVisualTrial && applyWrites)
+    {
+        if (rightSolved && weaponResult.writeVerified)
+            captureRetailRigContinuityPose();
+        else if (!weaponResult.writeVerified)
+            continuityReplayed = replayRetailRigContinuityPose();
+    }
     if (weaponResult.endpointMeasured)
     {
         g_latestMuzzleProofPoseSequence = pose.sequence;
@@ -7426,7 +7558,7 @@ void onRetailPostAnimation(void* animData)
                 "\"originSource\":\"%s\","
                 "\"anchorSource\":\"%s\","
                 "\"cameraInput\":\"hmd-only\",\"rigInput\":\"controller-only\","
-                "\"apply\":%s,\"rightSolved\":%s,\"weaponAligned\":%s,"
+                "\"apply\":%s,\"rightSolved\":%s,\"continuityReplayed\":%s,\"weaponAligned\":%s,"
                 "\"weaponWriteRequested\":%s,\"weaponWriteAttempted\":%s,\"weaponWriteApplied\":%s,"
                 "\"headLocalMeters\":[%.6f,%.6f,%.6f],"
                 "\"controllerLocalMeters\":[%.6f,%.6f,%.6f],"
@@ -7470,6 +7602,7 @@ void onRetailPostAnimation(void* animData)
                 retailRigAnchorSourceName(),
                 applyWrites ? "true" : "false",
                 rightSolved ? "true" : "false",
+                continuityReplayed ? "true" : "false",
                 weaponAligned ? "true" : "false",
                 weaponResult.writeRequested ? "true" : "false",
                 weaponResult.writeAttempted ? "true" : "false",
@@ -8975,10 +9108,52 @@ bool postWindowMouseClick(HWND hwnd, POINT clientPoint)
     return moved && down && up;
 }
 
-bool holdDirectInputKey(UInt32 keycode, bool held)
+bool holdDirectInputKey(
+    UInt32 keycode,
+    bool held,
+    fnvxr::physical_input::LocomotionDelivery delivery =
+        fnvxr::physical_input::LocomotionDelivery::SharedInputQueue)
 {
     if (keycode >= MaxDirectInputMacros)
         return false;
+
+    if (delivery
+        == fnvxr::physical_input::LocomotionDelivery::InProcessNvseDirectInput)
+    {
+        const bool directDeliveryAlreadyApplied =
+            g_physicalLocomotionDirectInputApplied[keycode]
+            && g_publishedDirectInputHoldKnown[keycode]
+            && g_publishedDirectInputHoldState[keycode] == held
+            && (!held || g_publishedDirectInputHoldViaHook[keycode]);
+        if (directDeliveryAlreadyApplied)
+            return true;
+
+        if (!g_directInputHook)
+        {
+            if (!g_physicalLocomotionDirectInputUnavailableLogged[keycode])
+            {
+                g_physicalLocomotionDirectInputUnavailableLogged[keycode] = true;
+                logTelemetry(
+                    "physicalLocomotionDirectInput key=0x%02lx held=%d finalConsumer=nvse-directinput-hold applied=0 reason=directinput-hook-unavailable\n",
+                    static_cast<unsigned long>(keycode),
+                    static_cast<int>(held));
+            }
+            return false;
+        }
+
+        g_directInputHook->keys[keycode].hold = held;
+        g_publishedDirectInputHoldKnown[keycode] = true;
+        g_publishedDirectInputHoldState[keycode] = held;
+        g_publishedDirectInputHoldViaHook[keycode] = held;
+        g_publishedDirectInputHoldHeartbeatMs[keycode] = 0;
+        g_physicalLocomotionDirectInputApplied[keycode] = true;
+        g_physicalLocomotionDirectInputUnavailableLogged[keycode] = false;
+        logTelemetry(
+            "physicalLocomotionDirectInput key=0x%02lx held=%d finalConsumer=nvse-directinput-hold applied=1\n",
+            static_cast<unsigned long>(keycode),
+            static_cast<int>(held));
+        return true;
+    }
 
     if (g_publishedDirectInputHoldKnown[keycode]
         && g_publishedDirectInputHoldState[keycode] == held)
@@ -9008,6 +9183,7 @@ bool holdDirectInputKey(UInt32 keycode, bool held)
         g_publishedDirectInputHoldKnown[keycode] = true;
         g_publishedDirectInputHoldState[keycode] = false;
         g_publishedDirectInputHoldHeartbeatMs[keycode] = 0;
+        g_physicalLocomotionDirectInputApplied[keycode] = false;
         return true;
     }
     if (g_publishedDirectInputHoldViaHook[keycode])
@@ -9018,6 +9194,7 @@ bool holdDirectInputKey(UInt32 keycode, bool held)
         g_publishedDirectInputHoldState[keycode] = held;
         g_publishedDirectInputHoldViaHook[keycode] = held;
         g_publishedDirectInputHoldHeartbeatMs[keycode] = 0;
+        g_physicalLocomotionDirectInputApplied[keycode] = false;
         return true;
     }
     const bool releasingQueuedHold =
@@ -9045,6 +9222,7 @@ bool holdDirectInputKey(UInt32 keycode, bool held)
         g_publishedDirectInputHoldState[keycode] = held;
         g_publishedDirectInputHoldViaHook[keycode] = false;
         g_publishedDirectInputHoldHeartbeatMs[keycode] = held ? GetTickCount64() : 0;
+        g_physicalLocomotionDirectInputApplied[keycode] = false;
         return true;
     }
     if (releasingQueuedHold)
@@ -9057,7 +9235,17 @@ bool holdDirectInputKey(UInt32 keycode, bool held)
     g_publishedDirectInputHoldState[keycode] = held;
     g_publishedDirectInputHoldViaHook[keycode] = held;
     g_publishedDirectInputHoldHeartbeatMs[keycode] = 0;
+    g_physicalLocomotionDirectInputApplied[keycode] = false;
     return true;
+}
+
+bool holdGameplayMovementKey(UInt32 keycode, bool held)
+{
+    return holdDirectInputKey(
+        keycode,
+        held,
+        fnvxr::physical_input::selectLocomotionDelivery(
+            physicalHeadsetPlayRequested()));
 }
 
 UInt32 directInputMacroKeyFromEnv(const char* name, UInt32 fallback)
@@ -9577,10 +9765,10 @@ void releaseControllerHolds()
     releaseUiFavoriteAssignment("releaseControllerHolds", 0);
     holdDirectInputKey(DIK_R, false);
     holdGameplayGrab(false);
-    holdDirectInputKey(DIK_W, false);
-    holdDirectInputKey(DIK_A, false);
-    holdDirectInputKey(DIK_S, false);
-    holdDirectInputKey(DIK_D, false);
+    holdGameplayMovementKey(DIK_W, false);
+    holdGameplayMovementKey(DIK_A, false);
+    holdGameplayMovementKey(DIK_S, false);
+    holdGameplayMovementKey(DIK_D, false);
     holdDirectInputKey(DIK_UP, false);
     holdDirectInputKey(DIK_LEFT, false);
     holdDirectInputKey(DIK_DOWN, false);
@@ -10885,10 +11073,10 @@ void releaseExternalXInputGameplayHolds()
     holdDirectInputKey(DIK_R, false);
     holdGameplayGrab(false);
     holdGameplayRunModifier(false);
-    holdDirectInputKey(DIK_W, false);
-    holdDirectInputKey(DIK_A, false);
-    holdDirectInputKey(DIK_S, false);
-    holdDirectInputKey(DIK_D, false);
+    holdGameplayMovementKey(DIK_W, false);
+    holdGameplayMovementKey(DIK_A, false);
+    holdGameplayMovementKey(DIK_S, false);
+    holdGameplayMovementKey(DIK_D, false);
     holdDirectInputKey(DIK_LEFT, false);
     holdDirectInputKey(DIK_RIGHT, false);
     cancelThirdPersonL3Control("externalXInput:release", 0);
@@ -11240,6 +11428,8 @@ void updateExternalRightGripMenuMode(bool held, bool& previousHeld)
 
 void consumeExternalXInputGameplayControls(
     const SharedXInputState& state,
+    const SharedDInputState& hostInput,
+    bool physicalLocomotionAllowed,
     UInt16 pressed,
     bool& previousRightTriggerHeld,
     bool& previousLeftTriggerHeld,
@@ -11251,24 +11441,31 @@ void consumeExternalXInputGameplayControls(
     static bool previousThirdPersonChordHeld = false;
     static bool previousVatsChordHeld = false;
     static PrimaryAttackState primaryAttackState {};
-    const UInt64 frame = externalDInputFrame();
+    const UInt64 frame = hostInput.frame != 0u
+        ? hostInput.frame
+        : externalDInputFrame();
     const bool rightTriggerHeld = state.rightTrigger > triggerThreshold;
     const bool leftTriggerHeld = state.leftTrigger > triggerThreshold;
     const bool analogRun = gameplayAnalogRunHeld(state.leftThumbY);
     const bool keyboardMovement = pluginKeyboardMovementEnabled();
     const bool keyboardGameplayFallback = pluginGameplayKeyboardFallbackEnabled();
+    const bool physicalLocomotionRoute = physicalHeadsetPlayRequested();
     const int movementDeadzone = std::clamp(
         getIntFromEnv("FNVXR_PLUGIN_MOVEMENT_DEADZONE", 9000),
         1000,
         30000);
-    const bool moveLeft =
-        keyboardMovement && state.leftThumbX < -movementDeadzone;
-    const bool moveRight =
-        keyboardMovement && state.leftThumbX > movementDeadzone;
-    const bool moveBackward =
-        keyboardMovement && state.leftThumbY < -movementDeadzone;
-    const bool moveForward =
-        keyboardMovement && state.leftThumbY > movementDeadzone;
+    const auto requestedLocomotion =
+        fnvxr::physical_input::classifyLocomotion(
+            state.leftThumbX,
+            state.leftThumbY,
+            movementDeadzone);
+    const bool locomotionKeyboardMovement =
+        keyboardMovement
+        && (!physicalLocomotionRoute || physicalLocomotionAllowed);
+    const bool moveLeft = locomotionKeyboardMovement && requestedLocomotion.left;
+    const bool moveRight = locomotionKeyboardMovement && requestedLocomotion.right;
+    const bool moveBackward = locomotionKeyboardMovement && requestedLocomotion.backward;
+    const bool moveForward = locomotionKeyboardMovement && requestedLocomotion.forward;
     const bool keyTurnEnabled =
         keyboardMovement
         && envEnabled("FNVXR_RIGHT_STICK_KEY_TURN", true);
@@ -11317,7 +11514,7 @@ void consumeExternalXInputGameplayControls(
     if (autoRunPressed)
         toggleGameplayAutoRun("externalXInput:R3", frame);
     const bool runHeld =
-        keyboardMovement
+        locomotionKeyboardMovement
         &&
         envEnabled("FNVXR_GAMEPLAY_RUN_BUTTON_ENABLE", true)
         && (g_gameplayRunModeEnabled || analogRun);
@@ -11328,15 +11525,62 @@ void consumeExternalXInputGameplayControls(
     holdDirectInputKey(DIK_R, reloadHeld);
     holdGameplayGrab(rightGripGrabHeld);
     holdGameplayRunModifier(runHeld);
-    holdDirectInputKey(
-        DIK_W,
-        keyboardMovement
-            && (moveForward || g_gameplayAutoRunEnabled));
-    holdDirectInputKey(DIK_A, moveLeft);
-    holdDirectInputKey(DIK_S, moveBackward);
-    holdDirectInputKey(DIK_D, moveRight);
+    const bool finalForwardHeld =
+        locomotionKeyboardMovement
+        && (moveForward || g_gameplayAutoRunEnabled);
+    const bool forwardApplied =
+        holdGameplayMovementKey(DIK_W, finalForwardHeld);
+    const bool leftApplied = holdGameplayMovementKey(DIK_A, moveLeft);
+    const bool backwardApplied = holdGameplayMovementKey(DIK_S, moveBackward);
+    const bool rightApplied = holdGameplayMovementKey(DIK_D, moveRight);
     holdDirectInputKey(DIK_LEFT, turnLeft);
     holdDirectInputKey(DIK_RIGHT, turnRight);
+
+    if (physicalLocomotionRoute)
+    {
+        const UInt8 requestedMask = static_cast<UInt8>(
+            (requestedLocomotion.forward ? 0x1u : 0u)
+            | (requestedLocomotion.backward ? 0x2u : 0u)
+            | (requestedLocomotion.left ? 0x4u : 0u)
+            | (requestedLocomotion.right ? 0x8u : 0u));
+        const UInt8 generatedMask = static_cast<UInt8>(
+            (finalForwardHeld ? 0x1u : 0u)
+            | (moveBackward ? 0x2u : 0u)
+            | (moveLeft ? 0x4u : 0u)
+            | (moveRight ? 0x8u : 0u));
+        const bool finalApplied =
+            forwardApplied && leftApplied && backwardApplied && rightApplied;
+        static bool physicalLocomotionFinalTelemetryInitialized = false;
+        static UInt8 previousPhysicalLocomotionRequestedMask = 0u;
+        static UInt8 previousPhysicalLocomotionGeneratedMask = 0u;
+        static bool previousPhysicalLocomotionApplied = false;
+        if (!physicalLocomotionFinalTelemetryInitialized
+            || requestedMask != previousPhysicalLocomotionRequestedMask
+            || generatedMask != previousPhysicalLocomotionGeneratedMask
+            || finalApplied != previousPhysicalLocomotionApplied)
+        {
+            physicalLocomotionFinalTelemetryInitialized = true;
+            previousPhysicalLocomotionRequestedMask = requestedMask;
+            previousPhysicalLocomotionGeneratedMask = generatedMask;
+            previousPhysicalLocomotionApplied = finalApplied;
+            logTelemetry(
+                "physicalLocomotionFinal runtimeFrame=%llu hostFrame=%lu sourcePacket=%lu effectivePacket=%lu sharedLs=(%d,%d) hostLs=(%ld,%ld) requested=0x%02x generated=0x%02x authority=%d finalConsumer=%s finalApplied=%d\n",
+                static_cast<unsigned long long>(frame),
+                static_cast<unsigned long>(hostInput.frame),
+                static_cast<unsigned long>(g_lastExternalXInputSourcePacket),
+                static_cast<unsigned long>(state.packet),
+                static_cast<int>(state.leftThumbX),
+                static_cast<int>(state.leftThumbY),
+                static_cast<long>(hostInput.leftStickX),
+                static_cast<long>(hostInput.leftStickY),
+                static_cast<unsigned int>(requestedMask),
+                static_cast<unsigned int>(generatedMask),
+                static_cast<int>(physicalLocomotionAllowed),
+                fnvxr::physical_input::locomotionDeliveryName(
+                    fnvxr::physical_input::selectLocomotionDelivery(true)),
+                static_cast<int>(finalApplied));
+        }
+    }
 
     if (vatsChordPressed)
         tapVatsKey("externalXInput:LT+RG", frame);
@@ -11488,6 +11732,11 @@ void consumeExternalXInputBridge(
     static UInt64 lastUiMapZoomMs = 0;
     static bool wasInputAllowed = false;
     static bool releaseBeforePressPending = true;
+    static bool physicalLocomotionRearmPending = true;
+    static bool physicalLocomotionAuthorityTelemetryInitialized = false;
+    static bool previousPhysicalLocomotionAuthority = false;
+    static bool previousPhysicalLocomotionRearmPending = true;
+    static UInt8 previousPhysicalLocomotionIntentMask = 0u;
     static fnvxr::shared::RuntimeControllerMode previousControllerMode =
         fnvxr::shared::RuntimeControllerMode::Unknown;
 
@@ -11507,6 +11756,8 @@ void consumeExternalXInputBridge(
         previousUiFavoriteAssignChordState = 0;
         wasInputAllowed = false;
         releaseBeforePressPending = true;
+        physicalLocomotionRearmPending = true;
+        physicalLocomotionAuthorityTelemetryInitialized = false;
         previousControllerMode =
             fnvxr::shared::RuntimeControllerMode::Unknown;
         return;
@@ -11520,6 +11771,54 @@ void consumeExternalXInputBridge(
             observation.showroomActive ? 1u : 0u,
             observation.cameraActive,
             observation.frame != 0u);
+    SharedDInputState hostInput {};
+    const bool hostInputAvailable = readSharedDInputSnapshot(hostInput);
+    const bool physicalLocomotionRoute = physicalHeadsetPlayRequested();
+    const bool hostGameplayControlsActive =
+        hostInputAvailable && hostInput.gameplayControlsActive != 0u;
+    const bool hostMenuInputActive =
+        hostInputAvailable && hostInput.menuInputActive != 0u;
+    const int physicalMovementDeadzone = std::clamp(
+        getIntFromEnv("FNVXR_PLUGIN_MOVEMENT_DEADZONE", 9000),
+        1000,
+        30000);
+    const auto physicalLocomotionIntent =
+        fnvxr::physical_input::classifyLocomotion(
+            state.leftThumbX,
+            state.leftThumbY,
+            physicalMovementDeadzone);
+    const UInt8 physicalLocomotionIntentMask = static_cast<UInt8>(
+        (physicalLocomotionIntent.forward ? 0x1u : 0u)
+        | (physicalLocomotionIntent.backward ? 0x2u : 0u)
+        | (physicalLocomotionIntent.left ? 0x4u : 0u)
+        | (physicalLocomotionIntent.right ? 0x8u : 0u));
+    const bool physicalLocomotionAuthority =
+        physicalLocomotionRoute
+        && controllerMode == fnvxr::shared::RuntimeControllerMode::Gameplay
+        && hostGameplayControlsActive;
+    if (physicalLocomotionRoute)
+    {
+        if (!physicalLocomotionAuthority)
+        {
+            physicalLocomotionRearmPending = true;
+        }
+        else if (physicalLocomotionRearmPending
+            && !physicalLocomotionIntent.any())
+        {
+            // A held stick must never restart movement after a menu, focus,
+            // or runtime-authority transition. Require neutral, then a new
+            // press before the physical W/A/S/D holds can return.
+            physicalLocomotionRearmPending = false;
+        }
+    }
+    else
+    {
+        physicalLocomotionRearmPending = false;
+        physicalLocomotionAuthorityTelemetryInitialized = false;
+    }
+    const bool physicalLocomotionAllowed =
+        !physicalLocomotionRoute
+        || (physicalLocomotionAuthority && !physicalLocomotionRearmPending);
     const bool uiInputAllowed =
         controllerMode == fnvxr::shared::RuntimeControllerMode::Ui;
     const bool gameplayInputAllowed =
@@ -11530,6 +11829,38 @@ void consumeExternalXInputBridge(
     const bool pipBoyMenuVisible = pipBoyVisibleFromMenuBits(menuBits);
     const bool startMenuVisible = (menuBits & (1u << 1)) != 0;
     const bool menuKeyboardFallback = pluginMenuKeyboardFallbackEnabled();
+    if (physicalLocomotionRoute
+        && (!physicalLocomotionAuthorityTelemetryInitialized
+            || physicalLocomotionAuthority
+                != previousPhysicalLocomotionAuthority
+            || physicalLocomotionRearmPending
+                != previousPhysicalLocomotionRearmPending
+            || physicalLocomotionIntentMask
+                != previousPhysicalLocomotionIntentMask))
+    {
+        physicalLocomotionAuthorityTelemetryInitialized = true;
+        previousPhysicalLocomotionAuthority = physicalLocomotionAuthority;
+        previousPhysicalLocomotionRearmPending =
+            physicalLocomotionRearmPending;
+        previousPhysicalLocomotionIntentMask = physicalLocomotionIntentMask;
+        logTelemetry(
+            "physicalLocomotionConsumerAuthority runtimeFrame=%llu hostFrame=%lu sourcePacket=%lu effectivePacket=%lu sharedLs=(%d,%d) hostLs=(%ld,%ld) hostInput=%d hostGameplay=%d hostMenu=%d localMode=%s authorized=%d rearmPending=%d releaseMovement=%d\n",
+            static_cast<unsigned long long>(observation.frame),
+            static_cast<unsigned long>(hostInput.frame),
+            static_cast<unsigned long>(g_lastExternalXInputSourcePacket),
+            static_cast<unsigned long>(state.packet),
+            static_cast<int>(state.leftThumbX),
+            static_cast<int>(state.leftThumbY),
+            static_cast<long>(hostInput.leftStickX),
+            static_cast<long>(hostInput.leftStickY),
+            static_cast<int>(hostInputAvailable),
+            static_cast<int>(hostGameplayControlsActive),
+            static_cast<int>(hostMenuInputActive),
+            fnvxr::shared::runtimeControllerModeName(controllerMode),
+            static_cast<int>(physicalLocomotionAuthority),
+            static_cast<int>(physicalLocomotionRearmPending),
+            static_cast<int>(!physicalLocomotionAllowed));
+    }
     if (controllerMode != previousControllerMode)
     {
         updateExternalPipBoyGripMode(false, previousPipBoyGripHeld);
@@ -11709,6 +12040,8 @@ void consumeExternalXInputBridge(
     {
         consumeExternalXInputGameplayControls(
             state,
+            hostInput,
+            physicalLocomotionAllowed,
             pressed,
             previousRightTriggerHeld,
             previousLeftTriggerHeld,
@@ -13771,11 +14104,17 @@ bool ensureAuthorizedHeadlessStereoRigVisualTrialBridgeStarted()
         return false;
 
     // The host owns the OpenXR pose mapping and the D3D bridge owns camera and
-    // same-tick stereo publication. The plugin maps only the pose plus
-    // read-only runtime records needed by the post-animation visual rig.
+    // same-tick stereo publication. The plugin normally maps only the pose
+    // plus read-only runtime records needed by the post-animation visual rig.
+    // The separately opted-in owned-fixture combat trial additionally maps
+    // XInput so its game-thread consumer can accept only RT and X below.
     initSharedVrPose();
     initSharedCamera();
     initSharedPlayer();
+    const bool combatVisualTrial =
+        envEnabled("FNVXR_HEADSET_COMBAT_VISUAL_TRIAL", false);
+    if (combatVisualTrial)
+        initSharedXInput();
     if (!g_vrPoseState || !g_cameraState || !g_runtimeState || !g_playerState)
     {
         logTelemetry(
@@ -13793,9 +14132,29 @@ bool ensureAuthorizedHeadlessStereoRigVisualTrialBridgeStarted()
     }
 
     g_headlessStereoRigVisualTrialBridgeStarted = true;
+    if (combatVisualTrial)
+    {
+        if (!g_xinputState)
+        {
+            logTelemetry(
+                "headlessStereoRig combat bridge deferred: XInput mapping unavailable\n");
+            g_headlessStereoRigVisualTrialBridgeStarted = false;
+            return false;
+        }
+        // This is the same exact-current-process consumer acknowledgement
+        // used by the full bridge, but the visual-trial loop below consumes
+        // only the two explicitly leased combat controls.
+        InterlockedExchange8(
+            reinterpret_cast<volatile char*>(
+                &g_xinputState->reserved[
+                    fnvxr::shared::XInputReservedRetailConsumed]),
+            1);
+    }
     logTelemetry(
-        "headlessStereoRig bridge ready attempt=%lu mode=body-anchored-controller-weapon-visual-rig input=0 projectile=0 hit=0 cameraHook=0 replay=0 ui=0 physical=0 engineCenterStereo=external\n",
-        static_cast<unsigned long>(g_headlessStereoRigVisualTrialAuthorityAttempts));
+        "headlessStereoRig bridge ready attempt=%lu mode=body-anchored-controller-weapon-visual-rig combatInput=%d inputScope=%s projectile=0 hit=0 cameraHook=0 replay=0 ui=0 physical=0 engineCenterStereo=external\n",
+        static_cast<unsigned long>(g_headlessStereoRigVisualTrialAuthorityAttempts),
+        static_cast<int>(combatVisualTrial),
+        combatVisualTrial ? "right-trigger-and-x-only" : "none");
     return true;
 }
 
@@ -13989,6 +14348,44 @@ void processTrackedPropAssistMainLoop(const RuntimeObservation& observation)
     logCameraTelemetry(observation.frame, observation.menuBits);
 }
 
+void consumeHeadlessCombatVisualTrialInput(
+    const RuntimeObservation& observation)
+{
+    static PrimaryAttackState primaryAttackState {};
+    static bool previousReloadHeld = false;
+
+    const bool authorized =
+        envEnabled("FNVXR_HEADSET_COMBAT_VISUAL_TRIAL", false)
+        && headlessStereoRigVisualTrialLeaseCurrent()
+        && observation.phase == RuntimePhase::Gameplay
+        && observation.menuBits == 0u;
+    SharedXInputState state {};
+    const bool haveInput = authorized
+        && readSharedXInputFrameSnapshot(state)
+        && state.connected != 0u;
+    const bool rightTriggerHeld =
+        haveInput && state.rightTrigger > 64u;
+    const bool reloadHeld =
+        haveInput && (state.buttons & XInputX) != 0u;
+
+    // Keep this path intentionally smaller than the normal input bridge. It
+    // cannot consume sticks, menu buttons, grips, UI pointers, or locomotion.
+    driveGameplayPrimaryAttack(
+        rightTriggerHeld,
+        primaryAttackState,
+        observation.frame,
+        "headlessCombat:RT");
+    holdDirectInputKey(DIK_R, reloadHeld);
+    if (reloadHeld != previousReloadHeld)
+    {
+        logTelemetry(
+            "buttonX reloadHold frame=%llu held=%d source=headlessCombat:X\n",
+            static_cast<unsigned long long>(observation.frame),
+            static_cast<int>(reloadHeld));
+        previousReloadHeld = reloadHeld;
+    }
+}
+
 void processHeadlessStereoRigVisualTrialMainLoop(
     const RuntimeObservation& observation)
 {
@@ -13998,6 +14395,8 @@ void processHeadlessStereoRigVisualTrialMainLoop(
     updateSharedCamera(observation.frame, observation.menuBits);
     updateSharedPlayer(observation.frame, observation.phase);
     logCameraTelemetry(observation.frame, observation.menuBits);
+    if (envEnabled("FNVXR_HEADSET_COMBAT_VISUAL_TRIAL", false))
+        consumeHeadlessCombatVisualTrialInput(observation);
 }
 
 void handleNvseMessage(NVSEMessagingInterface::Message* message)

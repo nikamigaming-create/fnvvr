@@ -64,6 +64,17 @@ add_test(
     NAME fnvxr_headset_demo_authority_test
     COMMAND fnvxr_headset_demo_authority_test)
 
+add_executable(fnvxr_physical_input_authority_test
+    tests/fnvxr_physical_input_authority_test.cpp)
+target_include_directories(fnvxr_physical_input_authority_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/runtime)
+if(MSVC)
+    target_compile_options(fnvxr_physical_input_authority_test PRIVATE /W4 /WX)
+endif()
+add_test(
+    NAME fnvxr_physical_input_authority_test
+    COMMAND fnvxr_physical_input_authority_test)
+
 if(WIN32)
     add_test(
         NAME fnvxr_build_attestation_test
@@ -95,6 +106,14 @@ if(WIN32)
             -NoProfile
             -ExecutionPolicy Bypass
             -File ${CMAKE_CURRENT_SOURCE_DIR}/tests/fnvxr_phase1_6dof_verifier_test.ps1
+            -SourceRoot ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    add_test(
+        NAME fnvxr_physical_locomotion_contract_test
+        COMMAND powershell.exe
+            -NoProfile
+            -ExecutionPolicy Bypass
+            -File ${CMAKE_CURRENT_SOURCE_DIR}/tests/fnvxr_physical_locomotion_contract_test.ps1
             -SourceRoot ${CMAKE_CURRENT_SOURCE_DIR}
     )
     add_test(
@@ -187,6 +206,7 @@ if(FNVXR_OPENXR_INCLUDE_DIR AND CMAKE_SIZEOF_VOID_P EQUAL 8)
         ${FNVXR_OPENXR_INCLUDE_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}/protocol
         ${CMAKE_CURRENT_SOURCE_DIR}/renderhook
+        ${CMAKE_CURRENT_SOURCE_DIR}/runtime
     )
     target_link_libraries(fnvxr_openxr_pose_host PRIVATE
         fnvxr_gpu_color_consumer

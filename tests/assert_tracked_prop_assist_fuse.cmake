@@ -61,7 +61,7 @@ foreach(required IN ITEMS
 endforeach()
 
 string(FIND "${plugin_text}" "bool ensureAuthorizedTrackedPropAssistBridgeStarted()" bridge_start)
-string(FIND "${plugin_text}" "bool ensureAuthorizedSharedBridgeStarted()" bridge_end)
+string(FIND "${plugin_text}" "bool ensureAuthorizedHeadlessStereoRigVisualTrialBridgeStarted()" bridge_end)
 if(bridge_start EQUAL -1 OR bridge_end EQUAL -1 OR bridge_end LESS bridge_start)
     message(FATAL_ERROR "Could not isolate tracked-prop bridge")
 endif()

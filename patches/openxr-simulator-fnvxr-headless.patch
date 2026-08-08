@@ -166,7 +166,7 @@ diff --git a/src/runtime.cpp b/src/runtime.cpp
 index 201bee2..4e1d302 100644
 --- a/src/runtime.cpp
 +++ b/src/runtime.cpp
-@@ -122,8 +122,26 @@ inline UINT D3D12CalcSubresource(UINT MipSlice, UINT ArraySlice, UINT PlaneSlice
+@@ -122,8 +122,30 @@ inline UINT D3D12CalcSubresource(UINT MipSlice, UINT ArraySlice, UINT PlaneSlice
  
  // Simple logging (debug output + file log)
  static FILE* g_LogFile = nullptr;
@@ -181,6 +181,10 @@ index 201bee2..4e1d302 100644
 +    static const bool enabled = EnvEnabled("OPENXR_SIMULATOR_HEADLESS");
 +    return enabled;
 +}
++static bool SimulatorDesktopPreview() {
++    static const bool enabled = EnvEnabled("OPENXR_SIMULATOR_DESKTOP_PREVIEW");
++    return enabled;
++}
  static void EnsureLogFile() {
      if (g_LogFile) return;
 +    char explicitPath[MAX_PATH]{};
@@ -193,7 +197,7 @@ index 201bee2..4e1d302 100644
      char base[MAX_PATH]{};
      DWORD len = GetEnvironmentVariableA("LOCALAPPDATA", base, (DWORD)sizeof(base));
      char path[MAX_PATH]{};
-@@ -468,6 +486,27 @@ static float g_poseSweepFreq     = 0.25f;  // Hz
+@@ -468,6 +490,27 @@ static float g_poseSweepFreq     = 0.25f;  // Hz
  static bool g_mouseCapture = false;
  static POINT g_lastMousePos = {0, 0};
  
@@ -221,7 +225,7 @@ index 201bee2..4e1d302 100644
  // Controller tracking state for motion controller emulation
  // Positions are relative to head position, orientation follows head by default
  struct ControllerState {
-@@ -510,6 +549,10 @@ static ControllerState g_rightController = {
+@@ -510,6 +553,10 @@ static ControllerState g_rightController = {
  // Map XrSpace handles to controller type (0=none, 1=left grip, 2=left aim, 3=right grip, 4=right aim)
  static std::unordered_map<XrSpace, int> g_controllerSpaces;
  
@@ -232,7 +236,7 @@ index 201bee2..4e1d302 100644
  // Map XrPath to path string for controller detection
  static std::unordered_map<XrPath, std::string> g_pathStrings;
  
-@@ -524,18 +567,19 @@ static XrTime g_lastFrameTime = 0;
+@@ -524,18 +571,19 @@ static XrTime g_lastFrameTime = 0;
  
  // Get controller world pose (combines head pose with controller offset)
  static void GetControllerPose(const ControllerState& ctrl, XrPosef* outPose) {
@@ -257,7 +261,23 @@ index 201bee2..4e1d302 100644
      outPose->position.x = g_headPos.x + ctrl.posOffset.x * cosY - ctrl.posOffset.z * sinY;
      outPose->position.y = g_headPos.y + ctrl.posOffset.y;
      outPose->position.z = g_headPos.z + ctrl.posOffset.x * sinY + ctrl.posOffset.z * cosY;
-@@ -2480,8 +2524,9 @@ static XrResult XRAPI_PTR xrBeginSession_runtime(XrSession s, const XrSessionBeg
+@@ -893,6 +941,16 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
+             Log("[SimXR] WndProc: WM_DESTROY received");
+             return 0;
+         case WM_ACTIVATE:
++            // Logical headless mode is driven only by file IPC. The optional
++            // recording preview must never acquire or revoke XR input focus.
++            if (SimulatorHeadless()) {
++                rt::g_session.isFocused = true;
++                rt::g_mouseCapture = false;
++                ReleaseCapture();
++                Log("[SimXR] WndProc: WM_ACTIVATE ignored in logical headless mode");
++                return 0;
++            }
+             if (LOWORD(wParam) != WA_INACTIVE) {
+                 rt::g_session.isFocused = true;
+                 Log("[SimXR] WndProc: WM_ACTIVATE -> focused");
+@@ -2480,8 +2538,9 @@ static XrResult XRAPI_PTR xrBeginSession_runtime(XrSession s, const XrSessionBeg
      Log("[SimXR] ============================================");
      rt::PushState(s, XR_SESSION_STATE_SYNCHRONIZED); 
      rt::PushState(s, XR_SESSION_STATE_VISIBLE);
@@ -269,7 +289,7 @@ index 201bee2..4e1d302 100644
          rt::PushState(s, XR_SESSION_STATE_FOCUSED);
      }
      return XR_SUCCESS; 
-@@ -2861,19 +2906,41 @@ static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession, const XrFrameWaitInfo*,
+@@ -2861,19 +2910,41 @@ static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession, const XrFrameWaitInfo*,
          mcp::ControllerPoseCommand ctrlCmd = mcp::CheckControllerPoseCommand();
          if (ctrlCmd.valid) {
              rt::ControllerState& ctrl = (ctrlCmd.hand == 0) ? rt::g_leftController : rt::g_rightController;
@@ -317,20 +337,20 @@ index 201bee2..4e1d302 100644
          }
      }
  
-@@ -2900,6 +2967,7 @@ static XrResult XRAPI_PTR xrBeginFrame_runtime(XrSession, const XrFrameBeginInfo
+@@ -2900,6 +2971,7 @@ static XrResult XRAPI_PTR xrBeginFrame_runtime(XrSession, const XrFrameBeginInfo
  // NOT touched on subsequent calls — once it exists, the user (or the menu
  // resize callback) owns its size.
  static void ensurePreviewWindow(rt::Session& s, UINT initialClientW, UINT initialClientH) {
-+    if (SimulatorHeadless()) return;
++    if (SimulatorHeadless() && !SimulatorDesktopPreview()) return;
      if (s.hwnd) return;
  
      // Register window class if not done (use global flag)
-@@ -4969,12 +5037,14 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession, const XrFrameEndInfo* in
+@@ -4969,12 +5041,16 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession, const XrFrameEndInfo* in
                  if (mcp::g_projLogCount < mcp::PROJ_LOG_CAPACITY) ++mcp::g_projLogCount;
              }
  
 -            presentProjection(rt::g_session, *proj, hasOverlays);  // skipPresent if overlays pending
-+            if (!SimulatorHeadless()) {
++            if (!SimulatorHeadless() || SimulatorDesktopPreview()) {
 +                presentProjection(rt::g_session, *proj, hasOverlays);  // skipPresent if overlays pending
 +            }
          }
@@ -338,11 +358,13 @@ index 201bee2..4e1d302 100644
  
      // Third pass: render overlay layers (quad, cylinder) on top of the projection
 -    for (uint32_t i = 0; i < info->layerCount; ++i) {
-+    for (uint32_t i = 0; !SimulatorHeadless() && i < info->layerCount; ++i) {
++    for (uint32_t i = 0;
++         (!SimulatorHeadless() || SimulatorDesktopPreview()) && i < info->layerCount;
++         ++i) {
          const XrCompositionLayerBaseHeader* base = info->layers[i];
          if (!base) continue;
  
-@@ -5049,22 +5119,13 @@ static XrResult XRAPI_PTR xrLocateViews_runtime(XrSession, const XrViewLocateInf
+@@ -5049,22 +5125,13 @@ static XrResult XRAPI_PTR xrLocateViews_runtime(XrSession, const XrViewLocateInf
      // a continuous range of orientations and any handedness/axis bug
      // produces a visible "world rotates wrong way" symptom instantly.
      // Each axis uses a different phase so the signal isn't degenerate.
@@ -368,7 +390,7 @@ index 201bee2..4e1d302 100644
      
      // Helper function to rotate a vector by a quaternion
      auto rotateVector = [](XrQuaternionf q, XrVector3f v) -> XrVector3f {
-@@ -5131,11 +5192,14 @@ static XrResult XRAPI_PTR xrCreateReferenceSpace_runtime(XrSession, const XrRefe
+@@ -5131,11 +5198,14 @@ static XrResult XRAPI_PTR xrCreateReferenceSpace_runtime(XrSession, const XrRefe
      if (!info || !space) return XR_ERROR_VALIDATION_FAILURE;
      static uintptr_t nextSpace = 100;
      *space = (XrSpace)(nextSpace++);
@@ -383,7 +405,7 @@ index 201bee2..4e1d302 100644
      Logf("[SimXR] xrDestroySpace: space=%p", space);
      return XR_SUCCESS;
  }
-@@ -5181,10 +5245,25 @@ static XrResult XRAPI_PTR xrLocateSpace_runtime(XrSpace space, XrSpace baseSpace
+@@ -5181,10 +5251,25 @@ static XrResult XRAPI_PTR xrLocateSpace_runtime(XrSpace space, XrSpace baseSpace
              location->pose.position = {0, 0, 0};
          }
      } else {
@@ -411,7 +433,7 @@ index 201bee2..4e1d302 100644
      }
      return XR_SUCCESS;
  }
-@@ -5275,6 +5354,17 @@ static XrResult XRAPI_PTR xrCreateAction_runtime(XrActionSet, const XrActionCrea
+@@ -5275,6 +5360,17 @@ static XrResult XRAPI_PTR xrCreateAction_runtime(XrActionSet, const XrActionCrea
              }
          }
      }
@@ -429,7 +451,7 @@ index 201bee2..4e1d302 100644
      rt::g_actionHand[*action] = handBinding;
  
      return XR_SUCCESS;
-@@ -5348,9 +5438,13 @@ static XrResult XRAPI_PTR xrGetActionStateBoolean_runtime(XrSession, const XrAct
+@@ -5348,9 +5444,13 @@ static XrResult XRAPI_PTR xrGetActionStateBoolean_runtime(XrSession, const XrAct
              buttonState = ctrl->gripPressed;
          } else if (ActionNameMatches(name, "menu")) {
              buttonState = ctrl->menuPressed;

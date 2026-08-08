@@ -2153,6 +2153,7 @@ function Get-FnvxrProductMinimalEnvironment {
         [ValidateSet("None", "Primary", "Alternate", "Third")]
         [string]$RetailVrFirstPersonPrivateCaller = "None",
         [switch]$HeadsetControllerRigVisualTrial,
+        [switch]$HeadsetCombatVisualTrial,
         [switch]$PhysicalHeadsetPlay,
         [ValidateRange(1280, 4096)][int]$PhysicalGameWidth = 1920,
         [ValidateRange(720, 2560)][int]$PhysicalGameHeight = 1200,
@@ -2230,6 +2231,9 @@ function Get-FnvxrProductMinimalEnvironment {
     }
     if ($HeadsetControllerRigVisualTrial -and $PhysicalHeadsetPlay) {
         throw "The controller visual-rig trial is headless-only and cannot combine with physical headset play."
+    }
+    if ($HeadsetCombatVisualTrial -and -not $HeadsetControllerRigVisualTrial) {
+        throw "The headless combat visual trial requires the controller visual-rig trial."
     }
     if ($HeadsetFixtureWeaponDraw -and $RetailFixtureAction -cne "load") {
         throw "The headset fixture weapon draw requires an existing owned fixture load."
@@ -2493,6 +2497,12 @@ function Get-FnvxrProductMinimalEnvironment {
             # cameras. xNVSE may only restore/apply first-person hand and
             # weapon transforms from current grip/aim pose samples.
             $environment.FNVXR_HEADSET_CONTROLLER_RIG_VISUAL_TRIAL = "1"
+            # Select the observed outer seam so the already accumulated
+            # engine-center eye pair can be published there. The center-
+            # integrated branch returns before the legacy private-eye fanout,
+            # so this selector produces privateEyeCalls=0 and one stock gun.
+            $environment.FNVXR_RETAIL_VR_FIRST_PERSON_PRIVATE_CALLER = "third"
+            $environment.FNVXR_RETAIL_CENTER_INTEGRATED_FIRST_PERSON = "1"
             $environment.FNVXR_INSTALL_CAMERA_HOOK = "0"
             $environment.FNVXR_CAMERA_HOOK = "0"
             $environment.FNVXR_CAMERA_APPLY = "0"
@@ -2511,12 +2521,26 @@ function Get-FnvxrProductMinimalEnvironment {
             $environment.FNVXR_D3D9_NATIVE_SINGLE_TRAVERSAL_REPLAY = "0"
             $environment.FNVXR_D3D9_WIDE_WORLD_REPLAY = "0"
             $environment.FNVXR_DESKTOP_ASSIST_UI_CAPTURE = "0"
+            if ($HeadsetCombatVisualTrial) {
+                # A bounded owned-fixture input lease. The OpenXR host remains
+                # the sole controller payload producer; xNVSE translates RT
+                # and X through Fallout's normal attack/reload key path. Do
+                # not set the generic external-writer flags here: they are
+                # deliberately incompatible with the base visual-rig lease.
+                $environment.FNVXR_HEADSET_COMBAT_VISUAL_TRIAL = "1"
+                $environment.FNVXR_PLUGIN_GAMEPLAY_KEYBOARD_FALLBACK = "1"
+            }
         }
     }
     if (-not [string]::IsNullOrWhiteSpace($HeadlessRuntimeManifest)) {
         $environment.XR_RUNTIME_JSON = $HeadlessRuntimeManifest
-        if (-not $SimulatorDesktopPreview) {
-            $environment.OPENXR_SIMULATOR_HEADLESS = "1"
+        # Keep the simulator logically headless/command-driven even when its
+        # SBS preview is visible for recording. Logical XR focus, tracked pose
+        # publication, and controller IPC must not depend on whether the
+        # diagnostic preview window is shown.
+        $environment.OPENXR_SIMULATOR_HEADLESS = "1"
+        if ($SimulatorDesktopPreview) {
+            $environment.OPENXR_SIMULATOR_DESKTOP_PREVIEW = "1"
         }
         $environment.OPENXR_SIMULATOR_DATA_DIR =
             Join-Path $RunDirectory "openxr-simulator"

@@ -672,6 +672,43 @@ if ([string]$headsetWorldWeaponDrawEnvironment.FNVXR_HEADSET_DEMO_FIXTURE -cne "
 if ([string]$headsetWorldWeaponDrawEnvironment.FNVXR_RETAIL_VR_FIRST_PERSON_PRIVATE_CALLER -cne "primary") {
     throw "Headset world weapon draw did not carry the selected primary first-person caller proof route."
 }
+$headsetControllerRigEnvironment = Get-FnvxrProductMinimalEnvironment `
+    -RunId "headset-controller-rig-contract" `
+    -RunDirectory "C:\fnvxr-headset-controller-rig-contract" `
+    -OpenXrLoaderPath "C:\fnvxr-headset-controller-rig-contract\openxr_loader.dll" `
+    -SessionReadyTimeoutSeconds 60 `
+    -AutomateRetailFixture `
+    -HeadsetWorldOnlyCapture `
+    -HeadsetFixtureWeaponDraw `
+    -HeadsetControllerRigVisualTrial `
+    -RetailFixtureAction "load" `
+    -RetailFixtureSaveName "FNVXR_AutoRetail_L1_Pistol" `
+    -RetailFixtureWeapon "Pistol" `
+    -HeadlessRuntimeManifest "C:\fnvxr-headset-controller-rig-contract\openxr_simulator.json"
+if ([string]$headsetControllerRigEnvironment.FNVXR_RETAIL_VR_FIRST_PERSON_PRIVATE_CALLER -cne "third" -or
+    [string]$headsetControllerRigEnvironment.FNVXR_RETAIL_CENTER_INTEGRATED_FIRST_PERSON -cne "1") {
+    throw "The controller-rig visual trial must publish at the observed outer seam through the zero-private-eye center-integrated branch."
+}
+$headsetCombatEnvironment = Get-FnvxrProductMinimalEnvironment `
+    -RunId "headset-combat-contract" `
+    -RunDirectory "C:\fnvxr-headset-combat-contract" `
+    -OpenXrLoaderPath "C:\fnvxr-headset-combat-contract\openxr_loader.dll" `
+    -SessionReadyTimeoutSeconds 60 `
+    -AutomateRetailFixture `
+    -HeadsetWorldOnlyCapture `
+    -HeadsetFixtureWeaponDraw `
+    -HeadsetControllerRigVisualTrial `
+    -HeadsetCombatVisualTrial `
+    -RetailFixtureAction "load" `
+    -RetailFixtureSaveName "FNVXR_AutoRetail_L1_Pistol" `
+    -RetailFixtureWeapon "Pistol" `
+    -HeadlessRuntimeManifest "C:\fnvxr-headset-combat-contract\openxr_simulator.json"
+if ([string]$headsetCombatEnvironment.FNVXR_HEADSET_COMBAT_VISUAL_TRIAL -cne "1" -or
+    [string]$headsetCombatEnvironment.FNVXR_EXTERNAL_XINPUT_WRITER -cne "0" -or
+    [string]$headsetCombatEnvironment.FNVXR_EXTERNAL_DINPUT_WRITER -cne "0" -or
+    [string]$headsetCombatEnvironment.FNVXR_PLUGIN_GAMEPLAY_KEYBOARD_FALLBACK -cne "1") {
+    throw "The bounded headless combat trial must keep the generic writer flags closed while retaining its explicit fire/reload lease."
+}
 $physicalHeadsetEnvironment = Get-FnvxrProductMinimalEnvironment `
     -RunId "physical-headset-play-contract" `
     -RunDirectory "C:\fnvxr-physical-headset-play-contract" `
