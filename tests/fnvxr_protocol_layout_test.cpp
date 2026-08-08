@@ -29,7 +29,7 @@ int main()
     if (sizeof(fnvxr::GameFrame) != 96)
         return fail("GameFrame size mismatch");
 
-    if (sizeof(fnvxr::shared::SharedPlayerState) != 160)
+    if (sizeof(fnvxr::shared::SharedPlayerState) != 184)
         return fail("SharedPlayerState size mismatch");
 
     if (sizeof(fnvxr::shared::SharedDesktopAssistState) != 240
@@ -382,7 +382,15 @@ int main()
 
     if (fnvxr::shared::PlayerSharedWeaponClassReservedIndex != 0
         || fnvxr::shared::PlayerSharedEquippedWeaponFormIdReservedIndex != 1
-        || fnvxr::shared::PlayerSharedEquippedFavoriteSlotReservedIndex != 2)
+        || fnvxr::shared::PlayerSharedEquippedFavoriteSlotReservedIndex != 2
+        || fnvxr::shared::PlayerSharedFirstPersonWeaponNodeReservedIndex != 3
+        || fnvxr::shared::PlayerSharedFirstPersonArmsNodeReservedIndex != 4
+        || fnvxr::shared::PlayerSharedFirstPersonUpperBodyNodeReservedIndex != 5
+        || fnvxr::shared::PlayerSharedFirstPersonLeftHandNodeReservedIndex != 6
+        || fnvxr::shared::PlayerSharedFirstPersonRightHandNodeReservedIndex != 7
+        || fnvxr::shared::PlayerSharedFirstPersonPipBoyNodeReservedIndex != 8
+        || fnvxr::shared::PlayerSharedFirstPersonArmsGeometry0ReservedIndex != 9
+        || fnvxr::shared::PlayerSharedFirstPersonArmsGeometry1ReservedIndex != 10)
     {
         return fail("SharedPlayerState weapon reserved index mismatch");
     }

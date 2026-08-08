@@ -13,6 +13,8 @@
 
 namespace fnvxr::engine
 {
+inline constexpr std::size_t RetailFirstPersonRootCapacity = 8u;
+
 struct RetailEyeTargetOperations
 {
     void* context = nullptr;
@@ -361,11 +363,16 @@ public:
         return true;
     }
 
-    bool setFirstPersonRootNode(abi::RetailPointer32 root) noexcept
+    bool setFirstPersonRootNodes(
+        const std::array<abi::RetailPointer32,
+            RetailFirstPersonRootCapacity>& roots,
+        std::uint32_t count) noexcept
     {
-        if (!ready() || mEngineSnapshot.active)
+        if (!ready() || mEngineSnapshot.active
+            || count > RetailFirstPersonRootCapacity)
             return false;
-        mFirstPersonRootNode = root;
+        mFirstPersonRootNodes = roots;
+        mFirstPersonRootNodeCount = count;
         return true;
     }
 
@@ -579,7 +586,9 @@ private:
         mFirstPersonGeometryMutations {};
     std::uint32_t mFirstPersonImmediateGeometryCount = 0u;
     std::uint32_t mFirstPersonQueueSafeGeometryCount = 0u;
-    abi::RetailPointer32 mFirstPersonRootNode = 0u;
+    std::array<abi::RetailPointer32, RetailFirstPersonRootCapacity>
+        mFirstPersonRootNodes {};
+    std::uint32_t mFirstPersonRootNodeCount = 0u;
     void* mFrameSceneObject = nullptr;
     abi::RetailNiCameraLayout* mActiveEyeCamera = nullptr;
     std::uint64_t mNextStockCaptureGeneration = 0u;
@@ -726,6 +735,89 @@ struct RetailCenterRendererOperationsAdapter
         return false;
     }
 
+    static bool geometryDescendsFromAnyFirstPersonRoot(
+        const Context& context,
+        abi::RetailPointer32 geometryAddress) noexcept
+    {
+        for (std::uint32_t index = 0u;
+             index < context.mFirstPersonRootNodeCount;
+             ++index)
+        {
+            if (geometryDescendsFrom(
+                    geometryAddress,
+                    context.mFirstPersonRootNodes[index]))
+                return true;
+        }
+        return false;
+    }
+
+    static bool firstPersonGeometryAlreadyCollected(
+        const Context& context,
+        abi::RetailPointer32 geometryAddress) noexcept
+    {
+        for (std::uint32_t index = 0u;
+             index < context.mFirstPersonQueueSafeGeometryCount;
+             ++index)
+        {
+            if (context.mFirstPersonQueueSafeGeometryPointers[index]
+                == geometryAddress)
+                return true;
+        }
+        for (std::uint32_t index = 0u;
+             index < context.mFirstPersonImmediateGeometryCount;
+             ++index)
+        {
+            if (context.mFirstPersonImmediateGeometryPointers[index]
+                == geometryAddress)
+                return true;
+        }
+        return false;
+    }
+
+    static bool isDirectFirstPersonLeafRoot(
+        const Context& context,
+        abi::RetailPointer32 geometryAddress) noexcept
+    {
+        if (niObjectKind(geometryAddress) != 1)
+            return false;
+        for (std::uint32_t index = 0u;
+             index < context.mFirstPersonRootNodeCount;
+             ++index)
+        {
+            if (context.mFirstPersonRootNodes[index] == geometryAddress)
+                return true;
+        }
+        return false;
+    }
+
+    static bool isRetailFirstPersonArmsGeometry(
+        abi::RetailPointer32 geometryAddress) noexcept
+    {
+#if defined(_MSC_VER) && defined(_M_IX86)
+        constexpr std::size_t ObjectNameOffset = 0x08u;
+        __try
+        {
+            const char* name = nullptr;
+            std::memcpy(
+                &name,
+                reinterpret_cast<const std::uint8_t*>(
+                    static_cast<std::uintptr_t>(geometryAddress))
+                    + ObjectNameOffset,
+                sizeof(name));
+            return name != nullptr
+                && (std::strcmp(name, "Arms:0") == 0
+                    || std::strcmp(name, "Arms:1") == 0);
+        }
+        __except (1)
+        {
+            return false;
+        }
+#else
+        static_cast<void>(geometryAddress);
+        return false;
+#endif
+    }
+
     static int niObjectKind(abi::RetailPointer32 objectAddress) noexcept
     {
 #if defined(_MSC_VER) && defined(_M_IX86)
@@ -833,13 +925,37 @@ struct RetailCenterRendererOperationsAdapter
         {
             return;
         }
+        constexpr std::size_t AvObjectFlagsOffset = 0x30u;
+        std::uint32_t objectFlags = 0u;
+        __try
+        {
+            std::memcpy(
+                &objectFlags,
+                reinterpret_cast<const std::uint8_t*>(
+                    static_cast<std::uintptr_t>(objectAddress))
+                    + AvObjectFlagsOffset,
+                sizeof(objectFlags));
+        }
+        __except (1)
+        {
+            return;
+        }
         const int kind = niObjectKind(objectAddress);
+        // Fallout marks the separate first-person container hidden while
+        // leaving its renderable arm children live for the dedicated view-
+        // model pass. Traverse hidden nodes, but never replay a hidden
+        // geometry leaf such as a body/limb cap.
+        if (kind == 1 && (objectFlags & 1u) != 0u
+            && !isRetailFirstPersonArmsGeometry(objectAddress))
+            return;
         if (kind == 1)
         {
             // NiAVObject leaves also include non-geometry render helpers.
             // Admit only objects whose authenticated +0xDC virtual is the
             // retail NiGeometry::OnVisible implementation.
             if (!isRetailNiGeometry(objectAddress))
+                return;
+            if (firstPersonGeometryAlreadyCollected(context, objectAddress))
                 return;
             if (geometryQueuesWithoutImmediateDispatch(
                     context.mCollectionAccumulator,
@@ -901,6 +1017,25 @@ struct RetailCenterRendererOperationsAdapter
         static_cast<void>(depth);
         static_cast<void>(visits);
 #endif
+    }
+
+    static std::uint32_t collectAllFirstPersonQueueSafeLeaves(
+        Context& context) noexcept
+    {
+        std::uint32_t totalVisits = 0u;
+        for (std::uint32_t index = 0u;
+             index < context.mFirstPersonRootNodeCount;
+             ++index)
+        {
+            std::uint32_t rootVisits = 0u;
+            collectFirstPersonQueueSafeLeaves(
+                context,
+                context.mFirstPersonRootNodes[index],
+                0u,
+                rootVisits);
+            totalVisits += rootVisits;
+        }
+        return totalVisits;
     }
 
     static void captureVisibilityDiagnostics(
@@ -1379,15 +1514,14 @@ struct RetailCenterRendererOperationsAdapter
         context->mFirstPersonImmediateGeometryPointers.fill(0u);
         context->mFirstPersonQueueSafeGeometryCount = 0u;
         context->mFirstPersonQueueSafeGeometryPointers.fill(0u);
-        if (context->mFirstPersonRootNode != 0u)
+        if (context->mFirstPersonRootNodeCount != 0u)
         {
             for (std::uint32_t index = 0u; index < view.itemCount; ++index)
             {
                 const abi::RetailPointer32 geometry =
                     view.geometryPointers[index];
-                const bool firstPerson = geometryDescendsFrom(
-                    geometry,
-                    context->mFirstPersonRootNode);
+                const bool firstPerson =
+                    geometryDescendsFromAnyFirstPersonRoot(*context, geometry);
                 const bool queueSafe = geometryQueuesWithoutImmediateDispatch(
                     context->mCollectionAccumulator,
                     geometry);
@@ -1411,12 +1545,8 @@ struct RetailCenterRendererOperationsAdapter
             // the branch.
             context->mFirstPersonQueueSafeGeometryCount = 0u;
             context->mFirstPersonQueueSafeGeometryPointers.fill(0u);
-            std::uint32_t visits = 0u;
-            collectFirstPersonQueueSafeLeaves(
-                *context,
-                context->mFirstPersonRootNode,
-                0u,
-                visits);
+            const std::uint32_t visits =
+                collectAllFirstPersonQueueSafeLeaves(*context);
             context->mLastVisibility.firstPersonTraversalVisits = visits;
             context->mLastVisibility.firstPersonQueueSafeItemCount =
                 context->mFirstPersonQueueSafeGeometryCount;
@@ -1617,13 +1747,11 @@ struct RetailCenterRendererOperationsAdapter
         context->mFirstPersonImmediateGeometryPointers.fill(0u);
         std::uint32_t firstPersonVisits = 0u;
         context->mLastVisibility.firstPersonRootNode =
-            context->mFirstPersonRootNode;
+            context->mFirstPersonRootNodeCount != 0u
+                ? context->mFirstPersonRootNodes[0]
+                : 0u;
         ++context->mLastVisibility.firstPersonPopulateCalls;
-        collectFirstPersonQueueSafeLeaves(
-            *context,
-            context->mFirstPersonRootNode,
-            0u,
-            firstPersonVisits);
+        firstPersonVisits = collectAllFirstPersonQueueSafeLeaves(*context);
         context->mLastVisibility.firstPersonTraversalVisits =
             firstPersonVisits;
         context->mLastVisibility.firstPersonQueueSafeItemCount =
@@ -1693,7 +1821,7 @@ struct RetailCenterRendererOperationsAdapter
             // correct in the right eye: temporarily convert the authenticated
             // weapon leaves to the queued branch and restore the exact bytes
             // in the __finally block below.
-            if (context->mFirstPersonRootNode != 0u)
+            if (context->mFirstPersonRootNodeCount != 0u)
             {
                 constexpr std::uint32_t GeometryImmediateDispatch = 0x40u;
                 constexpr std::uint16_t PropertyAccumulatorQueue = 0x0001u;
@@ -1750,17 +1878,32 @@ struct RetailCenterRendererOperationsAdapter
                 context->mActiveEyeCamera,
                 context->mFrameSceneObject,
                 privateCuller);
-            if (context->mFirstPersonRootNode != 0u)
+            if (context->mFirstPersonRootNodeCount != 0u)
             {
                 // The view model is a distinct live scene branch. Running the
                 // authenticated wrapper with that root lets Fallout build its
                 // weapon shader passes against the right-eye camera instead of
                 // trying to smuggle view-model leaves through the world scene.
-                context->mCalls.accumulateScene(
-                    context->mActiveEyeCamera,
-                    reinterpret_cast<void*>(static_cast<std::uintptr_t>(
-                        context->mFirstPersonRootNode)),
-                    privateCuller);
+                for (std::uint32_t rootIndex = 0u;
+                     rootIndex < context->mFirstPersonRootNodeCount;
+                     ++rootIndex)
+                {
+                    const abi::RetailPointer32 rootAddress =
+                        context->mFirstPersonRootNodes[rootIndex];
+                    // AccumulateScene expects an NiNode-compatible scene
+                    // branch. A standalone skinned NiGeometry (Fallout's
+                    // RightHand sibling is one) must be admitted only through
+                    // the authenticated visible-array/OnVisible replay below;
+                    // traversing the leaf as a scene root emits a second,
+                    // unskinned copy whose vertices stretch across the eye.
+                    if (niObjectKind(rootAddress) != 2)
+                        continue;
+                    context->mCalls.accumulateScene(
+                        context->mActiveEyeCamera,
+                        reinterpret_cast<void*>(static_cast<std::uintptr_t>(
+                            rootAddress)),
+                        privateCuller);
+                }
             }
             // A second stock cull in the same retail frame may reject the
             // first-person subtree through NiAVObject's per-frame cull stamp.
@@ -1804,7 +1947,7 @@ struct RetailCenterRendererOperationsAdapter
                 context->mLastVisibility.firstPersonRightQueueReplayCount +=
                     mutationCount;
             }
-            if (context->mFirstPersonRootNode != 0u)
+            if (context->mFirstPersonRootNodeCount != 0u)
             {
                 // Immediate first-person meshes are emitted through the
                 // authenticated NiGeometry::OnVisible virtual, not the

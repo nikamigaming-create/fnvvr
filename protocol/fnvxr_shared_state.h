@@ -86,7 +86,7 @@ constexpr std::uint32_t DesktopAssistUiQuadFlagPoseEpochCurrent = 1u << 5;
 constexpr std::uint32_t RuntimeSharedMagic = 0x53585646; // FNVS
 constexpr std::uint32_t RuntimeSharedVersion = 1;
 constexpr std::uint32_t PlayerSharedMagic = 0x50564e46; // FNVP
-constexpr std::uint32_t PlayerSharedVersion = 1;
+constexpr std::uint32_t PlayerSharedVersion = 2;
 constexpr std::uint32_t CommandSharedMagic = 0x43564e46; // FNVC
 constexpr std::uint32_t CommandSharedVersion = 2;
 inline constexpr char CommandSharedMappingName[] = "Local\\FNVXR_Command_State_v2";
@@ -271,6 +271,13 @@ constexpr std::uint32_t PlayerSharedWeaponClassReservedIndex = 0;
 constexpr std::uint32_t PlayerSharedEquippedWeaponFormIdReservedIndex = 1;
 constexpr std::uint32_t PlayerSharedEquippedFavoriteSlotReservedIndex = 2;
 constexpr std::uint32_t PlayerSharedFirstPersonWeaponNodeReservedIndex = 3;
+constexpr std::uint32_t PlayerSharedFirstPersonArmsNodeReservedIndex = 4;
+constexpr std::uint32_t PlayerSharedFirstPersonUpperBodyNodeReservedIndex = 5;
+constexpr std::uint32_t PlayerSharedFirstPersonLeftHandNodeReservedIndex = 6;
+constexpr std::uint32_t PlayerSharedFirstPersonRightHandNodeReservedIndex = 7;
+constexpr std::uint32_t PlayerSharedFirstPersonPipBoyNodeReservedIndex = 8;
+constexpr std::uint32_t PlayerSharedFirstPersonArmsGeometry0ReservedIndex = 9;
+constexpr std::uint32_t PlayerSharedFirstPersonArmsGeometry1ReservedIndex = 10;
 constexpr std::uint32_t PlayerWeaponClassUnknown = 0;
 constexpr std::uint32_t PlayerWeaponClassNone = 1;
 constexpr std::uint32_t PlayerWeaponClassUnarmed = 2;
@@ -809,7 +816,7 @@ struct SharedPlayerState
     float playerWorldPos[3];
     float cameraWorldRot[9];
     float cameraWorldPos[3];
-    std::uint32_t reserved[6];
+    std::uint32_t reserved[12];
 };
 
 struct SharedCommandState
@@ -861,7 +868,7 @@ static_assert(sizeof(SharedRuntimeState) == 88, "SharedRuntimeState layout chang
 static_assert(sizeof(SharedDesktopAssistUiQuadHeader) == 96, "SharedDesktopAssistUiQuadHeader layout changed");
 static_assert(sizeof(SharedD3D9FrameHeader) == 28, "SharedD3D9FrameHeader layout changed");
 static_assert(sizeof(SharedD3D9StereoFrameHeader) == 240, "SharedD3D9StereoFrameHeader layout changed");
-static_assert(sizeof(SharedPlayerState) == 160, "SharedPlayerState layout changed");
+static_assert(sizeof(SharedPlayerState) == 184, "SharedPlayerState layout changed");
 static_assert(sizeof(SharedDesktopAssistState) == 240, "SharedDesktopAssistState layout changed");
 static_assert(sizeof(SharedCommandState) == 216, "SharedCommandState layout changed");
 static_assert(sizeof(SharedInputEvent) == 32, "SharedInputEvent layout changed");

@@ -455,6 +455,12 @@ struct RetailRigNodes
     RetailArmNodes left {};
     RetailArmNodes right {};
     void* weapon {};
+    void* upperBodyMesh {};
+    void* armsGeometry0 {};
+    void* armsGeometry1 {};
+    void* leftHandMesh {};
+    void* rightHandMesh {};
+    void* pipBoy {};
     void* projectileNode {};
     void* muzzleFlash {};
 };
@@ -4350,6 +4356,50 @@ void updateSharedPlayer(UInt64 frame, RuntimePhase phase)
             fnvxr::shared::PlayerSharedFirstPersonWeaponNodeReservedIndex] =
                 sharedPointerAddress(firstPersonSceneRoot);
     }
+    // Both first-person clavicles share the stock view-model skeleton parent.
+    // Publish that narrow subtree separately from PlayerCharacter's full
+    // first-person root: it contains both arms, hands, and the child weapon
+    // without pulling unrelated/cull-only actor branches into the private
+    // eye traversal.
+    void* firstPersonArmsRoot = g_retailRigNodes.left.clavicle
+        ? readPointer(
+            reinterpret_cast<std::uintptr_t>(g_retailRigNodes.left.clavicle)
+                + NiAvObjectParentOffset)
+        : nullptr;
+    void* rightClavicleParent = g_retailRigNodes.right.clavicle
+        ? readPointer(
+            reinterpret_cast<std::uintptr_t>(g_retailRigNodes.right.clavicle)
+                + NiAvObjectParentOffset)
+        : nullptr;
+    if (firstPersonArmsRoot == rightClavicleParent
+        && looksLikeNiObject(firstPersonArmsRoot))
+    {
+        g_playerState->reserved[
+            fnvxr::shared::PlayerSharedFirstPersonArmsNodeReservedIndex] =
+                sharedPointerAddress(firstPersonArmsRoot);
+    }
+    const struct PublishedFirstPersonNode
+    {
+        void* object;
+        std::uint32_t reservedIndex;
+    } publishedFirstPersonNodes[] = {
+        { g_retailRigNodes.armsGeometry0,
+          fnvxr::shared::PlayerSharedFirstPersonArmsGeometry0ReservedIndex },
+        { g_retailRigNodes.armsGeometry1,
+          fnvxr::shared::PlayerSharedFirstPersonArmsGeometry1ReservedIndex },
+        { g_retailRigNodes.leftHandMesh,
+          fnvxr::shared::PlayerSharedFirstPersonLeftHandNodeReservedIndex },
+        { g_retailRigNodes.rightHandMesh,
+          fnvxr::shared::PlayerSharedFirstPersonRightHandNodeReservedIndex },
+        { g_retailRigNodes.pipBoy,
+          fnvxr::shared::PlayerSharedFirstPersonPipBoyNodeReservedIndex },
+    };
+    for (const PublishedFirstPersonNode& published : publishedFirstPersonNodes)
+    {
+        if (looksLikeNiObject(published.object))
+            g_playerState->reserved[published.reservedIndex] =
+                sharedPointerAddress(published.object);
+    }
 
     void* playerNode = player
         ? readPointer(reinterpret_cast<std::uintptr_t>(player) + PlayerCharacterFirstPersonNodeOffset)
@@ -5443,6 +5493,17 @@ bool niObjectNameEquals(void* object, const char* expected)
     return copyNiObjectName(object, name, sizeof(name)) && _stricmp(name, expected) == 0;
 }
 
+bool niObjectNameStartsWith(void* object, const char* prefix)
+{
+    if (!prefix)
+        return false;
+    char name[128] {};
+    if (!copyNiObjectName(object, name, sizeof(name)))
+        return false;
+    const size_t length = std::strlen(prefix);
+    return _strnicmp(name, prefix, length) == 0;
+}
+
 bool readNiNodeChildren(void* node, void*** children, UInt16& count)
 {
     if (children)
@@ -5539,6 +5600,52 @@ void* findUniqueNiNode(void* root, const char* name, UInt32* matchCountOut = nul
     UInt32 matches = 0;
     void* match = nullptr;
     collectNamedNiNodesRecursive(root, name, 0, visits, match, matches);
+    if (matchCountOut)
+        *matchCountOut = matches;
+    return matches == 1 ? match : nullptr;
+}
+
+void collectPrefixedNiObjectsRecursive(
+    void* object,
+    const char* prefix,
+    int depth,
+    UInt32& visits,
+    void*& onlyMatch,
+    UInt32& matchCount)
+{
+    if (!object || !prefix || depth > 64 || ++visits > 4096 || matchCount > 1)
+        return;
+    if (niObjectNameStartsWith(object, prefix))
+    {
+        onlyMatch = object;
+        ++matchCount;
+        if (matchCount > 1)
+            return;
+    }
+    void** children = nullptr;
+    UInt16 count = 0;
+    if (!readNiNodeChildren(object, &children, count))
+        return;
+    for (UInt16 index = 0; index < count && matchCount <= 1; ++index)
+    {
+        void* child = nullptr;
+        __try { child = children[index]; }
+        __except (EXCEPTION_EXECUTE_HANDLER) { child = nullptr; }
+        collectPrefixedNiObjectsRecursive(
+            child, prefix, depth + 1, visits, onlyMatch, matchCount);
+    }
+}
+
+void* findUniqueNiObjectByPrefix(
+    void* root,
+    const char* prefix,
+    UInt32* matchCountOut = nullptr)
+{
+    UInt32 visits = 0;
+    UInt32 matches = 0;
+    void* match = nullptr;
+    collectPrefixedNiObjectsRecursive(
+        root, prefix, 0, visits, match, matches);
     if (matchCountOut)
         *matchCountOut = matches;
     return matches == 1 ? match : nullptr;
@@ -6225,6 +6332,12 @@ bool discoverRetailRigNodes(void* root)
     UInt32 projectileMatches = 0;
     UInt32 muzzleMatches = 0;
     discovered.weapon = findUniqueNiNode(root, "Weapon", &weaponMatches);
+    discovered.upperBodyMesh = findUniqueNiObjectByPrefix(root, "UpperBody ");
+    discovered.armsGeometry0 = findUniqueNiNode(root, "Arms:0");
+    discovered.armsGeometry1 = findUniqueNiNode(root, "Arms:1");
+    discovered.leftHandMesh = findUniqueNiObjectByPrefix(root, "LeftHand ");
+    discovered.rightHandMesh = findUniqueNiObjectByPrefix(root, "RightHand ");
+    discovered.pipBoy = findUniqueNiObjectByPrefix(root, "PipBoy ");
     discovered.projectileNode = findUniqueNiNode(root, "ProjectileNode", &projectileMatches);
     discovered.muzzleFlash = findUniqueNiNode(root, "MuzzleFlash", &muzzleMatches);
     g_retailRigNodes = discovered;
@@ -6235,7 +6348,7 @@ bool discoverRetailRigNodes(void* root)
     ++g_retailRigDiscoveryCount;
 
     logTelemetry(
-        "retailRig discovery count=%llu root=%p left=(clav=%p upper=%p fore=%p hand=%p) right=(clav=%p upper=%p fore=%p hand=%p) weapon=%p weaponMatches=%lu projectile=%p projectileMatches=%lu muzzleFlash=%p muzzleMatches=%lu complete=%d ancestry=validated\n",
+        "retailRig discovery count=%llu root=%p left=(clav=%p upper=%p fore=%p hand=%p) right=(clav=%p upper=%p fore=%p hand=%p) weapon=%p weaponMatches=%lu upperBodyMesh=%p leftHandMesh=%p rightHandMesh=%p pipBoy=%p projectile=%p projectileMatches=%lu muzzleFlash=%p muzzleMatches=%lu complete=%d ancestry=validated\n",
         static_cast<unsigned long long>(g_retailRigDiscoveryCount),
         root,
         discovered.left.clavicle,
@@ -6248,6 +6361,10 @@ bool discoverRetailRigNodes(void* root)
         discovered.right.hand,
         discovered.weapon,
         static_cast<unsigned long>(weaponMatches),
+        discovered.upperBodyMesh,
+        discovered.leftHandMesh,
+        discovered.rightHandMesh,
+        discovered.pipBoy,
         discovered.projectileNode,
         static_cast<unsigned long>(projectileMatches),
         discovered.muzzleFlash,
@@ -7465,9 +7582,7 @@ void onRetailPostAnimation(void* animData)
     }
     // The animation call site runs several times for one OpenXR frame. The
     // first-person rig has one owner and is solved once per stable pose.
-    if (pose.sequence == g_lastRetailRigPoseSequence
-        && !physicalHeadsetEngineCenterRigRequested()
-        && !g_renderRigPoseOverrideActive)
+    if (pose.sequence == g_lastRetailRigPoseSequence)
         return;
     if ((pose.trackingFlags & fnvxr::shared::VrPoseTrackingHmd) == 0)
     {

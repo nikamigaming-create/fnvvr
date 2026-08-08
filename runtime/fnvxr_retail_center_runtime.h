@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <array>
 #include <limits>
 #include <utility>
 
@@ -53,7 +54,9 @@ struct RetailCenterRuntimeFrame
     // may use NiAccumulator's immediate-dispatch path, which is one-shot per
     // retail frame.  The private renderer uses this exact ancestry boundary
     // to queue only view-model geometry independently for both eyes.
-    abi::RetailPointer32 firstPersonRootNode = 0u;
+    std::array<abi::RetailPointer32, RetailFirstPersonRootCapacity>
+        firstPersonRootNodes {};
+    std::uint32_t firstPersonRootNodeCount = 0u;
 };
 
 struct RetailCenterCameraPoseProof
@@ -367,8 +370,9 @@ public:
             mResources.rightAccumulator(),
             frame.generation,
         };
-        if (!mRendererContext.setFirstPersonRootNode(
-                frame.firstPersonRootNode))
+        if (!mRendererContext.setFirstPersonRootNodes(
+                frame.firstPersonRootNodes,
+                frame.firstPersonRootNodeCount))
         {
             return reject(RetailCenterRuntimeFailure::InvalidFrame);
         }

@@ -8272,6 +8272,9 @@ volatile LONG gRetailVrFirstPersonTargetColorRedirects = 0;
 volatile LONG gRetailVrFirstPersonTargetDepthRedirects = 0;
 volatile LONG gRetailVrFirstPersonTargetRedirectMisses = 0;
 volatile LONG gRetailVrLastFirstPersonRootNode = 0;
+volatile LONG gRetailVrLastFirstPersonRootNodes[
+    fnvxr::engine::RetailFirstPersonRootCapacity] {};
+volatile LONG gRetailVrLastFirstPersonRootNodeCount = 0;
 // Exact JIP build evidence pins this flag behind the normalized
 // RenderFirstPerson callsite.  It is read-only diagnostic data: the bridge
 // never uses it to steer, patch, or otherwise change JIP behavior.
@@ -9127,23 +9130,79 @@ bool prepareRetailVrFrame(
         && (playerState.flags
             & fnvxr::shared::PlayerSharedFlagPlayerNodeValid) != 0u)
     {
-        const std::uint32_t weaponNode = playerState.reserved[
-            fnvxr::shared::PlayerSharedFirstPersonWeaponNodeReservedIndex];
-        const std::uint32_t rootNode = weaponNode != 0u
-            ? weaponNode
-            : playerState.playerNodeAddress;
-        if (rootNode != 0u)
+        const struct FirstPersonRootCandidate
+        {
+            std::uint32_t address;
+            bool enabled;
+        } publishedRoots[] = {
+            { playerState.reserved[
+                  fnvxr::shared::PlayerSharedFirstPersonWeaponNodeReservedIndex],
+              readRawEnvBool("FNVXR_FIRST_PERSON_WEAPON_ROOT", true) },
+            { playerState.reserved[
+                  fnvxr::shared::PlayerSharedFirstPersonUpperBodyNodeReservedIndex],
+              readRawEnvBool("FNVXR_FIRST_PERSON_UPPER_BODY_ROOT", true) },
+            { playerState.reserved[
+                  fnvxr::shared::PlayerSharedFirstPersonArmsGeometry0ReservedIndex],
+              readRawEnvBool("FNVXR_FIRST_PERSON_UPPER_BODY_ROOT", true) },
+            { playerState.reserved[
+                  fnvxr::shared::PlayerSharedFirstPersonArmsGeometry1ReservedIndex],
+              readRawEnvBool("FNVXR_FIRST_PERSON_UPPER_BODY_ROOT", true) },
+            { playerState.reserved[
+                  fnvxr::shared::PlayerSharedFirstPersonLeftHandNodeReservedIndex],
+              readRawEnvBool("FNVXR_FIRST_PERSON_LEFT_HAND_ROOT", true) },
+            { playerState.reserved[
+                  fnvxr::shared::PlayerSharedFirstPersonRightHandNodeReservedIndex],
+              readRawEnvBool("FNVXR_FIRST_PERSON_RIGHT_HAND_ROOT", true) },
+            { playerState.reserved[
+                  fnvxr::shared::PlayerSharedFirstPersonPipBoyNodeReservedIndex],
+              readRawEnvBool("FNVXR_FIRST_PERSON_PIPBOY_ROOT", true) },
+        };
+        LONG rootCount = 0;
+        for (const FirstPersonRootCandidate& candidate : publishedRoots)
+        {
+            if (!candidate.enabled)
+                continue;
+            const std::uint32_t rootNode = candidate.address;
+            if (rootNode == 0u)
+                continue;
+            bool duplicate = false;
+            for (LONG index = 0; index < rootCount; ++index)
+            {
+                duplicate = static_cast<std::uint32_t>(
+                    gRetailVrLastFirstPersonRootNodes[index]) == rootNode;
+                if (duplicate)
+                    break;
+            }
+            if (!duplicate)
+                InterlockedExchange(
+                    &gRetailVrLastFirstPersonRootNodes[rootCount++],
+                    static_cast<LONG>(rootNode));
+        }
+        if (rootCount != 0)
         {
             InterlockedExchange(
                 &gRetailVrLastFirstPersonRootNode,
-                static_cast<LONG>(rootNode));
+                gRetailVrLastFirstPersonRootNodes[0]);
+            InterlockedExchange(
+                &gRetailVrLastFirstPersonRootNodeCount,
+                rootCount);
         }
     }
-    frame.firstPersonRootNode = static_cast<RetailPointer32>(
-        static_cast<std::uint32_t>(InterlockedCompareExchange(
-            &gRetailVrLastFirstPersonRootNode,
+    frame.firstPersonRootNodeCount = static_cast<std::uint32_t>(
+        InterlockedCompareExchange(
+            &gRetailVrLastFirstPersonRootNodeCount,
             0,
-            0)));
+            0));
+    for (std::uint32_t index = 0u;
+         index < frame.firstPersonRootNodeCount;
+         ++index)
+    {
+        frame.firstPersonRootNodes[index] = static_cast<RetailPointer32>(
+            static_cast<std::uint32_t>(InterlockedCompareExchange(
+                &gRetailVrLastFirstPersonRootNodes[index],
+                0,
+                0)));
+    }
     if (InterlockedIncrement(&gRetailWorldArgumentLogged) == 1)
     {
         char message[384] {};

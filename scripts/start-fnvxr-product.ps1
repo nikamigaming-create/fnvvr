@@ -88,6 +88,9 @@ param(
     # still owns OpenXR poses and final eye submission; no input, fire,
     # projectile, hit, camera-hook, or physical-headset path is enabled.
     [switch]$HeadsetControllerRigVisualTrial,
+    # Diagnostic-only selection of authenticated first-person roots:
+    # weapon=1, upper-body=2, left-hand=4, right-hand=8, Pip-Boy=16.
+    [ValidateRange(1, 31)][int]$FirstPersonRootMask = 1,
     # In the owned headless fixture only, authorizes a bounded normal-input
     # sequence: right trigger fires and left-controller X reloads.
     [switch]$HeadsetCombatVisualTrial,
@@ -1133,9 +1136,7 @@ function Write-SupervisorLog {
     Add-Content -LiteralPath $launcherLog -Value ("{0} {1}" -f [DateTime]::UtcNow.ToString("o"), $Message) -Encoding UTF8
 }
 
-function Get-FnvxrSimulatorPreviewClientBounds {
-    param([Parameter(Mandatory = $true)][uint32]$ProcessId)
-
+function Initialize-FnvxrSimulatorPreviewNative {
     if (-not ("FnvxrSimulatorPreviewNative" -as [type])) {
         Add-Type -TypeDefinition @'
 using System;
@@ -1144,6 +1145,8 @@ using System.Runtime.InteropServices;
 
 public static class FnvxrSimulatorPreviewNative
 {
+    private static System.Threading.Timer isolationTimer;
+    private static uint isolatedProcessId;
     private delegate bool EnumWindowsProc(IntPtr window, IntPtr parameter);
 
     [StructLayout(LayoutKind.Sequential)]
@@ -1160,6 +1163,8 @@ public static class FnvxrSimulatorPreviewNative
     private static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
     [DllImport("user32.dll")]
     private static extern bool IsWindowVisible(IntPtr window);
+    [DllImport("user32.dll")]
+    private static extern bool ShowWindow(IntPtr window, int command);
     [DllImport("user32.dll")]
     private static extern bool GetClientRect(IntPtr window, out RECT rectangle);
     [DllImport("user32.dll")]
@@ -1204,9 +1209,47 @@ public static class FnvxrSimulatorPreviewNative
         GetWindowText(window, title, title.Capacity);
         return title.ToString();
     }
+
+    public static int HideProcessWindows(uint expectedProcessId)
+    {
+        int[] hidden = new int[] { 0 };
+        EnumWindows(delegate(IntPtr window, IntPtr parameter) {
+            uint processId;
+            GetWindowThreadProcessId(window, out processId);
+            if (processId != expectedProcessId) return true;
+            if (IsWindowVisible(window) && ShowWindow(window, 0)) hidden[0]++;
+            return true;
+        }, IntPtr.Zero);
+        return hidden[0];
+    }
+
+    public static void StartWindowIsolation(uint expectedProcessId)
+    {
+        StopWindowIsolation();
+        isolatedProcessId = expectedProcessId;
+        isolationTimer = new System.Threading.Timer(
+            delegate(object state) { HideProcessWindows(isolatedProcessId); },
+            null,
+            0,
+            25);
+    }
+
+    public static void StopWindowIsolation()
+    {
+        System.Threading.Timer timer = isolationTimer;
+        isolationTimer = null;
+        isolatedProcessId = 0;
+        if (timer != null) timer.Dispose();
+    }
 }
 '@
     }
+}
+
+function Get-FnvxrSimulatorPreviewClientBounds {
+    param([Parameter(Mandatory = $true)][uint32]$ProcessId)
+
+    Initialize-FnvxrSimulatorPreviewNative
 
     $bounds = [FnvxrSimulatorPreviewNative]::FindClientBounds($ProcessId)
     if ($null -eq $bounds -or $bounds.Length -ne 4) {
@@ -2703,6 +2746,16 @@ try {
         -MetaXrOperatorLayerDirectory $(if ($metaXrOperatorIdentity) {
             $metaXrOperatorIdentity.directory
         } else { "" })
+    $environment.FNVXR_FIRST_PERSON_WEAPON_ROOT =
+        $(if (($FirstPersonRootMask -band 1) -ne 0) { "1" } else { "0" })
+    $environment.FNVXR_FIRST_PERSON_UPPER_BODY_ROOT =
+        $(if (($FirstPersonRootMask -band 2) -ne 0) { "1" } else { "0" })
+    $environment.FNVXR_FIRST_PERSON_LEFT_HAND_ROOT =
+        $(if (($FirstPersonRootMask -band 4) -ne 0) { "1" } else { "0" })
+    $environment.FNVXR_FIRST_PERSON_RIGHT_HAND_ROOT =
+        $(if (($FirstPersonRootMask -band 8) -ne 0) { "1" } else { "0" })
+    $environment.FNVXR_FIRST_PERSON_PIPBOY_ROOT =
+        $(if (($FirstPersonRootMask -band 16) -ne 0) { "1" } else { "0" })
     Set-FnvxrProductMinimalEnvironment -Environment $environment
     if ($selectedRuntimeIdentity) {
         $openXrRuntimePlan.status = "process-local-environment-applied"
@@ -2866,9 +2919,21 @@ try {
         if ($hostProcess.HasExited) { throw "OpenXR host exited before Fallout startup with code $($hostProcess.ExitCode)." }
         $fallout = Get-ExactFalloutProcess -ExpectedPath $game.fallout.path
         if ($fallout) { break }
-        Start-Sleep -Milliseconds 200
+        Start-Sleep -Milliseconds $(if ($headlessRuntimeIdentity) { 25 } else { 200 })
     } while ([DateTime]::UtcNow -lt $retailDeadline)
     if (-not $fallout) { throw "Timed out waiting for exact FalloutNV.exe process." }
+
+    if ($headlessRuntimeIdentity) {
+        Initialize-FnvxrSimulatorPreviewNative
+        [FnvxrSimulatorPreviewNative]::StartWindowIsolation(
+            [uint32]$fallout.Id)
+        $hiddenWindowCount = [FnvxrSimulatorPreviewNative]::HideProcessWindows(
+            [uint32]$fallout.Id)
+        Write-SupervisorLog (
+            "headless retail window isolation armed process={0} initiallyHidden={1}; desktop foreground/input remains user-owned" -f
+                $fallout.Id,
+                $hiddenWindowCount)
+    }
 
     $manifest.processes.fallout = [ordered]@{
         processId = $fallout.Id
@@ -3737,6 +3802,9 @@ try {
     $manifest.state = "failed"
     Write-SupervisorLog ("ERROR " + $_.Exception.Message)
 } finally {
+    if ("FnvxrSimulatorPreviewNative" -as [type]) {
+        [FnvxrSimulatorPreviewNative]::StopWindowIsolation()
+    }
     if ($simulatorSbsRecorderProcess) {
         try {
             $simulatorSbsRecorderProcess.Refresh()
