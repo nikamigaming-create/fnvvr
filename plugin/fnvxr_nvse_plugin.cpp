@@ -141,6 +141,17 @@ constexpr std::uintptr_t InterfaceManagerCrosshairRefOffset = 0x0FC;
 constexpr std::uintptr_t TESObjectRefrBaseFormOffset = 0x20;
 constexpr std::uintptr_t TESObjectRefrParentCellOffset = 0x40;
 constexpr std::uintptr_t MobileObjectBaseProcessOffset = 0x68;
+constexpr std::uintptr_t ActorActorMoverOffset = 0x190;
+constexpr std::uintptr_t PlayerMoverMovementFlagsOffset = 0x94;
+constexpr UInt32 ActorMoverSetMovementFlagsAddress = 0x009EA3E0;
+constexpr UInt32 MovementFlagForward = 0x01;
+constexpr UInt32 MovementFlagBackward = 0x02;
+constexpr UInt32 MovementFlagLeft = 0x04;
+constexpr UInt32 MovementFlagRight = 0x08;
+constexpr UInt32 MovementFlagDirectionalMask = 0x0F;
+constexpr UInt32 MovementFlagIsKeyboard = 0x40;
+constexpr UInt32 MovementFlagWalking = 0x100;
+constexpr UInt32 MovementFlagRunning = 0x200;
 constexpr std::uintptr_t MiddleHighProcessWeaponOutOffset = 0x135;
 constexpr std::uintptr_t MiddleHighProcessProjectileNodeOffset = 0x130;
 // xNVSE GameProcess.h: HighProcess::forceFireWeapon is the engine-owned
@@ -6607,19 +6618,30 @@ bool applyRetailArmFabrik(
     const float maximumFinalError = getFloatFromEnv(
         "FNVXR_RETAIL_RIG_MAX_FINAL_ERROR_UNITS",
         0.25f);
-    if (!result.solved || !std::isfinite(result.error) || result.error > maximumFinalError)
+    const bool solverResultUsable =
+        result.solved && std::isfinite(result.error)
+        && result.error <= maximumFinalError;
+    if (!solverResultUsable && !physicalRightHand)
         return false;
 
-    finalError = result.error;
+    finalError = solverResultUsable ? result.error : shoulderTargetDistance;
     if (!applyWrites)
-        return true;
+        return solverResultUsable || physicalRightHand;
 
     const Vec3 solvedShoulder { joints[0].x, joints[0].y, joints[0].z };
     const Vec3 solvedElbow { joints[1].x, joints[1].y, joints[1].z };
     const Vec3 solvedWrist { joints[2].x, joints[2].y, joints[2].z };
-    if (!alignBoneToDirection(arm.upperArm, arm.forearm, subtractVec3(solvedElbow, solvedShoulder)))
-        return false;
-    if (!alignBoneToDirection(arm.forearm, arm.hand, subtractVec3(solvedWrist, solvedElbow)))
+    const bool upperAligned = solverResultUsable
+        && alignBoneToDirection(
+            arm.upperArm,
+            arm.forearm,
+            subtractVec3(solvedElbow, solvedShoulder));
+    const bool forearmAligned = upperAligned
+        && alignBoneToDirection(
+            arm.forearm,
+            arm.hand,
+            subtractVec3(solvedWrist, solvedElbow));
+    if ((!upperAligned || !forearmAligned) && !physicalRightHand)
         return false;
 
     void* handParent = readPointer(
@@ -9311,6 +9333,88 @@ bool holdGameplayMovementKey(UInt32 keycode, bool held)
             physicalHeadsetPlayRequested()));
 }
 
+bool drivePhysicalPlayerMovement(
+    const fnvxr::physical_input::LocomotionIntent& intent,
+    bool allowed,
+    bool runHeld,
+    UInt64 frame)
+{
+    UInt32 requestedDirections = 0u;
+    if (allowed)
+    {
+        requestedDirections =
+            (intent.forward ? MovementFlagForward : 0u)
+            | (intent.backward ? MovementFlagBackward : 0u)
+            | (intent.left ? MovementFlagLeft : 0u)
+            | (intent.right ? MovementFlagRight : 0u);
+    }
+
+    bool applied = false;
+    UInt32 before = 0u;
+    UInt32 after = 0u;
+    void* mover = nullptr;
+    __try
+    {
+        void* player = readPointer(PlayerCharacterAddress);
+        mover = player
+            ? readPointer(
+                reinterpret_cast<std::uintptr_t>(player)
+                    + ActorActorMoverOffset)
+            : nullptr;
+        if (mover)
+        {
+            before = *reinterpret_cast<UInt32*>(
+                reinterpret_cast<std::uintptr_t>(mover)
+                    + PlayerMoverMovementFlagsOffset);
+            after = (before & ~MovementFlagDirectionalMask)
+                | requestedDirections;
+            if (requestedDirections != 0u)
+            {
+                after |= MovementFlagIsKeyboard;
+                after &= ~(MovementFlagWalking | MovementFlagRunning);
+                after |= runHeld
+                    ? MovementFlagRunning
+                    : MovementFlagWalking;
+            }
+            using SetMovementFlagsFn = void (__thiscall*)(void*, UInt32);
+            reinterpret_cast<SetMovementFlagsFn>(
+                ActorMoverSetMovementFlagsAddress)(mover, after);
+            const UInt32 verified = *reinterpret_cast<UInt32*>(
+                reinterpret_cast<std::uintptr_t>(mover)
+                    + PlayerMoverMovementFlagsOffset);
+            applied = (verified & MovementFlagDirectionalMask)
+                == requestedDirections;
+            after = verified;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        applied = false;
+    }
+
+    static bool initialized = false;
+    static UInt32 previousDirections = 0u;
+    static bool previousApplied = false;
+    if (!initialized || requestedDirections != previousDirections
+        || applied != previousApplied)
+    {
+        initialized = true;
+        previousDirections = requestedDirections;
+        previousApplied = applied;
+        logTelemetry(
+            "physicalPlayerMover frame=%llu requested=0x%02lx before=0x%04lx after=0x%04lx run=%d allowed=%d mover=%p applied=%d finalConsumer=PlayerMover::SetMovementFlags\n",
+            static_cast<unsigned long long>(frame),
+            static_cast<unsigned long>(requestedDirections),
+            static_cast<unsigned long>(before),
+            static_cast<unsigned long>(after),
+            static_cast<int>(runHeld),
+            static_cast<int>(allowed),
+            mover,
+            static_cast<int>(applied));
+    }
+    return applied;
+}
+
 bool drivePhysicalGameplayPrimaryAttack(
     bool held,
     bool previousHeld,
@@ -11637,6 +11741,13 @@ void consumeExternalXInputGameplayControls(
         &&
         envEnabled("FNVXR_GAMEPLAY_RUN_BUTTON_ENABLE", true)
         && (g_gameplayRunModeEnabled || analogRun);
+    const bool playerMoverApplied = physicalLocomotionRoute
+        ? drivePhysicalPlayerMovement(
+            requestedLocomotion,
+            physicalLocomotionAllowed,
+            runHeld,
+            frame)
+        : false;
 
     const bool primaryAttackStep = physicalLocomotionRoute
         ? drivePhysicalGameplayPrimaryAttack(
@@ -11675,8 +11786,7 @@ void consumeExternalXInputGameplayControls(
             | (moveBackward ? 0x2u : 0u)
             | (moveLeft ? 0x4u : 0u)
             | (moveRight ? 0x8u : 0u));
-        const bool finalApplied =
-            forwardApplied && leftApplied && backwardApplied && rightApplied;
+        const bool finalApplied = playerMoverApplied;
         static bool physicalLocomotionFinalTelemetryInitialized = false;
         static UInt8 previousPhysicalLocomotionRequestedMask = 0u;
         static UInt8 previousPhysicalLocomotionGeneratedMask = 0u;
@@ -11703,8 +11813,7 @@ void consumeExternalXInputGameplayControls(
                 static_cast<unsigned int>(requestedMask),
                 static_cast<unsigned int>(generatedMask),
                 static_cast<int>(physicalLocomotionAllowed),
-                fnvxr::physical_input::locomotionDeliveryName(
-                    fnvxr::physical_input::selectLocomotionDelivery(true)),
+                "PlayerMover::SetMovementFlags",
                 static_cast<int>(finalApplied));
         }
     }

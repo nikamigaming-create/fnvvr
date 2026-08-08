@@ -65,6 +65,9 @@ foreach ($required in @(
         'physicalLocomotionFinal',
         'physicalLocomotionRearmPending',
         'physicalLocomotionAllowed',
+        'drivePhysicalPlayerMovement',
+        'ActorMoverSetMovementFlagsAddress',
+        'PlayerMover::SetMovementFlags',
         'holdGameplayMovementKey(DIK_W, finalForwardHeld)',
         'holdGameplayMovementKey(DIK_A, moveLeft)',
         'holdGameplayMovementKey(DIK_S, moveBackward)',
@@ -90,6 +93,7 @@ foreach ($required in @(
         'HighProcessForceFireWeaponOffset',
         'finalConsumer=HighProcess::forceFireWeapon',
         'physicalRightHand',
+        'solverResultUsable || physicalRightHand',
         'desiredHandLocalPosition')) {
     Require-Text -Text $plugin -Required $required -Reason "physical tracked weapon and trigger consumer"
 }
