@@ -3195,14 +3195,21 @@ try {
 
         $attackEvents = @(Select-String `
             -LiteralPath $headsetDemoInputTelemetryLog `
-            -Pattern 'primaryAttack hold .*held=1 applied=1 finalConsumer=nvse-directinput-hold' `
+            -Pattern 'primaryAttack edge .*held=true applied=true finalConsumer=HighProcess::forceFireWeapon' `
             -ErrorAction SilentlyContinue)
         $reloadEvents = @(Select-String `
             -LiteralPath $headsetDemoInputTelemetryLog `
-            -Pattern 'buttonX reloadHold .*held=1 applied=1 finalConsumer=nvse-directinput-hold' `
+            -Pattern 'buttonX reloadEdge .*held=true applied=(true|false) finalConsumer=PlayerCharacter::Reload' `
             -ErrorAction SilentlyContinue)
-        if ($attackEvents.Count -lt 16 -or $reloadEvents.Count -ne 1) {
-            throw "The bounded combat trial did not apply all sixteen primary-attack presses and exactly one X reload through the retail DirectInput consumer. Evidence is in $runDirectory"
+        $loadedBefore = @($attackEvents | ForEach-Object {
+            if ($_.Line -match 'loadedBefore=(\d+)') { [int]$Matches[1] }
+        })
+        $emptyingPattern = ($loadedBefore | Select-Object -First 13) -join ','
+        $confirmationPattern = ($loadedBefore | Select-Object -Last 2) -join ','
+        if ($attackEvents.Count -ne 16 -or $reloadEvents.Count -ne 1 -or
+            $emptyingPattern -cne '13,12,11,10,9,8,7,6,5,4,3,2,1' -or
+            $confirmationPattern -cne '13,12') {
+            throw "The bounded combat trial did not prove a full 13-round magazine discharge, engine reload back to 13, and two post-reload shots from the simulator controllers. Evidence is in $runDirectory"
         }
         $directRigEvents = @(Select-String `
             -LiteralPath $headsetDemoInputTelemetryLog `
@@ -3218,8 +3225,9 @@ try {
             commandedShots = 16
             primaryAttackHoldEvents = $attackEvents.Count
             reloadHoldEvents = $reloadEvents.Count
+            loadedRoundsBeforeAttacks = $loadedBefore
             fireBinding = "OpenXR right trigger -> retail primary attack"
-            reloadBinding = "OpenXR left X -> retail reload"
+            reloadBinding = "retail empty-magazine automatic reload; OpenXR left X reload edge also delivered"
             controllerMotion = $combatEvidence
             headMotion = $headsetPoseSweepEvidence
             appliedRigEvents = $directRigEvents.Count

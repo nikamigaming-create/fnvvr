@@ -143,6 +143,15 @@ constexpr std::uintptr_t TESObjectRefrParentCellOffset = 0x40;
 constexpr std::uintptr_t MobileObjectBaseProcessOffset = 0x68;
 constexpr std::uintptr_t MiddleHighProcessWeaponOutOffset = 0x135;
 constexpr std::uintptr_t MiddleHighProcessProjectileNodeOffset = 0x130;
+// xNVSE GameProcess.h: HighProcess::forceFireWeapon is the engine-owned
+// one-frame request consumed by the normal weapon pipeline.  The two virtual
+// slots below are BaseProcess::GetAmmoInfo and its PlayerCharacter reload
+// vtable entry.  These are used only by the leased headless combat fixture so
+// the simulator can exercise real gameplay without foreground-window input.
+constexpr std::uintptr_t HighProcessForceFireWeaponOffset = 0x2F4;
+constexpr UInt32 BaseProcessGetWeaponInfoVtableSlot = 0x52;
+constexpr UInt32 BaseProcessGetAmmoInfoVtableSlot = 0x53;
+constexpr UInt32 PlayerCharacterReloadVtableAddress = 0x0108AE28;
 // Verified against the live retail body of PlayerCharacter::ToggleFirstPerson
 // at 0x00950110.  Offset 0x64A is a separate first-person-node transition
 // flag; treating it as the camera mode causes false third-person transitions.
@@ -311,10 +320,14 @@ struct DirectInputDeviceObjectData
 
 struct DirectInputHookControl
 {
-    void* vtable;
+    // xNVSE's DIHookControl inherits only the empty ISingleton helper and has
+    // no virtual methods.  The key array therefore begins at offset zero.
+    // A synthetic vtable pointer shifts every hold/tap into the wrong key.
     DirectInputKeyInfo keys[MaxDirectInputMacros];
     std::queue<DirectInputDeviceObjectData> bufferedPresses;
 };
+
+static_assert(sizeof(DirectInputKeyInfo) == 7, "xNVSE DirectInput key ABI drift");
 
 struct TileValue
 {
@@ -14364,7 +14377,7 @@ void processTrackedPropAssistMainLoop(const RuntimeObservation& observation)
 void consumeHeadlessCombatVisualTrialInput(
     const RuntimeObservation& observation)
 {
-    static PrimaryAttackState primaryAttackState {};
+    static bool previousTriggerHeld = false;
     static bool previousReloadHeld = false;
 
     const bool authorized =
@@ -14381,27 +14394,139 @@ void consumeHeadlessCombatVisualTrialInput(
     const bool reloadHeld =
         haveInput && (state.buttons & XInputX) != 0u;
 
-    // Keep this path intentionally smaller than the normal input bridge. It
-    // cannot consume sticks, menu buttons, grips, UI pointers, or locomotion.
-    driveGameplayPrimaryAttack(
-        rightTriggerHeld,
-        primaryAttackState,
-        observation.frame,
-        "headlessCombat:RT",
-        fnvxr::physical_input::LocomotionDelivery::InProcessNvseDirectInput);
-    const bool reloadApplied = holdDirectInputKey(
-        DIK_R,
-        reloadHeld,
-        fnvxr::physical_input::LocomotionDelivery::InProcessNvseDirectInput);
-    if (reloadHeld != previousReloadHeld)
+    struct CombatAmmoSnapshot
     {
+        void* process {};
+        void* ammoInfo {};
+        void* weapon {};
+        UInt32 loadedRounds {};
+        bool valid {};
+    };
+    const auto readCombatAmmo = []() -> CombatAmmoSnapshot
+    {
+        CombatAmmoSnapshot result {};
+        __try
+        {
+            void* player = readPointer(PlayerCharacterAddress);
+            result.process = player
+                ? readPointer(reinterpret_cast<std::uintptr_t>(player)
+                    + MobileObjectBaseProcessOffset)
+                : nullptr;
+            if (!result.process)
+                return result;
+            void** processVtable = *reinterpret_cast<void***>(result.process);
+            if (!processVtable
+                || !processVtable[BaseProcessGetWeaponInfoVtableSlot]
+                || !processVtable[BaseProcessGetAmmoInfoVtableSlot])
+            {
+                return result;
+            }
+            using GetAmmoInfoFn = void* (__thiscall*)(void*);
+            result.ammoInfo = reinterpret_cast<GetAmmoInfoFn>(
+                processVtable[BaseProcessGetAmmoInfoVtableSlot])(
+                    result.process);
+            if (!result.ammoInfo)
+                return result;
+            const auto ammoBase = reinterpret_cast<std::uintptr_t>(
+                result.ammoInfo);
+            result.loadedRounds = readUInt32(ammoBase + 0x04);
+            // xNVSE Actor::GetEquippedWeapon reads EntryData::type at +0x08
+            // from BaseProcess::GetWeaponInfo. AmmoInfo::weapon is not
+            // populated for every player weapon and cannot be the authority.
+            using GetWeaponInfoFn = void* (__thiscall*)(void*);
+            void* weaponInfo = reinterpret_cast<GetWeaponInfoFn>(
+                processVtable[BaseProcessGetWeaponInfoVtableSlot])(
+                    result.process);
+            result.weapon = weaponInfo
+                ? readPointer(reinterpret_cast<std::uintptr_t>(weaponInfo)
+                    + 0x08)
+                : nullptr;
+            result.valid = result.weapon != nullptr;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            result = {};
+        }
+        return result;
+    };
+
+    // Drive the real engine action state, not an OS/DInput queue. Fallout
+    // consumes forceFireWeapon on its gameplay update even while its window is
+    // deliberately kept in the background by the headless simulator run.
+    if (rightTriggerHeld && !previousTriggerHeld)
+    {
+        const CombatAmmoSnapshot before = readCombatAmmo();
+        bool applied = false;
+        if (before.process && before.valid)
+        {
+            __try
+            {
+                *reinterpret_cast<UInt8*>(
+                    reinterpret_cast<std::uintptr_t>(before.process)
+                    + HighProcessForceFireWeaponOffset) = 1u;
+                applied = true;
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                applied = false;
+            }
+        }
         logTelemetry(
-            "buttonX reloadHold frame=%llu held=%d applied=%d finalConsumer=nvse-directinput-hold source=headlessCombat:X\n",
+            "primaryAttack edge frame=%llu source=headlessCombat:RT held=true applied=%s finalConsumer=HighProcess::forceFireWeapon loadedBefore=%lu process=%p weapon=%p\n",
             static_cast<unsigned long long>(observation.frame),
-            static_cast<int>(reloadHeld),
-            static_cast<int>(reloadApplied));
-        previousReloadHeld = reloadHeld;
+            applied ? "true" : "false",
+            static_cast<unsigned long>(before.loadedRounds),
+            before.process,
+            before.weapon);
     }
+    else if (!rightTriggerHeld && previousTriggerHeld)
+    {
+        // forceFireWeapon is a level-triggered engine request. Clear it on
+        // the controller's release edge so the next squeeze is a distinct
+        // semi-automatic shot instead of a permanently asserted request.
+        const CombatAmmoSnapshot released = readCombatAmmo();
+        if (released.process)
+        {
+            __try
+            {
+                *reinterpret_cast<UInt8*>(
+                    reinterpret_cast<std::uintptr_t>(released.process)
+                    + HighProcessForceFireWeaponOffset) = 0u;
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+            }
+        }
+    }
+    previousTriggerHeld = rightTriggerHeld;
+    if (reloadHeld && !previousReloadHeld)
+    {
+        const CombatAmmoSnapshot before = readCombatAmmo();
+        bool reloadApplied = false;
+        __try
+        {
+            void* player = readPointer(PlayerCharacterAddress);
+            using ReloadFn = bool (__thiscall*)(
+                void*, void*, int, UInt8, UInt8);
+            ReloadFn reload = player
+                ? *pointerFromAddress32<ReloadFn*>(
+                    PlayerCharacterReloadVtableAddress)
+                : nullptr;
+            reloadApplied = reload && before.weapon
+                && reload(player, before.weapon, 1, 0u, 0u);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            reloadApplied = false;
+        }
+        logTelemetry(
+            "buttonX reloadEdge frame=%llu held=true applied=%s finalConsumer=PlayerCharacter::Reload loadedBefore=%lu weapon=%p source=headlessCombat:X\n",
+            static_cast<unsigned long long>(observation.frame),
+            reloadApplied ? "true" : "false",
+            static_cast<unsigned long>(before.loadedRounds),
+            before.weapon);
+    }
+    previousReloadHeld = reloadHeld;
 }
 
 void processHeadlessStereoRigVisualTrialMainLoop(
