@@ -9,8 +9,11 @@ param(
     [switch]$PhysicalHeadsetPlay,
     # Temporary per-eye retail source resolution for interactive headset play.
     # The user's Fallout INIs are backed up and restored byte-for-byte.
-    [ValidateRange(1280, 4096)][int]$PhysicalGameWidth = 1600,
-    [ValidateRange(720, 2560)][int]$PhysicalGameHeight = 1728,
+    # Match the attached Quest runtime's reported per-eye recommendation.
+    # VR projection views are headset-shaped (near-square/portrait), not a
+    # desktop 16:9 backbuffer.
+    [ValidateRange(1280, 4096)][int]$PhysicalGameWidth = 1872,
+    [ValidateRange(720, 2560)][int]$PhysicalGameHeight = 2016,
     # Optional workspace-staged Meta XR Operator API layer. It is observed
     # only: FNVXR neither starts its MCP proxy nor invokes pose/controller tools.
     [string]$MetaXrOperatorLayerDirectory = "",

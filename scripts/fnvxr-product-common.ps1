@@ -2158,8 +2158,8 @@ function Get-FnvxrProductMinimalEnvironment {
         [switch]$HeadsetControllerRigVisualTrial,
         [switch]$HeadsetCombatVisualTrial,
         [switch]$PhysicalHeadsetPlay,
-        [ValidateRange(1280, 4096)][int]$PhysicalGameWidth = 1600,
-        [ValidateRange(720, 2560)][int]$PhysicalGameHeight = 1728,
+        [ValidateRange(1280, 4096)][int]$PhysicalGameWidth = 1872,
+        [ValidateRange(720, 2560)][int]$PhysicalGameHeight = 2016,
         [ValidateRange(1, 1200)]
         [int]$HeadsetDemoGameplayWarmupFrames = 90,
         [ValidateSet(

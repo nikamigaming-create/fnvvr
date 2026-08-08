@@ -1103,8 +1103,8 @@ if (-not (Get-Content -LiteralPath (Join-Path $SourceRoot `
 foreach ($physicalPlayContract in @(
     'retail-vr-play-v1',
     'physical-headset-interactive-play',
-    '[ValidateRange(1280, 4096)][int]$PhysicalGameWidth = 1600',
-    '[ValidateRange(720, 2560)][int]$PhysicalGameHeight = 1728',
+    '[ValidateRange(1280, 4096)][int]$PhysicalGameWidth = 1872',
+    '[ValidateRange(720, 2560)][int]$PhysicalGameHeight = 2016',
     'FNVXR_PHYSICAL_HEADSET_PLAY = "1"',
     'FNVXR_PHASE1_TRACE_TELEMETRY = "1"',
     'FNVXR_PLUGIN_KEYBOARD_MOVEMENT_ENABLE = "1"',
