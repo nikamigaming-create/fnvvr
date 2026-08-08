@@ -26,9 +26,13 @@ $reloadPressed = $false
 $reloadReleased = $false
 $triggerPresses = 0
 $commands = 0
-$ticksPerShot = 6
-$reloadTicks = 18
-$settleTicks = 8
+# Hold each trigger edge long enough for the retail input/animation pipeline
+# and leave a full semi-auto recovery interval between shots. The old two-tick
+# pulse was acknowledged by IPC but was too short to remain visible in-game.
+$ticksPerShot = 9
+$triggerHeldTicks = 4
+$reloadTicks = 24
+$settleTicks = 10
 $emptyingTicks = $ShotsToEmpty * $ticksPerShot
 $confirmationStartTick = $emptyingTicks + $reloadTicks + $settleTicks
 $totalTicks = $confirmationStartTick +
@@ -75,23 +79,28 @@ while ($tick -lt $totalTicks) {
     # A slow Lissajous aim path crosses left, center, right, high, and low
     # target regions with meaningful reach. Smooth per-tick interpolation
     # avoids the old cardinal-step jerk while preserving full 6DoF rotation.
-    $phase = 2.0 * [Math]::PI * 0.115 * $seconds
-    $x = 0.20 + 0.22 * [Math]::Sin($phase)
-    $y = 1.40 + 0.14 * [Math]::Sin(1.7 * $phase + 0.7)
-    $z = -0.40 + 0.16 * [Math]::Sin(1.3 * $phase + 1.4)
-    $yaw = 28.0 * $radiansPerDegree * [Math]::Sin($phase)
-    $pitch = -0.30 + 18.0 * $radiansPerDegree *
-        [Math]::Sin(1.5 * $phase + 0.5)
-    $roll = 12.0 * $radiansPerDegree *
-        [Math]::Sin(1.2 * $phase + 1.1)
+    $phase = 2.0 * [Math]::PI * 0.085 * $seconds
+    # Deliberately large, slow presentation motion: cross the view left/right,
+    # lift/drop the pistol, move it in/out, and visibly point the muzzle both
+    # above and below the horizon. This must read as hand control on video,
+    # not as idle weapon sway.
+    $x = 0.15 + 0.50 * [Math]::Sin($phase)
+    $y = 1.35 + 0.38 * [Math]::Sin(1.3 * $phase + 0.7)
+    $z = -0.45 + 0.28 * [Math]::Sin(0.8 * $phase + 1.4)
+    $yaw = 55.0 * $radiansPerDegree * [Math]::Sin($phase)
+    $pitch = -0.20 + 50.0 * $radiansPerDegree *
+        [Math]::Sin(1.1 * $phase + 0.5)
+    $roll = 28.0 * $radiansPerDegree *
+        [Math]::Sin(0.9 * $phase + 1.1)
 
     $trigger = $false
     if ($tick -lt $emptyingTicks) {
-        $trigger = ($tick % $ticksPerShot) -lt 2
+        $trigger = ($tick % $ticksPerShot) -lt $triggerHeldTicks
     } elseif ($tick -ge $confirmationStartTick -and
         $tick -lt $confirmationStartTick +
             ($ShotsAfterReload * $ticksPerShot)) {
-        $trigger = (($tick - $confirmationStartTick) % $ticksPerShot) -lt 2
+        $trigger = (($tick - $confirmationStartTick) % $ticksPerShot) -lt
+            $triggerHeldTicks
     }
     if ($trigger -and -not $lastTrigger) { ++$triggerPresses }
 
@@ -134,12 +143,12 @@ while ($tick -lt $totalTicks) {
     # tick without racing over the simulator's single acknowledgement file.
     $headPhase = 2.0 * [Math]::PI * 0.12 * $seconds
     Publish-HeadPose `
-        -X (0.025 * [Math]::Sin($headPhase)) `
-        -Y (1.70 + 0.020 * [Math]::Sin($headPhase + 1.1)) `
-        -Z (0.020 * [Math]::Sin($headPhase + 2.2)) `
-        -Yaw (6.0 * $radiansPerDegree * [Math]::Sin($headPhase)) `
-        -Pitch (4.0 * $radiansPerDegree * [Math]::Sin($headPhase + 1.3)) `
-        -Roll (2.0 * $radiansPerDegree * [Math]::Sin($headPhase + 2.6)) `
+        -X (0.040 * [Math]::Sin($headPhase)) `
+        -Y (1.70 + 0.030 * [Math]::Sin($headPhase + 1.1)) `
+        -Z (0.030 * [Math]::Sin($headPhase + 2.2)) `
+        -Yaw (12.0 * $radiansPerDegree * [Math]::Sin($headPhase)) `
+        -Pitch (8.0 * $radiansPerDegree * [Math]::Sin($headPhase + 1.3)) `
+        -Roll (3.0 * $radiansPerDegree * [Math]::Sin($headPhase + 2.6)) `
         -Ordinal ($tick + 1)
 
     ++$tick
@@ -184,12 +193,12 @@ Invoke-SimulatorInput -Arguments @{
     updatesPerSecond = $UpdatesPerSecond
     controllerPoseSpace = "local"
     controllerPath = "smooth multi-target Lissajous 6DoF"
-    xAmplitudeMeters = 0.22
-    yAmplitudeMeters = 0.14
-    zAmplitudeMeters = 0.16
-    yawAmplitudeDegrees = 28.0
-    pitchAmplitudeDegrees = 18.0
-    rollAmplitudeDegrees = 12.0
+    xAmplitudeMeters = 0.50
+    yAmplitudeMeters = 0.38
+    zAmplitudeMeters = 0.28
+    yawAmplitudeDegrees = 55.0
+    pitchAmplitudeDegrees = 50.0
+    rollAmplitudeDegrees = 28.0
     shotsToEmpty = $ShotsToEmpty
     reloads = 1
     shotsAfterReload = $ShotsAfterReload
@@ -199,12 +208,12 @@ Invoke-SimulatorInput -Arguments @{
     controlsReleased = $true
     headMotion = [ordered]@{
         pattern = "gentle-sinusoidal-v1"
-        xAmplitudeMeters = 0.025
-        yAmplitudeMeters = 0.020
-        zAmplitudeMeters = 0.020
-        yawAmplitudeDegrees = 6.0
-        pitchAmplitudeDegrees = 4.0
-        rollAmplitudeDegrees = 2.0
+        xAmplitudeMeters = 0.040
+        yAmplitudeMeters = 0.030
+        zAmplitudeMeters = 0.030
+        yawAmplitudeDegrees = 12.0
+        pitchAmplitudeDegrees = 8.0
+        rollAmplitudeDegrees = 3.0
         concurrentWithController = $true
         centerRestored = $true
     }

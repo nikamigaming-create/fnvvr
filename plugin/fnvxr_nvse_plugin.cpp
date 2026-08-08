@@ -11196,7 +11196,13 @@ UInt64 meleeTriggerRepeatMs()
     return static_cast<UInt64>((std::max)(80, getIntFromEnv("FNVXR_GAMEPLAY_MELEE_TRIGGER_REPEAT_MS", 420)));
 }
 
-bool driveGameplayPrimaryAttack(bool rightTriggerHeld, PrimaryAttackState& state, UInt64 frame, const char* source)
+bool driveGameplayPrimaryAttack(
+    bool rightTriggerHeld,
+    PrimaryAttackState& state,
+    UInt64 frame,
+    const char* source,
+    fnvxr::physical_input::LocomotionDelivery delivery =
+        fnvxr::physical_input::LocomotionDelivery::SharedInputQueue)
 {
     const UInt32 weaponClass = currentWeaponClass();
     const bool classTapMode =
@@ -11209,19 +11215,26 @@ bool driveGameplayPrimaryAttack(bool rightTriggerHeld, PrimaryAttackState& state
         state.lastWeaponClass = weaponClass;
         const bool changed = state.held != rightTriggerHeld;
         state.held = rightTriggerHeld;
-        holdDirectInputKey(MouseButtonOffset, rightTriggerHeld);
+        const bool applied = holdDirectInputKey(
+            MouseButtonOffset,
+            rightTriggerHeld,
+            delivery);
         if (changed)
         {
             logTelemetry(
-                "primaryAttack hold frame=%llu source=%s held=%d class=%s formId=0x%08lx slot=%lu\n",
+                "primaryAttack hold frame=%llu source=%s held=%d applied=%d finalConsumer=%s class=%s formId=0x%08lx slot=%lu\n",
                 static_cast<unsigned long long>(frame),
                 source ? source : "unknown",
                 static_cast<int>(rightTriggerHeld),
+                static_cast<int>(applied),
+                delivery == fnvxr::physical_input::LocomotionDelivery::InProcessNvseDirectInput
+                    ? "nvse-directinput-hold"
+                    : "shared-input-queue",
                 weaponClassName(weaponClass),
                 static_cast<unsigned long>(g_lastKnownWeaponFormId),
                 static_cast<unsigned long>(g_lastKnownWeaponFavoriteSlot));
         }
-        return changed;
+        return changed && applied;
     }
 
     holdDirectInputKey(MouseButtonOffset, false);
@@ -14374,14 +14387,19 @@ void consumeHeadlessCombatVisualTrialInput(
         rightTriggerHeld,
         primaryAttackState,
         observation.frame,
-        "headlessCombat:RT");
-    holdDirectInputKey(DIK_R, reloadHeld);
+        "headlessCombat:RT",
+        fnvxr::physical_input::LocomotionDelivery::InProcessNvseDirectInput);
+    const bool reloadApplied = holdDirectInputKey(
+        DIK_R,
+        reloadHeld,
+        fnvxr::physical_input::LocomotionDelivery::InProcessNvseDirectInput);
     if (reloadHeld != previousReloadHeld)
     {
         logTelemetry(
-            "buttonX reloadHold frame=%llu held=%d source=headlessCombat:X\n",
+            "buttonX reloadHold frame=%llu held=%d applied=%d finalConsumer=nvse-directinput-hold source=headlessCombat:X\n",
             static_cast<unsigned long long>(observation.frame),
-            static_cast<int>(reloadHeld));
+            static_cast<int>(reloadHeld),
+            static_cast<int>(reloadApplied));
         previousReloadHeld = reloadHeld;
     }
 }

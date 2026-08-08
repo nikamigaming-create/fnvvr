@@ -289,6 +289,18 @@ index 201bee2..4e1d302 100644
          rt::PushState(s, XR_SESSION_STATE_FOCUSED);
      }
      return XR_SUCCESS; 
+@@ -2525,6 +2601,10 @@ static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession, const XrFrameWaitInfo*,
+             previewWindowFocused = (fgPid != 0 && fgPid == GetCurrentProcessId());
+         }
+     }
+-    if (previewWindowFocused) {
++    // Logical-headless runs are owned exclusively by file IPC. The optional
++    // preview is an output surface only; legacy keyboard, auto-motion, and
++    // button polling must not overwrite an IPC controller command on the
++    // following frame.
++    if (!SimulatorHeadless() && previewWindowFocused) {
+         const float moveSpeed = 3.0f;  // meters per second
+         float deltaTime = (float)periodSec;
 @@ -2861,19 +2910,41 @@ static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession, const XrFrameWaitInfo*,
          mcp::ControllerPoseCommand ctrlCmd = mcp::CheckControllerPoseCommand();
          if (ctrlCmd.valid) {

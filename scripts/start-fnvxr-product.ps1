@@ -176,8 +176,9 @@ if ($ControllerPoseSweep -and -not $HeadsetControllerRigVisualTrial) {
 if ($HeadsetCombatVisualTrial -and -not $HeadsetControllerRigVisualTrial) {
     throw "-HeadsetCombatVisualTrial requires -HeadsetControllerRigVisualTrial."
 }
-if ($HeadsetCombatVisualTrial -and -not $RecordSimulatorSbs) {
-    throw "-HeadsetCombatVisualTrial requires -RecordSimulatorSbs so firing and reload are recorded."
+if ($HeadsetCombatVisualTrial -and
+    -not ($RecordSimulatorSbs -or $CaptureHeadsetMirror)) {
+    throw "-HeadsetCombatVisualTrial requires -RecordSimulatorSbs or -CaptureHeadsetMirror so firing and reload are recorded."
 }
 if (-not $ControllerPoseSweep -and $ControllerPoseSweepSeconds -ne 14) {
     throw "-ControllerPoseSweepSeconds requires -ControllerPoseSweep."
@@ -3101,6 +3102,9 @@ try {
                 $recorder.bounds.width,
                 $recorder.bounds.height,
                 $SimulatorSbsRecordSeconds)
+        # Give gdigrab a deterministic pre-roll before the first trigger edge.
+        # This also makes the neutral-to-motion transition obvious on video.
+        Start-Sleep -Milliseconds 1000
     }
     # Establish the controller in stage-local space first.  The following HMD
     # sweep can then prove the hand target remains fixed while the head moves;
@@ -3191,12 +3195,14 @@ try {
 
         $attackEvents = @(Select-String `
             -LiteralPath $headsetDemoInputTelemetryLog `
-            -Pattern 'primaryAttack hold .*held=1' -ErrorAction SilentlyContinue)
+            -Pattern 'primaryAttack hold .*held=1 applied=1 finalConsumer=nvse-directinput-hold' `
+            -ErrorAction SilentlyContinue)
         $reloadEvents = @(Select-String `
             -LiteralPath $headsetDemoInputTelemetryLog `
-            -Pattern 'buttonX reloadHold .*held=1' -ErrorAction SilentlyContinue)
-        if ($attackEvents.Count -lt 1 -or $reloadEvents.Count -lt 1) {
-            throw "The bounded combat trial did not prove both normal primary attack and normal X reload in retail telemetry. Evidence is in $runDirectory"
+            -Pattern 'buttonX reloadHold .*held=1 applied=1 finalConsumer=nvse-directinput-hold' `
+            -ErrorAction SilentlyContinue)
+        if ($attackEvents.Count -lt 16 -or $reloadEvents.Count -ne 1) {
+            throw "The bounded combat trial did not apply all sixteen primary-attack presses and exactly one X reload through the retail DirectInput consumer. Evidence is in $runDirectory"
         }
         $directRigEvents = @(Select-String `
             -LiteralPath $headsetDemoInputTelemetryLog `
