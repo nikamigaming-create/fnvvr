@@ -2348,6 +2348,10 @@ function Get-FnvxrProductMinimalEnvironment {
         $environment.FNVXR_PHASE1_TRACE_TELEMETRY = "1"
         $environment.FNVXR_EXTERNAL_XINPUT_WRITER = "1"
         $environment.FNVXR_EXTERNAL_DINPUT_WRITER = "1"
+        # Let Fallout consume the Quest left stick through its native analog
+        # XInput lane. The proxy still masks plugin-owned combat controls.
+        $environment.FNVXR_XINPUT_NATIVE_LOCOMOTION = "1"
+        $environment.FNVXR_XINPUT_MASK_PLUGIN_OWNED_TRIGGERS = "1"
         $environment.FNVXR_PLUGIN_KEYBOARD_MOVEMENT_ENABLE = "1"
         $environment.FNVXR_PLUGIN_MOVEMENT_DEADZONE = "9000"
         $environment.FNVXR_PLUGIN_MENU_KEYBOARD_FALLBACK = "1"

@@ -55,9 +55,30 @@
 
 namespace
 {
-constexpr bool vrInputMutationAuthorized() noexcept
+bool vrInputMutationAuthorized() noexcept
 {
-    return fnvxr::input_proxy::productionInputMutationAuthorizedForCurrentBuild();
+    // The general-purpose proxy remains source-fused.  The physical product
+    // launcher may opt this already-staged shim into one narrow job: deliver
+    // the authenticated Quest left stick through Fallout's native analog
+    // XInput consumer.  Buttons and triggers stay masked for the xNVSE
+    // game-thread owner, so this cannot revive the retired proxy mapper.
+    char physical[8] {};
+    char nativeLocomotion[8] {};
+    char profile[32] {};
+    const DWORD physicalLength = GetEnvironmentVariableA(
+        "FNVXR_PHYSICAL_HEADSET_PLAY", physical, sizeof(physical));
+    const DWORD locomotionLength = GetEnvironmentVariableA(
+        "FNVXR_XINPUT_NATIVE_LOCOMOTION", nativeLocomotion,
+        sizeof(nativeLocomotion));
+    const DWORD profileLength = GetEnvironmentVariableA(
+        "FNVXR_RUN_PROFILE", profile, sizeof(profile));
+    const bool exactPhysicalProduct =
+        physicalLength == 1u && physical[0] == '1'
+        && locomotionLength == 1u && nativeLocomotion[0] == '1'
+        && profileLength == std::strlen("retail-vr-play-v1")
+        && std::strcmp(profile, "retail-vr-play-v1") == 0;
+    return fnvxr::input_proxy::productionInputMutationAuthorizedForCurrentBuild()
+        || exactPhysicalProduct;
 }
 
 constexpr std::uint32_t XInputSharedMagic = fnvxr::shared::XInputSharedMagic;

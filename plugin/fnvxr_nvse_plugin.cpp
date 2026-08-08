@@ -6560,10 +6560,32 @@ bool applyRetailArmFabrik(
     const float maximumReach = lengths[0] + lengths[1];
     const float minimumReach = std::fabs(lengths[0] - lengths[1]);
     const float reachTolerance = getFloatFromEnv("FNVXR_RETAIL_RIG_REACH_TOLERANCE", 0.10f);
-    if (shoulderTargetDistance > maximumReach + reachTolerance
-        || shoulderTargetDistance < minimumReach - reachTolerance)
+    const bool physicalRightHand =
+        !left && physicalHeadsetEngineCenterRigRequested();
+    const bool targetOutsideArmReach =
+        shoulderTargetDistance > maximumReach + reachTolerance
+        || shoulderTargetDistance < minimumReach - reachTolerance;
+    if (targetOutsideArmReach && !physicalRightHand)
     {
         return false;
+    }
+
+    // A room-scale hand can naturally move beyond the stock first-person
+    // skeleton's short arm. Solve the bones toward the reachable point, then
+    // place the terminal hand at the tracked wrist below. Otherwise the old
+    // reach rejection leaves the rendered weapon attached to a static hand.
+    Vec3 solveTarget = target;
+    if (targetOutsideArmReach && shoulderTargetDistance > 0.0001f)
+    {
+        const float reachableDistance = std::clamp(
+            shoulderTargetDistance,
+            minimumReach + reachTolerance,
+            maximumReach - reachTolerance);
+        solveTarget = addVec3(
+            shoulder,
+            scaleVec3(
+                normalizeVec3(subtractVec3(target, shoulder)),
+                reachableDistance));
     }
 
     fnvxr::ik::Vec3 joints[3] {
@@ -6579,7 +6601,7 @@ bool applyRetailArmFabrik(
         joints,
         3,
         lengths,
-        { target.x, target.y, target.z },
+        { solveTarget.x, solveTarget.y, solveTarget.z },
         { pole.x, pole.y, pole.z },
         options);
     const float maximumFinalError = getFloatFromEnv(
@@ -6613,6 +6635,34 @@ bool applyRetailArmFabrik(
         desiredHandWorldRotation);
     if (!finiteMatrix33(desiredHandLocalRotation))
         return false;
+    if (physicalRightHand && handParent)
+    {
+        const auto parentBase = reinterpret_cast<std::uintptr_t>(handParent);
+        const Vec3 parentWorldPosition = readVec3(
+            parentBase + NiAvObjectWorldTranslationOffset);
+        const float parentWorldScale = readFloat(
+            parentBase + NiAvObjectWorldScaleOffset,
+            1.0f);
+        Vec3 desiredHandLocalPosition = transformVec3(
+            transposeMatrix33(parentWorldRotation),
+            subtractVec3(target, parentWorldPosition));
+        if (!std::isfinite(parentWorldScale)
+            || std::fabs(parentWorldScale) < 0.0001f)
+        {
+            return false;
+        }
+        desiredHandLocalPosition = scaleVec3(
+            desiredHandLocalPosition,
+            1.0f / parentWorldScale);
+        if (!finiteVec3(desiredHandLocalPosition)
+            || !writeVec3(
+                reinterpret_cast<std::uintptr_t>(arm.hand)
+                    + NiAvObjectLocalTranslationOffset,
+                desiredHandLocalPosition))
+        {
+            return false;
+        }
+    }
     if (!writeMatrix33(
             reinterpret_cast<std::uintptr_t>(arm.hand) + NiAvObjectLocalRotationOffset,
             desiredHandLocalRotation))
@@ -9261,6 +9311,47 @@ bool holdGameplayMovementKey(UInt32 keycode, bool held)
             physicalHeadsetPlayRequested()));
 }
 
+bool drivePhysicalGameplayPrimaryAttack(
+    bool held,
+    bool previousHeld,
+    UInt64 frame)
+{
+    bool applied = false;
+    void* process = nullptr;
+    __try
+    {
+        void* player = readPointer(PlayerCharacterAddress);
+        process = player
+            ? readPointer(reinterpret_cast<std::uintptr_t>(player)
+                + MobileObjectBaseProcessOffset)
+            : nullptr;
+        if (process)
+        {
+            // HighProcess::forceFireWeapon is consumed by Fallout's normal
+            // weapon pipeline. Reassert while squeezed because the engine
+            // clears the request after each gameplay update.
+            *reinterpret_cast<UInt8*>(
+                reinterpret_cast<std::uintptr_t>(process)
+                + HighProcessForceFireWeaponOffset) = held ? 1u : 0u;
+            applied = true;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        applied = false;
+    }
+    if (held != previousHeld)
+    {
+        logTelemetry(
+            "primaryAttack physical frame=%llu held=%d applied=%d finalConsumer=HighProcess::forceFireWeapon process=%p\n",
+            static_cast<unsigned long long>(frame),
+            static_cast<int>(held),
+            static_cast<int>(applied),
+            process);
+    }
+    return applied;
+}
+
 UInt32 directInputMacroKeyFromEnv(const char* name, UInt32 fallback)
 {
     const int value = getIntFromEnv(name, static_cast<int>(fallback));
@@ -11082,6 +11173,8 @@ void releaseExternalXInputGameplayHolds()
     setGameplayRunMode(false, "externalXInput:release", 0);
     setGameplayAutoRun(false, "externalXInput:release", 0);
     holdDirectInputKey(MouseButtonOffset, false);
+    if (physicalHeadsetPlayRequested())
+        drivePhysicalGameplayPrimaryAttack(false, false, 0);
     holdDirectInputKey(MouseButtonOffset + 1, false);
     holdDirectInputKey(DIK_R, false);
     holdGameplayGrab(false);
@@ -11545,8 +11638,16 @@ void consumeExternalXInputGameplayControls(
         envEnabled("FNVXR_GAMEPLAY_RUN_BUTTON_ENABLE", true)
         && (g_gameplayRunModeEnabled || analogRun);
 
-    const bool primaryAttackStep =
-        driveGameplayPrimaryAttack(rightTriggerHeld, primaryAttackState, frame, "externalXInput:RT");
+    const bool primaryAttackStep = physicalLocomotionRoute
+        ? drivePhysicalGameplayPrimaryAttack(
+            rightTriggerHeld,
+            previousRightTriggerHeld,
+            frame)
+        : driveGameplayPrimaryAttack(
+            rightTriggerHeld,
+            primaryAttackState,
+            frame,
+            "externalXInput:RT");
     holdDirectInputKey(MouseButtonOffset + 1, leftTriggerHeld && !suppressAimMouseForCombatChord && !vatsChordHeld);
     holdDirectInputKey(DIK_R, reloadHeld);
     holdGameplayGrab(rightGripGrabHeld);

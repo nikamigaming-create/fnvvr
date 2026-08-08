@@ -31,6 +31,8 @@ $hostSource = Get-RequiredFileText "host\fnvxr_openxr_pose_host.cpp"
 $plugin = Get-RequiredFileText "plugin\fnvxr_nvse_plugin.cpp"
 $authority = Get-RequiredFileText "runtime\fnvxr_physical_input_authority.h"
 $proxySafety = Get-RequiredFileText "renderhook\fnvxr_input_proxy_safety.h"
+$xinputProxy = Get-RequiredFileText "renderhook\fnvxr_xinput_proxy.cpp"
+$productCommon = Get-RequiredFileText "scripts\fnvxr-product-common.ps1"
 
 foreach ($required in @(
         '#include "fnvxr_physical_input_authority.h"',
@@ -68,6 +70,28 @@ foreach ($required in @(
         'holdGameplayMovementKey(DIK_S, moveBackward)',
         'holdGameplayMovementKey(DIK_D, moveRight)')) {
     Require-Text -Text $plugin -Required $required -Reason "xNVSE final-consumer boundary"
+}
+
+foreach ($required in @(
+        'FNVXR_XINPUT_NATIVE_LOCOMOTION',
+        'retail-vr-play-v1',
+        'exactPhysicalProduct')) {
+    Require-Text -Text $xinputProxy -Required $required -Reason "native physical XInput locomotion"
+}
+
+foreach ($required in @(
+        'FNVXR_XINPUT_NATIVE_LOCOMOTION = "1"',
+        'FNVXR_XINPUT_MASK_PLUGIN_OWNED_TRIGGERS = "1"')) {
+    Require-Text -Text $productCommon -Required $required -Reason "physical launcher input split"
+}
+
+foreach ($required in @(
+        'drivePhysicalGameplayPrimaryAttack',
+        'HighProcessForceFireWeaponOffset',
+        'finalConsumer=HighProcess::forceFireWeapon',
+        'physicalRightHand',
+        'desiredHandLocalPosition')) {
+    Require-Text -Text $plugin -Required $required -Reason "physical tracked weapon and trigger consumer"
 }
 
 $legacyStart = $plugin.IndexOf('void updateControllerAxes(')
