@@ -2352,6 +2352,10 @@ function Get-FnvxrProductMinimalEnvironment {
         # XInput lane. The proxy still masks plugin-owned combat controls.
         $environment.FNVXR_XINPUT_NATIVE_LOCOMOTION = "1"
         $environment.FNVXR_XINPUT_MASK_PLUGIN_OWNED_TRIGGERS = "1"
+        # CPU-v8 frames can arrive one game-frame late during controller and
+        # weapon animation bursts. Retain that proven stereo pair briefly so
+        # the compositor does not alternate between stereo and zero layers.
+        $environment.FNVXR_CPU_STEREO_MAX_SOURCE_POSE_AGE_MS = "150"
         $environment.FNVXR_PLUGIN_KEYBOARD_MOVEMENT_ENABLE = "1"
         $environment.FNVXR_PLUGIN_MOVEMENT_DEADZONE = "9000"
         $environment.FNVXR_PLUGIN_MENU_KEYBOARD_FALLBACK = "1"

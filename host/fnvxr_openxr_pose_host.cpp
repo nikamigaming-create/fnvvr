@@ -10023,7 +10023,7 @@ int main(int argc, char** argv)
                     "FNVXR_CPU_STEREO_MAX_SOURCE_POSE_AGE_MS",
                     75),
                 1,
-                100))
+                250))
             * 1000000LL;
         const bool controlMode = mode == HostMode::Control;
         const bool flatMode = mode == HostMode::Flat;

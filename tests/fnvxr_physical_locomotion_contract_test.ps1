@@ -66,6 +66,8 @@ foreach ($required in @(
         'physicalLocomotionRearmPending',
         'physicalLocomotionAllowed',
         'drivePhysicalPlayerMovement',
+        'installPhysicalPlayerMoverHook',
+        'hookedPhysicalPlayerMovementFlags',
         'ActorMoverSetMovementFlagsAddress',
         'PlayerMover::SetMovementFlags',
         'holdGameplayMovementKey(DIK_W, finalForwardHeld)',
@@ -84,7 +86,8 @@ foreach ($required in @(
 
 foreach ($required in @(
         'FNVXR_XINPUT_NATIVE_LOCOMOTION = "1"',
-        'FNVXR_XINPUT_MASK_PLUGIN_OWNED_TRIGGERS = "1"')) {
+        'FNVXR_XINPUT_MASK_PLUGIN_OWNED_TRIGGERS = "1"',
+        'FNVXR_CPU_STEREO_MAX_SOURCE_POSE_AGE_MS = "150"')) {
     Require-Text -Text $productCommon -Required $required -Reason "physical launcher input split"
 }
 

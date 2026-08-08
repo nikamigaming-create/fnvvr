@@ -576,6 +576,12 @@ bool g_publishedDirectInputHoldViaHook[MaxDirectInputMacros] {};
 UInt64 g_publishedDirectInputHoldHeartbeatMs[MaxDirectInputMacros] {};
 bool g_physicalLocomotionDirectInputApplied[MaxDirectInputMacros] {};
 bool g_physicalLocomotionDirectInputUnavailableLogged[MaxDirectInputMacros] {};
+std::atomic<UInt32> g_physicalPlayerMoverDirections { 0u };
+std::atomic<bool> g_physicalPlayerMoverAllowed { false };
+std::atomic<bool> g_physicalPlayerMoverRun { false };
+void** g_physicalPlayerMoverVtable = nullptr;
+void* g_physicalPlayerMoverOriginalSetMovementFlags = nullptr;
+bool g_physicalPlayerMoverHookInstalled = false;
 constexpr UInt64 DirectInputHoldHeartbeatMilliseconds = 200;
 constexpr bool LegacyInProcessDirectInputHoldFallbackEnabled = false;
 using BufferedKeyTapFn = void (__thiscall*)(void*, UInt32);
@@ -9333,6 +9339,97 @@ bool holdGameplayMovementKey(UInt32 keycode, bool held)
             physicalHeadsetPlayRequested()));
 }
 
+using SetPlayerMovementFlagsFn = void (__thiscall*)(void*, UInt32);
+
+void __fastcall hookedPhysicalPlayerMovementFlags(
+    void* mover,
+    void*,
+    UInt32 movementFlags)
+{
+    const bool allowed =
+        g_physicalPlayerMoverAllowed.load(std::memory_order_acquire);
+    const UInt32 directions = allowed
+        ? g_physicalPlayerMoverDirections.load(std::memory_order_acquire)
+        : 0u;
+    movementFlags = (movementFlags & ~MovementFlagDirectionalMask)
+        | directions;
+    if (directions != 0u)
+    {
+        movementFlags |= MovementFlagIsKeyboard;
+        movementFlags &= ~(MovementFlagWalking | MovementFlagRunning);
+        movementFlags |= g_physicalPlayerMoverRun.load(
+            std::memory_order_acquire)
+            ? MovementFlagRunning
+            : MovementFlagWalking;
+    }
+
+    auto original = reinterpret_cast<SetPlayerMovementFlagsFn>(
+        g_physicalPlayerMoverOriginalSetMovementFlags);
+    if (original)
+        original(mover, movementFlags);
+}
+
+bool installPhysicalPlayerMoverHook(void* mover)
+{
+    if (!mover)
+        return false;
+    if (g_physicalPlayerMoverHookInstalled)
+        return true;
+
+    void** vtable = nullptr;
+    void* original = nullptr;
+    __try
+    {
+        vtable = *reinterpret_cast<void***>(mover);
+        original = vtable ? vtable[3] : nullptr;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        vtable = nullptr;
+        original = nullptr;
+    }
+    if (!vtable
+        || original != pointerFromAddress32<void*>(
+            ActorMoverSetMovementFlagsAddress))
+    {
+        logTelemetry(
+            "physicalPlayerMoverHook rejected mover=%p vtable=%p slot=%p expected=%p\n",
+            mover,
+            vtable,
+            original,
+            pointerFromAddress32<void*>(ActorMoverSetMovementFlagsAddress));
+        return false;
+    }
+
+    DWORD oldProtect = 0;
+    if (!VirtualProtect(
+            &vtable[3],
+            sizeof(void*),
+            PAGE_READWRITE,
+            &oldProtect))
+    {
+        logTelemetry(
+            "physicalPlayerMoverHook protect failed err=%lu\n",
+            static_cast<unsigned long>(GetLastError()));
+        return false;
+    }
+    g_physicalPlayerMoverOriginalSetMovementFlags = original;
+    vtable[3] = reinterpret_cast<void*>(
+        hookedPhysicalPlayerMovementFlags);
+    DWORD ignored = 0;
+    VirtualProtect(&vtable[3], sizeof(void*), oldProtect, &ignored);
+    FlushInstructionCache(GetCurrentProcess(), &vtable[3], sizeof(void*));
+    g_physicalPlayerMoverVtable = vtable;
+    g_physicalPlayerMoverHookInstalled = true;
+    logTelemetry(
+        "physicalPlayerMoverHook installed mover=%p vtable=%p slot=3 original=%p hook=%p finalConsumer=PlayerMover::SetMovementFlags\n",
+        mover,
+        vtable,
+        original,
+        reinterpret_cast<void*>(hookedPhysicalPlayerMovementFlags));
+    return true;
+}
+
 bool drivePhysicalPlayerMovement(
     const fnvxr::physical_input::LocomotionIntent& intent,
     bool allowed,
@@ -9348,6 +9445,11 @@ bool drivePhysicalPlayerMovement(
             | (intent.left ? MovementFlagLeft : 0u)
             | (intent.right ? MovementFlagRight : 0u);
     }
+    g_physicalPlayerMoverDirections.store(
+        requestedDirections,
+        std::memory_order_release);
+    g_physicalPlayerMoverRun.store(runHeld, std::memory_order_release);
+    g_physicalPlayerMoverAllowed.store(allowed, std::memory_order_release);
 
     bool applied = false;
     UInt32 before = 0u;
@@ -9363,6 +9465,7 @@ bool drivePhysicalPlayerMovement(
             : nullptr;
         if (mover)
         {
+            const bool hookInstalled = installPhysicalPlayerMoverHook(mover);
             before = *reinterpret_cast<UInt32*>(
                 reinterpret_cast<std::uintptr_t>(mover)
                     + PlayerMoverMovementFlagsOffset);
@@ -9376,9 +9479,12 @@ bool drivePhysicalPlayerMovement(
                     ? MovementFlagRunning
                     : MovementFlagWalking;
             }
-            using SetMovementFlagsFn = void (__thiscall*)(void*, UInt32);
-            reinterpret_cast<SetMovementFlagsFn>(
-                ActorMoverSetMovementFlagsAddress)(mover, after);
+            auto setMovementFlags = hookInstalled && g_physicalPlayerMoverVtable
+                ? reinterpret_cast<SetPlayerMovementFlagsFn>(
+                    g_physicalPlayerMoverVtable[3])
+                : reinterpret_cast<SetPlayerMovementFlagsFn>(
+                    ActorMoverSetMovementFlagsAddress);
+            setMovementFlags(mover, after);
             const UInt32 verified = *reinterpret_cast<UInt32*>(
                 reinterpret_cast<std::uintptr_t>(mover)
                     + PlayerMoverMovementFlagsOffset);
