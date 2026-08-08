@@ -37,6 +37,15 @@ $hostSource = Get-Content -LiteralPath $hostSourcePath -Raw
 $pluginSource = Get-Content -LiteralPath $pluginSourcePath -Raw
 $d3d9Source = Get-Content -LiteralPath $d3d9SourcePath -Raw
 
+if (-not $hostSource.Contains(
+        'envEnabled("FNVXR_GAME_PLANE_SHARP_FILTER", false)')) {
+    throw "OpenXR production eye copy must default to motion-stable linear sampling."
+}
+if (-not $common.Contains(
+        'FNVXR_GAME_PLANE_SHARP_FILTER = "0"')) {
+    throw "Product profiles must pin motion-stable linear eye sampling."
+}
+
 $documentsPath = Get-FnvxrProductDocumentsPath
 if ([string]::IsNullOrWhiteSpace($documentsPath) -or
     -not [System.IO.Path]::IsPathRooted($documentsPath)) {

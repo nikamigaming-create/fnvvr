@@ -2317,6 +2317,10 @@ function Get-FnvxrProductMinimalEnvironment {
         FNVXR_ALLOW_STEREO_WORLD_2D_FALLBACK = "0"
         FNVXR_SHOW_GAME_PLANE_ON_STEREO_LOSS = "0"
         FNVXR_STEREO_FALLBACK_MONO_FULLSCREEN = "0"
+        # Bilinear final-eye sampling prevents terrain texture shimmer when a
+        # runtime rounds or otherwise adjusts its recommended eye extent.
+        # Point sampling remains available only as an explicit diagnostic.
+        FNVXR_GAME_PLANE_SHARP_FILTER = "0"
         # The CPU producer replaces a sequenced stereo pair while the OpenXR
         # host polls independently. A read that lands inside that atomic
         # replacement is not stereo loss: retain the last identity-validated

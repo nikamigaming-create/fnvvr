@@ -8242,7 +8242,11 @@ float4 PSHudOverlay(VSOutput input) : SV_TARGET
     }
 
     D3D11_SAMPLER_DESC samplerDesc {};
-    samplerDesc.Filter = envEnabled("FNVXR_GAME_PLANE_SHARP_FILTER", true)
+    // Point sampling makes Fallout's high-frequency terrain crawl whenever
+    // the producer and runtime eye extents differ by even one pixel.  Keep
+    // the old sharp mode as an explicit diagnostic opt-in, but make the
+    // production eye copy bilinear so head motion remains stable.
+    samplerDesc.Filter = envEnabled("FNVXR_GAME_PLANE_SHARP_FILTER", false)
         ? D3D11_FILTER_MIN_MAG_MIP_POINT
         : D3D11_FILTER_MIN_MAG_MIP_LINEAR;
     samplerDesc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
