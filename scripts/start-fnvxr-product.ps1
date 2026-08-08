@@ -3162,6 +3162,11 @@ try {
             $directRigEvents.Count)
     }
     if ($HeadsetCombatVisualTrial) {
+        $playerStateBeforeCombat = @(Get-Content `
+            -LiteralPath $headsetDemoInputTelemetryLog `
+            -ErrorAction SilentlyContinue | Where-Object {
+                $_ -match '"event":"fnvxrPlayerState"'
+            } | Select-Object -Last 1)
         $manifest.controllerPoseSweep.status = "running-smooth-combat-path"
         $manifest.headsetPoseSweep.status = "running-gentle-concurrent-head-look"
         $manifest.headsetControllerRigVisualTrial.status =
@@ -3186,6 +3191,7 @@ try {
         $headsetPoseSweepEvidence = $combatEvidence.headMotion
         if (-not [bool]$combatEvidence.centerRestored -or
             -not [bool]$combatEvidence.controlsReleased -or
+            -not [bool]$combatEvidence.locomotion.neutralRestored -or
             [int]$combatEvidence.triggerPresses -lt 16 -or
             -not [bool]$headsetPoseSweepEvidence.centerRestored -or
             [string]$headsetPoseSweepEvidence.pattern -cne
@@ -3218,6 +3224,32 @@ try {
         if ($directRigEvents.Count -lt 1) {
             throw "The direct controller-to-stock-weapon path did not apply during the combined harness."
         }
+        $playerStateAfterCombat = @(Get-Content `
+            -LiteralPath $headsetDemoInputTelemetryLog `
+            -ErrorAction SilentlyContinue | Where-Object {
+                $_ -match '"event":"fnvxrPlayerState"'
+            } | Select-Object -Last 1)
+        if ($playerStateBeforeCombat.Count -ne 1 -or
+            $playerStateAfterCombat.Count -ne 1) {
+            throw "The simulator locomotion proof did not capture player-state samples on both sides of the commanded left-stick interval."
+        }
+        $beforePlayer = $playerStateBeforeCombat[0] | ConvertFrom-Json
+        $afterPlayer = $playerStateAfterCombat[0] | ConvertFrom-Json
+        $dx = [double]$afterPlayer.playerPosition[0] -
+            [double]$beforePlayer.playerPosition[0]
+        $dy = [double]$afterPlayer.playerPosition[1] -
+            [double]$beforePlayer.playerPosition[1]
+        $dz = [double]$afterPlayer.playerPosition[2] -
+            [double]$beforePlayer.playerPosition[2]
+        $playerPositionDelta = [Math]::Sqrt(
+            $dx * $dx + $dy * $dy + $dz * $dz)
+        if ([double]::IsNaN($playerPositionDelta) -or
+            [double]::IsInfinity($playerPositionDelta) -or
+            $playerPositionDelta -lt 1.0) {
+            throw ("Simulator left-stick input did not move the real Fallout player: world-position delta={0:N4} units. Evidence is in {1}" -f
+                $playerPositionDelta,
+                $runDirectory)
+        }
         $combatProof = [ordered]@{
             shotsToEmpty = 14
             reloads = 1
@@ -3231,6 +3263,14 @@ try {
             controllerMotion = $combatEvidence
             headMotion = $headsetPoseSweepEvidence
             appliedRigEvents = $directRigEvents.Count
+            locomotion = [ordered]@{
+                binding = "OpenXR left thumbstick -> PlayerMover::SetMovementFlags"
+                beforePlayerPosition = @($beforePlayer.playerPosition)
+                afterPlayerPosition = @($afterPlayer.playerPosition)
+                worldPositionDeltaUnits = $playerPositionDelta
+                thresholdUnits = 1.0
+                neutralRestored = [bool]$combatEvidence.locomotion.neutralRestored
+            }
             observedAtUtc = [DateTime]::UtcNow.ToString("o")
         }
         $manifest.controllerPoseSweep.status =
@@ -3252,11 +3292,12 @@ try {
         $manifest.headsetCombatVisualTrial.evidence = $combatProof
         Write-FnvxrProductJsonAtomic -Value $manifest -Path $manifestPath
         Write-SupervisorLog (
-            "completed combined harness shots={0} attackEvents={1} reloadEvents={2} rigEvents={3}" -f
+            "completed combined harness shots={0} attackEvents={1} reloadEvents={2} rigEvents={3} playerDeltaUnits={4:N3}" -f
                 $combatProof.commandedShots,
                 $combatProof.primaryAttackHoldEvents,
                 $combatProof.reloadHoldEvents,
-                $combatProof.appliedRigEvents)
+                $combatProof.appliedRigEvents,
+                $combatProof.locomotion.worldPositionDeltaUnits)
     }
     if ($HeadsetPoseSweep -and -not $HeadsetCombatVisualTrial) {
         $manifest.headsetPoseSweep.status = "running"

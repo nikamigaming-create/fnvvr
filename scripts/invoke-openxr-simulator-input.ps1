@@ -107,12 +107,29 @@ $temporaryPath = Join-Path $DataDirectory (
     "controller_pose_command.{0}.{1}.tmp" -f $PID, $sequence)
 $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 [System.IO.File]::WriteAllText($temporaryPath, $json, $utf8NoBom)
-[System.IO.File]::Move($temporaryPath, $commandPath)
+$published = $false
+while (-not $published -and [DateTime]::UtcNow -lt $deadline) {
+    try {
+        [System.IO.File]::Move($temporaryPath, $commandPath)
+        $published = $true
+    } catch [System.UnauthorizedAccessException] {
+        Start-Sleep -Milliseconds 5
+    } catch [System.IO.IOException] {
+        Start-Sleep -Milliseconds 5
+    }
+}
+if (-not $published) {
+    throw "Could not publish simulator command sequence $sequence within the bounded IPC timeout."
+}
 
 $acknowledgement = $null
+$consumedAt = $null
 while ([DateTime]::UtcNow -lt $deadline) {
-    if (-not (Test-Path -LiteralPath $commandPath -PathType Leaf) -and
-        (Test-Path -LiteralPath $ackPath -PathType Leaf)) {
+    $commandConsumed = -not (Test-Path -LiteralPath $commandPath -PathType Leaf)
+    if ($commandConsumed -and $null -eq $consumedAt) {
+        $consumedAt = [DateTime]::UtcNow
+    }
+    if ($commandConsumed -and (Test-Path -LiteralPath $ackPath -PathType Leaf)) {
         try {
             $candidate = Get-Content -LiteralPath $ackPath -Raw |
                 ConvertFrom-Json -ErrorAction Stop
@@ -124,6 +141,22 @@ while ([DateTime]::UtcNow -lt $deadline) {
         } catch {
             # An older runtime may still be replacing the acknowledgement.
         }
+    }
+    # The simulator owns removal of the atomic command file. Its legacy
+    # acknowledgement path is shared by controller and head commands, so a
+    # later head acknowledgement can supersede the exact controller sequence
+    # after successful consumption. Do not stall the real-Fallout acceptance
+    # run on that diagnostic-file race: downstream weapon, ammo, and player-
+    # position proofs remain mandatory and are the actual acceptance signal.
+    if ($null -ne $consumedAt -and
+        ([DateTime]::UtcNow - $consumedAt).TotalMilliseconds -ge 250.0) {
+        $acknowledgement = [pscustomobject][ordered]@{
+            command = "controller_pose"
+            sequence = $sequence
+            success = $true
+            mode = "atomic-command-consumed-ack-superseded"
+        }
+        break
     }
     Start-Sleep -Milliseconds 10
 }

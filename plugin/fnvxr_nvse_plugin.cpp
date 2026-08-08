@@ -14695,6 +14695,7 @@ void consumeHeadlessCombatVisualTrialInput(
 {
     static bool previousTriggerHeld = false;
     static bool previousReloadHeld = false;
+    static UInt8 previousLocomotionMask = 0xffu;
 
     const bool authorized =
         envEnabled("FNVXR_HEADSET_COMBAT_VISUAL_TRIAL", false)
@@ -14709,6 +14710,43 @@ void consumeHeadlessCombatVisualTrialInput(
         haveInput && state.rightTrigger > 64u;
     const bool reloadHeld =
         haveInput && (state.buttons & XInputX) != 0u;
+    const int movementDeadzone = std::clamp(
+        getIntFromEnv("FNVXR_PLUGIN_MOVEMENT_DEADZONE", 9000),
+        1000,
+        30000);
+    const auto requestedLocomotion =
+        fnvxr::physical_input::classifyLocomotion(
+            state.leftThumbX,
+            state.leftThumbY,
+            movementDeadzone);
+    const UInt8 locomotionMask = static_cast<UInt8>(
+        (requestedLocomotion.forward ? 0x1u : 0u)
+        | (requestedLocomotion.backward ? 0x2u : 0u)
+        | (requestedLocomotion.left ? 0x4u : 0u)
+        | (requestedLocomotion.right ? 0x8u : 0u));
+
+    // The headless acceptance harness must exercise the same final engine
+    // consumer as physical play. Simulator acknowledgement or generated key
+    // flags are not locomotion proof: PlayerMover receives the stick intent,
+    // and the supervisor separately requires the player's world coordinates
+    // to change before the run can pass.
+    const bool playerMoverApplied = drivePhysicalPlayerMovement(
+        requestedLocomotion,
+        haveInput,
+        gameplayAnalogRunHeld(state.leftThumbY),
+        observation.frame);
+    if (locomotionMask != previousLocomotionMask)
+    {
+        previousLocomotionMask = locomotionMask;
+        logTelemetry(
+            "headlessLocomotion frame=%llu stick=(%d,%d) requested=0x%02x authorized=%d finalConsumer=PlayerMover::SetMovementFlags applied=%d\n",
+            static_cast<unsigned long long>(observation.frame),
+            static_cast<int>(state.leftThumbX),
+            static_cast<int>(state.leftThumbY),
+            static_cast<unsigned int>(locomotionMask),
+            static_cast<int>(haveInput),
+            static_cast<int>(playerMoverApplied));
+    }
 
     struct CombatAmmoSnapshot
     {

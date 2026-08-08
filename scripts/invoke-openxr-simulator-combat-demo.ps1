@@ -15,6 +15,7 @@ if (-not (Test-Path -LiteralPath $inputDriver -PathType Leaf)) {
     throw "The simulator input driver is missing: $inputDriver"
 }
 $headCommandPath = Join-Path $DataDirectory "head_pose_command.json"
+$ackPath = Join-Path $DataDirectory "command_ack.json"
 $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 
 $intervalMilliseconds = [int][Math]::Round(1000.0 / $UpdatesPerSecond)
@@ -37,6 +38,10 @@ $emptyingTicks = $ShotsToEmpty * $ticksPerShot
 $confirmationStartTick = $emptyingTicks + $reloadTicks + $settleTicks
 $totalTicks = $confirmationStartTick +
     ($ShotsAfterReload * $ticksPerShot) + $settleTicks
+$locomotionStartTick = 12
+$locomotionStopTick = 48
+$locomotionPressed = $false
+$locomotionReleased = $false
 
 function Invoke-SimulatorInput {
     param([hashtable]$Arguments)
@@ -71,7 +76,43 @@ function Publish-HeadPose {
         $temporaryPath,
         ($command | ConvertTo-Json -Compress),
         $utf8NoBom)
-    [System.IO.File]::Move($temporaryPath, $headCommandPath)
+    $published = $false
+    while (-not $published -and [DateTime]::UtcNow -lt $deadline) {
+        try {
+            [System.IO.File]::Move($temporaryPath, $headCommandPath)
+            $published = $true
+        } catch [System.UnauthorizedAccessException] {
+            Start-Sleep -Milliseconds 5
+        } catch [System.IO.IOException] {
+            Start-Sleep -Milliseconds 5
+        }
+    }
+    if (-not $published) {
+        throw "Could not publish head sample $Ordinal within the bounded IPC timeout."
+    }
+
+    # The simulator exposes one acknowledgement file for both controller and
+    # head commands. Do not return merely because the head command disappeared:
+    # if the next controller command is published first, this head ack can
+    # overwrite its sequence-specific controller ack and create a false IPC
+    # timeout. Fully serialize the two command types here.
+    while ([DateTime]::UtcNow -lt $deadline) {
+        if (-not (Test-Path -LiteralPath $headCommandPath -PathType Leaf) -and
+            (Test-Path -LiteralPath $ackPath -PathType Leaf)) {
+            try {
+                $candidate = Get-Content -LiteralPath $ackPath -Raw |
+                    ConvertFrom-Json -ErrorAction Stop
+                if ([string]$candidate.command -ceq "head_pose" -and
+                    [bool]$candidate.success) {
+                    return
+                }
+            } catch {
+                # The runtime may be replacing the acknowledgement atomically.
+            }
+        }
+        Start-Sleep -Milliseconds 5
+    }
+    throw "The simulator did not acknowledge head sample $Ordinal."
 }
 
 while ($tick -lt $totalTicks) {
@@ -115,6 +156,32 @@ while ($tick -lt $totalTicks) {
         WaitMilliseconds = $ConsumeTimeoutMilliseconds
     }
     $lastTrigger = $trigger
+
+    # Sustain a real left-stick deflection long enough to cross multiple
+    # Fallout movement updates. The product supervisor accepts this only when
+    # the retail player's world coordinates measurably change.
+    if (-not $locomotionPressed -and $tick -ge $locomotionStartTick) {
+        ++$commands
+        Invoke-SimulatorInput -Arguments @{
+            DataDirectory = $DataDirectory
+            Hand = "left"
+            ThumbstickX = 0.0
+            ThumbstickY = 1.0
+            WaitMilliseconds = $ConsumeTimeoutMilliseconds
+        }
+        $locomotionPressed = $true
+    }
+    if (-not $locomotionReleased -and $tick -ge $locomotionStopTick) {
+        ++$commands
+        Invoke-SimulatorInput -Arguments @{
+            DataDirectory = $DataDirectory
+            Hand = "left"
+            ThumbstickX = 0.0
+            ThumbstickY = 0.0
+            WaitMilliseconds = $ConsumeTimeoutMilliseconds
+        }
+        $locomotionReleased = $true
+    }
 
     if (-not $reloadPressed -and $tick -ge $emptyingTicks + 2) {
         ++$commands
@@ -182,7 +249,7 @@ while (Test-Path -LiteralPath $headCommandPath -PathType Leaf) {
 Invoke-SimulatorInput -Arguments @{
     DataDirectory = $DataDirectory
     Hand = "left"
-    Primary = "released"
+    ReleaseAll = $true
     WaitMilliseconds = $ConsumeTimeoutMilliseconds
 }
 
@@ -206,6 +273,17 @@ Invoke-SimulatorInput -Arguments @{
     commandCount = $commands + 2
     centerRestored = $true
     controlsReleased = $true
+    locomotion = [ordered]@{
+        hand = "left"
+        axis = "thumbstickY"
+        value = 1.0
+        startTick = $locomotionStartTick
+        stopTick = $locomotionStopTick
+        durationSeconds = [double]($locomotionStopTick -
+            $locomotionStartTick) / $UpdatesPerSecond
+        neutralRestored = $locomotionReleased
+        acceptance = "retail player world-position delta required"
+    }
     headMotion = [ordered]@{
         pattern = "gentle-sinusoidal-v1"
         xAmplitudeMeters = 0.040

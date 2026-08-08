@@ -11,11 +11,14 @@ $headSweepPath =
     Join-Path $SourceRoot "scripts\invoke-openxr-simulator-head-sweep.ps1"
 $controllerSweepPath =
     Join-Path $SourceRoot "scripts\invoke-openxr-simulator-controller-sweep.ps1"
+$combatDemoPath =
+    Join-Path $SourceRoot "scripts\invoke-openxr-simulator-combat-demo.ps1"
 $patchPath = Join-Path $SourceRoot "patches\openxr-simulator-fnvxr-headless.patch"
 $controllerPosePatchPath =
     Join-Path $SourceRoot "patches\openxr-simulator-controller-local-6dof.patch"
 foreach ($path in @(
-    $buildPath, $inputPath, $headSweepPath, $controllerSweepPath, $patchPath,
+    $buildPath, $inputPath, $headSweepPath, $controllerSweepPath,
+    $combatDemoPath, $patchPath,
     $controllerPosePatchPath)) {
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
         throw "Headless simulator CLI contract file is missing: $path"
@@ -26,6 +29,7 @@ $build = Get-Content -LiteralPath $buildPath -Raw
 $inputDriver = Get-Content -LiteralPath $inputPath -Raw
 $headSweepDriver = Get-Content -LiteralPath $headSweepPath -Raw
 $controllerSweepDriver = Get-Content -LiteralPath $controllerSweepPath -Raw
+$combatDemoDriver = Get-Content -LiteralPath $combatDemoPath -Raw
 $patch = Get-Content -LiteralPath $patchPath -Raw
 $controllerPosePatch = Get-Content -LiteralPath $controllerPosePatchPath -Raw
 
@@ -34,6 +38,7 @@ $controllerPosePatch = Get-Content -LiteralPath $controllerPosePatchPath -Raw
 [void][ScriptBlock]::Create($inputDriver)
 [void][ScriptBlock]::Create($headSweepDriver)
 [void][ScriptBlock]::Create($controllerSweepDriver)
+[void][ScriptBlock]::Create($combatDemoDriver)
 
 foreach ($contract in @(
     '48a70f440ac7d9bda385994937e3da8e15a4d9bb',
@@ -48,6 +53,16 @@ foreach ($contract in @(
     '"x64"')) {
     if (-not $build.Contains($contract)) {
         throw "Headless simulator build script lost contract: $contract"
+    }
+}
+
+foreach ($contract in @(
+    'ThumbstickY = 1.0',
+    'ThumbstickY = 0.0',
+    '[string]$candidate.command -ceq "head_pose"',
+    'retail player world-position delta required')) {
+    if (-not $combatDemoDriver.Contains($contract)) {
+        throw "Headless simulator combat/locomotion driver lost contract: $contract"
     }
 }
 
@@ -141,7 +156,8 @@ foreach ($forbidden in @(
     if ($build.Contains($forbidden) -or
         $inputDriver.Contains($forbidden) -or
         $headSweepDriver.Contains($forbidden) -or
-        $controllerSweepDriver.Contains($forbidden)) {
+        $controllerSweepDriver.Contains($forbidden) -or
+        $combatDemoDriver.Contains($forbidden)) {
         throw "Headless simulator CLI scripts must not contain: $forbidden"
     }
 }
