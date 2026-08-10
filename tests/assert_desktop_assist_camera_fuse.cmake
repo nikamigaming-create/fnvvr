@@ -145,7 +145,7 @@ foreach(forbidden IN ITEMS
 endforeach()
 
 string(FIND "${plugin_text}" "void processDesktopAssistMainLoop(const RuntimeObservation& observation)" desktop_loop_start)
-string(FIND "${plugin_text}" "void handleNvseMessage" desktop_loop_end)
+string(FIND "${plugin_text}" "void processTrackedPropAssistMainLoop" desktop_loop_end)
 if(desktop_loop_start EQUAL -1 OR desktop_loop_end EQUAL -1 OR desktop_loop_end LESS desktop_loop_start)
     message(FATAL_ERROR "Could not isolate desktop-assist main-loop consumer")
 endif()

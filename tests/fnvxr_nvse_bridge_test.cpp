@@ -105,6 +105,13 @@ bool createHostOwnedFixture(
         mapName);
     if (!mapping)
         return false;
+    if (GetLastError() == ERROR_ALREADY_EXISTS)
+    {
+        CloseHandle(mapping);
+        mapping = nullptr;
+        std::cerr << "host-owned fixture mapping already exists: " << mapName << "\n";
+        return false;
+    }
     view = static_cast<State*>(MapViewOfFile(
         mapping,
         FILE_MAP_READ | FILE_MAP_WRITE,
@@ -131,6 +138,31 @@ bool fixtureUnchanged(const State* view, const std::array<std::uint8_t, sizeof(S
 {
     return view && std::memcmp(view, before.data(), sizeof(State)) == 0;
 }
+
+template <typename State>
+void reportFirstFixtureDifference(
+    const char* name,
+    const State* view,
+    const std::array<std::uint8_t, sizeof(State)>& before)
+{
+    if (!view)
+    {
+        std::cerr << " " << name << "=unmapped";
+        return;
+    }
+    const auto* after = reinterpret_cast<const std::uint8_t*>(view);
+    for (std::size_t offset = 0; offset < sizeof(State); ++offset)
+    {
+        if (after[offset] != before[offset])
+        {
+            std::cerr
+                << " " << name << "Offset=" << offset
+                << " before=" << static_cast<unsigned>(before[offset])
+                << " after=" << static_cast<unsigned>(after[offset]);
+            return;
+        }
+    }
+}
 }
 
 int main(int argc, char** argv)
@@ -144,6 +176,18 @@ int main(int argc, char** argv)
         // and must neither create nor initialize them. Supply sentinel records
         // exactly as the host would and prove plugin load leaves every byte
         // unchanged.
+        HANDLE inputProducerLease = CreateMutexA(
+            nullptr,
+            TRUE,
+            fnvxr::shared::InputCoreProducerMutexName);
+        if (!inputProducerLease)
+            return fail("host input-producer lease creation failed");
+        if (GetLastError() == ERROR_ALREADY_EXISTS)
+        {
+            const DWORD wait = WaitForSingleObject(inputProducerLease, 0);
+            if (wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED)
+                return fail("host input-producer lease is owned by another live process");
+        }
         HANDLE xinputMapping = nullptr;
         HANDLE dinputMapping = nullptr;
         HANDLE poseMapping = nullptr;
@@ -202,11 +246,24 @@ int main(int argc, char** argv)
         if (!load(&nvse))
             return fail("load failed");
 
-        if (!fixtureUnchanged(xinputView, xinputBefore)
-            || !fixtureUnchanged(dinputView, dinputBefore)
-            || !fixtureUnchanged(poseView, poseBefore))
+        const bool xinputUnchanged = fixtureUnchanged(xinputView, xinputBefore);
+        const bool dinputUnchanged = fixtureUnchanged(dinputView, dinputBefore);
+        const bool poseUnchanged = fixtureUnchanged(poseView, poseBefore);
+        if (!xinputUnchanged || !dinputUnchanged || !poseUnchanged)
         {
-            return fail("plugin mutated a host-owned input/pose mapping");
+            std::cerr
+                << "plugin mutated a host-owned input/pose mapping"
+                << " xinput=" << xinputUnchanged
+                << " dinput=" << dinputUnchanged
+                << " pose=" << poseUnchanged;
+            if (!xinputUnchanged)
+                reportFirstFixtureDifference("xinput", xinputView, xinputBefore);
+            if (!dinputUnchanged)
+                reportFirstFixtureDifference("dinput", dinputView, dinputBefore);
+            if (!poseUnchanged)
+                reportFirstFixtureDifference("pose", poseView, poseBefore);
+            std::cerr << "\n";
+            return 1;
         }
 
         if (!validateSharedHeader<SharedXInputState>(fnvxr::shared::XInputSharedMappingName, fnvxr::shared::XInputSharedMagic, fnvxr::shared::XInputSharedVersion))

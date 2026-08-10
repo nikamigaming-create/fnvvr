@@ -9,15 +9,15 @@
 namespace fnvxr::shared
 {
 constexpr std::uint32_t XInputSharedMagic = 0x58564e46; // FNVX
-constexpr std::uint32_t XInputSharedVersion = 2;
-inline constexpr char XInputSharedMappingName[] = "Local\\FNVXR_XInput_State_v2";
+constexpr std::uint32_t XInputSharedVersion = 3;
+inline constexpr char XInputSharedMappingName[] = "Local\\FNVXR_XInput_State_v3";
 constexpr std::uint32_t DInputSharedMagic = 0x49444e46; // FNDI
-constexpr std::uint32_t DInputSharedVersion = 9;
-inline constexpr char DInputSharedMappingName[] = "Local\\FNVXR_DInput_State_v9";
-inline constexpr char InputCoreProducerMutexName[] = "Local\\FNVXR_Input_Core_Producer_v2_v9";
+constexpr std::uint32_t DInputSharedVersion = 10;
+inline constexpr char DInputSharedMappingName[] = "Local\\FNVXR_DInput_State_v10";
+inline constexpr char InputCoreProducerMutexName[] = "Local\\FNVXR_Input_Core_Producer_v3_v10_pose9_g2";
 constexpr std::uint32_t VrPoseSharedMagic = 0x52505646; // FVPR
-constexpr std::uint32_t VrPoseSharedVersion = 8;
-inline constexpr char VrPoseSharedMappingName[] = "Local\\FNVXR_VR_Pose_State_v8";
+constexpr std::uint32_t VrPoseSharedVersion = 9;
+inline constexpr char VrPoseSharedMappingName[] = "Local\\FNVXR_VR_Pose_State_v9";
 constexpr std::uint32_t VrOriginSharedMagic = 0x4f565846; // FXVO
 constexpr std::uint32_t VrOriginSharedVersion = 6;
 inline constexpr char VrOriginSharedMappingName[] = "Local\\FNVXR_VR_Origin_State_v6";
@@ -104,11 +104,11 @@ constexpr std::uint32_t D3D9StereoFrameSharedMagic = 0x53585646; // FNXS
 constexpr std::uint32_t D3D9StereoFrameSharedVersion = 8;
 inline constexpr char D3D9StereoFrameSharedMappingName[] = "Local\\FNVXR_D3D9_StereoFrame_v8";
 inline constexpr char D3D9StereoFrameProducerMutexName[] =
-    "Local\\FNVXR_D3D9_Stereo_Producer_v8";
+    "Local\\FNVXR_D3D9_Stereo_Producer_v8_g2";
 inline constexpr char D3D9StereoFrameHostReaderMutexName[] =
-    "Local\\FNVXR_D3D9_Stereo_HostReader_v8";
+    "Local\\FNVXR_D3D9_Stereo_HostReader_v8_g2";
 inline constexpr char D3D9StereoFrameCaptureReaderMutexName[] =
-    "Local\\FNVXR_D3D9_Stereo_CaptureReader_v8";
+    "Local\\FNVXR_D3D9_Stereo_CaptureReader_v8_g2";
 constexpr std::uint32_t D3D9SharedFrameMaxWidth = 4096;
 constexpr std::uint32_t D3D9SharedFrameMaxHeight = 2560;
 // Two independent consumers (the OpenXR host and the evidence capturer) each

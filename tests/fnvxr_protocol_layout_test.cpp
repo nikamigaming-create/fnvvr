@@ -63,7 +63,7 @@ int main()
         return fail("SharedInputEventQueue size mismatch");
 
     if (sizeof(fnvxr::shared::SharedXInputState) != 32
-        || fnvxr::shared::XInputSharedVersion != 2
+        || fnvxr::shared::XInputSharedVersion != 3
         || offsetof(fnvxr::shared::SharedXInputState, sequence) != 8
         || offsetof(fnvxr::shared::SharedXInputState, packet) != 12
         || offsetof(fnvxr::shared::SharedXInputState, buttons) != 16
@@ -77,7 +77,7 @@ int main()
     }
 
     if (sizeof(fnvxr::shared::SharedDInputState) != 100
-        || fnvxr::shared::DInputSharedVersion != 9
+        || fnvxr::shared::DInputSharedVersion != 10
         || offsetof(fnvxr::shared::SharedDInputState, sequence) != 8
         || offsetof(fnvxr::shared::SharedDInputState, frame) != 12
         || offsetof(fnvxr::shared::SharedDInputState, mouseClickPacket) != 28
@@ -162,7 +162,7 @@ int main()
     if (offsetof(fnvxr::shared::SharedVrPoseState, recenterRequestId) != 280)
         return fail("SharedVrPoseState recenter request offset mismatch");
 
-    if (fnvxr::shared::VrPoseSharedVersion != 8)
+    if (fnvxr::shared::VrPoseSharedVersion != 9)
         return fail("SharedVrPoseState event-mailbox contract version mismatch");
 
     if (sizeof(fnvxr::shared::SharedVrOriginState) != 216
@@ -233,13 +233,13 @@ int main()
             "Local\\FNVXR_D3D9_StereoFrame_v8") != 0
         || std::strcmp(
             fnvxr::shared::D3D9StereoFrameProducerMutexName,
-            "Local\\FNVXR_D3D9_Stereo_Producer_v8") != 0
+            "Local\\FNVXR_D3D9_Stereo_Producer_v8_g2") != 0
         || std::strcmp(
             fnvxr::shared::D3D9StereoFrameHostReaderMutexName,
-            "Local\\FNVXR_D3D9_Stereo_HostReader_v8") != 0
+            "Local\\FNVXR_D3D9_Stereo_HostReader_v8_g2") != 0
         || std::strcmp(
             fnvxr::shared::D3D9StereoFrameCaptureReaderMutexName,
-            "Local\\FNVXR_D3D9_Stereo_CaptureReader_v8") != 0
+            "Local\\FNVXR_D3D9_Stereo_CaptureReader_v8_g2") != 0
         || fnvxr::shared::StereoProducerMonoUiQuad != 5u)
     {
         return fail("SharedD3D9StereoFrameHeader v8 names or mono UI producer mismatch");

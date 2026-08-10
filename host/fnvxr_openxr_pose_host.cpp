@@ -1032,7 +1032,8 @@ bool interactiveControllerRouteRequested()
 {
     return physicalHeadsetPlayRequested()
         || (envEqualsIgnoreCase("FNVXR_RUN_PROFILE", "stereo-visual-trial-v5")
-            && envEnabled("FNVXR_HEADSET_COMBAT_VISUAL_TRIAL", false)
+            && (envEnabled("FNVXR_HEADSET_COMBAT_VISUAL_TRIAL", false)
+                || envEnabled("FNVXR_HEADSET_INVENTORY_VISUAL_TRIAL", false))
             && envEnabled("FNVXR_HEADSET_CONTROLLER_RIG_VISUAL_TRIAL", false)
             && envEnabled("FNVXR_RETAIL_FIXTURE_AUTOMATION", false)
             && envEnabled("OPENXR_SIMULATOR_HEADLESS", false))
@@ -5273,6 +5274,53 @@ GamePlane gamePlaneFromHmd(const XrPosef& hmdPose)
         hmdPose.position.x + rotatedOffset.x,
         hmdPose.position.y + rotatedOffset.y,
         hmdPose.position.z + rotatedOffset.z
+    };
+    return plane;
+}
+
+GamePlane gamePlaneFromLeftWrist(
+    const SolvedArm& leftArm,
+    const XrPosef& hmdPose,
+    float sourceAspect)
+{
+    GamePlane plane {};
+    plane.width = envFloat("FNVXR_PIPBOY_WRIST_UI_WIDTH", 0.34f);
+    plane.height = plane.width / std::max(0.1f, sourceAspect);
+
+    const XMVECTOR wristOrientation = quat(leftArm.wrist.orientation);
+    // The physical wrist owns position, while the user's current view owns
+    // readability.  A controller's palm-roll quaternion is not a stable
+    // display normal and previously turned the screen almost edge-on.
+    const XMVECTOR hmdOrientation = quat(hmdPose.orientation);
+    const XMVECTOR localOrientation = XMQuaternionRotationRollPitchYaw(
+        degreesToRadians(envFloat("FNVXR_PIPBOY_WRIST_UI_ROT_X", 0.0f)),
+        degreesToRadians(envFloat("FNVXR_PIPBOY_WRIST_UI_ROT_Y", 0.0f)),
+        degreesToRadians(envFloat("FNVXR_PIPBOY_WRIST_UI_ROT_Z", 0.0f)));
+    const XMVECTOR orientation = XMQuaternionNormalize(
+        XMQuaternionMultiply(localOrientation, hmdOrientation));
+    XMFLOAT4 orientationValue {};
+    XMStoreFloat4(&orientationValue, orientation);
+    plane.pose.orientation = {
+        orientationValue.x,
+        orientationValue.y,
+        orientationValue.z,
+        orientationValue.w,
+    };
+
+    const XMFLOAT3 localOffset {
+        envFloat("FNVXR_PIPBOY_WRIST_UI_OFFSET_X", 0.0f),
+        envFloat("FNVXR_PIPBOY_WRIST_UI_OFFSET_Y", 0.075f),
+        envFloat("FNVXR_PIPBOY_WRIST_UI_OFFSET_Z", -0.035f),
+    };
+    const XMVECTOR worldOffset = XMVector3Rotate(
+        XMLoadFloat3(&localOffset),
+        wristOrientation);
+    XMFLOAT3 offsetValue {};
+    XMStoreFloat3(&offsetValue, worldOffset);
+    plane.pose.position = {
+        leftArm.wrist.position.x + offsetValue.x,
+        leftArm.wrist.position.y + offsetValue.y,
+        leftArm.wrist.position.z + offsetValue.z,
     };
     return plane;
 }
@@ -9924,6 +9972,14 @@ int main(int argc, char** argv)
             gamePlane.pose.position.y += deltaFloat.y;
             gamePlane.pose.position.z += deltaFloat.z;
         }
+        if (pipBoyMenuMode
+            && envEnabled("FNVXR_PIPBOY_WRIST_UI_ENABLE", true))
+        {
+            gamePlane = gamePlaneFromLeftWrist(
+                bodyRig.left,
+                hmdPose,
+                renderer.retainedUiTextureAspect);
+        }
         if (gameplayPlaneSize != previousLoggedGameplayPlaneSize
             || pipBoyGripMode != previousLoggedPipBoyGripMode
             || pipBoyMenuMode != previousLoggedPipBoyMenuMode
@@ -9974,6 +10030,16 @@ int main(int argc, char** argv)
                       << "\n";
         }
         const bool gameUiModeChanged = gameUiMode != previousGameUiMode;
+        const bool retainVerifiedWorldBehindPipBoy =
+            fnvxr::host::cpu_engine_presentation::
+                preserveVerifiedWorldBehindPipBoy(
+                    productionCpuEngineStereo,
+                    pipBoyMenuMode,
+                    envEnabled("FNVXR_PIPBOY_WORLD_BEHIND_WRIST_UI", true),
+                    renderer.hasStereoGameFrame,
+                    renderer.stereoGameFrameSeparated,
+                    renderer.stereoGameTextureViews[0] != nullptr,
+                    renderer.stereoGameTextureViews[1] != nullptr);
         if (gameUiMode)
         {
             gameUiModeFrames = previousGameUiMode ? gameUiModeFrames + 1 : 1;
@@ -9992,7 +10058,7 @@ int main(int argc, char** argv)
             gameUiModeFrames = 0;
             hasPauseSceneAnchor = false;
         }
-        if (gameUiModeChanged)
+        if (gameUiModeChanged && !retainVerifiedWorldBehindPipBoy)
         {
             renderer.hasStereoGameFrame = false;
             renderer.stereoGameFrameSeparated = false;
@@ -10439,6 +10505,14 @@ int main(int argc, char** argv)
             && stereoVisualTrialDecision.bindsStereoVisuals();
         const bool presentedBinocularWorld = productionBinocularWorld
             || stereoVisualTrialActive;
+        const bool cpuWristWorldBehindPipBoy =
+            cpuEngineUiQuadActive
+            && pipBoyMenuMode
+            && envEnabled("FNVXR_PIPBOY_WORLD_BEHIND_WRIST_UI", true)
+            && renderer.hasStereoGameFrame
+            && renderer.stereoGameFrameSeparated
+            && renderer.stereoGameTextureViews[0]
+            && renderer.stereoGameTextureViews[1];
         if (productionUiQuadActive || cpuEngineUiQuadActive)
         {
             gamePlane.height = gamePlane.width
@@ -10940,7 +11014,7 @@ int main(int argc, char** argv)
             {
                 updateStereoGameTextures(device.Get(), renderer);
             }
-            else
+            else if (!retainVerifiedWorldBehindPipBoy)
             {
                 renderer.hasStereoGameFrame = false;
                 renderer.stereoGameFrameSeparated = false;
@@ -11298,10 +11372,15 @@ int main(int argc, char** argv)
                 && displayGamePlane
                 && renderer.retainedUiTextureView;
             // A demo recording is evidence for WorldStereo only. Retain no
-            // menu, splash, or fallback-quad frame merely because it happened
-            // to be visible while capture was enabled.
+            // generic menu, splash, or fallback-quad frame merely because it
+            // happened to be visible while capture was enabled. The explicit
+            // wrist route is different: it retains an identity-validated
+            // binocular world pair and overlays the live Pip-Boy UI at the
+            // tracked left wrist, so that exact composition is eligible.
             const bool headsetMirrorCaptureEligible =
-                presentedBinocularWorld || cpuEngineStereoActive;
+                presentedBinocularWorld
+                || cpuEngineStereoActive
+                || (cpuWristWorldBehindPipBoy && uiQuadVisible);
             HeadsetMirrorCapture* const activeHeadsetMirrorCapture =
                 headsetMirrorCapture.enabled && headsetMirrorCaptureEligible
                 ? &headsetMirrorCapture
@@ -11316,7 +11395,7 @@ int main(int argc, char** argv)
                 || legacyDiagnosticVisible)
             {
                 ID3D11ShaderResourceView* leftProductionView =
-                    cpuEngineStereoActive
+                    (cpuEngineStereoActive || cpuWristWorldBehindPipBoy)
                         ? renderer.stereoGameTextureViews[0].Get()
                         : (productionBinocularWorld
                         ? gpuColorConsumer.eyeView(0u)
@@ -11324,7 +11403,7 @@ int main(int argc, char** argv)
                             ? stereoVisualTrialDecision.bindings.leftEyeSrv
                             : nullptr));
                 ID3D11ShaderResourceView* rightProductionView =
-                    cpuEngineStereoActive
+                    (cpuEngineStereoActive || cpuWristWorldBehindPipBoy)
                         ? renderer.stereoGameTextureViews[1].Get()
                         : (productionBinocularWorld
                         ? gpuColorConsumer.eyeView(1u)

@@ -214,4 +214,27 @@ constexpr bool preserveVerifiedWorldAcrossCellChange(
 {
     return productionCpuEngineStereo && hasVerifiedWorldFrame;
 }
+
+// A Pip-Boy is an in-world wrist computer, not a full-screen pause scene.
+// Keep the last identity-validated binocular world pair as a non-advancing
+// background while its independently validated flat UI texture is active.
+// Returning to gameplay still requires a world transaction newer than the UI
+// boundary; this policy never lets the retained pair advance render proof.
+constexpr bool preserveVerifiedWorldBehindPipBoy(
+    bool productionCpuEngineStereo,
+    bool pipBoyMenuMode,
+    bool retentionEnabled,
+    bool hasVerifiedWorldFrame,
+    bool separatedWorldFrame,
+    bool leftTextureReady,
+    bool rightTextureReady) noexcept
+{
+    return productionCpuEngineStereo
+        && pipBoyMenuMode
+        && retentionEnabled
+        && hasVerifiedWorldFrame
+        && separatedWorldFrame
+        && leftTextureReady
+        && rightTextureReady;
+}
 }

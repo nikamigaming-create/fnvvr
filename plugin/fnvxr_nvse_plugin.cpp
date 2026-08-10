@@ -18,7 +18,6 @@
 #include "fnvxr_weapon_frame_contract.h"
 
 #include <windows.h>
-#include <dbghelp.h>
 #include <intrin.h>
 
 #include <atomic>
@@ -58,7 +57,7 @@ constexpr UInt32 InterfaceMessaging = 2;
 constexpr UInt32 InterfaceData = 7;
 constexpr UInt32 InterfacePlayerControls = 10;
 constexpr UInt32 NvseDataDiHookControl = 1;
-constexpr const char* GamePluginProducerMutexName = "Local\\FNVXR_GamePlugin_Producer_v1";
+constexpr const char* GamePluginProducerMutexName = "Local\\FNVXR_GamePlugin_Producer_v1_g2";
 constexpr const char* DesktopAssistRecoveryLoadCommand = "load FNVXR_HostExitRecovery";
 // The OpenXR host is the sole producer for XInput, DInput, and VR pose in the
 // supported architecture.  Retained in-plugin writers stay source-disabled
@@ -89,6 +88,8 @@ constexpr UInt32 DIK_LSHIFT = 0x2A;
 constexpr UInt32 DIK_Z = 0x2C;
 constexpr UInt32 DIK_X = 0x2D;
 constexpr UInt32 DIK_SPACE = 0x39;
+constexpr UInt32 DIK_F1 = 0x3B;
+constexpr UInt32 DIK_F2 = 0x3C;
 constexpr UInt32 DIK_RETURN = 0x1C;
 constexpr UInt32 DIK_UP = 0xC8;
 constexpr UInt32 DIK_LEFT = 0xCB;
@@ -336,9 +337,11 @@ struct DirectInputDeviceObjectData
 
 struct DirectInputHookControl
 {
-    // xNVSE's DIHookControl inherits only the empty ISingleton helper and has
-    // no virtual methods.  The key array therefore begins at offset zero.
-    // A synthetic vtable pointer shifts every hold/tap into the wrong key.
+    // The retail xNVSE DIHookControl inherits ISingleton, whose virtual
+    // destructor gives this object a vtable.  This is confirmed by the PDB
+    // shipped with the installed nvse_1_4.dll.  The public data interface
+    // returns the complete object, so m_keys begins after this pointer.
+    void* vtable;
     DirectInputKeyInfo keys[MaxDirectInputMacros];
     std::queue<DirectInputDeviceObjectData> bufferedPresses;
 };
@@ -393,6 +396,9 @@ struct PointerMenuPoint
     float y;
     const char* space;
 };
+
+constexpr float DirectMenuViewportWidth = 1280.0f;
+constexpr float DirectMenuViewportHeight = 720.0f;
 
 struct Vec3
 {
@@ -596,10 +602,6 @@ void* g_physicalPlayerMoverOriginalSetMovementFlags = nullptr;
 bool g_physicalPlayerMoverHookInstalled = false;
 constexpr UInt64 DirectInputHoldHeartbeatMilliseconds = 200;
 constexpr bool LegacyInProcessDirectInputHoldFallbackEnabled = false;
-using BufferedKeyTapFn = void (__thiscall*)(void*, UInt32);
-BufferedKeyTapFn g_bufferedKeyTap = nullptr;
-bool g_triedResolveBufferedKeyTap = false;
-bool g_loggedBufferedSymbolEnum = false;
 std::atomic<UInt32> g_pendingAcceptClicks { 0 };
 std::atomic<LONG> g_latestPointerX { 0 };
 std::atomic<LONG> g_latestPointerY { 0 };
@@ -621,6 +623,7 @@ UInt32 g_lastExternalXInputPacket = 0;
 UInt16 g_lastExternalXInputButtons = 0;
 UInt32 g_lastExternalXInputNavMask = 0;
 UInt64 g_lastExternalXInputNavMs = 0;
+UInt64 g_lastPipBoyMenuChordMs = 0;
 UInt32 g_loggedExternalXInput = 0;
 SharedXInputState g_lastStableExternalXInput {};
 bool g_haveLastStableExternalXInput = false;
@@ -2293,22 +2296,18 @@ void initSharedVrPose()
     if (g_vrPoseState)
         return;
 
-    g_vrPoseMapping = CreateFileMappingA(
-        INVALID_HANDLE_VALUE,
-        nullptr,
-        PAGE_READWRITE,
-        0,
-        sizeof(SharedVrPoseState),
+    g_vrPoseMapping = OpenFileMappingA(
+        FILE_MAP_READ,
+        FALSE,
         fnvxr::shared::VrPoseSharedMappingName);
     if (!g_vrPoseMapping)
     {
-        logTelemetry("vr pose shared CreateFileMapping failed err=%lu\n", GetLastError());
+        logTelemetry("vr pose shared OpenFileMapping failed err=%lu\n", GetLastError());
         return;
     }
-    const DWORD createError = GetLastError();
 
     g_vrPoseState = static_cast<SharedVrPoseState*>(
-        MapViewOfFile(g_vrPoseMapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(SharedVrPoseState)));
+        MapViewOfFile(g_vrPoseMapping, FILE_MAP_READ, 0, 0, sizeof(SharedVrPoseState)));
     if (!g_vrPoseState)
     {
         logTelemetry("vr pose shared MapViewOfFile failed err=%lu\n", GetLastError());
@@ -2317,8 +2316,7 @@ void initSharedVrPose()
         return;
     }
 
-    const bool existingValid = createError == ERROR_ALREADY_EXISTS
-        && g_vrPoseState->magic == VrPoseSharedMagic
+    const bool existingValid = g_vrPoseState->magic == VrPoseSharedMagic
         && g_vrPoseState->version == VrPoseSharedVersion;
     // VR_Pose is host-owned. An invalid header remains unreadable until the
     // InputCore producer publishes; reader startup never mutates its seqlock.
@@ -3114,90 +3112,29 @@ void publishDInputMouseClick()
     fnvxr::shared::endSequencedSharedWrite(g_dinputState->sequence);
 }
 
-BufferedKeyTapFn resolveBufferedKeyTap()
-{
-    if (g_triedResolveBufferedKeyTap)
-        return g_bufferedKeyTap;
-
-    g_triedResolveBufferedKeyTap = true;
-
-    HMODULE nvseModule = GetModuleHandleA("nvse_1_4.dll");
-    if (!nvseModule)
-    {
-        logTelemetry("bufferedTap resolve failed: nvse module missing\n");
-        return nullptr;
-    }
-
-    char modulePath[MAX_PATH] {};
-    GetModuleFileNameA(nvseModule, modulePath, sizeof(modulePath));
-
-    HANDLE process = GetCurrentProcess();
-    SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
-    if (!SymInitialize(process, nullptr, FALSE) && GetLastError() != ERROR_INVALID_PARAMETER)
-    {
-        logTelemetry("bufferedTap SymInitialize failed err=%lu\n", GetLastError());
-        return nullptr;
-    }
-
-    DWORD64 moduleBase = SymLoadModuleEx(
-        process,
-        nullptr,
-        modulePath,
-        nullptr,
-        reinterpret_cast<DWORD64>(nvseModule),
-        0,
-        nullptr,
-        0);
-    if (moduleBase == 0)
-        moduleBase = reinterpret_cast<DWORD64>(nvseModule);
-
-    SYMBOL_INFO_PACKAGE symbol {};
-    symbol.si.SizeOfStruct = sizeof(SYMBOL_INFO);
-    symbol.si.MaxNameLen = MAX_SYM_NAME;
-    const char* names[] = {
-        "?BufferedKeyTap@DIHookControl@@QAEXI@Z",
-        "DIHookControl::BufferedKeyTap"
-    };
-    for (const char* name : names)
-    {
-        if (SymFromName(process, name, &symbol.si))
-        {
-            g_bufferedKeyTap = reinterpret_cast<BufferedKeyTapFn>(symbol.si.Address);
-            logTelemetry("bufferedTap resolved name=%s addr=%p module=%p\n", name, g_bufferedKeyTap, nvseModule);
-            return g_bufferedKeyTap;
-        }
-    }
-
-    if (!g_loggedBufferedSymbolEnum)
-    {
-        g_loggedBufferedSymbolEnum = true;
-        auto enumCallback = [](PSYMBOL_INFO info, ULONG, PVOID) -> BOOL
-        {
-            if (info && info->Name)
-                logTelemetry("bufferedTap candidate name=%s addr=%p\n", info->Name, reinterpret_cast<void*>(info->Address));
-            return TRUE;
-        };
-        SymEnumSymbols(process, moduleBase, "*BufferedKey*", enumCallback, nullptr);
-        SymEnumSymbols(process, moduleBase, "*DIHookControl*", enumCallback, nullptr);
-    }
-
-    logTelemetry("bufferedTap resolve failed err=%lu module=%p path='%s'\n", GetLastError(), nvseModule, modulePath);
-    return nullptr;
-}
-
 bool tapDirectInputKey(UInt32 keycode)
 {
     if (keycode >= MaxDirectInputMacros)
         return false;
 
     bool published = false;
-    if (keycode >= MouseButtonOffset && keycode < MouseButtonOffset + 8)
+    // The proxy-owned shared queue is the durable VR input lane: unlike the
+    // xNVSE in-process hook, it can synthesize DirectInput while the physical
+    // desktop keyboard is unacquired.  Keep the hook as an explicit legacy
+    // fallback, but do not make headset inventory input depend on foreground
+    // window ownership.
+    const bool inventoryUsesNvseInputOwner =
+        envEnabled("FNVXR_HEADSET_INVENTORY_VISUAL_TRIAL", false)
+        && g_directInputHook
+        && !envEnabled("FNVXR_INVENTORY_SHARED_INPUT_QUEUE", true);
+    if (!inventoryUsesNvseInputOwner
+        && keycode >= MouseButtonOffset && keycode < MouseButtonOffset + 8)
     {
         published = publishInputEvent(
             fnvxr::shared::InputEventTypeMouseButtonTap,
             keycode - MouseButtonOffset);
     }
-    else
+    else if (!inventoryUsesNvseInputOwner)
     {
         published = publishInputEvent(fnvxr::shared::InputEventTypeKeyTap, keycode);
     }
@@ -3231,14 +3168,6 @@ bool tapDirectInputKey(UInt32 keycode)
         data.dwData = 0x00;
         g_directInputHook->bufferedPresses.push(data);
         logTelemetry("bufferedTap key=%u queue=%zu\n", keycode, g_directInputHook->bufferedPresses.size());
-    }
-    if (envEnabled("FNVXR_BUFFERED_DIRECTINPUT_CALL", false))
-    {
-        if (BufferedKeyTapFn bufferedKeyTap = resolveBufferedKeyTap())
-        {
-            bufferedKeyTap(g_directInputHook, keycode);
-            logTelemetry("bufferedTap key=%u\n", keycode);
-        }
     }
     return true;
 }
@@ -8829,7 +8758,11 @@ void collectMenuButtons(
     const float height = getTileFloatByName(tile, "height", TileValueHeight, 0.0f);
     const UInt32 buttonId = getTileButtonId(tile);
     const bool plausibleButtonRect = width >= 4.0f && height >= 4.0f && width <= 900.0f && height <= 220.0f;
-    if (visible != 0.0f && buttonId != 0 && plausibleButtonRect)
+    const bool overlapsViewport = x < DirectMenuViewportWidth
+        && y < DirectMenuViewportHeight
+        && x + width > 0.0f
+        && y + height > 0.0f;
+    if (visible != 0.0f && buttonId != 0 && plausibleButtonRect && overlapsViewport)
     {
         buttons.push_back({ tile, buttonId, x, y, width, height });
     }
@@ -8843,6 +8776,102 @@ void collectMenuButtons(
             collectMenuButtons(child, x, y, depth + 1, buttons);
         node = node->next;
     }
+}
+
+bool copyFirstPrintableTileTextReadOnly(
+    void* tile,
+    char* output,
+    size_t outputCapacity,
+    UInt32 depth = 0u)
+{
+    if (!tile || !output || outputCapacity < 2u || depth > 3u)
+        return false;
+
+    __try
+    {
+        auto* values = *reinterpret_cast<TileValue***>(
+            reinterpret_cast<std::uintptr_t>(tile) + 0x14);
+        const UInt32 valueCount = *reinterpret_cast<UInt32*>(
+            reinterpret_cast<std::uintptr_t>(tile) + 0x18);
+        if (values && valueCount <= 512u)
+        {
+            for (UInt32 index = 0u; index < valueCount; ++index)
+            {
+                if (copyPrintableTileValueStringReadOnly(
+                        values[index], output, outputCapacity)
+                    && std::strlen(output) >= 2u)
+                {
+                    return true;
+                }
+            }
+        }
+
+        auto* node = reinterpret_cast<TileListNode*>(
+            reinterpret_cast<std::uintptr_t>(tile) + 0x04);
+        for (UInt32 count = 0u; node && count < 128u; ++count)
+        {
+            auto* childNode = static_cast<TileChildNode*>(node->data);
+            void* child = childNode ? childNode->child : nullptr;
+            if (child && copyFirstPrintableTileTextReadOnly(
+                    child, output, outputCapacity, depth + 1u))
+            {
+                return true;
+            }
+            node = node->next;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        output[0] = '\0';
+    }
+    return false;
+}
+
+bool tileSubtreeContainsExactTextReadOnly(
+    void* tile,
+    const char* expected,
+    UInt32 depth = 0u)
+{
+    if (!tile || !expected || !*expected || depth > 4u)
+        return false;
+    __try
+    {
+        auto* values = *reinterpret_cast<TileValue***>(
+            reinterpret_cast<std::uintptr_t>(tile) + 0x14);
+        const UInt32 valueCount = *reinterpret_cast<UInt32*>(
+            reinterpret_cast<std::uintptr_t>(tile) + 0x18);
+        if (values && valueCount <= 512u)
+        {
+            for (UInt32 index = 0u; index < valueCount; ++index)
+            {
+                char text[160] {};
+                if (copyPrintableTileValueStringReadOnly(
+                        values[index], text, sizeof(text))
+                    && _stricmp(text, expected) == 0)
+                {
+                    return true;
+                }
+            }
+        }
+        auto* node = reinterpret_cast<TileListNode*>(
+            reinterpret_cast<std::uintptr_t>(tile) + 0x04);
+        for (UInt32 count = 0u; node && count < 128u; ++count)
+        {
+            auto* childNode = static_cast<TileChildNode*>(node->data);
+            void* child = childNode ? childNode->child : nullptr;
+            if (child && tileSubtreeContainsExactTextReadOnly(
+                    child, expected, depth + 1u))
+            {
+                return true;
+            }
+            node = node->next;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+    return false;
 }
 
 std::vector<MenuButtonCandidate> visibleMenuButtons(void* menu, void* tileMenu)
@@ -9060,6 +9089,41 @@ bool dispatchMenuClick(void* menu, void* tile, UInt32 buttonId, const char* sour
     }
 }
 
+bool directMenuClickExactText(const char* expected)
+{
+    void* tileMenu = nullptr;
+    UInt32 menuType = 0;
+    void* menu = visibleMenuForInput(&tileMenu, &menuType);
+    if (!menu || !expected || !*expected)
+        return false;
+
+    const auto buttons = visibleMenuButtons(menu, tileMenu);
+    for (const auto& candidate : buttons)
+    {
+        if (!tileSubtreeContainsExactTextReadOnly(candidate.tile, expected))
+            continue;
+        logTelemetry(
+            "directMenu exactText menu=%p type=0x%lx tile=%p id=%u text=\"%s\"\n",
+            menu,
+            static_cast<unsigned long>(menuType),
+            candidate.tile,
+            candidate.buttonId,
+            expected);
+        return dispatchMenuClick(
+            menu,
+            candidate.tile,
+            candidate.buttonId,
+            "exactText");
+    }
+    logTelemetry(
+        "directMenu exactText miss menu=%p type=0x%lx buttons=%zu text=\"%s\"\n",
+        menu,
+        static_cast<unsigned long>(menuType),
+        buttons.size(),
+        expected);
+    return false;
+}
+
 bool dispatchPointerMenuClick()
 {
     void* tileMenu = nullptr;
@@ -9187,8 +9251,11 @@ bool directMenuNavigate(int delta)
     if (g_directMenuSelectionLogCount < 96)
     {
         ++g_directMenuSelectionLogCount;
+        char label[160] {};
+        const bool haveLabel = copyFirstPrintableTileTextReadOnly(
+            buttons[index].tile, label, sizeof(label));
         logTelemetry(
-            "directMenu nav menu=%p type=0x%lx buttons=%zu index=%lu tile=%p id=%u delta=%d rect=(%.1f %.1f %.1f %.1f)\n",
+            "directMenu nav menu=%p type=0x%lx buttons=%zu index=%lu tile=%p id=%u delta=%d rect=(%.1f %.1f %.1f %.1f) label=\"%s\"\n",
             menu,
             static_cast<unsigned long>(menuType),
             buttons.size(),
@@ -9199,7 +9266,8 @@ bool directMenuNavigate(int delta)
             buttons[index].x,
             buttons[index].y,
             buttons[index].width,
-            buttons[index].height);
+            buttons[index].height,
+            haveLabel ? label : "");
     }
     return true;
 }
@@ -9235,12 +9303,16 @@ bool directMenuAcceptSelection()
         g_directMenuSelectionTile = candidate->tile;
     }
 
+    char label[160] {};
+    const bool haveLabel = copyFirstPrintableTileTextReadOnly(
+        candidate->tile, label, sizeof(label));
     logTelemetry(
-        "directMenu accept menu=%p type=0x%lx tile=%p id=%u\n",
+        "directMenu accept menu=%p type=0x%lx tile=%p id=%u label=\"%s\"\n",
         menu,
         static_cast<unsigned long>(menuType),
         candidate->tile,
-        candidate->buttonId);
+        candidate->buttonId,
+        haveLabel ? label : "");
     return dispatchMenuClick(menu, candidate->tile, candidate->buttonId, "xinput");
 }
 
@@ -11669,9 +11741,15 @@ UInt32 externalXInputNavMask(const SharedXInputState& state, UInt32 menuBits)
     return mask;
 }
 
-void tapExternalXInputNav(UInt32 navMask)
+void tapExternalXInputNav(UInt32 navMask, UInt32 menuBits)
 {
-    const bool directUiClick = directUiClickEnabled();
+    // Pip-Boy navigation is stateful (major page, category, list selection).
+    // Let Fallout's own keyboard menu handler own those transitions instead
+    // of cycling raw Scaleform descendants that merely happen to carry an id.
+    const bool directUiClick = directUiClickEnabled()
+        && (menuBits & fnvxr::shared::RuntimePipBoyMenuBit) == 0u;
+    const bool pipBoyVisible =
+        (menuBits & fnvxr::shared::RuntimePipBoyMenuBit) != 0u;
     HWND hwnd = gameWindow();
     if (navMask & 1u)
     {
@@ -12282,6 +12360,8 @@ void consumeExternalXInputGameplayControls(
         && !leftTriggerHeld
         && externalLeftGripHeld()
         && (pressed & XInputBack) != 0
+        && (g_lastPipBoyMenuChordMs == 0
+            || GetTickCount64() >= g_lastPipBoyMenuChordMs + 750)
         && envEnabled("FNVXR_PIPBOY_MENU_CHORD_ENABLE", true);
     const UInt16 combatChordPressed = combatChordHeld ? pressed : 0;
     const bool combatChordFaceHeld =
@@ -12430,8 +12510,24 @@ void consumeExternalXInputGameplayControls(
     }
     if (keyboardGameplayFallback && (pressed & XInputStart))
     {
-        tapDirectInputKey(DIK_ESCAPE);
-        logTelemetry("menuStart fire frame=%llu source=externalXInput:Start gameplay=1\n", static_cast<unsigned long long>(frame));
+        const bool pipBoyItemsChord =
+            !leftTriggerHeld
+            && externalLeftGripHeld()
+            && envEnabled("FNVXR_PIPBOY_MENU_CHORD_ENABLE", true);
+        if (pipBoyItemsChord)
+        {
+            g_lastPipBoyMenuChordMs = GetTickCount64();
+            tapDirectInputKey(DIK_F2);
+            logTelemetry(
+                "pipboyItems fire frame=%llu source=externalXInput:LG+RightMenu key=0x%02lx gameplay=1\n",
+                static_cast<unsigned long long>(frame),
+                static_cast<unsigned long>(DIK_F2));
+        }
+        else
+        {
+            tapDirectInputKey(DIK_ESCAPE);
+            logTelemetry("menuStart fire frame=%llu source=externalXInput:Start gameplay=1\n", static_cast<unsigned long long>(frame));
+        }
     }
     if (waitChordPressed)
     {
@@ -12439,13 +12535,17 @@ void consumeExternalXInputGameplayControls(
     }
     else if (pipBoyMenuChordPressed)
     {
+        g_lastPipBoyMenuChordMs = GetTickCount64();
         tapDirectInputKey(DIK_TAB);
         logTelemetry(
             "pipboyToggle fire frame=%llu source=externalXInput:LG+LeftMenu key=0x%02lx gameplay=1\n",
             static_cast<unsigned long long>(frame),
             static_cast<unsigned long>(DIK_TAB));
     }
-    else if (keyboardGameplayFallback && (pressed & XInputBack))
+    else if (keyboardGameplayFallback
+        && (pressed & XInputBack)
+        && (g_lastPipBoyMenuChordMs == 0
+            || GetTickCount64() >= g_lastPipBoyMenuChordMs + 2000))
     {
         tapDirectInputKey(DIK_ESCAPE);
         logTelemetry("menuStart fire frame=%llu source=externalXInput:Back gameplay=1\n", static_cast<unsigned long long>(frame));
@@ -12765,6 +12865,8 @@ void consumeExternalXInputBridge(
     const bool pipBoyMenuChordPressed =
         externalLeftGripHeld()
         && (pressed & XInputBack) != 0
+        && (g_lastPipBoyMenuChordMs == 0
+            || GetTickCount64() >= g_lastPipBoyMenuChordMs + 750)
         && envEnabled("FNVXR_PIPBOY_MENU_CHORD_ENABLE", true);
     const UInt32 navMask = uiInputAllowed ? externalXInputNavMask(state, menuBits) : 0;
     const UInt64 nowMs = GetTickCount64();
@@ -12773,7 +12875,7 @@ void consumeExternalXInputBridge(
 
     if (menuKeyboardFallback && (navChanged || navRepeat))
     {
-        tapExternalXInputNav(navMask);
+        tapExternalXInputNav(navMask, menuBits);
     }
     if (navChanged || navRepeat)
     {
@@ -12956,7 +13058,10 @@ void consumeExternalXInputBridge(
     }
     if (menuKeyboardFallback && uiInputAllowed && (pressed & XInputStart))
     {
-        const bool handled = uiInputAllowed && directUiClickEnabled() && directMenuAcceptSelection();
+        const bool handled = uiInputAllowed
+            && !pipBoyMenuVisible
+            && directUiClickEnabled()
+            && directMenuAcceptSelection();
         if (!handled)
             tapDirectInputKey(uiInputAllowed ? DIK_RETURN : uiBackKeyForMenu(menuBits));
         if (!handled)
@@ -12967,6 +13072,7 @@ void consumeExternalXInputBridge(
     }
     if (menuKeyboardFallback && uiInputAllowed && pipBoyMenuChordPressed)
     {
+        g_lastPipBoyMenuChordMs = GetTickCount64();
         tapDirectInputKey(DIK_TAB);
         logTelemetry(
             "pipboyToggle fire frame=%llu source=externalXInput:LG+LeftMenu key=0x%02lx ui=1 menuBits=0x%02lx\n",
@@ -12974,7 +13080,11 @@ void consumeExternalXInputBridge(
             static_cast<unsigned long>(DIK_TAB),
             static_cast<unsigned long>(menuBits));
     }
-    else if (menuKeyboardFallback && uiInputAllowed && (pressed & XInputBack))
+    else if (menuKeyboardFallback
+        && uiInputAllowed
+        && (pressed & XInputBack)
+        && (g_lastPipBoyMenuChordMs == 0
+            || GetTickCount64() >= g_lastPipBoyMenuChordMs + 2000))
     {
         // The physical left Quest/Oculus menu button is the one reliable
         // Fallout pause-menu escape hatch. Keep it independent from the
@@ -14932,14 +15042,24 @@ bool ensureAuthorizedHeadlessStereoRigVisualTrialBridgeStarted()
     // same-tick stereo publication. The plugin normally maps only the pose
     // plus read-only runtime records needed by the post-animation visual rig.
     // The separately opted-in owned-fixture combat trial additionally maps
-    // XInput so its game-thread consumer can accept only RT and X below.
+    // the host-owned controller records so its game-thread consumer can drive
+    // gameplay, Pip-Boy, and native menu controls from this one bounded run.
     initSharedVrPose();
     initSharedCamera();
     initSharedPlayer();
     const bool combatVisualTrial =
         envEnabled("FNVXR_HEADSET_COMBAT_VISUAL_TRIAL", false);
-    if (combatVisualTrial)
+    const bool inventoryVisualTrial =
+        envEnabled("FNVXR_HEADSET_INVENTORY_VISUAL_TRIAL", false);
+    const bool controllerInputTrial =
+        combatVisualTrial || inventoryVisualTrial;
+    if (controllerInputTrial)
+    {
         initSharedXInput();
+        initSharedDInput();
+        if (inventoryVisualTrial)
+            initSharedInputEvents();
+    }
     if (!g_vrPoseState || !g_cameraState || !g_runtimeState || !g_playerState)
     {
         logTelemetry(
@@ -14957,18 +15077,19 @@ bool ensureAuthorizedHeadlessStereoRigVisualTrialBridgeStarted()
     }
 
     g_headlessStereoRigVisualTrialBridgeStarted = true;
-    if (combatVisualTrial)
+    if (controllerInputTrial)
     {
-        if (!g_xinputState)
+        if (!g_xinputState || !g_dinputState
+            || (inventoryVisualTrial && !g_inputEvents))
         {
             logTelemetry(
-                "headlessStereoRig combat bridge deferred: XInput mapping unavailable\n");
+                "headlessStereoRig combat bridge deferred: controller mappings unavailable\n");
             g_headlessStereoRigVisualTrialBridgeStarted = false;
             return false;
         }
         // This is the same exact-current-process consumer acknowledgement
-        // used by the full bridge, but the visual-trial loop below consumes
-        // only the two explicitly leased combat controls.
+        // used by the full bridge. The visual-trial loop consumes the normal
+        // mode-aware gameplay/Pip-Boy/menu controller route.
         InterlockedExchange8(
             reinterpret_cast<volatile char*>(
                 &g_xinputState->reserved[
@@ -14976,10 +15097,11 @@ bool ensureAuthorizedHeadlessStereoRigVisualTrialBridgeStarted()
             1);
     }
     logTelemetry(
-        "headlessStereoRig bridge ready attempt=%lu mode=body-anchored-controller-weapon-visual-rig combatInput=%d inputScope=%s projectile=0 hit=0 cameraHook=0 replay=0 ui=0 physical=0 engineCenterStereo=external\n",
+        "headlessStereoRig bridge ready attempt=%lu mode=body-anchored-controller-weapon-visual-rig combatInput=%d inventoryInput=%d inputScope=%s projectile=0 hit=0 cameraHook=0 replay=0 physical=0 engineCenterStereo=external\n",
         static_cast<unsigned long>(g_headlessStereoRigVisualTrialAuthorityAttempts),
         static_cast<int>(combatVisualTrial),
-        combatVisualTrial ? "right-trigger-and-x-only" : "none");
+        static_cast<int>(inventoryVisualTrial),
+        controllerInputTrial ? "gameplay-pipboy-native-menu" : "none");
     return true;
 }
 
@@ -15378,6 +15500,17 @@ void consumeHeadlessCombatVisualTrialInput(
 void processHeadlessStereoRigVisualTrialMainLoop(
     const RuntimeObservation& observation)
 {
+    static bool inventoryMeleeSeedAttempted = false;
+    if (!inventoryMeleeSeedAttempted
+        && envEnabled("FNVXR_HEADSET_INVENTORY_VISUAL_TRIAL", false)
+        && g_headsetDemoFixtureReady
+        && realRetailFixtureFreshGameplayState(observation))
+    {
+        inventoryMeleeSeedAttempted = true;
+        runPluginConsoleCommand(
+            "fnvxrInventoryTrialSeedMelee",
+            "player.additem 00004347 1");
+    }
     // The D3D bridge retains camera and same-tick eye authority. This
     // fixture-only path publishes observations solely for the separately
     // leased post-animation controller/weapon visual rig.
@@ -15386,6 +15519,8 @@ void processHeadlessStereoRigVisualTrialMainLoop(
     logCameraTelemetry(observation.frame, observation.menuBits);
     if (envEnabled("FNVXR_HEADSET_COMBAT_VISUAL_TRIAL", false))
         consumeHeadlessCombatVisualTrialInput(observation);
+    else if (envEnabled("FNVXR_HEADSET_INVENTORY_VISUAL_TRIAL", false))
+        consumeExternalXInputBridge(observation);
 }
 
 void handleNvseMessage(NVSEMessagingInterface::Message* message)
@@ -15529,8 +15664,9 @@ void handleNvseMessage(NVSEMessagingInterface::Message* message)
                     {
                         if (headsetControllerRigVisualTrialRequested())
                         {
-                            logTelemetry(
-                                "headset world-only fixture runtime publication ready; engine-center stereo and host display remain separately owned, while the fixture-only lease may apply controller-driven hand/weapon visual transforms; no input, firing, projectile, hit, camera-hook, replay, UI, or physical-headset path is enabled\n");
+                            logTelemetry(envEnabled("FNVXR_HEADSET_COMBAT_VISUAL_TRIAL", false)
+                                ? "headset world-only fixture controller proof ready; engine-center stereo and host display remain separately owned; bounded native gameplay, Pip-Boy, and menu controller input enabled; no desktop, window, mouse, simulator-GUI, camera-hook, replay, or physical-headset path is enabled\n"
+                                : "headset world-only fixture runtime publication ready; engine-center stereo and host display remain separately owned, while the fixture-only lease may apply controller-driven hand/weapon visual transforms; no input, firing, projectile, hit, camera-hook, replay, UI, or physical-headset path is enabled\n");
                         }
                         else
                         {
@@ -16012,6 +16148,18 @@ void injectRisingEdgeInput(
             && envEnabled("FNVXR_GAMEPLAY_WAIT_CHORD_ENABLE", true))
         {
             tapWaitKey("pose:LT+LeftMenu", pose.frame);
+        }
+        else if (!uiInputAllowed
+            && gameplayKeyboardFallback
+            && leftGripModifierDown
+            && envEnabled("FNVXR_PIPBOY_MENU_CHORD_ENABLE", true))
+        {
+            const bool tapped = tapDirectInputKey(DIK_TAB);
+            logTelemetry(
+                "pipboyToggle fire frame=%llu source=pose:LG+LeftMenu key=0x%02lx gameplay=1 tapped=%d\n",
+                static_cast<unsigned long long>(pose.frame),
+                static_cast<unsigned long>(DIK_TAB),
+                static_cast<int>(tapped));
         }
         else if (menuKeyboardFallback)
         {

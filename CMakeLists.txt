@@ -265,7 +265,7 @@ if(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 4)
     target_link_libraries(nvse_fnvxr PRIVATE
         fnvxr_protocol
         fnvxr_retail_runtime_authority
-        dbghelp)
+        )
     set_target_properties(nvse_fnvxr PROPERTIES
         PREFIX ""
         OUTPUT_NAME "nvse_fnvxr"
@@ -1468,6 +1468,8 @@ if(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 4)
     add_test(NAME fnvxr_nvse_bridge_test
         COMMAND fnvxr_nvse_bridge_test "$<TARGET_FILE:nvse_fnvxr>"
     )
+    # The fixture needs exclusive ownership of the process-global pose map.
+    set_tests_properties(fnvxr_nvse_bridge_test PROPERTIES RUN_SERIAL TRUE)
 endif()
 
 # The former preprocessor test authority changed inline header definitions and

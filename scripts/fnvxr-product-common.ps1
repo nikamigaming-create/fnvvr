@@ -2156,6 +2156,7 @@ function Get-FnvxrProductMinimalEnvironment {
         [ValidateSet("None", "Primary", "Alternate", "Third")]
         [string]$RetailVrFirstPersonPrivateCaller = "None",
         [switch]$HeadsetControllerRigVisualTrial,
+        [switch]$HeadsetInventoryVisualTrial,
         [switch]$HeadsetCombatVisualTrial,
         [switch]$PhysicalHeadsetPlay,
         [ValidateRange(1280, 4096)][int]$PhysicalGameWidth = 1872,
@@ -2237,6 +2238,12 @@ function Get-FnvxrProductMinimalEnvironment {
     }
     if ($HeadsetCombatVisualTrial -and -not $HeadsetControllerRigVisualTrial) {
         throw "The headless combat visual trial requires the controller visual-rig trial."
+    }
+    if ($HeadsetInventoryVisualTrial -and -not $HeadsetControllerRigVisualTrial) {
+        throw "The headless inventory visual trial requires the controller visual-rig trial."
+    }
+    if ($HeadsetInventoryVisualTrial -and $HeadsetCombatVisualTrial) {
+        throw "The headless inventory and automated combat visual trials are mutually exclusive."
     }
     if ($HeadsetFixtureWeaponDraw -and $RetailFixtureAction -cne "load") {
         throw "The headset fixture weapon draw requires an existing owned fixture load."
@@ -2545,6 +2552,18 @@ function Get-FnvxrProductMinimalEnvironment {
             $environment.FNVXR_D3D9_NATIVE_SINGLE_TRAVERSAL_REPLAY = "0"
             $environment.FNVXR_D3D9_WIDE_WORLD_REPLAY = "0"
             $environment.FNVXR_DESKTOP_ASSIST_UI_CAPTURE = "0"
+            if ($HeadsetInventoryVisualTrial) {
+                # This lease leaves the per-run simulator stream manual so an
+                # authentic Pip-Boy inventory selection can be observed.
+                $environment.FNVXR_HEADSET_INVENTORY_VISUAL_TRIAL = "1"
+                $environment.FNVXR_LEFT_GRIP_PIPBOY_MODE = "0"
+                $environment.FNVXR_XINPUT_LEFT_GRIP_PIPBOY_ENABLE = "0"
+                $environment.FNVXR_XINPUT_PHYSICAL_MENU_BUTTONS_ENABLE = "1"
+                $environment.FNVXR_PLUGIN_KEYBOARD_MOVEMENT_ENABLE = "1"
+                $environment.FNVXR_PLUGIN_MENU_KEYBOARD_FALLBACK = "1"
+                $environment.FNVXR_PLUGIN_GAMEPLAY_KEYBOARD_FALLBACK = "1"
+                $environment.FNVXR_BUFFERED_DIRECTINPUT_CALL = "1"
+            }
             if ($HeadsetCombatVisualTrial) {
                 # A bounded owned-fixture input lease. The OpenXR host remains
                 # the sole controller payload producer; xNVSE translates RT
@@ -2552,6 +2571,8 @@ function Get-FnvxrProductMinimalEnvironment {
                 # not set the generic external-writer flags here: they are
                 # deliberately incompatible with the base visual-rig lease.
                 $environment.FNVXR_HEADSET_COMBAT_VISUAL_TRIAL = "1"
+                $environment.FNVXR_PLUGIN_KEYBOARD_MOVEMENT_ENABLE = "1"
+                $environment.FNVXR_PLUGIN_MENU_KEYBOARD_FALLBACK = "1"
                 $environment.FNVXR_PLUGIN_GAMEPLAY_KEYBOARD_FALLBACK = "1"
             }
         }

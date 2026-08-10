@@ -17,7 +17,7 @@ param(
     # Optional workspace-staged Meta XR Operator API layer. It is observed
     # only: FNVXR neither starts its MCP proxy nor invokes pose/controller tools.
     [string]$MetaXrOperatorLayerDirectory = "",
-    [ValidateRange(1, 60000)][int]$HostFrames = 60000,
+    [ValidateRange(1, 2000000000)][int]$HostFrames = 60000,
     [ValidateRange(5, 900)][int]$MaximumRunSeconds = 40,
     [ValidateRange(5, 120)][int]$HostReadyTimeoutSeconds = 45,
     [ValidateRange(5, 900)][int]$RetailReadyTimeoutSeconds = 60,
@@ -91,6 +91,9 @@ param(
     # still owns OpenXR poses and final eye submission; no input, fire,
     # projectile, hit, camera-hook, or physical-headset path is enabled.
     [switch]$HeadsetControllerRigVisualTrial,
+    # Leaves the isolated simulator controller stream manual for authentic
+    # Pip-Boy navigation and inventory equip proof.
+    [switch]$HeadsetInventoryVisualTrial,
     # Diagnostic-only selection of authenticated first-person roots:
     # weapon=1, upper-body=2, left-hand=4, right-hand=8, Pip-Boy=16.
     [ValidateRange(1, 31)][int]$FirstPersonRootMask = 1,
@@ -181,6 +184,12 @@ if ($ControllerPoseSweep -and -not $HeadsetControllerRigVisualTrial) {
 }
 if ($HeadsetCombatVisualTrial -and -not $HeadsetControllerRigVisualTrial) {
     throw "-HeadsetCombatVisualTrial requires -HeadsetControllerRigVisualTrial."
+}
+if ($HeadsetInventoryVisualTrial -and -not $HeadsetControllerRigVisualTrial) {
+    throw "-HeadsetInventoryVisualTrial requires -HeadsetControllerRigVisualTrial."
+}
+if ($HeadsetInventoryVisualTrial -and $HeadsetCombatVisualTrial) {
+    throw "-HeadsetInventoryVisualTrial and -HeadsetCombatVisualTrial are mutually exclusive."
 }
 if ($HeadsetCombatVisualTrial -and
     -not ($RecordSimulatorSbs -or $CaptureHeadsetMirror)) {
@@ -852,6 +861,7 @@ if ($ValidateOnly) {
             -HeadsetFixtureWeaponDraw:$HeadsetFixtureWeaponDraw `
             -RetailVrFirstPersonPrivateCaller $RetailVrFirstPersonPrivateCaller `
             -HeadsetControllerRigVisualTrial:$HeadsetControllerRigVisualTrial `
+            -HeadsetInventoryVisualTrial:$HeadsetInventoryVisualTrial `
             -HeadsetCombatVisualTrial:$HeadsetCombatVisualTrial `
             -PhysicalHeadsetPlay:$PhysicalHeadsetPlay `
             -PhysicalGameWidth $PhysicalGameWidth `
@@ -1030,7 +1040,11 @@ $manifest = [ordered]@{
     }
     headsetControllerRigVisualTrial = [ordered]@{
         requested = [bool]$HeadsetControllerRigVisualTrial
-        scope = "headless owned-fixture visual rig only: right OpenXR grip/aim may drive stock first-person hand/weapon transforms while engine-center stereo retains final-eye authority; no input, firing, projectile, hit, camera hook, replay, UI, or physical-headset route"
+        scope = if ($HeadsetCombatVisualTrial) {
+            "headless owned-fixture controller proof: tracked hands/weapon plus native gameplay, Pip-Boy, and menu controls while engine-center stereo retains final-eye authority; no desktop, window, mouse, simulator GUI, camera hook, replay, or physical-headset route"
+        } else {
+            "headless owned-fixture visual rig only: right OpenXR grip/aim may drive stock first-person hand/weapon transforms while engine-center stereo retains final-eye authority; no input, firing, projectile, hit, camera hook, replay, UI, or physical-headset route"
+        }
         status = if ($HeadsetControllerRigVisualTrial) {
             "pending-owned-fixture-weapon-and-rig-proof"
         } else {
@@ -1040,7 +1054,7 @@ $manifest = [ordered]@{
     }
     headsetCombatVisualTrial = [ordered]@{
         requested = [bool]$HeadsetCombatVisualTrial
-        scope = "owned headless fixture only: smooth multi-target controller motion with gentle concurrent head look, thirteen shots to empty, one left-controller X reload, and two confirmation shots; no desktop, window, keyboard, mouse, or simulator UI control"
+        scope = "owned headless fixture only: sticks, native Pip-Boy/menu selection, smooth multi-target controller motion, firing, and reload through per-run OpenXR IPC; no desktop, window, mouse, or simulator UI control"
         status = if ($HeadsetCombatVisualTrial) { "pending-ready-weapon" } else { "disabled" }
         evidence = $null
     }
@@ -2727,6 +2741,7 @@ try {
         -HeadsetFixtureWeaponDraw:$HeadsetFixtureWeaponDraw `
         -RetailVrFirstPersonPrivateCaller $RetailVrFirstPersonPrivateCaller `
         -HeadsetControllerRigVisualTrial:$HeadsetControllerRigVisualTrial `
+        -HeadsetInventoryVisualTrial:$HeadsetInventoryVisualTrial `
         -HeadsetCombatVisualTrial:$HeadsetCombatVisualTrial `
         -PhysicalHeadsetPlay:$PhysicalHeadsetPlay `
         -PhysicalGameWidth $PhysicalGameWidth `

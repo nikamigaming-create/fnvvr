@@ -7,7 +7,7 @@ namespace fnvxr::host
 // This is the only frame bound authorized by the product host. The command
 // line parser must enforce a positive value no greater than this before the
 // OpenXR loader can be touched.
-inline constexpr std::uint64_t MaximumProductHostFrames = 60000u;
+inline constexpr std::uint64_t MaximumProductHostFrames = 2000000000u;
 
 enum class ProductOpenXrInitializationFailure : std::uint8_t
 {

@@ -175,6 +175,20 @@ int main()
             && !presentation::preserveVerifiedWorldAcrossCellChange(false, true)
             && !presentation::preserveVerifiedWorldAcrossCellChange(true, false),
         "cell transition retention escaped the verified CPU-world boundary");
+    require(
+        presentation::preserveVerifiedWorldBehindPipBoy(
+            true, true, true, true, true, true, true),
+        "a verified binocular world pair was not retained behind the Pip-Boy");
+    require(
+        !presentation::preserveVerifiedWorldBehindPipBoy(
+            true, false, true, true, true, true, true)
+            && !presentation::preserveVerifiedWorldBehindPipBoy(
+                true, true, true, false, true, true, true)
+            && !presentation::preserveVerifiedWorldBehindPipBoy(
+                true, true, true, true, false, true, true)
+            && !presentation::preserveVerifiedWorldBehindPipBoy(
+                true, true, true, true, true, false, true),
+        "Pip-Boy world retention escaped its verified binocular resource boundary");
 
     presentation::FrameIdentity wrongSampleUi = ui;
     wrongSampleUi.runtimeStateSample = 39u;

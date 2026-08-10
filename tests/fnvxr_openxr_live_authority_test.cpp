@@ -17,7 +17,7 @@ int main()
 {
     using namespace fnvxr::host;
 
-    static_assert(MaximumProductHostFrames == 60000u);
+    static_assert(MaximumProductHostFrames == 2000000000u);
     static_assert(
         CompiledProductOpenXrInitializationAuthorization.authorized());
 
