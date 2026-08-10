@@ -6,14 +6,41 @@ standalone OpenXR host supplies headset/controller tracking and VR
 presentation. An xNVSE plugin and retail proxy DLLs expose the engine state and
 rendering hooks needed to connect the two sides.
 
-This repository contains only FNVVR-owned C++ and PowerShell source. It does
-not contain Fallout: New Vegas files, Bethesda assets, xNVSE binaries, OpenXR
-binaries, generated build output, local logs, or private runtime data.
+This repository contains FNVVR-owned source and a small set of retained proof
+artifacts. It does not contain Fallout: New Vegas files, Bethesda assets, xNVSE
+binaries, OpenXR binaries, generated build output, local logs, or private
+runtime data.
 
 FNVVR does not fork or patch xNVSE. `nvse_fnvxr.dll` is a separate xNVSE
 plugin. The D3D9, DirectInput, and XInput proxies and the OpenXR host are also
 FNVVR-owned components. Upstream dependencies are fetched unchanged into
 ignored directories.
+
+## Recent Progress
+
+These captures are retained simulator evidence from the retail engine. They
+show meaningful progress, but they are not a claim that FNVVR is a stable,
+physically validated, playable VR release.
+
+[![Side-by-side retail eye views showing the authentic forearm, Pip-Boy
+housing, hand, and pistol](output/fnvxr-hands-pipboy-gate-preview.png)](output/fnvxr-hands-pipboy-gate-assessment.mp4)
+
+**Retail hands and Pip-Boy roots — August 9, 2026.** A fresh attested run
+retained 300 binocular pairs with the authentic left forearm/hand, Pip-Boy
+housing, and equipped pistol in the first-person stereo roots. The run also
+recorded tracked motion, locomotion, firing, and reload. It did **not** prove a
+live wrist-menu selection or ranged-to-melee equipped-model swap.
+[Watch the 22-second assessment](output/fnvxr-hands-pipboy-gate-assessment.mp4)
+or [read the evidence assessment](output/fnvxr-vr-capability-assessment.md).
+
+[![Side-by-side retail eye views with a tracked pistol during the combat
+loop](output/fnvxr-vr-capability-showcase-preview.png)](output/fnvxr-vr-capability-showcase.mp4)
+
+**Binocular movement and combat loop — August 9, 2026.** This retained reel
+shows distinct retail left/right views, six-degree head motion, controller
+aim, locomotion, firing, an empty magazine, engine reload, and follow-up shots.
+It is headless OpenXR simulator evidence; physical-headset sign-off remains
+pending. [Watch the 19-second capability reel](output/fnvxr-vr-capability-showcase.mp4).
 
 ## Retail-Only Architecture
 
@@ -38,9 +65,11 @@ The presentation contract has two modes:
 - All non-blocking gameplay, exploration, combat, and world interaction require
   true binocular 3D, independent 6DoF head motion, a tracked retail weapon,
   and no persistent gameplay HUD. Mono gameplay is never accepted as success.
-- Startup, pause, inventory, barter, terminals, dialogue, VATS, loading,
-  Pip-Boy, and other blocking retail UI use the stable mono quad. The
-  controller ray drives the ordinary retail mouse pointer and click path.
+- Startup, pause, inventory, barter, terminals, dialogue, VATS, loading, and
+  other blocking retail UI use the stable mono quad. The bounded Pip-Boy wrist
+  route can retain the last validated binocular world pair behind its live mono
+  UI without advancing world-frame proof. The controller ray drives the
+  ordinary retail mouse pointer and click path.
 - Leaving UI holds the last valid quad until one fresh, complete, pose-matched
   stereo transaction from a strictly newer retail source frame is ready, then
   changes to world stereo atomically. Stale stereo remains rejected even after
@@ -59,20 +88,20 @@ rendering, outputs must be non-aliased and distinct, and mono gameplay
 fallbacks remain disabled.
 
 This is not full product acceptance. The CPU-v8 image transfer is intentionally
-bounded and too expensive for the production transport; controller mutation,
-tracked weapon/muzzle behavior, encoded depth submission, and the retained D3D
-draw-hook set remain source-fused. The plugin is inert outside explicit
-profiles, and the visual trial keeps its full input/camera/rig bridge disabled
-so it cannot invalidate the D3D engine-authority proof.
+bounded and too expensive for the production transport. The retained simulator
+evidence proves a controller-driven movement/combat loop and authentic
+first-person hand, Pip-Boy, and weapon roots, but encoded depth submission,
+authoritative muzzle alignment, live wrist-menu selection, equipped-item model
+swaps, and physical-headset acceptance remain open gates. The plugin remains
+inert outside explicit profiles.
 
-The process-local headless OpenXR Simulator is now built and can supply
-deterministic HMD/controller poses and final-eye capture without changing the
-machine-wide OpenXR runtime. The latest TTW simulator run started the host and
-retail process, verified advancing runtime/pose publication and the CPU-v8
-bridge, and published non-black mono Start Menu frames. It did not reach
-gameplay or accepted binocular output. No recorded run has yet authorized
-controller mutation or a tracked weapon, so this tree must not be described as
-a stable playable VR build.
+The process-local headless OpenXR Simulator supplies deterministic
+HMD/controller poses and final-eye capture without changing the machine-wide
+OpenXR runtime. The August 9 TTW run reached sustained binocular gameplay,
+retained 300 stereo pairs, recorded 424.117 world units of movement, 15
+attacks, two reload events, and 113 rig events, and captured authentic retail
+first-person roots. It remains simulator evidence, and the tree must not be
+described as a stable playable VR build.
 
 Read-only inspection of the loaded retail `1.4.0.525` executable has verified
 the world-render boundary, explicit visible-array culling, and separate
