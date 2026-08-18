@@ -23,10 +23,13 @@ There are exactly two user-visible content modes:
 
 1. `WorldStereo`: all non-blocking gameplay, exploration, combat, and world
    interaction use true binocular 3D, independent 6DoF head motion, a tracked
-   retail weapon, and no persistent gameplay HUD.
-2. `UiQuad`: startup, pause, inventory, barter, terminals, dialogue, VATS,
-   loading, Pip-Boy, and other blocking retail UI use a stable mono quad. The
-   controller ray drives the ordinary retail mouse pointer and click path.
+   retail weapon, persistent live wrist Pip-Boy, and no persistent gameplay
+   HUD. Pointing at the device enlarges/focuses it; opening its screen changes
+   only retail input focus, not presentation mode.
+2. `UiQuad`: startup, pause, containers, barter, terminals, dialogue, VATS,
+   loading, conflicting/unknown menus, and every other blocking retail UI use
+   a stable mono quad floating in front of the player. The controller ray
+   drives the ordinary retail pointer and click path.
 
 Mono gameplay is never a successful fallback. When UI closes, the last valid
 quad remains visible until one fresh, complete, pose-matched stereo transaction
@@ -140,9 +143,12 @@ projectile or hit ray, and impact result must share one calibrated transform
 chain. Retail retains ammunition, recoil, spread, animation, projectile, and
 damage authority. A host-only debug hand or ray does not satisfy this gate.
 
-Retail HUD pixels are excluded from `WorldStereo`. Blocking retail UI switches
-the whole presentation to `UiQuad`; no synthetic gameplay HUD is composited on
-top of the world.
+Retail HUD pixels are excluded from `WorldStereo`. The live Pip-Boy is always a
+first-person world prop; focusing its screen never creates a presentation
+state or quad. Missing camera, tracking, Pip-Boy root, or complete eye resources
+produces a visible reject. Every unrelated blocking menu switches the whole
+presentation to the front-floating `UiQuad`. No synthetic gameplay HUD is
+composited on top of the world.
 
 ## Release Gates
 

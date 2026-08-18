@@ -100,10 +100,30 @@ int main()
         validateRetailTrackedUiFrame(frame).complete(),
         "confirmed loading UI rejected");
     frame = validFrame();
+    frame.runtime.phase = fnvxr::shared::RuntimePhaseMenu;
     frame.runtime.menuBits = fnvxr::shared::RuntimePipBoyMenuBit;
     require(
-        validateRetailTrackedUiFrame(frame).complete(),
-        "confirmed Pip-Boy rejected as UI quad");
+        validateRetailTrackedGameplayFrame(frame).complete()
+            && retailTrackedPresentationRoute(frame)
+                == RetailTrackedPresentationRoute::BinocularWorld,
+        "focused live Pip-Boy did not continue binocular world");
+    require(
+        validateRetailTrackedUiFrame(frame).failure
+            == RetailTrackedFrameFailure::RuntimeNotUi,
+        "focused live Pip-Boy remained eligible for MonoUiQuad");
+    frame.runtime.cameraActive = 0u;
+    require(
+        validateRetailTrackedGameplayFrame(frame).complete()
+            && retailTrackedPresentationRoute(frame)
+                == RetailTrackedPresentationRoute::BinocularWorld,
+        "retail camera-inactive Pip-Boy focus did not retain binocular world");
+    frame.runtime.cameraActive = 1u;
+    frame.runtime.menuBits |= fnvxr::shared::RuntimeGenericMenuBit;
+    require(
+        validateRetailTrackedUiFrame(frame).complete()
+            && retailTrackedPresentationRoute(frame)
+                == RetailTrackedPresentationRoute::MonoUiQuad,
+        "conflicting retail UI escaped the flat safety route");
     frame = validFrame();
     frame.runtime.phase = fnvxr::shared::RuntimePhaseUnknown;
     require(

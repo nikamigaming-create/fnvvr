@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../protocol/fnvxr_shared_state.h"
+#include "../runtime/fnvxr_live_pipboy_contract.h"
 
 #include <cstdint>
 
@@ -57,6 +58,11 @@ constexpr bool runtimeUiConfirmed(const RuntimeSample& runtime) noexcept
     return runtime.fresh
         && runtime.sample != 0u
         && runtime.phase != shared::RuntimePhaseUnknown
+        && !engine::live_pipboy::worldPresentationContinues(
+            runtime.phase,
+            runtime.menuBits,
+            runtime.showroomActive,
+            runtime.cameraActive)
         && !shared::runtimeGameplayPhase(
             runtime.phase,
             runtime.menuBits,
@@ -68,10 +74,15 @@ constexpr bool runtimeGameplayConfirmed(const RuntimeSample& runtime) noexcept
     return runtime.fresh
         && runtime.sample != 0u
         && runtime.cameraActive
-        && shared::runtimeGameplayPhase(
-            runtime.phase,
-            runtime.menuBits,
-            runtime.showroomActive);
+        && (shared::runtimeGameplayPhase(
+                runtime.phase,
+                runtime.menuBits,
+                runtime.showroomActive)
+            || engine::live_pipboy::worldPresentationContinues(
+                runtime.phase,
+                runtime.menuBits,
+                runtime.showroomActive,
+                runtime.cameraActive));
 }
 
 constexpr RuntimeMode confirmedRuntimeMode(
@@ -215,26 +226,4 @@ constexpr bool preserveVerifiedWorldAcrossCellChange(
     return productionCpuEngineStereo && hasVerifiedWorldFrame;
 }
 
-// A Pip-Boy is an in-world wrist computer, not a full-screen pause scene.
-// Keep the last identity-validated binocular world pair as a non-advancing
-// background while its independently validated flat UI texture is active.
-// Returning to gameplay still requires a world transaction newer than the UI
-// boundary; this policy never lets the retained pair advance render proof.
-constexpr bool preserveVerifiedWorldBehindPipBoy(
-    bool productionCpuEngineStereo,
-    bool pipBoyMenuMode,
-    bool retentionEnabled,
-    bool hasVerifiedWorldFrame,
-    bool separatedWorldFrame,
-    bool leftTextureReady,
-    bool rightTextureReady) noexcept
-{
-    return productionCpuEngineStereo
-        && pipBoyMenuMode
-        && retentionEnabled
-        && hasVerifiedWorldFrame
-        && separatedWorldFrame
-        && leftTextureReady
-        && rightTextureReady;
-}
 }

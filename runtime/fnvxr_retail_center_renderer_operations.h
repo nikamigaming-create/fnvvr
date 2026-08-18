@@ -941,13 +941,11 @@ struct RetailCenterRendererOperationsAdapter
             return;
         }
         const int kind = niObjectKind(objectAddress);
-        // Fallout marks the separate first-person container hidden while
-        // leaving its renderable arm children live for the dedicated view-
-        // model pass. Traverse hidden nodes, but never replay a hidden
-        // geometry leaf such as a body/limb cap.
-        if (kind == 1 && (objectFlags & 1u) != 0u
-            && !isRetailFirstPersonArmsGeometry(objectAddress))
-            return;
+        // These roots are the narrow, authenticated render surfaces published
+        // by xNVSE (upper-body arms, both hand models, weapon, and Pip-Boy),
+        // never the broad actor root. Fallout marks several of those leaves
+        // AppCulled outside its stock view-model pass. Retain them here and
+        // clear that bit only inside the private eye mutation transaction.
         if (kind == 1)
         {
             // NiAVObject leaves also include non-geometry render helpers.
@@ -957,7 +955,8 @@ struct RetailCenterRendererOperationsAdapter
                 return;
             if (firstPersonGeometryAlreadyCollected(context, objectAddress))
                 return;
-            if (geometryQueuesWithoutImmediateDispatch(
+            const bool appCulled = (objectFlags & 1u) != 0u;
+            if (!appCulled && geometryQueuesWithoutImmediateDispatch(
                     context.mCollectionAccumulator,
                     objectAddress))
             {
@@ -1823,6 +1822,7 @@ struct RetailCenterRendererOperationsAdapter
             // in the __finally block below.
             if (context->mFirstPersonRootNodeCount != 0u)
             {
+                constexpr std::uint32_t GeometryAppCulled = 0x01u;
                 constexpr std::uint32_t GeometryImmediateDispatch = 0x40u;
                 constexpr std::uint16_t PropertyAccumulatorQueue = 0x0001u;
                 constexpr std::uint16_t PropertyModeExcluded = 0x2000u;
@@ -1856,7 +1856,8 @@ struct RetailCenterRendererOperationsAdapter
                         property + 0x18u,
                         sizeof(mutation.propertyFlags));
                     const std::uint32_t queuedGeometryFlags =
-                        mutation.geometryFlags & ~GeometryImmediateDispatch;
+                        mutation.geometryFlags
+                        & ~(GeometryAppCulled | GeometryImmediateDispatch);
                     const std::uint16_t queuedPropertyFlags =
                         static_cast<std::uint16_t>(
                             (mutation.propertyFlags
@@ -1880,22 +1881,12 @@ struct RetailCenterRendererOperationsAdapter
                 privateCuller);
             if (context->mFirstPersonRootNodeCount != 0u)
             {
-                // The view model is a distinct live scene branch. Running the
-                // authenticated wrapper with that root lets Fallout build its
-                // weapon shader passes against the right-eye camera instead of
-                // trying to smuggle view-model leaves through the world scene.
                 for (std::uint32_t rootIndex = 0u;
                      rootIndex < context->mFirstPersonRootNodeCount;
                      ++rootIndex)
                 {
                     const abi::RetailPointer32 rootAddress =
                         context->mFirstPersonRootNodes[rootIndex];
-                    // AccumulateScene expects an NiNode-compatible scene
-                    // branch. A standalone skinned NiGeometry (Fallout's
-                    // RightHand sibling is one) must be admitted only through
-                    // the authenticated visible-array/OnVisible replay below;
-                    // traversing the leaf as a scene root emits a second,
-                    // unskinned copy whose vertices stretch across the eye.
                     if (niObjectKind(rootAddress) != 2)
                         continue;
                     context->mCalls.accumulateScene(
@@ -1905,12 +1896,6 @@ struct RetailCenterRendererOperationsAdapter
                         privateCuller);
                 }
             }
-            // A second stock cull in the same retail frame may reject the
-            // first-person subtree through NiAVObject's per-frame cull stamp.
-            // The stock center traversal already proved these exact geometry
-            // pointers visible, and the ancestry check above proves they are
-            // inside xNVSE's current first-person root. Replay only that
-            // queue-safe subset into each eye's already-prepared accumulator.
             if (context->mFirstPersonQueueSafeGeometryCount != 0u)
             {
                 const abi::RetailNiVisibleArrayLayout firstPersonVisible {
@@ -1949,11 +1934,6 @@ struct RetailCenterRendererOperationsAdapter
             }
             if (context->mFirstPersonRootNodeCount != 0u)
             {
-                // Immediate first-person meshes are emitted through the
-                // authenticated NiGeometry::OnVisible virtual, not the
-                // accumulator's queued list. Re-run that exact engine
-                // callback with the private right-eye culler so its current
-                // accumulator receives a complete independent weapon pass.
                 for (std::uint32_t index = mutationCount;
                      index < context->mFirstPersonImmediateGeometryCount;
                      ++index)

@@ -14,6 +14,7 @@
 #include "fnvxr_retail_fixture_automation_authority.h"
 #include "fnvxr_headset_demo_authority.h"
 #include "fnvxr_physical_input_authority.h"
+#include "fnvxr_live_pipboy_contract.h"
 #include "fnvxr_stereo_visual_trial_automation_authority.h"
 #include "fnvxr_weapon_frame_contract.h"
 
@@ -90,6 +91,7 @@ constexpr UInt32 DIK_X = 0x2D;
 constexpr UInt32 DIK_SPACE = 0x39;
 constexpr UInt32 DIK_F1 = 0x3B;
 constexpr UInt32 DIK_F2 = 0x3C;
+constexpr UInt32 DIK_F3 = 0x3D;
 constexpr UInt32 DIK_RETURN = 0x1C;
 constexpr UInt32 DIK_UP = 0xC8;
 constexpr UInt32 DIK_LEFT = 0xCB;
@@ -104,6 +106,12 @@ constexpr UInt32 TileValueMouseover = 0x0FC6;
 constexpr UInt32 TileValueHeight = 0x0FAF;
 constexpr UInt32 TileValueWidth = 0x0FB0;
 constexpr UInt32 InterfaceManagerAddress = 0x011D8A80;
+constexpr UInt32 InterfaceManagerOpenPipBoyAddress = 0x0070F4E0;
+constexpr UInt32 InterfaceManagerClosePipBoyAddress = 0x0070F690;
+constexpr UInt32 InterfaceManagerPipBoyModeOffset = 0x4BC;
+constexpr UInt32 InventoryMenuType = 1002;
+constexpr UInt32 InventorySelectionAddress = 0x011D9EA8;
+constexpr UInt32 ActorEquipItemAddress = 0x0088C650;
 // xNVSE GameUI.h identifies these as InterfaceManager::activeTile and
 // InterfaceManager::activeMenu.  The exact official-pack path below sets them
 // only for the single verified native MessageMenu response; it never routes
@@ -461,12 +469,16 @@ struct RetailRigNodes
     RetailArmNodes left {};
     RetailArmNodes right {};
     void* weapon {};
+    // Fallout keeps the hand's "Weapon" attachment node stable while
+    // replacing this model root after an inventory equip.
+    void* weaponModel {};
     void* upperBodyMesh {};
     void* armsGeometry0 {};
     void* armsGeometry1 {};
     void* leftHandMesh {};
     void* rightHandMesh {};
     void* pipBoy {};
+    void* pipBoyScreen {};
     void* projectileNode {};
     void* muzzleFlash {};
 };
@@ -492,6 +504,13 @@ struct RetailWeaponCalibration
     Matrix33 controllerToWeaponRotation {};
     Vec3 controllerToWeaponPosition {};
     Vec3 controllerToWeaponBodyLocal {};
+};
+
+struct RetailPipBoyCalibration
+{
+    Matrix33 controllerToRootRotation {};
+    Vec3 rootToScreenLocal {};
+    bool valid {};
 };
 
 struct RetailRigContinuityPose
@@ -646,6 +665,8 @@ void* g_directMenuSelectionMenu = nullptr;
 void* g_directMenuSelectionTile = nullptr;
 UInt32 g_directMenuSelectionIndex = 0;
 UInt32 g_directMenuSelectionLogCount = 0;
+void* g_directMenuLastAcceptTile = nullptr;
+UInt64 g_directMenuLastAcceptMs = 0;
 void* g_directMenuPointerHoverMenu = nullptr;
 void* g_directMenuPointerHoverTile = nullptr;
 UInt32 g_directMenuPointerHoverLogCount = 0;
@@ -701,7 +722,28 @@ RetailRigNodes g_retailRigNodes {};
 RetailHandCalibration g_retailLeftCalibration {};
 RetailHandCalibration g_retailRightCalibration {};
 RetailWeaponCalibration g_retailWeaponCalibration {};
+RetailPipBoyCalibration g_retailPipBoyCalibration {};
 RetailRigContinuityPose g_retailRigContinuityPose {};
+void* g_livePipBoyScaleNode = nullptr;
+float g_livePipBoyBaseScale = 1.0f;
+float g_livePipBoyAppliedScale = 1.0f;
+bool g_weaponOrbitWasActive = false;
+int g_weaponOrbitSelectedSlot = -1;
+Vec3 g_latestTrackedLeftHandWorld {};
+Vec3 g_latestTrackedPipBoyScreenWorld {};
+bool g_latestTrackedLeftHandValid = false;
+bool g_latestTrackedPipBoyScreenValid = false;
+LONG g_latestCompleteTrackedPropsPoseSequence = 0;
+UInt64 g_latestCompleteTrackedPropsPoseFrame = 0;
+bool g_latestCompleteTrackedPropsApplied = false;
+void* g_retailEquippedWeaponForm = nullptr;
+UInt32 g_retailEquippedWeaponFormId = 0;
+UInt32 g_retailWeaponModelFormId = 0;
+bool g_retailWeaponRefreshRequested = true;
+// Inventory/Pip-Boy transitions can rebuild the first-person biped in place:
+// the root address may survive while its child transforms and model bindings
+// do not. Force one complete discovery/calibration pass when gameplay resumes.
+bool g_retailRigRediscoveryRequested = true;
 bool g_haveRetailRigOrigin = false;
 Quat g_retailRigOriginHmdRot { 0.0f, 0.0f, 0.0f, 1.0f };
 Vec3 g_retailRigOriginHmdPos {};
@@ -3248,6 +3290,66 @@ bool isPipboyVisible()
         || menuVisibleWithTile(kMenuTypeMap);
 }
 
+bool openEnginePipBoyInventory(const char* source, UInt64 frame)
+{
+    __try
+    {
+        void* manager = *pointerFromAddress32<void**>(InterfaceManagerAddress);
+        if (!manager)
+            return false;
+        const UInt32 mode = readUInt32(
+            reinterpret_cast<std::uintptr_t>(manager)
+            + InterfaceManagerPipBoyModeOffset);
+        if (mode != 0u)
+            return isPipboyVisible();
+        using OpenPipBoyFn = void (__thiscall*)(void*, void (__cdecl*)(), UInt32);
+        pointerFromAddress32<OpenPipBoyFn>(InterfaceManagerOpenPipBoyAddress)(
+            manager,
+            nullptr,
+            InventoryMenuType);
+        logTelemetry(
+            "enginePipBoy open frame=%llu source=%s menuType=%lu manager=%p modeBefore=%lu\n",
+            static_cast<unsigned long long>(frame),
+            source ? source : "unknown",
+            static_cast<unsigned long>(InventoryMenuType),
+            manager,
+            static_cast<unsigned long>(mode));
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        logTelemetry("enginePipBoy open exception frame=%llu source=%s\n",
+            static_cast<unsigned long long>(frame), source ? source : "unknown");
+        return false;
+    }
+}
+
+bool closeEnginePipBoy(const char* source, UInt64 frame)
+{
+    __try
+    {
+        void* manager = *pointerFromAddress32<void**>(InterfaceManagerAddress);
+        if (!manager || !isPipboyVisible())
+            return false;
+        using ClosePipBoyFn = void (__thiscall*)(void*, void (__cdecl*)());
+        pointerFromAddress32<ClosePipBoyFn>(InterfaceManagerClosePipBoyAddress)(
+            manager,
+            nullptr);
+        logTelemetry(
+            "enginePipBoy close frame=%llu source=%s manager=%p\n",
+            static_cast<unsigned long long>(frame),
+            source ? source : "unknown",
+            manager);
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        logTelemetry("enginePipBoy close exception frame=%llu source=%s\n",
+            static_cast<unsigned long long>(frame), source ? source : "unknown");
+        return false;
+    }
+}
+
 UInt32 visibleGenericBlockingMenuType()
 {
     for (UInt32 menuType = kMenuTypeMin; menuType <= kMenuTypeMax; ++menuType)
@@ -3579,6 +3681,7 @@ bool assignUiFavoriteSlot(const char* source, UInt64 frame, bool utilitySlot);
 void tickUiFavoriteAssignment(UInt64 frame, UInt32 menuBits);
 void releaseUiFavoriteAssignment(const char* source, UInt64 frame);
 bool externalDInputSharedReady();
+UInt32 externalDInputFrame();
 
 bool cameraAllowedForMenuBits(UInt32 menuBits)
 {
@@ -3596,6 +3699,12 @@ bool cameraAllowedForMenuBits(UInt32 menuBits)
 bool directUiClickEnabled()
 {
     return envEnabled("FNVXR_DIRECT_UI_CLICK", true);
+}
+
+bool physicalLeftMenuPipBoyEnabled()
+{
+    return physicalHeadsetPlayRequested()
+        && envEnabled("FNVXR_PHYSICAL_LEFT_MENU_PIPBOY_ENABLE", true);
 }
 
 bool pointerTileFallbackEnabled()
@@ -4306,6 +4415,12 @@ void updateSharedPlayer(UInt64 frame, RuntimePhase phase)
         g_playerState->reserved[
             fnvxr::shared::PlayerSharedFirstPersonArmsNodeReservedIndex] =
                 sharedPointerAddress(firstPersonArmsRoot);
+    }
+    if (looksLikeNiObject(g_retailRigNodes.upperBodyMesh))
+    {
+        g_playerState->reserved[
+            fnvxr::shared::PlayerSharedFirstPersonUpperBodyNodeReservedIndex] =
+                sharedPointerAddress(g_retailRigNodes.upperBodyMesh);
     }
     const struct PublishedFirstPersonNode
     {
@@ -5613,6 +5728,39 @@ bool niObjectAncestorChainVisible(void* object, void* root)
     return false;
 }
 
+void makeRetailVrSurfaceVisible(void* node, int depth, UInt32& visits)
+{
+    if (!node || depth > 64 || ++visits > 4096 || niObjectKind(node) == 0)
+        return;
+    const auto base = reinterpret_cast<std::uintptr_t>(node);
+    __try
+    {
+        auto* flags = reinterpret_cast<UInt32*>(base + NiAvObjectFlagsOffset);
+        *flags &= ~1u;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return;
+    }
+    void** children = nullptr;
+    UInt16 count = 0;
+    if (!readNiNodeChildren(node, &children, count))
+        return;
+    for (UInt16 index = 0; index < count; ++index)
+    {
+        void* child = nullptr;
+        __try { child = children[index]; }
+        __except (EXCEPTION_EXECUTE_HANDLER) { child = nullptr; }
+        makeRetailVrSurfaceVisible(child, depth + 1, visits);
+    }
+}
+
+void makeRetailVrSurfaceVisible(void* node)
+{
+    UInt32 visits = 0;
+    makeRetailVrSurfaceVisible(node, 0, visits);
+}
+
 UInt32 countVisibleNiLeaves(void* node, void* root, int depth, UInt32& visits)
 {
     if (!node || !root || depth > 64 || ++visits > 4096
@@ -6261,23 +6409,44 @@ bool discoverRetailRigNodes(void* root)
     UInt32 projectileMatches = 0;
     UInt32 muzzleMatches = 0;
     discovered.weapon = findUniqueNiNode(root, "Weapon", &weaponMatches);
+    discovered.weaponModel = discovered.weapon
+        ? findUniqueNiObjectByPrefix(discovered.weapon, "Weapon ")
+        : nullptr;
     discovered.upperBodyMesh = findUniqueNiObjectByPrefix(root, "UpperBody ");
     discovered.armsGeometry0 = findUniqueNiNode(root, "Arms:0");
     discovered.armsGeometry1 = findUniqueNiNode(root, "Arms:1");
     discovered.leftHandMesh = findUniqueNiObjectByPrefix(root, "LeftHand ");
     discovered.rightHandMesh = findUniqueNiObjectByPrefix(root, "RightHand ");
     discovered.pipBoy = findUniqueNiObjectByPrefix(root, "PipBoy ");
+    discovered.pipBoyScreen = discovered.pipBoy
+        ? findUniqueNiNode(discovered.pipBoy, "ScreenLit")
+        : nullptr;
     discovered.projectileNode = findUniqueNiNode(root, "ProjectileNode", &projectileMatches);
     discovered.muzzleFlash = findUniqueNiNode(root, "MuzzleFlash", &muzzleMatches);
     g_retailRigNodes = discovered;
     g_retailLeftCalibration = {};
     g_retailRightCalibration = {};
     g_retailWeaponCalibration = {};
+    g_retailPipBoyCalibration = {};
+    g_livePipBoyScaleNode = nullptr;
+    g_livePipBoyBaseScale = 1.0f;
+    g_livePipBoyAppliedScale = 1.0f;
+    g_latestTrackedLeftHandValid = false;
+    g_latestTrackedPipBoyScreenValid = false;
+    g_latestCompleteTrackedPropsPoseSequence = 0;
+    g_latestCompleteTrackedPropsPoseFrame = 0;
+    g_latestCompleteTrackedPropsApplied = false;
     g_retailRigContinuityPose = {};
+    g_retailEquippedWeaponForm = nullptr;
+    g_retailEquippedWeaponFormId = 0;
+    g_retailWeaponModelFormId = 0;
+    g_retailWeaponRefreshRequested = true;
     ++g_retailRigDiscoveryCount;
+    const bool complete = retailRigNodesComplete(discovered);
+    g_retailRigRediscoveryRequested = !complete;
 
     logTelemetry(
-        "retailRig discovery count=%llu root=%p left=(clav=%p upper=%p fore=%p hand=%p) right=(clav=%p upper=%p fore=%p hand=%p) weapon=%p weaponMatches=%lu upperBodyMesh=%p leftHandMesh=%p rightHandMesh=%p pipBoy=%p projectile=%p projectileMatches=%lu muzzleFlash=%p muzzleMatches=%lu complete=%d ancestry=validated\n",
+        "retailRig discovery count=%llu root=%p left=(clav=%p upper=%p fore=%p hand=%p) right=(clav=%p upper=%p fore=%p hand=%p) weapon=%p weaponModel=%p weaponMatches=%lu upperBodyMesh=%p leftHandMesh=%p rightHandMesh=%p pipBoy=%p pipBoyScreen=%p projectile=%p projectileMatches=%lu muzzleFlash=%p muzzleMatches=%lu complete=%d ancestry=validated\n",
         static_cast<unsigned long long>(g_retailRigDiscoveryCount),
         root,
         discovered.left.clavicle,
@@ -6289,52 +6458,183 @@ bool discoverRetailRigNodes(void* root)
         discovered.right.forearm,
         discovered.right.hand,
         discovered.weapon,
+        discovered.weaponModel,
         static_cast<unsigned long>(weaponMatches),
         discovered.upperBodyMesh,
         discovered.leftHandMesh,
         discovered.rightHandMesh,
         discovered.pipBoy,
+        discovered.pipBoyScreen,
         discovered.projectileNode,
         static_cast<unsigned long>(projectileMatches),
         discovered.muzzleFlash,
         static_cast<unsigned long>(muzzleMatches),
-        retailRigNodesComplete(discovered) ? 1 : 0);
+        complete ? 1 : 0);
 
     if (envEnabled("FNVXR_RETAIL_RIG_DUMP_NODES", true)
-        && (g_retailRigDiscoveryCount == 1 || !retailRigNodesComplete(discovered)))
+        && (g_retailRigDiscoveryCount == 1 || !complete))
     {
         UInt32 visits = 0;
         dumpNiNodesRecursive(root, 0, visits);
         logTelemetry("retailRig node dump complete visits=%lu\n", static_cast<unsigned long>(visits));
     }
-    return retailRigNodesComplete(discovered);
+    return complete;
 }
 
-void refreshRetailWeaponNodes()
+void* currentEquippedWeaponForm()
+{
+    __try
+    {
+        void* player = readPointer(PlayerCharacterAddress);
+        void* process = player
+            ? readPointer(
+                reinterpret_cast<std::uintptr_t>(player)
+                    + MobileObjectBaseProcessOffset)
+            : nullptr;
+        if (!process)
+            return nullptr;
+        void** processVtable = *reinterpret_cast<void***>(process);
+        if (!processVtable || !processVtable[BaseProcessGetWeaponInfoVtableSlot])
+            return nullptr;
+        using GetWeaponInfoFn = void* (__thiscall*)(void*);
+        void* weaponInfo = reinterpret_cast<GetWeaponInfoFn>(
+            processVtable[BaseProcessGetWeaponInfoVtableSlot])(process);
+        // xNVSE Actor::GetEquippedWeapon reads EntryData::type at +0x08.
+        return weaponInfo
+            ? readPointer(reinterpret_cast<std::uintptr_t>(weaponInfo) + 0x08)
+            : nullptr;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return nullptr;
+    }
+}
+
+UInt32 retailWeaponModelFormId(void* model)
+{
+    char name[128] {};
+    if (!copyNiObjectName(model, name, sizeof(name)))
+        return 0u;
+    const char* open = std::strrchr(name, '(');
+    if (!open || !open[1])
+        return 0u;
+    char* end = nullptr;
+    const unsigned long parsed = std::strtoul(open + 1, &end, 16);
+    return end && end != open + 1 && *end == ')'
+        ? static_cast<UInt32>(parsed)
+        : 0u;
+}
+
+bool currentRetailWeaponBindingReady()
+{
+    const bool endpointInCurrentModel = g_retailRigNodes.projectileNode
+        && g_retailRigNodes.weaponModel
+        && niObjectDescendsFrom(
+            g_retailRigNodes.projectileNode,
+            g_retailRigNodes.weaponModel);
+    return fnvxr::weapon_frame::weaponBindingReady(
+        g_retailRigNodes.weapon != nullptr,
+        g_retailRigNodes.weaponModel != nullptr,
+        endpointInCurrentModel,
+        g_retailEquippedWeaponFormId,
+        g_retailWeaponModelFormId);
+}
+
+bool refreshRetailWeaponNodes()
 {
     if (!g_retailRigNodes.root)
-        return;
-    void* previousWeapon = g_retailRigNodes.weapon;
-    g_retailRigNodes.weapon = findUniqueNiNode(g_retailRigNodes.root, "Weapon");
-    if (g_retailRigNodes.weapon != previousWeapon)
-    {
-        g_retailWeaponCalibration = {};
-        g_retailRigContinuityPose = {};
-        logTelemetry(
-            "retailWeapon node changed previous=%p current=%p calibrationReset=1\n",
-            previousWeapon,
-            g_retailRigNodes.weapon);
-    }
+        return false;
+
+    void* const previousWeapon = g_retailRigNodes.weapon;
+    void* const previousModel = g_retailRigNodes.weaponModel;
+    void* const previousEndpoint = g_retailRigNodes.projectileNode;
+    const UInt32 previousEquippedFormId = g_retailEquippedWeaponFormId;
+    const bool explicitRefresh = g_retailWeaponRefreshRequested;
+
+    void* const weapon = findUniqueNiNode(g_retailRigNodes.root, "Weapon");
+    void* const model = weapon
+        ? findUniqueNiObjectByPrefix(weapon, "Weapon ")
+        : nullptr;
+    void* const equippedForm = currentEquippedWeaponForm();
+    const UInt32 equippedFormId = equippedForm
+        ? readUInt32(
+            reinterpret_cast<std::uintptr_t>(equippedForm)
+                + TESFormRefIdOffset)
+        : 0u;
+    const UInt32 modelFormId = retailWeaponModelFormId(model);
+
     void* player = readPointer(PlayerCharacterAddress);
     void* process = player
-        ? readPointer(reinterpret_cast<std::uintptr_t>(player) + MobileObjectBaseProcessOffset)
+        ? readPointer(
+            reinterpret_cast<std::uintptr_t>(player)
+                + MobileObjectBaseProcessOffset)
         : nullptr;
-    g_retailRigNodes.projectileNode = process
-        ? readPointer(reinterpret_cast<std::uintptr_t>(process) + MiddleHighProcessProjectileNodeOffset)
+    void* endpoint = process
+        ? readPointer(
+            reinterpret_cast<std::uintptr_t>(process)
+                + MiddleHighProcessProjectileNodeOffset)
         : nullptr;
-    if (!g_retailRigNodes.projectileNode)
-        g_retailRigNodes.projectileNode = findUniqueNiNode(g_retailRigNodes.root, "ProjectileNode");
-    g_retailRigNodes.muzzleFlash = findUniqueNiNode(g_retailRigNodes.root, "MuzzleFlash");
+    if (!endpoint || !model || !niObjectDescendsFrom(endpoint, model))
+        endpoint = model ? findUniqueNiNode(model, "ProjectileNode") : nullptr;
+    void* const muzzleFlash = model
+        ? findUniqueNiNode(model, "MuzzleFlash")
+        : nullptr;
+
+    const bool bindingChanged =
+        fnvxr::weapon_frame::weaponBindingMustBeRecalibrated(
+            explicitRefresh,
+            previousEquippedFormId,
+            equippedFormId,
+            reinterpret_cast<std::uintptr_t>(previousWeapon),
+            reinterpret_cast<std::uintptr_t>(weapon),
+            reinterpret_cast<std::uintptr_t>(previousModel),
+            reinterpret_cast<std::uintptr_t>(model),
+            reinterpret_cast<std::uintptr_t>(previousEndpoint),
+            reinterpret_cast<std::uintptr_t>(endpoint));
+
+    g_retailRigNodes.weapon = weapon;
+    g_retailRigNodes.weaponModel = model;
+    g_retailRigNodes.projectileNode = endpoint;
+    g_retailRigNodes.muzzleFlash = muzzleFlash;
+    g_retailEquippedWeaponForm = equippedForm;
+    g_retailEquippedWeaponFormId = equippedFormId;
+    g_retailWeaponModelFormId = modelFormId;
+    if (equippedFormId != 0u)
+        g_lastKnownWeaponFormId = equippedFormId;
+
+    if (bindingChanged)
+    {
+        // The replacement view-model can alter the stock right-hand terminal
+        // even when the stable Weapon wrapper survives. Rebind the hand and
+        // weapon from the same current controller sample.
+        g_retailRightCalibration = {};
+        g_retailWeaponCalibration = {};
+        g_retailRigContinuityPose = {};
+        // A model swap can complete without a new OpenXR sample. Permit that
+        // exact pose to bind and render the replacement weapon immediately.
+        g_lastRetailRigPoseSequence = 0;
+    }
+
+    const bool ready = currentRetailWeaponBindingReady();
+    g_retailWeaponRefreshRequested = !ready;
+    if (bindingChanged || !ready)
+    {
+        logTelemetry(
+            "retailWeapon binding refresh explicit=%d ready=%d previousForm=0x%08lx currentForm=0x%08lx modelForm=0x%08lx previousWeapon=%p weapon=%p previousModel=%p model=%p previousEndpoint=%p endpoint=%p calibrationReset=%d\n",
+            explicitRefresh ? 1 : 0,
+            ready ? 1 : 0,
+            static_cast<unsigned long>(previousEquippedFormId),
+            static_cast<unsigned long>(equippedFormId),
+            static_cast<unsigned long>(modelFormId),
+            previousWeapon,
+            weapon,
+            previousModel,
+            model,
+            previousEndpoint,
+            endpoint,
+            bindingChanged ? 1 : 0);
+    }
+    return ready;
 }
 
 void forwardKinematics(void* node, int depth, UInt32& visits)
@@ -6397,6 +6697,178 @@ void forwardKinematics(void* node)
 {
     UInt32 visits = 0;
     forwardKinematics(node, 0, visits);
+}
+
+bool livePipBoyInteractionAuthorized()
+{
+    return physicalHeadsetPlayRequested()
+        || (stereoVisualTrialProfileSelected()
+            && envEnabled("OPENXR_SIMULATOR_HEADLESS", false)
+            && envEnabled("FNVXR_HEADSET_DEMO_FIXTURE", false));
+}
+
+void updateLivePipBoyInteraction(
+    const fnvxr::PoseFrame& pose,
+    UInt32 menuBits,
+    bool rightTriggerPressed)
+{
+    if (!livePipBoyInteractionAuthorized())
+        return;
+
+    const std::uint8_t flags = pose.poseReserved[
+        fnvxr::PoseReservedInteractionFlags];
+    const bool focused =
+        (flags & fnvxr::PoseInteractionLivePipBoyFocused) != 0u;
+    const bool openRequested =
+        (flags & fnvxr::PoseInteractionLivePipBoyOpenRequest) != 0u;
+    void* const pipBoy = g_retailRigNodes.pipBoy;
+    if (pipBoy && niObjectKind(pipBoy) != 0)
+    {
+        const auto base = reinterpret_cast<std::uintptr_t>(pipBoy);
+        if (g_livePipBoyScaleNode != pipBoy)
+        {
+            g_livePipBoyScaleNode = pipBoy;
+            g_livePipBoyBaseScale = readFloat(
+                base + NiAvObjectLocalScaleOffset,
+                1.0f);
+            if (!std::isfinite(g_livePipBoyBaseScale)
+                || std::fabs(g_livePipBoyBaseScale) < 0.0001f)
+            {
+                g_livePipBoyBaseScale = 1.0f;
+            }
+            g_livePipBoyAppliedScale = g_livePipBoyBaseScale;
+        }
+        const float focusAmount = static_cast<float>(pose.poseReserved[
+            fnvxr::PoseReservedPipBoyScale]) / 510.0f;
+        const float target = g_livePipBoyBaseScale
+            * (1.0f + std::clamp(focusAmount, 0.0f, 0.5f));
+        g_livePipBoyAppliedScale +=
+            (target - g_livePipBoyAppliedScale) * 0.25f;
+        if (writeFloat(
+                base + NiAvObjectLocalScaleOffset,
+                g_livePipBoyAppliedScale))
+        {
+            forwardKinematics(pipBoy);
+        }
+    }
+
+    if (openRequested && !pipBoyVisibleFromMenuBits(menuBits))
+    {
+        static UInt64 lastOpenFrame = 0u;
+        if (lastOpenFrame == 0u || pose.frame >= lastOpenFrame + 30u)
+        {
+            lastOpenFrame = pose.frame;
+            static_cast<void>(openEnginePipBoyInventory(
+                "live-pipboy-focus",
+                pose.frame));
+        }
+    }
+
+    if (focused && pipBoyVisibleFromMenuBits(menuBits)
+        && pose.menuPointerActive && rightTriggerPressed)
+    {
+        const float u = static_cast<float>(pose.poseReserved[
+            fnvxr::PoseReservedPipBoyDeviceU]) / 255.0f;
+        const float v = static_cast<float>(pose.poseReserved[
+            fnvxr::PoseReservedPipBoyDeviceV]) / 255.0f;
+        using Control = fnvxr::engine::live_pipboy::PhysicalControl;
+        const Control control =
+            fnvxr::engine::live_pipboy::physicalControl(u, v);
+        bool handled = false;
+        switch (control)
+        {
+            case Control::StatsDial:
+                handled = tapDirectInputKey(DIK_F1);
+                break;
+            case Control::ItemsDial:
+                handled = tapDirectInputKey(DIK_F2);
+                break;
+            case Control::DataDial:
+                handled = tapDirectInputKey(DIK_F3);
+                break;
+            case Control::ScrollUp:
+                handled = publishMouseWheelInput(
+                    120,
+                    pose.frame,
+                    "live-pipboy-scroll-up");
+                break;
+            case Control::ScrollDown:
+                handled = publishMouseWheelInput(
+                    -120,
+                    pose.frame,
+                    "live-pipboy-scroll-down");
+                break;
+            case Control::Screen:
+                // The ordinary pointer/click path owns the live screen.
+                break;
+        }
+        if (control != Control::Screen)
+        {
+            logTelemetry(
+                "livePipBoy physical control frame=%llu control=%u uv=(%.4f,%.4f) handled=%d\n",
+                static_cast<unsigned long long>(pose.frame),
+                static_cast<unsigned>(control),
+                u,
+                v,
+                handled ? 1 : 0);
+        }
+    }
+
+    const bool orbitActive =
+        (flags & fnvxr::PoseInteractionWeaponOrbitActive) != 0u;
+    const std::uint8_t encodedSlot = pose.poseReserved[
+        fnvxr::PoseReservedWeaponOrbitSlot];
+    if (orbitActive && encodedSlot >= 1u && encodedSlot <= 8u)
+        g_weaponOrbitSelectedSlot = static_cast<int>(encodedSlot - 1u);
+    if (!orbitActive && g_weaponOrbitWasActive
+        && g_weaponOrbitSelectedSlot >= 0
+        && runtimePhaseFromMenuBits(menuBits) == RuntimePhase::Gameplay)
+    {
+        constexpr UInt32 FavoriteKeys[8] {
+            DIK_1, DIK_2, DIK_3, DIK_4,
+            DIK_5, DIK_6, DIK_7, DIK_8,
+        };
+        const int selected = g_weaponOrbitSelectedSlot;
+        const bool selectedOk = tapDirectInputKey(FavoriteKeys[selected]);
+        logTelemetry(
+            "weaponOrbit select frame=%llu slot=%d key=0x%02lx handled=%d\n",
+            static_cast<unsigned long long>(pose.frame),
+            selected + 1,
+            static_cast<unsigned long>(FavoriteKeys[selected]),
+            selectedOk ? 1 : 0);
+        g_weaponOrbitSelectedSlot = -1;
+    }
+    g_weaponOrbitWasActive = orbitActive;
+}
+
+void updateLivePipBoyInteraction(
+    const SharedXInputState& state,
+    UInt32 menuBits,
+    bool rightTriggerPressed)
+{
+    fnvxr::PoseFrame pose {};
+    pose.frame = externalDInputSharedReady()
+        ? externalDInputFrame()
+        : state.packet;
+    pose.poseReserved[fnvxr::PoseReservedInteractionFlags] =
+        state.reserved[fnvxr::shared::XInputReservedInteractionFlags];
+    pose.poseReserved[fnvxr::PoseReservedPipBoyScale] =
+        state.reserved[fnvxr::shared::XInputReservedPipBoyScale];
+    pose.poseReserved[fnvxr::PoseReservedWeaponOrbitSlot] =
+        state.reserved[fnvxr::shared::XInputReservedWeaponOrbitSlot];
+    pose.poseReserved[fnvxr::PoseReservedPipBoyDeviceU] =
+        state.reserved[fnvxr::shared::XInputReservedPipBoyDeviceU];
+    pose.poseReserved[fnvxr::PoseReservedPipBoyDeviceV] =
+        state.reserved[fnvxr::shared::XInputReservedPipBoyDeviceV];
+    pose.menuPointerActive =
+        (pose.poseReserved[fnvxr::PoseReservedInteractionFlags]
+            & fnvxr::PoseInteractionLivePipBoyHovered) != 0u
+        ? 1u
+        : 0u;
+    updateLivePipBoyInteraction(
+        pose,
+        menuBits,
+        rightTriggerPressed);
 }
 
 bool alignBoneToDirection(void* bone, void* child, Vec3 desiredDirection)
@@ -6608,6 +7080,88 @@ bool applyRetailArmFabrik(
     if (!calibration.valid)
         return false;
 
+    const Vec3 target = calibration.usesStageLocalBodyPositionAnchor
+        ? addVec3(
+            controller.wristPosition,
+            transformVec3(
+                bodyWorldRotation,
+                calibration.controllerToWristBodyLocal))
+        : addVec3(
+            controller.wristPosition,
+            transformVec3(
+                controller.wristRotation,
+                calibration.controllerToWristLocal));
+    const bool controllerOwnedHand =
+        physicalHeadsetEngineCenterRigRequested()
+            || (headsetControllerRigVisualTrialRequested()
+                && headlessStereoRigVisualTrialLeaseCurrent());
+
+    if (controllerOwnedHand)
+    {
+        // A tracked VR wrist owns a six-degree-of-freedom terminal transform,
+        // not a point constrained to Fallout's short two-bone arm sphere. The
+        // stock upper arms may keep animating for visual continuity; cancel
+        // each parent transform here and put both hands exactly at their
+        // current grip poses. The Pip-Boy has its own tracked-left-wrist
+        // attachment below, matching the OpenMW lab's direct surface model.
+        if (!applyWrites)
+            return true;
+        void* handParent = readPointer(
+            reinterpret_cast<std::uintptr_t>(arm.hand)
+                + NiAvObjectParentOffset);
+        if (!handParent)
+            return false;
+        const auto parentBase = reinterpret_cast<std::uintptr_t>(handParent);
+        const Matrix33 parentWorldRotation = readMatrix33(
+            parentBase + NiAvObjectWorldRotationOffset);
+        const Vec3 parentWorldPosition = readVec3(
+            parentBase + NiAvObjectWorldTranslationOffset);
+        const float parentWorldScale = readFloat(
+            parentBase + NiAvObjectWorldScaleOffset,
+            0.0f);
+        const Matrix33 desiredHandWorldRotation = multiplyMatrix33(
+            controller.wristRotation,
+            calibration.controllerToHandRotation);
+        const Matrix33 desiredHandLocalRotation = multiplyMatrix33(
+            transposeMatrix33(parentWorldRotation),
+            desiredHandWorldRotation);
+        Vec3 desiredHandLocalPosition = transformVec3(
+            transposeMatrix33(parentWorldRotation),
+            subtractVec3(target, parentWorldPosition));
+        if (!finiteMatrix33(parentWorldRotation)
+            || !finiteVec3(parentWorldPosition)
+            || !std::isfinite(parentWorldScale)
+            || std::fabs(parentWorldScale) < 0.0001f
+            || !finiteMatrix33(desiredHandLocalRotation))
+        {
+            return false;
+        }
+        desiredHandLocalPosition = scaleVec3(
+            desiredHandLocalPosition,
+            1.0f / parentWorldScale);
+        if (!finiteVec3(desiredHandLocalPosition)
+            || !writeVec3(
+                reinterpret_cast<std::uintptr_t>(arm.hand)
+                    + NiAvObjectLocalTranslationOffset,
+                desiredHandLocalPosition)
+            || !writeMatrix33(
+                reinterpret_cast<std::uintptr_t>(arm.hand)
+                    + NiAvObjectLocalRotationOffset,
+                desiredHandLocalRotation))
+        {
+            return false;
+        }
+        forwardKinematics(arm.hand);
+        const Vec3 appliedWrist = readVec3(
+            reinterpret_cast<std::uintptr_t>(arm.hand)
+                + NiAvObjectWorldTranslationOffset);
+        finalError = lengthVec3(subtractVec3(appliedWrist, target));
+        const float maximumFinalError = getFloatFromEnv(
+            "FNVXR_RETAIL_RIG_MAX_FINAL_ERROR_UNITS",
+            0.25f);
+        return std::isfinite(finalError) && finalError <= maximumFinalError;
+    }
+
     const Vec3 shoulder = readVec3(
         reinterpret_cast<std::uintptr_t>(arm.upperArm) + NiAvObjectWorldTranslationOffset);
     const Vec3 elbow = readVec3(
@@ -6625,17 +7179,6 @@ bool applyRetailArmFabrik(
         return false;
     }
 
-    const Vec3 target = calibration.usesStageLocalBodyPositionAnchor
-        ? addVec3(
-            controller.wristPosition,
-            transformVec3(
-                bodyWorldRotation,
-                calibration.controllerToWristBodyLocal))
-        : addVec3(
-            controller.wristPosition,
-            transformVec3(
-                controller.wristRotation,
-                calibration.controllerToWristLocal));
     const float poleOut = getFloatFromEnv("FNVXR_RETAIL_RIG_ELBOW_POLE_OUT", 20.0f) * (left ? -1.0f : 1.0f);
     const Vec3 poleLocal {
         poleOut,
@@ -6647,14 +7190,10 @@ bool applyRetailArmFabrik(
     const float maximumReach = lengths[0] + lengths[1];
     const float minimumReach = std::fabs(lengths[0] - lengths[1]);
     const float reachTolerance = getFloatFromEnv("FNVXR_RETAIL_RIG_REACH_TOLERANCE", 0.10f);
-    const bool controllerOwnedRightHand = !left
-        && (physicalHeadsetEngineCenterRigRequested()
-            || (headsetControllerRigVisualTrialRequested()
-                && headlessStereoRigVisualTrialLeaseCurrent()));
     const bool targetOutsideArmReach =
         shoulderTargetDistance > maximumReach + reachTolerance
         || shoulderTargetDistance < minimumReach - reachTolerance;
-    if (targetOutsideArmReach && !controllerOwnedRightHand)
+    if (targetOutsideArmReach && !controllerOwnedHand)
     {
         return false;
     }
@@ -6699,12 +7238,12 @@ bool applyRetailArmFabrik(
     const bool solverResultUsable =
         result.solved && std::isfinite(result.error)
         && result.error <= maximumFinalError;
-    if (!solverResultUsable && !controllerOwnedRightHand)
+    if (!solverResultUsable && !controllerOwnedHand)
         return false;
 
     finalError = solverResultUsable ? result.error : shoulderTargetDistance;
     if (!applyWrites)
-        return solverResultUsable || controllerOwnedRightHand;
+        return solverResultUsable || controllerOwnedHand;
 
     const Vec3 solvedShoulder { joints[0].x, joints[0].y, joints[0].z };
     const Vec3 solvedElbow { joints[1].x, joints[1].y, joints[1].z };
@@ -6719,7 +7258,7 @@ bool applyRetailArmFabrik(
             arm.forearm,
             arm.hand,
             subtractVec3(solvedWrist, solvedElbow));
-    if ((!upperAligned || !forearmAligned) && !controllerOwnedRightHand)
+    if ((!upperAligned || !forearmAligned) && !controllerOwnedHand)
         return false;
 
     void* handParent = readPointer(
@@ -6735,7 +7274,7 @@ bool applyRetailArmFabrik(
         desiredHandWorldRotation);
     if (!finiteMatrix33(desiredHandLocalRotation))
         return false;
-    if (controllerOwnedRightHand && handParent)
+    if (controllerOwnedHand && handParent)
     {
         const auto parentBase = reinterpret_cast<std::uintptr_t>(handParent);
         const Vec3 parentWorldPosition = readVec3(
@@ -6775,6 +7314,160 @@ bool applyRetailArmFabrik(
         reinterpret_cast<std::uintptr_t>(arm.hand) + NiAvObjectWorldTranslationOffset);
     finalError = lengthVec3(subtractVec3(appliedWrist, target));
     return std::isfinite(finalError) && finalError <= maximumFinalError;
+}
+
+bool applyRetailTrackedPipBoy(
+    const RetailControllerWorldPose& controller,
+    bool applyWrites)
+{
+    void* const pipBoy = g_retailRigNodes.pipBoy;
+    void* const screen = g_retailRigNodes.pipBoyScreen;
+    if (!pipBoy || !screen || niObjectKind(pipBoy) != 2
+        || niObjectKind(screen) == 0)
+    {
+        return false;
+    }
+    const auto rootBase = reinterpret_cast<std::uintptr_t>(pipBoy);
+    const auto screenBase = reinterpret_cast<std::uintptr_t>(screen);
+    const Matrix33 rootWorldRotation = readMatrix33(
+        rootBase + NiAvObjectWorldRotationOffset);
+    const Vec3 rootWorldPosition = readVec3(
+        rootBase + NiAvObjectWorldTranslationOffset);
+    const Vec3 screenWorldPosition = readVec3(
+        screenBase + NiAvObjectWorldTranslationOffset);
+    const float rootWorldScale = readFloat(
+        rootBase + NiAvObjectWorldScaleOffset,
+        0.0f);
+    if (!finiteMatrix33(rootWorldRotation)
+        || !finiteVec3(rootWorldPosition)
+        || !finiteVec3(screenWorldPosition)
+        || !finiteMatrix33(controller.wristRotation)
+        || !finiteVec3(controller.wristPosition)
+        || !std::isfinite(rootWorldScale)
+        || std::fabs(rootWorldScale) < 0.0001f)
+    {
+        return false;
+    }
+    if (!g_retailPipBoyCalibration.valid)
+    {
+        g_retailPipBoyCalibration.controllerToRootRotation =
+            multiplyMatrix33(
+                transposeMatrix33(controller.wristRotation),
+                rootWorldRotation);
+        g_retailPipBoyCalibration.rootToScreenLocal = scaleVec3(
+            transformVec3(
+                transposeMatrix33(rootWorldRotation),
+                subtractVec3(screenWorldPosition, rootWorldPosition)),
+            1.0f / rootWorldScale);
+        g_retailPipBoyCalibration.valid = finiteMatrix33(
+                g_retailPipBoyCalibration.controllerToRootRotation)
+            && finiteVec3(g_retailPipBoyCalibration.rootToScreenLocal);
+        logTelemetry(
+            "retailPipBoy calibration valid=%d root=%p screen=%p rootToScreenLocal=(%.4f %.4f %.4f) anchor=tracked-left-wrist\n",
+            g_retailPipBoyCalibration.valid ? 1 : 0,
+            pipBoy,
+            screen,
+            g_retailPipBoyCalibration.rootToScreenLocal.x,
+            g_retailPipBoyCalibration.rootToScreenLocal.y,
+            g_retailPipBoyCalibration.rootToScreenLocal.z);
+    }
+    if (!g_retailPipBoyCalibration.valid)
+        return false;
+
+    const float unitsPerMeter = getFloatFromEnv(
+        "FNVXR_D3D9_GAME_UNITS_PER_METER",
+        70.0f);
+    const float positionScale = getFloatFromEnv(
+        "FNVXR_RETAIL_RIG_POSITION_SCALE",
+        1.0f);
+    const Vec3 deviceScreenOffsetMeters {
+        getFloatFromEnv("FNVXR_PIPBOY_WRIST_UI_OFFSET_X", 0.0f),
+        getFloatFromEnv("FNVXR_PIPBOY_WRIST_UI_OFFSET_Y", 0.075f),
+        getFloatFromEnv("FNVXR_PIPBOY_WRIST_UI_OFFSET_Z", -0.035f),
+    };
+    const Vec3 deviceScreenOffsetGame = scaleVec3(
+        xrDeltaToGamebryoVector(deviceScreenOffsetMeters),
+        unitsPerMeter * positionScale);
+    const Matrix33 desiredRootWorldRotation = multiplyMatrix33(
+        controller.wristRotation,
+        g_retailPipBoyCalibration.controllerToRootRotation);
+    const Vec3 desiredScreenWorldPosition = addVec3(
+        controller.wristPosition,
+        transformVec3(
+            controller.wristRotation,
+            deviceScreenOffsetGame));
+    const Vec3 desiredRootWorldPosition = subtractVec3(
+        desiredScreenWorldPosition,
+        scaleVec3(
+            transformVec3(
+                desiredRootWorldRotation,
+                g_retailPipBoyCalibration.rootToScreenLocal),
+            rootWorldScale));
+    void* const parent = readPointer(rootBase + NiAvObjectParentOffset);
+    if (!parent || !finiteMatrix33(desiredRootWorldRotation)
+        || !finiteVec3(desiredRootWorldPosition))
+    {
+        return false;
+    }
+    const auto parentBase = reinterpret_cast<std::uintptr_t>(parent);
+    const Matrix33 parentWorldRotation = readMatrix33(
+        parentBase + NiAvObjectWorldRotationOffset);
+    const Vec3 parentWorldPosition = readVec3(
+        parentBase + NiAvObjectWorldTranslationOffset);
+    const float parentWorldScale = readFloat(
+        parentBase + NiAvObjectWorldScaleOffset,
+        0.0f);
+    if (!finiteMatrix33(parentWorldRotation)
+        || !finiteVec3(parentWorldPosition)
+        || !std::isfinite(parentWorldScale)
+        || std::fabs(parentWorldScale) < 0.0001f)
+    {
+        return false;
+    }
+    const Matrix33 desiredLocalRotation = multiplyMatrix33(
+        transposeMatrix33(parentWorldRotation),
+        desiredRootWorldRotation);
+    Vec3 desiredLocalPosition = transformVec3(
+        transposeMatrix33(parentWorldRotation),
+        subtractVec3(desiredRootWorldPosition, parentWorldPosition));
+    desiredLocalPosition = scaleVec3(
+        desiredLocalPosition,
+        1.0f / parentWorldScale);
+    if (!finiteMatrix33(desiredLocalRotation)
+        || !finiteVec3(desiredLocalPosition))
+    {
+        return false;
+    }
+    if (applyWrites
+        && (!writeMatrix33(
+                rootBase + NiAvObjectLocalRotationOffset,
+                desiredLocalRotation)
+            || !writeVec3(
+                rootBase + NiAvObjectLocalTranslationOffset,
+                desiredLocalPosition)))
+    {
+        return false;
+    }
+    if (applyWrites)
+    {
+        makeRetailVrSurfaceVisible(pipBoy);
+        forwardKinematics(pipBoy);
+    }
+    const Vec3 appliedScreenWorld = readVec3(
+        screenBase + NiAvObjectWorldTranslationOffset);
+    const bool verified = finiteVec3(appliedScreenWorld)
+        && lengthVec3(subtractVec3(
+               appliedScreenWorld,
+               desiredScreenWorldPosition))
+            <= getFloatFromEnv(
+                "FNVXR_RETAIL_PIPBOY_MAX_WRITE_RESIDUAL_UNITS",
+                0.5f);
+    if (verified)
+    {
+        g_latestTrackedPipBoyScreenWorld = appliedScreenWorld;
+        g_latestTrackedPipBoyScreenValid = true;
+    }
+    return verified;
 }
 
 struct RetailWeaponApplyResult
@@ -6824,8 +7517,16 @@ RetailWeaponApplyResult applyRetailWeaponAim(
             ? g_retailRigNodes.projectileNode
             : g_retailRigNodes.muzzleFlash;
         const bool endpointUsable = endpoint
-            && niObjectDescendsFrom(endpoint, weapon)
+            && g_retailRigNodes.weaponModel
+            && niObjectDescendsFrom(
+                endpoint,
+                g_retailRigNodes.weaponModel)
             && niObjectKind(endpoint) != 0;
+        // During an equip, Fallout replaces the model below the stable Weapon
+        // attachment asynchronously. Never calibrate a replacement gun from
+        // the departing model's muzzle axis.
+        if (bodyAnchoredControllerRig && !endpointUsable)
+            return result;
         const Matrix33 endpointWorldRotation = endpointUsable
             ? readMatrix33(
                 reinterpret_cast<std::uintptr_t>(endpoint)
@@ -7121,8 +7822,13 @@ bool retailRigGameplayAllowed()
         return false;
     }
     const UInt32 menuBits = currentMenuBits();
-    return runtimePhaseFromMenuBits(menuBits) == RuntimePhase::Gameplay
+    const bool gameplay =
+        runtimePhaseFromMenuBits(menuBits) == RuntimePhase::Gameplay
         && (menuBits & fnvxr::shared::RuntimeBlockingMenuBits) == 0;
+    const bool livePipBoy = fnvxr::engine::live_pipboy::hasFocusedScreen(
+            menuBits)
+        && !fnvxr::engine::live_pipboy::hasConflictingMenu(menuBits);
+    return gameplay || livePipBoy;
 }
 
 void resetRetailRigOrigin(const char* reason)
@@ -7432,6 +8138,9 @@ void onRetailPostAnimation(void* animData)
     }
     if (!retailRigGameplayAllowed())
     {
+        // Pip-Boy/inventory work may reconstruct children below the same
+        // first-person root. A pointer comparison cannot detect that rebuild.
+        g_retailRigRediscoveryRequested = true;
         resetRetailRigOrigin("not-gameplay");
         return;
     }
@@ -7510,8 +8219,13 @@ void onRetailPostAnimation(void* animData)
         resetRetailRigOrigin("authoritative-origin-changed");
     }
     // The animation call site runs several times for one OpenXR frame. The
-    // first-person rig has one owner and is solved once per stable pose.
-    if (pose.sequence == g_lastRetailRigPoseSequence)
+    // first-person rig normally has one solve per stable pose. A renderer
+    // restore is deliberately allowed to repeat that exact pose after stock
+    // animation overwrote it and immediately before the binocular traversal.
+    if (fnvxr::weapon_frame::duplicatePoseSolveCanBeSkipped(
+            pose.sequence,
+            g_lastRetailRigPoseSequence,
+            g_renderRigPoseOverrideActive))
         return;
     if ((pose.trackingFlags & fnvxr::shared::VrPoseTrackingHmd) == 0)
     {
@@ -7560,7 +8274,9 @@ void onRetailPostAnimation(void* animData)
     {
         resetRetailRigOrigin("first-person-rig-root-changed");
     }
-    if (root != g_retailRigNodes.root || !retailRigNodesComplete(g_retailRigNodes))
+    if (g_retailRigRediscoveryRequested
+        || root != g_retailRigNodes.root
+        || !retailRigNodesComplete(g_retailRigNodes))
     {
         if (!discoverRetailRigNodes(root))
         {
@@ -7575,13 +8291,20 @@ void onRetailPostAnimation(void* animData)
     const UInt64 weaponRefreshStride = static_cast<UInt64>((std::max)(
         1,
         getIntFromEnv("FNVXR_RETAIL_WEAPON_REFRESH_SOLVES", 15)));
-    if (g_retailRigSolveCount == 0 || (g_retailRigSolveCount % weaponRefreshStride) == 0)
-        refreshRetailWeaponNodes();
-    if (!retailRigNodesComplete(g_retailRigNodes))
+    bool weaponBindingReady = currentRetailWeaponBindingReady();
+    if (g_retailWeaponRefreshRequested
+        || g_retailRigSolveCount == 0
+        || (g_retailRigSolveCount % weaponRefreshStride) == 0)
+    {
+        weaponBindingReady = refreshRetailWeaponNodes();
+    }
+    if (!retailRigNodesComplete(g_retailRigNodes) || !weaponBindingReady)
     {
         logRetailRigGateSkip(
             g_retailRigIncompleteCount,
-            "first-person-rig-incomplete",
+            weaponBindingReady
+                ? "first-person-rig-incomplete"
+                : "equipped-weapon-model-transition",
             pose,
             root);
         return;
@@ -7686,6 +8409,28 @@ void onRetailPostAnimation(void* animData)
         true,
         applyWrites,
         leftError);
+    const bool pipBoyTracked = leftControllerUsable
+        && applyRetailTrackedPipBoy(leftController, applyWrites);
+    if (leftSolved && g_retailRigNodes.left.hand)
+    {
+        g_latestTrackedLeftHandWorld = readVec3(
+            reinterpret_cast<std::uintptr_t>(g_retailRigNodes.left.hand)
+                + NiAvObjectWorldTranslationOffset);
+        g_latestTrackedLeftHandValid = finiteVec3(
+            g_latestTrackedLeftHandWorld);
+    }
+    g_latestCompleteTrackedPropsApplied = leftSolved && pipBoyTracked;
+    g_latestCompleteTrackedPropsPoseSequence =
+        g_latestCompleteTrackedPropsApplied ? pose.sequence : 0;
+    g_latestCompleteTrackedPropsPoseFrame =
+        g_latestCompleteTrackedPropsApplied ? pose.frame : 0u;
+    if (applyWrites)
+    {
+        makeRetailVrSurfaceVisible(g_retailRigNodes.upperBodyMesh);
+        makeRetailVrSurfaceVisible(g_retailRigNodes.leftHandMesh);
+        makeRetailVrSurfaceVisible(g_retailRigNodes.rightHandMesh);
+        makeRetailVrSurfaceVisible(g_retailRigNodes.pipBoy);
+    }
     // Weapon aim is controller-owned and remains valid even when the visual
     // arm chain is momentarily outside its FABRIK reach envelope. Coupling
     // these writes made the stock animation flash through during wide firing
@@ -7888,7 +8633,7 @@ void onRetailPostAnimation(void* animData)
                 "\"originSource\":\"%s\","
                 "\"anchorSource\":\"%s\","
                 "\"cameraInput\":\"hmd-only\",\"rigInput\":\"controller-only\","
-                "\"apply\":%s,\"rightSolved\":%s,\"continuityReplayed\":%s,\"weaponAligned\":%s,"
+                "\"apply\":%s,\"leftSolved\":%s,\"rightSolved\":%s,\"pipBoyTracked\":%s,\"continuityReplayed\":%s,\"weaponAligned\":%s,"
                 "\"weaponWriteRequested\":%s,\"weaponWriteAttempted\":%s,\"weaponWriteApplied\":%s,"
                 "\"headLocalMeters\":[%.6f,%.6f,%.6f],"
                 "\"controllerLocalMeters\":[%.6f,%.6f,%.6f],"
@@ -7931,7 +8676,9 @@ void onRetailPostAnimation(void* animData)
                 retailRigOriginSourceName(),
                 retailRigAnchorSourceName(),
                 applyWrites ? "true" : "false",
+                leftSolved ? "true" : "false",
                 rightSolved ? "true" : "false",
+                pipBoyTracked ? "true" : "false",
                 continuityReplayed ? "true" : "false",
                 weaponAligned ? "true" : "false",
                 weaponResult.writeRequested ? "true" : "false",
@@ -9018,7 +9765,30 @@ bool updateDirectMenuPointerHover()
         return false;
     }
 
-    const auto buttons = visibleMenuButtons(menu, tileMenu);
+    auto buttons = visibleMenuButtons(menu, tileMenu);
+    if (menuType == kMenuTypeInventory)
+    {
+        std::vector<MenuButtonCandidate> inventoryControls;
+        inventoryControls.reserve(buttons.size());
+        for (const auto& item : buttons)
+        {
+            char itemLabel[160] {};
+            const bool haveItemLabel = copyFirstPrintableTileTextReadOnly(
+                item.tile, itemLabel, sizeof(itemLabel));
+            const bool inventoryRow = item.buttonId == 255
+                && item.x >= 80.0f && item.x <= 400.0f
+                && item.y >= 100.0f && item.width >= 100.0f;
+            const bool actionButton = item.buttonId == 128;
+            const bool textureAsset = haveItemLabel
+                && (std::strstr(itemLabel, ".dds") != nullptr
+                    || std::strstr(itemLabel, "interface\\") != nullptr
+                    || std::strstr(itemLabel, "Interface\\") != nullptr);
+            if (haveItemLabel && !textureAsset && (inventoryRow || actionButton))
+                inventoryControls.push_back(item);
+        }
+        if (!inventoryControls.empty())
+            buttons = std::move(inventoryControls);
+    }
     PointerMenuPoint point {};
     const MenuButtonCandidate* hit = buttonUnderPointerInAnySpace(buttons, point);
     if (!hit)
@@ -9124,6 +9894,99 @@ bool directMenuClickExactText(const char* expected)
     return false;
 }
 
+bool equipNativeInventorySelection(const char* source, void* inventoryMenu, void* selectedTile)
+{
+    __try
+    {
+        void* selection = nullptr;
+        if (inventoryMenu && selectedTile)
+        {
+            // InventoryMenu::itemList is a ListBox<ItemChange> at +0xB8.
+            // The ListBox head stores its ListBoxItem pointer at +4 and the
+            // next BSSimpleList node at +8; later nodes store item/next at
+            // +0/+4. Resolve the controller-highlighted retail tile back to
+            // the exact ItemChange owned by the menu.
+            const std::uintptr_t listBox =
+                reinterpret_cast<std::uintptr_t>(inventoryMenu) + 0xB8;
+            void* listBoxItem = readPointer(listBox + 0x04);
+            void* node = readPointer(listBox + 0x08);
+            for (UInt32 guard = 0; guard < 512; ++guard)
+            {
+                if (listBoxItem)
+                {
+                    void* itemTile = readPointer(
+                        reinterpret_cast<std::uintptr_t>(listBoxItem) + 0x00);
+                    bool tileMatches = itemTile == selectedTile;
+                    void* ancestor = selectedTile;
+                    for (UInt32 depth = 0; !tileMatches && ancestor && depth < 16; ++depth)
+                    {
+                        ancestor = readPointer(
+                            reinterpret_cast<std::uintptr_t>(ancestor) + 0x28);
+                        tileMatches = ancestor == itemTile;
+                    }
+                    ancestor = itemTile;
+                    for (UInt32 depth = 0; !tileMatches && ancestor && depth < 16; ++depth)
+                    {
+                        ancestor = readPointer(
+                            reinterpret_cast<std::uintptr_t>(ancestor) + 0x28);
+                        tileMatches = ancestor == selectedTile;
+                    }
+                    if (tileMatches)
+                    {
+                        selection = readPointer(
+                            reinterpret_cast<std::uintptr_t>(listBoxItem) + 0x04);
+                        break;
+                    }
+                }
+                if (!node)
+                    break;
+                listBoxItem = readPointer(reinterpret_cast<std::uintptr_t>(node) + 0x00);
+                node = readPointer(reinterpret_cast<std::uintptr_t>(node) + 0x04);
+            }
+        }
+        // The global selection can lag one pointer frame behind the tile that
+        // received this controller click. Use it only when the exact list row
+        // could not be resolved.
+        if (!selection)
+            selection = readPointer(InventorySelectionAddress);
+        void* player = readPointer(PlayerCharacterAddress);
+        void* object = selection
+            ? readPointer(reinterpret_cast<std::uintptr_t>(selection) + 0x08)
+            : nullptr;
+        if (!selection || !player || !object)
+        {
+            logTelemetry(
+                "engineInventory equip unavailable source=%s selection=%p player=%p object=%p\n",
+                source ? source : "unknown", selection, player, object);
+            return false;
+        }
+
+        using EquipItemFn = void (__thiscall*)(
+            void*, void*, UInt32, void*, UInt32, bool, UInt32);
+        pointerFromAddress32<EquipItemFn>(ActorEquipItemAddress)(
+            player, object, 1, nullptr, 1, false, 1);
+        const UInt32 formId = readUInt32(reinterpret_cast<std::uintptr_t>(object) + 0x0C);
+        const UInt8 formType = readUInt8(
+            reinterpret_cast<std::uintptr_t>(object) + TESFormTypeIdOffset);
+        g_retailRigRediscoveryRequested = true;
+        g_retailWeaponRefreshRequested = true;
+        logTelemetry(
+            "engineInventory equip source=%s selection=%p player=%p object=%p formId=0x%08lx formType=0x%02x fullRigRebind=1 weaponReacquire=1\n",
+            source ? source : "unknown",
+            selection,
+            player,
+            object,
+            static_cast<unsigned long>(formId),
+            static_cast<unsigned int>(formType));
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        logTelemetry("engineInventory equip exception source=%s\n", source ? source : "unknown");
+        return false;
+    }
+}
+
 bool dispatchPointerMenuClick()
 {
     void* tileMenu = nullptr;
@@ -9132,7 +9995,30 @@ bool dispatchPointerMenuClick()
     if (!menu)
         return false;
 
-    const auto buttons = visibleMenuButtons(menu, tileMenu);
+    auto buttons = visibleMenuButtons(menu, tileMenu);
+    if (menuType == kMenuTypeInventory)
+    {
+        std::vector<MenuButtonCandidate> inventoryControls;
+        inventoryControls.reserve(buttons.size());
+        for (const auto& item : buttons)
+        {
+            char itemLabel[160] {};
+            const bool haveItemLabel = copyFirstPrintableTileTextReadOnly(
+                item.tile, itemLabel, sizeof(itemLabel));
+            const bool inventoryRow = item.buttonId == 255
+                && item.x >= 80.0f && item.x <= 400.0f
+                && item.y >= 100.0f && item.width >= 100.0f;
+            const bool actionButton = item.buttonId == 128;
+            const bool textureAsset = haveItemLabel
+                && (std::strstr(itemLabel, ".dds") != nullptr
+                    || std::strstr(itemLabel, "interface\\") != nullptr
+                    || std::strstr(itemLabel, "Interface\\") != nullptr);
+            if (haveItemLabel && !textureAsset && (inventoryRow || actionButton))
+                inventoryControls.push_back(item);
+        }
+        if (!inventoryControls.empty())
+            buttons = std::move(inventoryControls);
+    }
     if (buttons.empty())
     {
         logTelemetry("directMenu pointer no-buttons menu=%p type=0x%lx tileMenu=%p\n", menu, static_cast<unsigned long>(menuType), tileMenu);
@@ -9212,7 +10098,30 @@ bool directMenuNavigate(int delta)
     if (!menu)
         return false;
 
-    const auto buttons = visibleMenuButtons(menu, tileMenu);
+    auto buttons = visibleMenuButtons(menu, tileMenu);
+    if (menuType == kMenuTypeInventory)
+    {
+        std::vector<MenuButtonCandidate> inventoryControls;
+        inventoryControls.reserve(buttons.size());
+        for (const auto& item : buttons)
+        {
+            char itemLabel[160] {};
+            const bool haveItemLabel = copyFirstPrintableTileTextReadOnly(
+                item.tile, itemLabel, sizeof(itemLabel));
+            const bool inventoryRow = item.buttonId == 255
+                && item.x >= 80.0f && item.x <= 400.0f
+                && item.y >= 100.0f && item.width >= 100.0f;
+            const bool actionButton = item.buttonId == 128;
+            const bool textureAsset = haveItemLabel
+                && (std::strstr(itemLabel, ".dds") != nullptr
+                    || std::strstr(itemLabel, "interface\\") != nullptr
+                    || std::strstr(itemLabel, "Interface\\") != nullptr);
+            if (haveItemLabel && !textureAsset && (inventoryRow || actionButton))
+                inventoryControls.push_back(item);
+        }
+        if (!inventoryControls.empty())
+            buttons = std::move(inventoryControls);
+    }
     if (buttons.empty())
     {
         logTelemetry("directMenu nav no-buttons menu=%p type=0x%lx tileMenu=%p\n", menu, static_cast<unsigned long>(menuType), tileMenu);
@@ -9279,6 +10188,16 @@ bool directMenuAcceptSelection()
     void* menu = visibleMenuForInput(&tileMenu, &menuType);
     if (!menu)
         return false;
+    if (g_hasMenuPointer && !updateDirectMenuPointerHover())
+    {
+        logTelemetry(
+            "directMenu accept pointer-miss menu=%p type=0x%lx shared=(%ld,%ld)\n",
+            menu,
+            static_cast<unsigned long>(menuType),
+            g_lastMenuPointerClient.x,
+            g_lastMenuPointerClient.y);
+        return false;
+    }
 
     const auto buttons = visibleMenuButtons(menu, tileMenu);
     if (buttons.empty())
@@ -9303,6 +10222,22 @@ bool directMenuAcceptSelection()
         g_directMenuSelectionTile = candidate->tile;
     }
 
+    const UInt64 acceptNowMs = ::GetTickCount64();
+    if (g_directMenuLastAcceptTile == candidate->tile
+        && acceptNowMs >= g_directMenuLastAcceptMs
+        && (acceptNowMs - g_directMenuLastAcceptMs) < 250)
+    {
+        logTelemetry(
+            "directMenu accept deduplicated menu=%p type=0x%lx tile=%p ageMs=%llu\n",
+            menu,
+            static_cast<unsigned long>(menuType),
+            candidate->tile,
+            static_cast<unsigned long long>(acceptNowMs - g_directMenuLastAcceptMs));
+        return true;
+    }
+    g_directMenuLastAcceptTile = candidate->tile;
+    g_directMenuLastAcceptMs = acceptNowMs;
+
     char label[160] {};
     const bool haveLabel = copyFirstPrintableTileTextReadOnly(
         candidate->tile, label, sizeof(label));
@@ -9313,7 +10248,75 @@ bool directMenuAcceptSelection()
         candidate->tile,
         candidate->buttonId,
         haveLabel ? label : "");
-    return dispatchMenuClick(menu, candidate->tile, candidate->buttonId, "xinput");
+    const bool selected = dispatchMenuClick(menu, candidate->tile, candidate->buttonId, "xinput");
+    if (!selected)
+        return false;
+
+    // A VR controller A press is one complete inventory accept. Resolve the
+    // exact clicked ListBox row and invoke the engine equip once. Previously
+    // we clicked the menu's Equip control and then invoked Actor::EquipItem a
+    // second time, while a stale global selection could point at another row.
+    // That produced the observed holster-without-replacement transition.
+    if (menuType == kMenuTypeInventory && candidate->buttonId == 255)
+    {
+        const bool engineEquipped = equipNativeInventorySelection(
+            "directMenuAcceptSelection", menu, candidate->tile);
+        const bool menuEquipped = !engineEquipped
+            && directMenuClickExactText("Equip");
+        logTelemetry(
+            "directMenu inventory accept label=\"%s\" selected=1 menuEquipped=%u engineEquipped=%u\n",
+            haveLabel ? label : "",
+            menuEquipped ? 1u : 0u,
+            engineEquipped ? 1u : 0u);
+        return engineEquipped || menuEquipped;
+    }
+    return true;
+}
+
+bool directMenuCancel(const char* source)
+{
+    void* tileMenu = nullptr;
+    UInt32 menuType = 0;
+    void* menu = visibleMenuForInput(&tileMenu, &menuType);
+    if (!menu)
+        return false;
+
+    if (menuType == kMenuTypeStart && g_console)
+    {
+        const bool closed = g_console->RunScriptLine2("CloseAllMenus", nullptr, true);
+        logTelemetry(
+            "directMenu cancel source=%s menu=%p type=0x%lx engineCloseAll=%d\n",
+            source ? source : "unknown",
+            menu,
+            static_cast<unsigned long>(menuType),
+            static_cast<int>(closed));
+        return closed;
+    }
+
+    __try
+    {
+        auto** vtable = *reinterpret_cast<void***>(menu);
+        if (!vtable || !vtable[12])
+            return false;
+        using HandleKeyboardInputFn = bool (__thiscall*)(void*, UInt32);
+        reinterpret_cast<HandleKeyboardInputFn>(vtable[12])(menu, DIK_ESCAPE);
+        logTelemetry(
+            "directMenu cancel source=%s menu=%p type=0x%lx key=0x%02lx\n",
+            source ? source : "unknown",
+            menu,
+            static_cast<unsigned long>(menuType),
+            static_cast<unsigned long>(DIK_ESCAPE));
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        logTelemetry(
+            "directMenu cancel exception source=%s menu=%p type=0x%lx\n",
+            source ? source : "unknown",
+            menu,
+            static_cast<unsigned long>(menuType));
+        return false;
+    }
 }
 
 POINT mapSharedPointerToWindow(HWND hwnd, POINT point);
@@ -9349,8 +10352,12 @@ bool dispatchActiveMenuClick()
     if (!allowUiInput())
         return false;
 
-    if (retailSidecarProfile() && g_hasMenuPointer && pointerFallback)
-        return dispatchPointerMenuClick();
+    if (retailSidecarProfile() && g_hasMenuPointer)
+    {
+        return pointerFallback
+            ? dispatchPointerMenuClick()
+            : directMenuAcceptSelection();
+    }
     if (!directUi)
         return false;
 
@@ -11658,9 +12665,9 @@ void syncExternalDInputPointer(
             0,
             MAKELPARAM(static_cast<WORD>(windowPointer.x), static_cast<WORD>(windowPointer.y)));
         updateGameCursorTile(hwnd);
-        if (pointerTileFallbackEnabled())
-            updateDirectMenuPointerHover();
     }
+    if (directUiClickEnabled() || pointerTileFallbackEnabled())
+        updateDirectMenuPointerHover();
 
     if (g_loggedExternalDInputPointers < 48 || (frame % 120) == 0)
     {
@@ -11743,11 +12750,10 @@ UInt32 externalXInputNavMask(const SharedXInputState& state, UInt32 menuBits)
 
 void tapExternalXInputNav(UInt32 navMask, UInt32 menuBits)
 {
-    // Pip-Boy navigation is stateful (major page, category, list selection).
-    // Let Fallout's own keyboard menu handler own those transitions instead
-    // of cycling raw Scaleform descendants that merely happen to carry an id.
-    const bool directUiClick = directUiClickEnabled()
-        && (menuBits & fnvxr::shared::RuntimePipBoyMenuBit) == 0u;
+    // Navigate the live menu tiles directly. This is the durable headless VR
+    // path as well as the normal windowed path; it does not require a desktop
+    // keyboard device or foreground-window acquisition.
+    const bool directUiClick = directUiClickEnabled();
     const bool pipBoyVisible =
         (menuBits & fnvxr::shared::RuntimePipBoyMenuBit) != 0u;
     HWND hwnd = gameWindow();
@@ -12336,7 +13342,11 @@ void consumeExternalXInputGameplayControls(
     const bool thirdPersonChordHeld =
         thirdPersonL3ControlsEnabled()
         && (state.buttons & XInputLeftThumb) != 0;
-    const bool autoRunPressed = (pressed & XInputRightThumb) != 0;
+    const bool weaponOrbitHeld =
+        (state.reserved[fnvxr::shared::XInputReservedInteractionFlags]
+            & fnvxr::PoseInteractionWeaponOrbitActive) != 0u;
+    const bool autoRunPressed = !weaponOrbitHeld
+        && (pressed & XInputRightThumb) != 0;
     const bool combatChordHeld =
         keyboardGameplayFallback
         && leftTriggerHeld
@@ -12363,6 +13373,11 @@ void consumeExternalXInputGameplayControls(
         && (g_lastPipBoyMenuChordMs == 0
             || GetTickCount64() >= g_lastPipBoyMenuChordMs + 750)
         && envEnabled("FNVXR_PIPBOY_MENU_CHORD_ENABLE", true);
+    const bool physicalPipBoyMenuPressed =
+        keyboardGameplayFallback
+        && !leftTriggerHeld
+        && physicalLeftMenuPipBoyEnabled()
+        && (pressed & XInputBack) != 0;
     const UInt16 combatChordPressed = combatChordHeld ? pressed : 0;
     const bool combatChordFaceHeld =
         combatChordHeld
@@ -12376,7 +13391,8 @@ void consumeExternalXInputGameplayControls(
         keyboardGameplayFallback
         && envEnabled("FNVXR_GAMEPLAY_RIGHT_GRIP_GRAB_ENABLE", true)
         && rawRightGripHeld
-        && !leftTriggerHeld;
+        && !leftTriggerHeld
+        && !weaponOrbitHeld;
     const bool thirdPersonZoomStep =
         updateThirdPersonL3Control(thirdPersonChordHeld, state.rightThumbY, frame, "externalXInput:L3");
     if (autoRunPressed)
@@ -12517,11 +13533,14 @@ void consumeExternalXInputGameplayControls(
         if (pipBoyItemsChord)
         {
             g_lastPipBoyMenuChordMs = GetTickCount64();
-            tapDirectInputKey(DIK_F2);
+            const bool opened = openEnginePipBoyInventory(
+                "externalXInput:LG+RightMenu",
+                frame);
             logTelemetry(
-                "pipboyItems fire frame=%llu source=externalXInput:LG+RightMenu key=0x%02lx gameplay=1\n",
+                "pipboyItems fire frame=%llu source=externalXInput:LG+RightMenu key=0x%02lx gameplay=1 engineOpened=%d\n",
                 static_cast<unsigned long long>(frame),
-                static_cast<unsigned long>(DIK_F2));
+                static_cast<unsigned long>(DIK_F2),
+                static_cast<int>(opened));
         }
         else
         {
@@ -12532,6 +13551,16 @@ void consumeExternalXInputGameplayControls(
     if (waitChordPressed)
     {
         tapWaitKey("externalXInput:LT+Back", frame);
+    }
+    else if (physicalPipBoyMenuPressed)
+    {
+        const bool opened = openEnginePipBoyInventory(
+            "externalXInput:LeftMenu",
+            frame);
+        logTelemetry(
+            "pipboyOpen fire frame=%llu source=externalXInput:LeftMenu gameplay=1 engineOpened=%d\n",
+            static_cast<unsigned long long>(frame),
+            static_cast<int>(opened));
     }
     else if (pipBoyMenuChordPressed)
     {
@@ -12868,6 +13897,9 @@ void consumeExternalXInputBridge(
         && (g_lastPipBoyMenuChordMs == 0
             || GetTickCount64() >= g_lastPipBoyMenuChordMs + 750)
         && envEnabled("FNVXR_PIPBOY_MENU_CHORD_ENABLE", true);
+    const bool physicalPipBoyMenuPressed =
+        physicalLeftMenuPipBoyEnabled()
+        && (pressed & XInputBack) != 0;
     const UInt32 navMask = uiInputAllowed ? externalXInputNavMask(state, menuBits) : 0;
     const UInt64 nowMs = GetTickCount64();
     const bool navChanged = navMask != 0 && navMask != g_lastExternalXInputNavMask;
@@ -12954,6 +13986,13 @@ void consumeExternalXInputBridge(
     }
     previousUiFavoriteAssignChordState = uiFavoriteAssignChordState;
 
+    const bool livePipBoyRightTriggerPressed =
+        state.rightTrigger > 180 && !previousRightTriggerHeld;
+    updateLivePipBoyInteraction(
+        state,
+        menuBits,
+        livePipBoyRightTriggerPressed);
+
     if (gameplayInputAllowed && !uiInputAllowed)
     {
         consumeExternalXInputGameplayControls(
@@ -12980,10 +14019,12 @@ void consumeExternalXInputBridge(
     {
         if (pipBoyPointerOnly(menuBits))
         {
+            const bool handled = directUiClickEnabled() && directMenuAcceptSelection();
             logTelemetry(
-                "uiButton ignore source=A action=accept pointerOnly=1 pipBoy=%d menuBits=0x%02lx\n",
+                "uiButton fire source=A action=accept pointerOnly=1 pipBoy=%d menuBits=0x%02lx handled=%d\n",
                 static_cast<int>(pipBoyMenuVisible),
-                static_cast<unsigned long>(menuBits));
+                static_cast<unsigned long>(menuBits),
+                static_cast<int>(handled));
         }
         else
         {
@@ -13006,14 +14047,25 @@ void consumeExternalXInputBridge(
     if (menuKeyboardFallback && uiInputAllowed && (pressed & XInputB) && !(uiFavoriteAssignPressed & XInputB))
     {
         const UInt32 backKey = uiBackKeyForMenu(menuBits);
-        tapDirectInputKey(backKey);
-        if (HWND hwnd = gameWindow())
-            postMenuKey(hwnd, uiBackVirtualKeyForMenu(menuBits));
+        UInt32 topMenuType = 0;
+        visibleMenuForInput(nullptr, &topMenuType);
+        const bool handled = (topMenuType == kMenuTypeStart
+                && directMenuCancel("externalXInput:B:start"))
+            || (pipBoyMenuVisible
+                && closeEnginePipBoy("externalXInput:B", externalDInputFrame()))
+            || directMenuCancel("externalXInput:B:fallback");
+        if (!handled)
+        {
+            tapDirectInputKey(backKey);
+            if (HWND hwnd = gameWindow())
+                postMenuKey(hwnd, uiBackVirtualKeyForMenu(menuBits));
+        }
         logTelemetry(
-            "uiButton fire source=B action=back key=0x%02lx pipBoy=%d menuBits=0x%02lx\n",
+            "uiButton fire source=B action=back key=0x%02lx pipBoy=%d menuBits=0x%02lx handled=%d\n",
             static_cast<unsigned long>(backKey),
             static_cast<int>(pipBoyMenuVisible),
-            static_cast<unsigned long>(menuBits));
+            static_cast<unsigned long>(menuBits),
+            static_cast<int>(handled));
     }
     if (menuKeyboardFallback && uiInputAllowed && (pressed & XInputX) && !(uiFavoriteAssignPressed & XInputX))
     {
@@ -13070,7 +14122,19 @@ void consumeExternalXInputBridge(
                 postMenuKey(hwnd, uiInputAllowed ? VK_RETURN : uiBackVirtualKeyForMenu(menuBits));
         }
     }
-    if (menuKeyboardFallback && uiInputAllowed && pipBoyMenuChordPressed)
+    if (menuKeyboardFallback && uiInputAllowed && physicalPipBoyMenuPressed)
+    {
+        const bool handled = pipBoyMenuVisible
+            && closeEnginePipBoy("externalXInput:LeftMenu", externalDInputFrame());
+        if (!handled)
+            tapDirectInputKey(DIK_ESCAPE);
+        logTelemetry(
+            "pipboyClose fire frame=%llu source=externalXInput:LeftMenu ui=1 pipBoy=%d handled=%d\n",
+            static_cast<unsigned long long>(externalDInputFrame()),
+            static_cast<int>(pipBoyMenuVisible),
+            static_cast<int>(handled));
+    }
+    else if (menuKeyboardFallback && uiInputAllowed && pipBoyMenuChordPressed)
     {
         g_lastPipBoyMenuChordMs = GetTickCount64();
         tapDirectInputKey(DIK_TAB);
@@ -15606,6 +16670,26 @@ void handleNvseMessage(NVSEMessagingInterface::Message* message)
         }
         if (!ensureAuthorizedRuntimeObservationStarted())
             return;
+        // The D3D bridge is intentionally gated on the first published
+        // runtime frame. Acquire the headless controller-rig lease before
+        // publishing that frame so both independent compatibility proofs see
+        // pristine retail code. Publishing first creates a race in which the
+        // D3D bridge can install its audited callsite hook just before this
+        // plugin hashes the same protected function.
+        if (headsetDemoFixtureProfileSelected()
+            && headsetControllerRigVisualTrialRequested()
+            && !g_headlessStereoRigVisualTrialBridgeStarted
+            && !ensureAuthorizedHeadlessStereoRigVisualTrialBridgeStarted())
+        {
+            static bool loggedPrePublicationHeadlessRig = false;
+            if (!loggedPrePublicationHeadlessRig)
+            {
+                loggedPrePublicationHeadlessRig = true;
+                logTelemetry(
+                    "headlessStereoRig pre-publication lease deferred; runtime frame remains unpublished so D3D cannot race the compatibility proof\n");
+            }
+            return;
+        }
         const RuntimeObservation observation = observeAndPublishRuntime();
         if (ttwBaselineProfileSelected())
         {
@@ -15801,6 +16885,10 @@ void injectRisingEdgeInput(
     const bool uiInputAllowed = allowUiInput();
     const UInt32 menuBits = currentMenuBits();
     const bool pipBoyVisible = pipBoyVisibleFromMenuBits(menuBits);
+    updateLivePipBoyInteraction(
+        pose,
+        menuBits,
+        rightTriggerPressed);
     const bool menuKeyboardFallback = pluginMenuKeyboardFallbackEnabled();
     const bool gameplayKeyboardFallback = pluginGameplayKeyboardFallbackEnabled();
     if (uiInputAllowed)
@@ -15973,7 +17061,11 @@ void injectRisingEdgeInput(
     const int thirdPersonRightStickY = static_cast<int>(
         std::lround(std::clamp(pose.rightThumbstickY, -1.0f, 1.0f) * 32767.0f));
     updateThirdPersonL3Control(thirdPersonChordHeld, thirdPersonRightStickY, pose.frame, "pose:L3");
-    if (!uiInputAllowed && (pressed & fnvxr::RightThumbstick))
+    const bool weaponOrbitHeld =
+        (pose.poseReserved[fnvxr::PoseReservedInteractionFlags]
+            & fnvxr::PoseInteractionWeaponOrbitActive) != 0u;
+    if (!uiInputAllowed && !weaponOrbitHeld
+        && (pressed & fnvxr::RightThumbstick))
         toggleGameplayAutoRun("pose:R3", pose.frame);
     const bool poseReloadHeld =
         !uiInputAllowed
@@ -16044,12 +17136,20 @@ void injectRisingEdgeInput(
     if (uiInputAllowed && menuKeyboardFallback && (pressed & fnvxr::ButtonB) && !(uiFavoriteAssignPressed & fnvxr::ButtonB))
     {
         const UInt32 backKey = uiBackKeyForMenu(menuBits);
+        UInt32 topMenuType = 0;
+        visibleMenuForInput(nullptr, &topMenuType);
+        const bool handled = (topMenuType == kMenuTypeStart
+                && directMenuCancel("pose:B:start"))
+            || (pipBoyVisible && closeEnginePipBoy("pose:B", pose.frame))
+            || directMenuCancel("pose:B:fallback");
         logTelemetry(
-            "menuBack fire frame=%llu source=B key=0x%02lx pipBoy=%d\n",
+            "menuBack fire frame=%llu source=B key=0x%02lx pipBoy=%d handled=%d\n",
             static_cast<unsigned long long>(pose.frame),
             static_cast<unsigned long>(backKey),
-            static_cast<int>(pipBoyVisible));
-        tapDirectInputKey(backKey);
+            static_cast<int>(pipBoyVisible),
+            static_cast<int>(handled));
+        if (!handled)
+            tapDirectInputKey(backKey);
     }
     else if (combatChordPressed & fnvxr::ButtonB)
     {
@@ -16242,16 +17342,90 @@ FNVXR_ApplyWeaponFrameForRender(
     pose.rightRot = normalizeQuat(pose.rightRot);
     pose.leftAimRot = normalizeQuat(pose.leftAimRot);
     pose.rightAimRot = normalizeQuat(pose.rightAimRot);
+    // Both the center render and the later first-person seam can arrive with
+    // this exact OpenXR pose. Keep one controller-owned weapon state for that
+    // pose; only solve again when Fallout has actually put the weapon back
+    // into its stock animation before the draw.
+    const auto committedPoseStillOwnsLiveTransforms = [&]() noexcept
+    {
+        SharedWeaponFrameState* state = sharedWeaponFrameState();
+        if (!state || !g_retailRigNodes.right.hand || !g_retailRigNodes.weapon)
+            return false;
+        const LONG before = InterlockedCompareExchange(
+            &state->producerSequence, 0, 0);
+        if (!fnvxr::shared::sequencedValueIsPublished(before))
+            return false;
+        MemoryBarrier();
+        const bool identityMatches =
+            state->status == fnvxr::shared::WeaponFramePoseCommitted
+            && state->poseSequence == static_cast<UInt32>(poseSequence)
+            && state->poseFrame == pose.frame
+            && state->rightHandAddress == static_cast<UInt32>(
+                reinterpret_cast<std::uintptr_t>(g_retailRigNodes.right.hand))
+            && state->weaponAddress == static_cast<UInt32>(
+                reinterpret_cast<std::uintptr_t>(g_retailRigNodes.weapon));
+        const Vec3 hand = readVec3(
+            reinterpret_cast<std::uintptr_t>(g_retailRigNodes.right.hand)
+                + NiAvObjectWorldTranslationOffset);
+        const Vec3 weapon = readVec3(
+            reinterpret_cast<std::uintptr_t>(g_retailRigNodes.weapon)
+                + NiAvObjectWorldTranslationOffset);
+        const Matrix33 weaponRotation = readMatrix33(
+            reinterpret_cast<std::uintptr_t>(g_retailRigNodes.weapon)
+                + NiAvObjectWorldRotationOffset);
+        const float liveHand[3] { hand.x, hand.y, hand.z };
+        const float liveWeapon[3] { weapon.x, weapon.y, weapon.z };
+        const float liveRotation[9] {
+            weaponRotation.m[0][0], weaponRotation.m[0][1], weaponRotation.m[0][2],
+            weaponRotation.m[1][0], weaponRotation.m[1][1], weaponRotation.m[1][2],
+            weaponRotation.m[2][0], weaponRotation.m[2][1], weaponRotation.m[2][2],
+        };
+        MemoryBarrier();
+        const LONG after = InterlockedCompareExchange(
+            &state->producerSequence, 0, 0);
+        return before == after
+            && identityMatches
+            && fnvxr::weapon_frame::committedPoseOwnsLiveRigTransforms(
+                liveHand,
+                state->rightHandWorldPos,
+                liveWeapon,
+                state->weaponWorldPos,
+                liveRotation,
+                state->weaponWorldRot,
+                0.02f,
+                0.02f,
+                0.001f);
+    };
+    // Reapply the complete prop set at this exact render boundary every time.
+    // A right-hand/weapon commit alone cannot prove that stock animation did
+    // not subsequently hide or restore the opposite hand and wrist device.
     g_renderRigPoseOverride = pose;
     g_renderRigPoseOverrideActive = true;
     onRetailPostAnimation(g_lastRetailRigAnimData);
     g_renderRigPoseOverrideActive = false;
-
-    SharedWeaponFrameState* committed = sharedWeaponFrameState();
-    return committed
-        && committed->status == fnvxr::shared::WeaponFramePoseCommitted
-        && committed->poseSequence == static_cast<UInt32>(poseSequence)
-        && committed->poseFrame == pose.frame;
+    const bool completeTrackedPropsRestored =
+        g_latestCompleteTrackedPropsApplied
+        && g_latestCompleteTrackedPropsPoseSequence == poseSequence
+        && g_latestCompleteTrackedPropsPoseFrame == pose.frame;
+    const bool restored = committedPoseStillOwnsLiveTransforms()
+        && completeTrackedPropsRestored;
+    static LONG restoreAttempts = 0;
+    static LONG restoreFailures = 0;
+    const LONG attempt = InterlockedIncrement(&restoreAttempts);
+    LONG failure = 0;
+    if (!restored)
+        failure = InterlockedIncrement(&restoreFailures);
+    if (attempt <= 12 || attempt % 120 == 0 || (!restored && failure <= 12))
+    {
+        logTelemetry(
+            "retailRig render-bound restore attempt=%ld failure=%ld restored=%d poseSeq=%ld poseFrame=%llu\n",
+            attempt,
+            failure,
+            restored ? 1 : 0,
+            poseSequence,
+            static_cast<unsigned long long>(pose.frame));
+    }
+    return restored;
 }
 
 extern "C" __declspec(dllexport) bool NVSEPlugin_Query(const NVSEInterface* nvse, PluginInfo* info)

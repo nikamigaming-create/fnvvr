@@ -148,11 +148,11 @@ inline RetailState classifyRetailState(const PresentationInput& input)
         return RetailState::Loading;
     }
 
-    if (input.cameraActive
-        && shared::runtimeGameplayPhase(
+    if (shared::runtimeWorldPresentationPhase(
             input.runtimePhase,
             input.menuBits,
-            input.showroomActive))
+            input.showroomActive,
+            input.cameraActive))
     {
         return RetailState::Gameplay;
     }

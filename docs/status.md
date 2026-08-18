@@ -12,13 +12,16 @@ All non-blocking gameplay, exploration, combat, and world interaction require
 true binocular 3D, independent 6DoF head motion, a tracked retail weapon, and
 no persistent gameplay HUD. Mono gameplay cannot satisfy acceptance.
 
-Startup, pause, inventory, barter, terminals, dialogue, VATS, loading,
-Pip-Boy, and other blocking retail UI use the stable mono quad. The controller
-ray drives retail mouse pointer/click input. On UI exit, the last valid quad is
-held until one fresh complete pose-matched stereo transaction with a strictly
-newer retail source-frame identity is ready, then the compositor changes to
-world stereo atomically. That freshness watermark remains enforced after the
-bounded quad hold expires into a safety blank.
+The retail Pip-Boy is now modeled as a persistent live wrist device rather than
+a presentation state. Pointing progressively enlarges/focuses it, trigger hits
+route to its live screen or physical dial zones, and the eight-slot weapon
+orbit selector commits through retail favorites. These contracts are unit-tested
+but not yet live-accepted. Startup, pause, containers, barter, terminals,
+dialogue, VATS, loading, conflicting/unknown menus, and every other blocking UI
+use the stable front-floating mono quad. On ordinary UI exit, the
+last valid quad is held until one fresh complete pose-matched stereo transaction
+with a strictly newer retail source-frame identity is ready. The freshness
+watermark remains enforced after the bounded hold expires into a safety blank.
 
 `stereo-visual-trial-v5` remains a bounded CPU-v8 visual route.
 `retail-vr-play-v1` is the separately named physical-play investigation route;

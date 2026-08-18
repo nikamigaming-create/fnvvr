@@ -10929,18 +10929,28 @@ void __cdecl retailVrBeforeFirstPersonAdapter(
             bridge->pendingFirstPersonPoseFrame();
         std::uint32_t weaponFrameFailure = 0u;
         std::uint64_t weaponFrameCommitId = 0u;
+        const bool livePipBoy =
+            bridge->pendingFirstPersonLivePipBoy();
         const bool controllerRigRequired = readRawEnvBool(
                 "FNVXR_PHYSICAL_HEADSET_PLAY", false)
             || (readRawEnvBool("OPENXR_SIMULATOR_HEADLESS", false)
                 && readRawEnvBool(
                     "FNVXR_HEADSET_CONTROLLER_RIG_VISUAL_TRIAL", false));
-        const bool weaponFramePrepared = !controllerRigRequired
+        const bool controllerRigPrepared = !controllerRigRequired
             || bridge->preparePendingControllerRigForRender();
-        if (!weaponFramePrepared)
+        // A physical Pip-Boy frame must stay visible even if the stock menu
+        // has hidden or rebuilt the weapon branch.  Still run the controller
+        // preparation for its hand/Pip-Boy side effects, but require the
+        // weapon-frame commit only for ordinary gameplay.
+        const bool weaponFrameRequired = controllerRigRequired
+            && !livePipBoy;
+        const bool weaponFramePrepared = controllerRigPrepared
+            || livePipBoy;
+        if (weaponFrameRequired && !weaponFramePrepared)
             weaponFrameFailure = static_cast<std::uint32_t>(
                 fnvxr::weapon_frame::Failure::Unavailable);
         const bool weaponFrameConsumed = weaponFramePrepared
-            && (!controllerRigRequired
+            && (!weaponFrameRequired
                 || consumeWeaponFrameForFirstPerson(
                     pendingPoseSequence,
                     pendingPoseFrame,
@@ -10953,12 +10963,14 @@ void __cdecl retailVrBeforeFirstPersonAdapter(
         char event[768] {};
         sprintf_s(
             event,
-            "{\"event\":\"fnvxrRetailCenterIntegratedFirstPerson\",\"callerId\":%u,\"callerAddress\":\"0x%08X\",\"callerOrdinal\":%ld,\"poseSequence\":%u,\"poseFrame\":%llu,\"weaponFrameConsumed\":%s,\"weaponFrameCommitId\":%llu,\"weaponFrameFailure\":%u,\"published\":%s,\"privateEyeCalls\":0}",
+            "{\"event\":\"fnvxrRetailCenterIntegratedFirstPerson\",\"callerId\":%u,\"callerAddress\":\"0x%08X\",\"callerOrdinal\":%ld,\"poseSequence\":%u,\"poseFrame\":%llu,\"livePipBoy\":%s,\"controllerRigPrepared\":%s,\"weaponFrameConsumed\":%s,\"weaponFrameCommitId\":%llu,\"weaponFrameFailure\":%u,\"published\":%s,\"privateEyeCalls\":0}",
             callerId,
             retailVrFirstPersonCallerAddress(callerId),
             callerOrdinal,
             pendingPoseSequence,
             static_cast<unsigned long long>(pendingPoseFrame),
+            livePipBoy ? "true" : "false",
+            controllerRigPrepared ? "true" : "false",
             weaponFrameConsumed ? "true" : "false",
             static_cast<unsigned long long>(weaponFrameCommitId),
             weaponFrameFailure,
@@ -11383,10 +11395,36 @@ bool retailVrFirstPersonGameplayLeaseReady(void*) noexcept
         fnvxr::shared::PlayerSharedFlagGameplay
         | fnvxr::shared::PlayerSharedFlagWeaponOut
         | fnvxr::shared::PlayerSharedFlagPlayerNodeValid;
-    return sequence != 0
+    const bool gameplayReady = sequence != 0
         && (player.flags & Required) == Required
         && player.playerAddress != 0u
         && player.playerNodeAddress != 0u;
+    if (gameplayReady)
+        return true;
+
+    fnvxr::shared::SharedRuntimeState runtime {};
+    LONG runtimeSequence = 0;
+    const bool runtimeReady =
+        gRetailRuntimePublicationReadiness.readReadyPublication(
+            runtime,
+            runtimeSequence);
+    constexpr std::uint32_t RequiredPipBoy =
+        fnvxr::shared::PlayerSharedFlagPlayerNodeValid
+        | fnvxr::shared::PlayerSharedFlagCameraValid;
+    return runtimeReady
+        && runtimeSequence != 0
+        && fnvxr::engine::live_pipboy::worldPresentationContinues(
+            runtime.phase,
+            runtime.menuBits,
+            runtime.showroomActive,
+            runtime.cameraActive != 0u)
+        && (player.flags & RequiredPipBoy) == RequiredPipBoy
+        && (player.flags & fnvxr::shared::PlayerSharedFlagThirdPerson) == 0u
+        && player.playerAddress != 0u
+        && player.playerNodeAddress != 0u
+        && player.reserved[
+            fnvxr::shared::PlayerSharedFirstPersonPipBoyNodeReservedIndex]
+            != 0u;
 }
 
 bool prepareRetailVrControllerRigForRender(

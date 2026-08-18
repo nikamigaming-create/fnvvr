@@ -605,6 +605,9 @@ $expectedHeadsetDemoEnvironment = [ordered]@{
     FNVXR_RETAIL_FIXTURE_TRAIT_ONE = "FastShot"
     FNVXR_RETAIL_FIXTURE_TRAIT_TWO = "WildWasteland"
     FNVXR_HEADSET_DEMO_FIXTURE = "1"
+    FNVXR_LIVE_PIPBOY_FOCUS_FRAMES = "12"
+    FNVXR_RETAIL_VR_FIRST_PERSON_PRIVATE_CALLER = "third"
+    FNVXR_RETAIL_CENTER_INTEGRATED_FIRST_PERSON = "1"
     FNVXR_HEADSET_DEMO_GAMEPLAY_WARMUP_FRAMES = "90"
     FNVXR_HEADSET_DEMO_PIPBOY_HOLD_FRAMES = "240"
     FNVXR_HMD_MIRROR_CAPTURE_DIR = "C:\fnvxr-headset-demo-contract\headset-mirror"
@@ -1094,7 +1097,7 @@ foreach ($headsetDemoContract in @(
     'pitchCameraResponseProven',
     'Wait-FnvxrProductRetailFixtureGameplay',
     'retailFixtureRequested -and -not $headsetFixtureOpenXrRun',
-    'No final-headset Pip-Boy UI frame reached OpenXR',
+    'No live wrist Pip-Boy frame reached OpenXR',
     'FNVXR_HEADSET_DEMO_FIXTURE',
     'FNVXR_HEADSET_WORLD_ONLY_CAPTURE',
     'FNVXR_HEADSET_FIXTURE_DRAW_WEAPON',
@@ -1117,8 +1120,12 @@ foreach ($physicalPlayContract in @(
     'FNVXR_PHYSICAL_HEADSET_PLAY = "1"',
     'FNVXR_PHASE1_TRACE_TELEMETRY = "1"',
     'FNVXR_PLUGIN_KEYBOARD_MOVEMENT_ENABLE = "1"',
+    'FNVXR_PLUGIN_MOVEMENT_DEADZONE = "6000"',
     'FNVXR_PLUGIN_MENU_KEYBOARD_FALLBACK = "1"',
     'FNVXR_PLUGIN_GAMEPLAY_KEYBOARD_FALLBACK = "1"',
+    'FNVXR_PHYSICAL_LEFT_MENU_PIPBOY_ENABLE = "1"',
+    'FNVXR_DIRECT_UI_CLICK = "1"',
+    'FNVXR_LIVE_PIPBOY_FOCUS_FRAMES = "12"',
     'FNVXR_UI_INPUT_WIDTH',
     'FNVXR_UI_INPUT_HEIGHT',
     'FNVXR_D3D9_NATIVE_APPLY_HEAD_ROTATION = "1"',
@@ -1167,6 +1174,14 @@ if (([regex]::Matches(
     $physicalDisplayIni -notmatch '(?im)^\s*iSize W\s*=\s*1920\s*$' -or
     $physicalDisplayIni -notmatch '(?im)^\s*iSize H\s*=\s*1200\s*$') {
     throw "Physical display-profile INI conversion did not produce one exact staged resolution."
+}
+foreach ($physicalFovKey in @(
+        'fDefaultFOV=110.0000',
+        'fDefault1stPersonFOV=110.0000',
+        'fPipboy1stPersonFOV=110.0000')) {
+    if ($physicalDisplayIni -notmatch ("(?im)^\s*{0}\s*$" -f [regex]::Escape($physicalFovKey))) {
+        throw "Physical display-profile INI conversion did not stage the headset FOV: $physicalFovKey"
+    }
 }
 Require-Throws -Fragment "aspect" -Action {
     Assert-FnvxrProductPhysicalDisplaySize `

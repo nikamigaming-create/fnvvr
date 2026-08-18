@@ -20,7 +20,6 @@ fnvxr::physical_input::GameplayAuthorityInput physicalGameplayInput()
     return {
         true,
         true,
-        true,
         false,
         true,
         true,
@@ -36,7 +35,7 @@ int main()
     const auto granted = fnvxr::physical_input::assessGameplayAuthority(
         physicalGameplayInput());
     expect(granted.granted(),
-        "physical locomotion is authorized by focused, acknowledged runtime gameplay");
+        "physical locomotion is authorized by acknowledged runtime gameplay");
 
     auto input = physicalGameplayInput();
     input.physicalHeadsetPlayRequested = false;
@@ -44,13 +43,6 @@ int main()
         fnvxr::physical_input::assessGameplayAuthority(input).blocker
             == GameplayAuthorityBlocker::PhysicalPlayNotRequested,
         "physical profile opt-in is required");
-
-    input = physicalGameplayInput();
-    input.inputFocused = false;
-    expect(
-        fnvxr::physical_input::assessGameplayAuthority(input).blocker
-            == GameplayAuthorityBlocker::InputFocusLost,
-        "focus loss revokes physical locomotion");
 
     input = physicalGameplayInput();
     input.controllerConsumerAcknowledged = false;
@@ -99,6 +91,11 @@ int main()
         "diagonal backward-left intent preserves both axes");
     const auto neutral = fnvxr::physical_input::classifyLocomotion(9000, -9000, 9000);
     expect(!neutral.any(), "deadzone boundary is neutral");
+
+    const auto physicalWalkingForward =
+        fnvxr::physical_input::classifyLocomotion(0, 8257, 6000);
+    expect(physicalWalkingForward.forward,
+        "the observed physical forward-stick sample reaches locomotion");
 
     const auto noisyHardLeft =
         fnvxr::physical_input::classifyLocomotion(-31356, 9508, 9000);

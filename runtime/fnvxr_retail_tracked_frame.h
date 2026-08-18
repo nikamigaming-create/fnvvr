@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../protocol/fnvxr_shared_state.h"
+#include "fnvxr_live_pipboy_contract.h"
 
 #include <cmath>
 #include <cstdint>
@@ -177,6 +178,14 @@ inline bool retailTrackedRuntimeUiConfirmed(
 inline RetailTrackedPresentationRoute retailTrackedPublishedPresentationRoute(
     const RetailTrackedFrame& frame) noexcept
 {
+    if (live_pipboy::worldPresentationContinues(
+            frame.runtime.phase,
+            frame.runtime.menuBits,
+            frame.runtime.showroomActive,
+            frame.runtime.cameraActive != 0u))
+    {
+        return RetailTrackedPresentationRoute::BinocularWorld;
+    }
     if (retailTrackedRuntimeUiConfirmed(frame.runtime))
         return RetailTrackedPresentationRoute::MonoUiQuad;
     if (shared::runtimeGameplayPhase(

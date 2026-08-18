@@ -12,6 +12,7 @@
 #include "fnvxr_host_ui_capture_gate.h"
 #include "fnvxr_headset_mirror_capture.h"
 #include "fnvxr_openxr_live_authority.h"
+#include "fnvxr_pipboy_panel_contract.h"
 #include "fnvxr_physical_input_authority.h"
 #include "fnvxr_shared_state.h"
 #include "fnvxr_stereo_visual_trial.h"
@@ -159,6 +160,13 @@ struct MenuPointer
     bool active = false;
     float x = -1.0f;
     float y = -1.0f;
+};
+
+struct WeaponOrbitWheel
+{
+    bool active = false;
+    int selectedSlot = -1;
+    XrPosef pose {};
 };
 
 struct HeadspaceLook
@@ -4079,6 +4087,21 @@ std::uint64_t publishHostSharedBridge(
         bridge.xinputState->leftThumbY = leftThumbY;
         bridge.xinputState->rightThumbX = rightThumbX;
         bridge.xinputState->rightThumbY = rightThumbY;
+        bridge.xinputState->reserved[
+            fnvxr::shared::XInputReservedInteractionFlags] =
+                frame.poseReserved[fnvxr::PoseReservedInteractionFlags];
+        bridge.xinputState->reserved[
+            fnvxr::shared::XInputReservedPipBoyScale] =
+                frame.poseReserved[fnvxr::PoseReservedPipBoyScale];
+        bridge.xinputState->reserved[
+            fnvxr::shared::XInputReservedWeaponOrbitSlot] =
+                frame.poseReserved[fnvxr::PoseReservedWeaponOrbitSlot];
+        bridge.xinputState->reserved[
+            fnvxr::shared::XInputReservedPipBoyDeviceU] =
+                frame.poseReserved[fnvxr::PoseReservedPipBoyDeviceU];
+        bridge.xinputState->reserved[
+            fnvxr::shared::XInputReservedPipBoyDeviceV] =
+                frame.poseReserved[fnvxr::PoseReservedPipBoyDeviceV];
         fnvxr::shared::endSequencedSharedWrite(bridge.xinputState->sequence);
     }
 
@@ -5278,26 +5301,23 @@ GamePlane gamePlaneFromHmd(const XrPosef& hmdPose)
     return plane;
 }
 
-GamePlane gamePlaneFromLeftWrist(
-    const SolvedArm& leftArm,
-    const XrPosef& hmdPose,
-    float sourceAspect)
+GamePlane livePipBoyInteractionPlane(const SolvedArm& leftArm, float scale)
 {
     GamePlane plane {};
-    plane.width = envFloat("FNVXR_PIPBOY_WRIST_UI_WIDTH", 0.34f);
-    plane.height = plane.width / std::max(0.1f, sourceAspect);
+    constexpr float WristPipBoyDisplayAspect = 1.60f;
+    plane.width = envFloat("FNVXR_PIPBOY_WRIST_UI_WIDTH", 0.34f)
+        * std::clamp(scale, 1.0f, 1.5f);
+    plane.height = plane.width / WristPipBoyDisplayAspect;
 
     const XMVECTOR wristOrientation = quat(leftArm.wrist.orientation);
-    // The physical wrist owns position, while the user's current view owns
-    // readability.  A controller's palm-roll quaternion is not a stable
-    // display normal and previously turned the screen almost edge-on.
-    const XMVECTOR hmdOrientation = quat(hmdPose.orientation);
+    // This plane is never drawn. It follows the tracked wrist and supplies
+    // ray/fingertip UVs for the authored retail screen and physical controls.
     const XMVECTOR localOrientation = XMQuaternionRotationRollPitchYaw(
         degreesToRadians(envFloat("FNVXR_PIPBOY_WRIST_UI_ROT_X", 0.0f)),
         degreesToRadians(envFloat("FNVXR_PIPBOY_WRIST_UI_ROT_Y", 0.0f)),
         degreesToRadians(envFloat("FNVXR_PIPBOY_WRIST_UI_ROT_Z", 0.0f)));
     const XMVECTOR orientation = XMQuaternionNormalize(
-        XMQuaternionMultiply(localOrientation, hmdOrientation));
+        XMQuaternionMultiply(localOrientation, wristOrientation));
     XMFLOAT4 orientationValue {};
     XMStoreFloat4(&orientationValue, orientation);
     plane.pose.orientation = {
@@ -6416,6 +6436,40 @@ void drawMenuPointer(
         { 1.0f, 0.95f, 0.05f, 1.0f });
 }
 
+void drawWeaponOrbitWheel(
+    ID3D11DeviceContext* context,
+    Renderer& renderer,
+    const XMMATRIX& viewProjection,
+    const WeaponOrbitWheel& wheel)
+{
+    if (!wheel.active)
+        return;
+    constexpr float Pi = 3.14159265358979323846f;
+    const float radius = envFloat("FNVXR_WEAPON_ORBIT_RADIUS", 0.16f);
+    const float depth = -std::fabs(envFloat(
+        "FNVXR_WEAPON_ORBIT_DISTANCE",
+        0.32f));
+    for (int slot = 0; slot < 8; ++slot)
+    {
+        const float angle = static_cast<float>(slot) * Pi * 0.25f
+            + Pi * 0.5f;
+        const bool selected = slot == wheel.selectedSlot;
+        const float size = selected ? 0.048f : 0.032f;
+        const XMFLOAT4 color = selected
+            ? XMFLOAT4 { 1.0f, 0.72f, 0.08f, 1.0f }
+            : XMFLOAT4 { 0.12f, 0.72f, 1.0f, 0.85f };
+        drawLocalCube(
+            context,
+            renderer,
+            viewProjection,
+            wheel.pose,
+            { std::cos(angle) * radius, std::sin(angle) * radius, depth },
+            { 0.0f, 0.0f, -angle },
+            { size, size * 0.55f, 0.012f },
+            color);
+    }
+}
+
 void drawPoseAxes(
     ID3D11DeviceContext* context,
     Renderer& renderer,
@@ -6844,6 +6898,7 @@ bool renderEye(
     const XrPosef& rightAimPose,
     const BodyRig& bodyRig,
     const MenuPointer& menuPointer,
+    const WeaponOrbitWheel& weaponOrbitWheel,
     const GamePlane& gamePlane,
     const XrPosef& pauseSceneAnchor,
     bool gameUiMode,
@@ -6978,6 +7033,11 @@ bool renderEye(
         drawMenuPointer(context.Get(), renderer, viewProjection, menuPointer, gamePlane);
         context->OMSetDepthStencilState(renderer.depthState.Get(), 0);
     }
+    drawWeaponOrbitWheel(
+        context.Get(),
+        renderer,
+        viewProjection,
+        weaponOrbitWheel);
     const bool drawWorldProps = !productionWorldTextureView
         && !productionUiTextureView
         && envEnabled("FNVXR_SHOW_WORLD_PROPS", false)
@@ -9201,10 +9261,13 @@ int main(int argc, char** argv)
     bool previousHostButtonXDown = false;
     MenuPointer lastActiveMenuPointer {};
     bool hasLastActiveMenuPointer = false;
+    std::uint32_t livePipBoyHoverFrames = 0u;
+    fnvxr::engine::live_pipboy::FocusDecision livePipBoyFocus {};
     HeadspaceLookTracker headspaceLookTracker {};
     HandspaceLookTracker handspaceLookTracker {};
     HeadspaceLookTracker gyroAimLookTracker {};
     bool previousGameUiMode = false;
+    bool previousLivePipBoyScreenFocused = false;
     uint64_t runtimeUiStuckFrames = 0;
     uint64_t gameUiModeFrames = 0;
     uint64_t gameUiRenderFrames = 0;
@@ -9219,7 +9282,6 @@ int main(int argc, char** argv)
     uint64_t sharedPlayerReadMisses = 0;
     bool lastSharedPlayerWeaponOut = false;
     bool previousLoggedGameplayPlaneSize = false;
-    bool previousLoggedPipBoyGripMode = false;
     bool previousLoggedPipBoyMenuMode = false;
     float previousLoggedGamePlaneWidth = -1.0f;
     float previousLoggedGamePlaneHeight = -1.0f;
@@ -9932,13 +9994,35 @@ int main(int argc, char** argv)
         }
         if (envEnabled("FNVXR_FORCE_GAMEPLAY", false))
             gameUiMode = false;
-        const float pipBoyGripThreshold = envFloat("FNVXR_PIPBOY_GRIP_THRESHOLD", 0.55f);
-        const bool pipBoyGripMode = envEnabled("FNVXR_LEFT_GRIP_PIPBOY_MODE", false)
-            && frame.leftGrip > pipBoyGripThreshold;
         const bool pipBoyMenuMode =
             haveRuntimeUiState
             && (runtimeMenuBits & fnvxr::shared::RuntimePipBoyMenuBit) != 0;
-        const bool pipBoyPlaneMode = pipBoyGripMode || pipBoyMenuMode;
+        const bool livePipBoyScreenFocused =
+            fnvxr::engine::live_pipboy::worldPresentationContinues(
+                runtimePhase,
+                runtimeMenuBits,
+                runtimeShowroomActive,
+                runtimeCameraActive);
+        const GamePlane livePipBoyBasePlane =
+            livePipBoyInteractionPlane(bodyRig.left, 1.0f);
+        const MenuPointer livePipBoyBasePointer = rightAimTracked
+            ? menuPointerFromAimPose(rightAimPose, livePipBoyBasePlane)
+            : MenuPointer {};
+        if (livePipBoyBasePointer.active)
+            ++livePipBoyHoverFrames;
+        else
+            livePipBoyHoverFrames = 0u;
+        livePipBoyFocus = fnvxr::engine::live_pipboy::assessFocus({
+            livePipBoyBasePointer.active,
+            pipBoyMenuMode,
+            livePipBoyHoverFrames,
+            static_cast<std::uint32_t>((std::max)(
+                1,
+                envInt("FNVXR_LIVE_PIPBOY_FOCUS_FRAMES", 12))),
+        });
+        const GamePlane livePipBoyPlane = livePipBoyInteractionPlane(
+            bodyRig.left,
+            livePipBoyFocus.scale);
         const bool dialoguePlaneSize =
             haveRuntimeUiState
             && (runtimeMenuBits & fnvxr::shared::RuntimeDialogMenuBit) != 0
@@ -9946,7 +10030,7 @@ int main(int argc, char** argv)
         const bool gameplayPlaneSize =
             haveRuntimeUiState
             && (runtimeGameplayActive || dialoguePlaneSize)
-            && !pipBoyPlaneMode;
+            && !pipBoyMenuMode;
         const GamePlaneMode currentGamePlaneMode = gamePlaneMode();
         const GamePlaneModeSettings currentGamePlaneModeSettings = gamePlaneModeSettings(currentGamePlaneMode);
         const float menuPlaneWidth = envFloat("FNVXR_GAME_PLANE_WIDTH", 2.4f);
@@ -9972,23 +10056,15 @@ int main(int argc, char** argv)
             gamePlane.pose.position.y += deltaFloat.y;
             gamePlane.pose.position.z += deltaFloat.z;
         }
-        if (pipBoyMenuMode
-            && envEnabled("FNVXR_PIPBOY_WRIST_UI_ENABLE", true))
-        {
-            gamePlane = gamePlaneFromLeftWrist(
-                bodyRig.left,
-                hmdPose,
-                renderer.retainedUiTextureAspect);
-        }
+        if (pipBoyMenuMode)
+            gamePlane = livePipBoyPlane;
         if (gameplayPlaneSize != previousLoggedGameplayPlaneSize
-            || pipBoyGripMode != previousLoggedPipBoyGripMode
             || pipBoyMenuMode != previousLoggedPipBoyMenuMode
             || std::fabs(gamePlane.width - previousLoggedGamePlaneWidth) > 0.001f
             || std::fabs(gamePlane.height - previousLoggedGamePlaneHeight) > 0.001f
             || std::fabs(activePlaneOffsetZ - previousLoggedGamePlaneOffsetZ) > 0.001f)
         {
             previousLoggedGameplayPlaneSize = gameplayPlaneSize;
-            previousLoggedPipBoyGripMode = pipBoyGripMode;
             previousLoggedPipBoyMenuMode = pipBoyMenuMode;
             previousLoggedGamePlaneWidth = gamePlane.width;
             previousLoggedGamePlaneHeight = gamePlane.height;
@@ -9996,8 +10072,6 @@ int main(int argc, char** argv)
             std::cout << "gamePlaneSize frame=" << frame.frame
                       << " mode=" << gamePlaneModeName(currentGamePlaneMode)
                       << " gameplaySize=" << static_cast<int>(gameplayPlaneSize)
-                      << " pipBoyGripMode=" << static_cast<int>(pipBoyGripMode)
-                      << " leftGrip=" << frame.leftGrip
                       << " width=" << gamePlane.width
                       << " height=" << gamePlane.height
                       << " offsetZ=" << activePlaneOffsetZ
@@ -10026,20 +10100,13 @@ int main(int argc, char** argv)
                       << " runtimeCamera=" << static_cast<int>(runtimeCameraActive)
                       << " menuBits=0x" << std::hex << runtimeMenuBits << std::dec
                       << " pipBoyMenuMode=" << static_cast<int>(pipBoyMenuMode)
+                      << " livePipBoyFocused=" << static_cast<int>(livePipBoyScreenFocused)
+                      << " livePipBoyHover=" << static_cast<int>(livePipBoyFocus.hovered)
+                      << " livePipBoyScale=" << livePipBoyFocus.scale
                       << " dialogueSize=" << static_cast<int>(dialoguePlaneSize)
                       << "\n";
         }
         const bool gameUiModeChanged = gameUiMode != previousGameUiMode;
-        const bool retainVerifiedWorldBehindPipBoy =
-            fnvxr::host::cpu_engine_presentation::
-                preserveVerifiedWorldBehindPipBoy(
-                    productionCpuEngineStereo,
-                    pipBoyMenuMode,
-                    envEnabled("FNVXR_PIPBOY_WORLD_BEHIND_WRIST_UI", true),
-                    renderer.hasStereoGameFrame,
-                    renderer.stereoGameFrameSeparated,
-                    renderer.stereoGameTextureViews[0] != nullptr,
-                    renderer.stereoGameTextureViews[1] != nullptr);
         if (gameUiMode)
         {
             gameUiModeFrames = previousGameUiMode ? gameUiModeFrames + 1 : 1;
@@ -10058,7 +10125,9 @@ int main(int argc, char** argv)
             gameUiModeFrames = 0;
             hasPauseSceneAnchor = false;
         }
-        if (gameUiModeChanged && !retainVerifiedWorldBehindPipBoy)
+        if (gameUiModeChanged
+            && !livePipBoyScreenFocused
+            && !previousLivePipBoyScreenFocused)
         {
             renderer.hasStereoGameFrame = false;
             renderer.stereoGameFrameSeparated = false;
@@ -10076,6 +10145,7 @@ int main(int argc, char** argv)
             missingStereoFrames = 0;
         }
         previousGameUiMode = gameUiMode;
+        previousLivePipBoyScreenFocused = livePipBoyScreenFocused;
         int64_t sourcePoseAgeNanoseconds = 0;
         bool sourcePoseAgeValid = false;
         const int64_t maximumSourcePoseAgeNanoseconds =
@@ -10135,9 +10205,9 @@ int main(int argc, char** argv)
             productionCpuEngineStereo
             && vrMode
             && stereoWorldIntent
-            && !gameUiMode
+            && (!gameUiMode || livePipBoyScreenFocused)
             && haveRuntimeUiState
-            && runtimeGameplayActive;
+            && (runtimeGameplayActive || livePipBoyScreenFocused);
         namespace cpu_presentation = fnvxr::host::cpu_engine_presentation;
         const cpu_presentation::RuntimeSample cpuCurrentRuntime {
             runtimeStateSample,
@@ -10450,8 +10520,8 @@ int main(int argc, char** argv)
                     worldResourcesReady,
                     selectedUiResourceReady)
                 : fnvxr::host::gpu_color::ProductCompositionBindings {};
-        const bool productionUiQuadActive =
-            productComposition.content
+        const bool productionUiQuadActive = !livePipBoyScreenFocused
+            && productComposition.content
                 == fnvxr::host::gpu_color::RoutedContent::MonoUiQuad
             && productComposition.bindMonoUiView;
         const bool productionBinocularWorld =
@@ -10505,25 +10575,19 @@ int main(int argc, char** argv)
             && stereoVisualTrialDecision.bindsStereoVisuals();
         const bool presentedBinocularWorld = productionBinocularWorld
             || stereoVisualTrialActive;
-        const bool cpuWristWorldBehindPipBoy =
-            cpuEngineUiQuadActive
-            && pipBoyMenuMode
-            && envEnabled("FNVXR_PIPBOY_WORLD_BEHIND_WRIST_UI", true)
-            && renderer.hasStereoGameFrame
-            && renderer.stereoGameFrameSeparated
-            && renderer.stereoGameTextureViews[0]
-            && renderer.stereoGameTextureViews[1];
-        if (productionUiQuadActive || cpuEngineUiQuadActive)
+        if ((productionUiQuadActive || cpuEngineUiQuadActive)
+            && !pipBoyMenuMode)
         {
             gamePlane.height = gamePlane.width
                 / renderer.retainedUiTextureAspect;
         }
-        const bool showGamePlane = productionUiQuadActive
-            || cpuEngineUiQuadActive
-            || (!cacheOnlyMode
-                && legacyImageDiagnostics
-                && (gameUiMode || showGameplayPlane)
-                && envEnabled("FNVXR_SHOW_GAME_PLANE", true));
+        const bool showGamePlane = !livePipBoyScreenFocused
+            && (productionUiQuadActive
+                || cpuEngineUiQuadActive
+                || (!cacheOnlyMode
+                    && legacyImageDiagnostics
+                    && (gameUiMode || showGameplayPlane)
+                    && envEnabled("FNVXR_SHOW_GAME_PLANE", true)));
         const uint64_t stereoStaleFrameLimit = static_cast<uint64_t>(std::max(1, envInt("FNVXR_STEREO_STALE_FRAME_LIMIT", 2)));
         const uint64_t stereoStableHandoffFrames =
             static_cast<uint64_t>(std::max(1, envInt("FNVXR_STEREO_STABLE_HANDOFF_FRAMES", 6)));
@@ -10568,7 +10632,6 @@ int main(int argc, char** argv)
         const auto physicalGameplayAuthority =
             fnvxr::physical_input::assessGameplayAuthority({
                 physicalGameplayInputRequested,
-                shouldReadInput,
                 controllerConsumerAcknowledged,
                 physicalMenuOwnsInput,
                 runtimeGameplayActive,
@@ -10580,9 +10643,10 @@ int main(int argc, char** argv)
             && controllerMutationAuthorized
             && controllerMode
                 == fnvxr::shared::RuntimeControllerMode::Ui
-            && showGamePlane
+            && (showGamePlane || livePipBoyScreenFocused)
             && (productionCpuEngineStereo
-                ? (cpuMenuModeActive && cpuEngineUiQuadActive)
+                ? ((cpuMenuModeActive && cpuEngineUiQuadActive)
+                    || (livePipBoyScreenFocused && cpuGameplayModeActive))
                 : legacyImageDiagnostics
                 ? (haveRuntimeUiState ? runtimeUiActive : gameUiMode)
                 : (productionUiQuadActive
@@ -10686,6 +10750,9 @@ int main(int argc, char** argv)
             envEqualsIgnoreCase("FNVXR_MENU_POINTER_HAND", "head")
             || envEqualsIgnoreCase("FNVXR_MENU_POINTER_SOURCE", "head");
         const bool pointerHeadFallback = envEnabled("FNVXR_MENU_POINTER_HEAD_FALLBACK", false);
+        const MenuPointer livePipBoyPointer = rightAimTracked
+            ? menuPointerFromAimPose(rightAimPose, livePipBoyPlane)
+            : MenuPointer {};
         const MenuPointer leftMenuPointer = leftAimTracked
             ? menuPointerFromAimPose(leftAimPose, gamePlane)
             : MenuPointer {};
@@ -10695,7 +10762,13 @@ int main(int argc, char** argv)
         const MenuPointer headMenuPointer = menuPointerFromAimPose(hmdTracked ? rawHmdPose : hmdPose, gamePlane);
         MenuPointer menuPointer = rightMenuPointer;
         const char* menuPointerSource = rightMenuPointer.active ? "right" : "none";
-        if (pointerHeadOnly)
+        if (livePipBoyScreenFocused)
+        {
+            menuPointer = livePipBoyPointer;
+            menuPointerSource = livePipBoyPointer.active
+                ? "livePipBoy" : "none";
+        }
+        else if (pointerHeadOnly)
         {
             menuPointer = headMenuPointer;
             menuPointerSource = headMenuPointer.active ? "head" : "none";
@@ -10760,10 +10833,85 @@ int main(int argc, char** argv)
             menuPointer = lastActiveMenuPointer;
             menuPointerSource = "latched";
         }
+        MenuPointer bridgedMenuPointer = menuPointer;
+        const fnvxr::engine::live_pipboy::PhysicalControl
+            livePipBoyControl = fnvxr::engine::live_pipboy::physicalControl(
+                livePipBoyPointer.x,
+                livePipBoyPointer.y);
+        if (pipBoyMenuMode
+            && bridgedMenuPointer.active)
+        {
+            if (livePipBoyControl
+                == fnvxr::engine::live_pipboy::PhysicalControl::Screen)
+            {
+                bridgedMenuPointer.x = fnvxr::pipboy::sourceUFromPanel(
+                    fnvxr::engine::live_pipboy::screenUFromDevice(
+                        livePipBoyPointer.x));
+                bridgedMenuPointer.y = fnvxr::pipboy::sourceVFromPanel(
+                    fnvxr::engine::live_pipboy::screenVFromDevice(
+                        livePipBoyPointer.y));
+            }
+            else
+            {
+                // Physical knobs/buttons are consumed in-process and must
+                // not also click a screen row underneath them.
+                bridgedMenuPointer = {};
+                hostClick = false;
+            }
+        }
         updateHostCursorPointer(menuPointer, hostClick);
-        frame.menuPointerActive = menuPointer.active ? 1 : 0;
-        frame.menuPointerX = menuPointer.x;
-        frame.menuPointerY = menuPointer.y;
+        frame.menuPointerActive = bridgedMenuPointer.active ? 1 : 0;
+        frame.menuPointerX = bridgedMenuPointer.x;
+        frame.menuPointerY = bridgedMenuPointer.y;
+        std::uint8_t interactionFlags = 0u;
+        if (livePipBoyFocus.hovered)
+            interactionFlags |= fnvxr::PoseInteractionLivePipBoyHovered;
+        if (livePipBoyFocus.focused)
+            interactionFlags |= fnvxr::PoseInteractionLivePipBoyFocused;
+        if (livePipBoyFocus.requestOpen)
+            interactionFlags |= fnvxr::PoseInteractionLivePipBoyOpenRequest;
+        const bool weaponOrbitActive = shouldReadInput
+            && runtimeGameplayActive
+            && frame.rightGrip > envFloat(
+                "FNVXR_WEAPON_ORBIT_GRIP_THRESHOLD",
+                0.55f)
+            && rightThumbstick.value;
+        const int weaponOrbitSlot = weaponOrbitActive
+            ? fnvxr::engine::live_pipboy::weaponOrbitSlot(
+                frame.rightThumbstickX,
+                frame.rightThumbstickY,
+                envFloat("FNVXR_WEAPON_ORBIT_DEADZONE", 0.35f))
+            : -1;
+        if (weaponOrbitActive)
+            interactionFlags |= fnvxr::PoseInteractionWeaponOrbitActive;
+        frame.poseReserved[fnvxr::PoseReservedInteractionFlags] =
+            interactionFlags;
+        frame.poseReserved[fnvxr::PoseReservedPipBoyScale] =
+            static_cast<std::uint8_t>(std::clamp(
+                static_cast<int>(std::lround(
+                    (livePipBoyFocus.scale - 1.0f) * 510.0f)),
+                0,
+                255));
+        frame.poseReserved[fnvxr::PoseReservedWeaponOrbitSlot] =
+            weaponOrbitSlot >= 0
+                ? static_cast<std::uint8_t>(weaponOrbitSlot + 1)
+                : 0u;
+        frame.poseReserved[fnvxr::PoseReservedPipBoyDeviceU] =
+            livePipBoyPointer.active
+                ? static_cast<std::uint8_t>(std::clamp(
+                    static_cast<int>(std::lround(
+                        livePipBoyPointer.x * 255.0f)),
+                    0,
+                    255))
+                : 0u;
+        frame.poseReserved[fnvxr::PoseReservedPipBoyDeviceV] =
+            livePipBoyPointer.active
+                ? static_cast<std::uint8_t>(std::clamp(
+                    static_cast<int>(std::lround(
+                        livePipBoyPointer.y * 255.0f)),
+                    0,
+                    255))
+                : 0u;
         // Shared retail tracking must preserve the same predicted-time sample
         // for head and hands. Independent smoothing creates artificial
         // head/hand lag and makes a stationary physical pose swim in view.
@@ -10832,7 +10980,7 @@ int main(int argc, char** argv)
             sharedBridge,
             frame,
             frameState.predictedDisplayTime,
-            menuPointer,
+            bridgedMenuPointer,
             headspaceLook,
             publishedHandLook,
             hostClick,
@@ -10911,6 +11059,7 @@ int main(int argc, char** argv)
                           << static_cast<int>(gameplayControlsActive)
                           << " locomotionAuthorized="
                           << static_cast<int>(locomotionControlsActive)
+                          << " inputSampled=" << static_cast<int>(shouldReadInput)
                           << " blocker="
                           << fnvxr::physical_input::gameplayAuthorityBlockerName(
                               physicalGameplayAuthority.blocker)
@@ -11014,7 +11163,7 @@ int main(int argc, char** argv)
             {
                 updateStereoGameTextures(device.Get(), renderer);
             }
-            else if (!retainVerifiedWorldBehindPipBoy)
+            else if (!livePipBoyScreenFocused)
             {
                 renderer.hasStereoGameFrame = false;
                 renderer.stereoGameFrameSeparated = false;
@@ -11166,6 +11315,7 @@ int main(int argc, char** argv)
             }
             const bool monoFullscreenFallback =
                 allowStereoFullscreen
+                && !livePipBoyScreenFocused
                 && !worldBehindMenu
                 && !legacyStereoFullscreenActive
                 && renderer.hasGameTextureFrame
@@ -11176,6 +11326,7 @@ int main(int argc, char** argv)
                 && renderer.stereoStableFrameCount > 0;
             const bool stereoLossGamePlane =
                 allowStereoFullscreen
+                && !livePipBoyScreenFocused
                 && !legacyStereoFullscreenActive
                 && !monoFullscreenFallback
                 && renderer.hasGameTextureFrame
@@ -11373,14 +11524,11 @@ int main(int argc, char** argv)
                 && renderer.retainedUiTextureView;
             // A demo recording is evidence for WorldStereo only. Retain no
             // generic menu, splash, or fallback-quad frame merely because it
-            // happened to be visible while capture was enabled. The explicit
-            // wrist route is different: it retains an identity-validated
-            // binocular world pair and overlays the live Pip-Boy UI at the
-            // tracked left wrist, so that exact composition is eligible.
+            // happened to be visible while capture was enabled. The live
+            // Pip-Boy is already part of the fresh binocular engine pair.
             const bool headsetMirrorCaptureEligible =
                 presentedBinocularWorld
-                || cpuEngineStereoActive
-                || (cpuWristWorldBehindPipBoy && uiQuadVisible);
+                || cpuEngineStereoActive;
             HeadsetMirrorCapture* const activeHeadsetMirrorCapture =
                 headsetMirrorCapture.enabled && headsetMirrorCaptureEligible
                 ? &headsetMirrorCapture
@@ -11395,7 +11543,7 @@ int main(int argc, char** argv)
                 || legacyDiagnosticVisible)
             {
                 ID3D11ShaderResourceView* leftProductionView =
-                    (cpuEngineStereoActive || cpuWristWorldBehindPipBoy)
+                    cpuEngineStereoActive
                         ? renderer.stereoGameTextureViews[0].Get()
                         : (productionBinocularWorld
                         ? gpuColorConsumer.eyeView(0u)
@@ -11403,7 +11551,7 @@ int main(int argc, char** argv)
                             ? stereoVisualTrialDecision.bindings.leftEyeSrv
                             : nullptr));
                 ID3D11ShaderResourceView* rightProductionView =
-                    (cpuEngineStereoActive || cpuWristWorldBehindPipBoy)
+                    cpuEngineStereoActive
                         ? renderer.stereoGameTextureViews[1].Get()
                         : (productionBinocularWorld
                         ? gpuColorConsumer.eyeView(1u)
@@ -11415,6 +11563,11 @@ int main(int argc, char** argv)
                     : nullptr;
                 const bool renderLegacyUiScene = legacyImageDiagnostics
                     && gameUiMode;
+                const WeaponOrbitWheel weaponWheel {
+                    weaponOrbitActive,
+                    weaponOrbitSlot,
+                    rightAimPose,
+                };
                 leftRendered = renderEye(
                     xr,
                     device.Get(),
@@ -11428,6 +11581,7 @@ int main(int argc, char** argv)
                     rightAimPose,
                     bodyRig,
                     menuPointer,
+                    weaponWheel,
                     gamePlane,
                     pauseSceneAnchor,
                     renderLegacyUiScene,
@@ -11453,6 +11607,7 @@ int main(int argc, char** argv)
                     rightAimPose,
                     bodyRig,
                     menuPointer,
+                    weaponWheel,
                     gamePlane,
                     pauseSceneAnchor,
                     renderLegacyUiScene,
@@ -11738,6 +11893,11 @@ int main(int argc, char** argv)
                 << ",\"runtimeUi\":" << (runtimeUiActive ? "true" : "false")
                 << ",\"runtimePhase\":" << runtimePhase
                 << ",\"runtimeMenuBits\":" << runtimeMenuBits
+                << ",\"livePipBoy\":"
+                << (livePipBoyScreenFocused ? "true" : "false")
+                << ",\"livePipBoyHovered\":"
+                << (livePipBoyFocus.hovered ? "true" : "false")
+                << ",\"livePipBoyScale\":" << livePipBoyFocus.scale
                 << ",\"uiQuadVisible\":" << (uiQuadVisible ? "true" : "false")
                 << ",\"productionUiQuadActive\":"
                 << (productionUiQuadActive ? "true" : "false")

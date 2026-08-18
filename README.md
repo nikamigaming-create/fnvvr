@@ -65,11 +65,16 @@ The presentation contract has two modes:
 - All non-blocking gameplay, exploration, combat, and world interaction require
   true binocular 3D, independent 6DoF head motion, a tracked retail weapon,
   and no persistent gameplay HUD. Mono gameplay is never accepted as success.
-- Startup, pause, inventory, barter, terminals, dialogue, VATS, loading, and
-  other blocking retail UI use the stable mono quad. The bounded Pip-Boy wrist
-  route can retain the last validated binocular world pair behind its live mono
-  UI without advancing world-frame proof. The controller ray drives the
-  ordinary retail mouse pointer and click path.
+- The retail Pip-Boy is a persistent live wrist device inside `WorldStereo`,
+  alongside the tracked hands and weapon. Pointing at it progressively enlarges
+  it and focuses its live screen; the right trigger acts as the fingertip for
+  screen, tab-dial, and scroll-control hits. It never becomes a host quad.
+- Right-grip plus R3 opens an eight-slot orbit selector around the controller;
+  releasing it equips the selected retail favorite through the normal engine
+  input path.
+- Startup, pause, containers, barter, terminals, dialogue, VATS, loading,
+  conflicting/unknown menus, and every other blocking retail UI use a stable
+  floating mono quad anchored in front of the player.
 - Leaving UI holds the last valid quad until one fresh, complete, pose-matched
   stereo transaction from a strictly newer retail source frame is ready, then
   changes to world stereo atomically. Stale stereo remains rejected even after
@@ -90,8 +95,10 @@ fallbacks remain disabled.
 This is not full product acceptance. The CPU-v8 image transfer is intentionally
 bounded and too expensive for the production transport. The retained simulator
 evidence proves a controller-driven movement/combat loop and authentic
-first-person hand, Pip-Boy, and weapon roots, but encoded depth submission,
-authoritative muzzle alignment, live wrist-menu selection, equipped-item model
+first-person hand, Pip-Boy, and weapon roots. The live Pip-Boy focus/scale,
+physical control-zone, and weapon-orbit contracts are unit-tested but still
+need a retained live eye/pointer/equip proof;
+encoded depth submission, authoritative muzzle alignment, equipped-item model
 swaps, and physical-headset acceptance remain open gates. The plugin remains
 inert outside explicit profiles.
 

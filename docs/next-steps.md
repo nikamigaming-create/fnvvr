@@ -13,9 +13,11 @@ world presentation.
 - Engine-sensitive work stays in xNVSE. Every shared mapping must have a
   fixed/versioned layout, a stable-snapshot rule, and one declared producer per
   mutable field before it is trusted.
-- Confirmed startup/menu, pause, Pip-Boy, inventory, dialogue, VATS, and loading
-  states use the flat mono retail surface. Unknown/stale runtime fails blank;
-  it cannot relabel arbitrary pixels as an allowed UI quad.
+- The retail Pip-Boy remains a live wrist object in fresh binocular rendering.
+  Pointing focuses/scales it and its screen/dials consume tracked fingertip
+  actions without changing presentation mode. Confirmed startup/menu, pause,
+  containers, dialogue, VATS, loading, conflicting menus, and unknown UI states
+  use the front-floating mono retail surface. Unknown/stale runtime fails blank.
 - All non-blocking gameplay requires true binocular stereo, independent 6DoF,
   a tracked authoritative retail weapon, and no persistent gameplay HUD.
   Invalid gameplay stereo is a visible rejection, not a mono fallback.
@@ -72,11 +74,14 @@ Weapon acceptance gate: where the physical controller points, the visible
 barrel, retail projectile/hit result, and impact marker agree within a logged
 tolerance, including after recoil and reload.
 
-## Phase 3: Keep UI Deliberately Flat
+## Phase 3: Keep Other UI Deliberately Front-Floating
 
 - Treat runtime UI classification as authoritative, not pixel heuristics.
-- Suppress world stereo for every blocking/interactive UI state and present the
-  retail mono frame on the stable headset surface.
+- Keep the Pip-Boy root live with the hands/weapon in every accepted world eye.
+  Intersect its wrist-following screen/control plane, enlarge it on focus, and
+  route screen, tab-dial, scroll, and weapon-orbit selections through retail.
+- Suppress world stereo for every other blocking/interactive UI state and
+  present the retail mono frame on the stable quad floating in front.
 - Keep pointer ray, click, scroll, back, and controller navigation mapped to
   retail input only.
 - Require a short stable-gameplay debounce plus a fresh complete eye pair
@@ -84,9 +89,10 @@ tolerance, including after recoil and reload.
 - On any UI transition, restore the flat surface before discarding the last
   world pair. Stale or invalid gameplay stereo publishes no successful frame.
 
-UI acceptance gate: open and close pause, Pip-Boy/inventory, dialogue, VATS,
-loading transitions, and nested menus without blank frames, stereo menus,
-double input, or a lost pointer.
+UI acceptance gate: open and operate the physical Pip-Boy without a quad while
+the authored arm/screen and both eyes remain current; then open and close pause,
+containers, dialogue, VATS, loading transitions, and nested menus without blank
+frames, accidental stereo menus, double input, or a lost pointer.
 
 ## Phase 4: Native Retail Stereo
 

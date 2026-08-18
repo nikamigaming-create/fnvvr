@@ -12,7 +12,6 @@ enum class GameplayAuthorityBlocker : std::uint8_t
 {
     None = 0u,
     PhysicalPlayNotRequested,
-    InputFocusLost,
     ControllerConsumerUnacknowledged,
     MenuOwnsInput,
     RuntimeNotGameplay,
@@ -22,7 +21,6 @@ enum class GameplayAuthorityBlocker : std::uint8_t
 struct GameplayAuthorityInput
 {
     bool physicalHeadsetPlayRequested = false;
-    bool inputFocused = false;
     bool controllerConsumerAcknowledged = false;
     bool menuOwnsInput = false;
     bool runtimeGameplay = false;
@@ -45,8 +43,6 @@ constexpr GameplayAuthorityDecision assessGameplayAuthority(
 {
     if (!input.physicalHeadsetPlayRequested)
         return { GameplayAuthorityBlocker::PhysicalPlayNotRequested };
-    if (!input.inputFocused)
-        return { GameplayAuthorityBlocker::InputFocusLost };
     if (!input.controllerConsumerAcknowledged)
         return { GameplayAuthorityBlocker::ControllerConsumerUnacknowledged };
     if (input.menuOwnsInput)
@@ -66,8 +62,6 @@ constexpr const char* gameplayAuthorityBlockerName(
         case GameplayAuthorityBlocker::None: return "granted";
         case GameplayAuthorityBlocker::PhysicalPlayNotRequested:
             return "physical-play-not-requested";
-        case GameplayAuthorityBlocker::InputFocusLost:
-            return "input-focus-lost";
         case GameplayAuthorityBlocker::ControllerConsumerUnacknowledged:
             return "controller-consumer-unacknowledged";
         case GameplayAuthorityBlocker::MenuOwnsInput:

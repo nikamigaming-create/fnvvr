@@ -35,6 +35,18 @@ presentation::RuntimeSample gameplayRuntime(std::uint64_t sample)
     return runtime;
 }
 
+presentation::RuntimeSample pipBoyRuntime(std::uint64_t sample)
+{
+    presentation::RuntimeSample runtime {};
+    runtime.sample = sample;
+    runtime.phase = fnvxr::shared::RuntimePhaseMenu;
+    runtime.menuBits = fnvxr::shared::RuntimeMenuModeBit
+        | fnvxr::shared::RuntimePipBoyMenuBit;
+    runtime.cameraActive = true;
+    runtime.fresh = true;
+    return runtime;
+}
+
 presentation::FrameIdentity flatUiFrame(
     std::uint64_t transaction,
     std::uint64_t sourceFrame,
@@ -69,6 +81,38 @@ presentation::FrameIdentity worldFrame(
 
 int main()
 {
+    namespace liveContract = fnvxr::engine::live_pipboy;
+    const liveContract::FocusDecision hover = liveContract::assessFocus({
+        true, false, 6u, 12u,
+    });
+    const liveContract::FocusDecision focus = liveContract::assessFocus({
+        true, false, 12u, 12u,
+    });
+    require(
+        hover.hovered && !hover.focused && hover.scale > 1.0f
+            && focus.focused && focus.requestOpen
+            && focus.scale > hover.scale,
+        "pointing did not smoothly focus and enlarge the live Pip-Boy");
+    require(
+        liveContract::weaponOrbitSlot(0.0f, 1.0f) == 0
+            && liveContract::weaponOrbitSlot(1.0f, 0.0f) == 2
+            && liveContract::weaponOrbitSlot(0.0f, -1.0f) == 4
+            && liveContract::weaponOrbitSlot(-1.0f, 0.0f) == 6
+            && liveContract::weaponOrbitSlot(0.1f, 0.1f) == -1,
+        "weapon orbit selector lost its eight-slot/deadzone contract");
+    require(
+        liveContract::physicalControl(0.08f, 0.1f)
+                == liveContract::PhysicalControl::StatsDial
+            && liveContract::physicalControl(0.08f, 0.5f)
+                == liveContract::PhysicalControl::ItemsDial
+            && liveContract::physicalControl(0.08f, 0.9f)
+                == liveContract::PhysicalControl::DataDial
+            && liveContract::physicalControl(0.92f, 0.2f)
+                == liveContract::PhysicalControl::ScrollUp
+            && liveContract::physicalControl(0.5f, 0.5f)
+                == liveContract::PhysicalControl::Screen,
+        "live Pip-Boy screen/dial control zones changed");
+
     const presentation::RuntimeSample menu = menuRuntime(40u);
     const presentation::FrameIdentity ui = flatUiFrame(100u, 1000u, 40u);
     require(
@@ -82,6 +126,13 @@ int main()
         presentation::confirmedRuntimeMode(gameplayRuntime(41u))
             == presentation::RuntimeMode::Gameplay,
         "a confirmed gameplay runtime did not select gameplay mode");
+    const presentation::RuntimeSample livePipBoyRuntime =
+        pipBoyRuntime(42u);
+    require(
+        presentation::confirmedRuntimeMode(livePipBoyRuntime)
+                == presentation::RuntimeMode::Gameplay
+            && !presentation::runtimeUiConfirmed(livePipBoyRuntime),
+        "live Pip-Boy focus did not retain binocular presentation mode");
 
     const presentation::RuntimeSample laterMenu = menuRuntime(64u);
     require(
@@ -135,6 +186,12 @@ int main()
             gameplayRuntime(42u),
             uiBoundary),
         "the first new post-menu world pair did not resume binocular presentation");
+    require(
+        presentation::binocularWorldFrameEligible(
+            resumedWorld,
+            livePipBoyRuntime,
+            {}),
+        "a current live Pip-Boy world pair was rejected");
 
     // Source-pose freshness controls advancing proof, not whether the verified
     // world layer remains visible between exact producer updates.
@@ -175,21 +232,6 @@ int main()
             && !presentation::preserveVerifiedWorldAcrossCellChange(false, true)
             && !presentation::preserveVerifiedWorldAcrossCellChange(true, false),
         "cell transition retention escaped the verified CPU-world boundary");
-    require(
-        presentation::preserveVerifiedWorldBehindPipBoy(
-            true, true, true, true, true, true, true),
-        "a verified binocular world pair was not retained behind the Pip-Boy");
-    require(
-        !presentation::preserveVerifiedWorldBehindPipBoy(
-            true, false, true, true, true, true, true)
-            && !presentation::preserveVerifiedWorldBehindPipBoy(
-                true, true, true, false, true, true, true)
-            && !presentation::preserveVerifiedWorldBehindPipBoy(
-                true, true, true, true, false, true, true)
-            && !presentation::preserveVerifiedWorldBehindPipBoy(
-                true, true, true, true, true, false, true),
-        "Pip-Boy world retention escaped its verified binocular resource boundary");
-
     presentation::FrameIdentity wrongSampleUi = ui;
     wrongSampleUi.runtimeStateSample = 39u;
     require(

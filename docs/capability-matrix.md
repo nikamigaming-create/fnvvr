@@ -11,8 +11,8 @@ until the capability's phase gate and the final aggregate release gate pass.
 |---|---|---|---|---|---|---|
 | `CameraStereoVisual` | Partial | Yes | Yes | No | No | CPU-v8 engine-center visual trial proves simulator motion only; physical body/head behavior is unproven. |
 | `ControllerInput` | Partial | Yes | Partial | No | No | The xNVSE main-game-loop consumer exists, but the release semantic map and physical action matrix are incomplete. |
-| `UiInteraction` | Partial | Yes | Partial | No | No | Current mono capture/basic pointer work is not the complete retail menu matrix. |
-| `VisualRig` | Partial | Yes | No | No | No | Rig discovery/FABRIK and a visual-only assist seam exist; they do not authorize weapon mutation. |
+| `UiInteraction` | Partial | Yes | Partial | No | No | Other menus retain the front quad; live Pip-Boy focus/scale, screen/dial zones, and weapon-orbit selection are unit-tested but lack retained live acceptance. |
+| `VisualRig` | Partial | Yes | No | No | No | Rig discovery/FABRIK now remains eligible for the physical Pip-Boy and gameplay seams; live wrist/hand/weapon acceptance is still open. |
 | `CombatAim` | No | Partial | No | No | No | Only read-only weapon/projectile observations exist; no retail firing seam is authorized. |
 | `GpuPresentation` | Partial | Yes | No | No | No | Color ABI v5 contracts and components exist; a live supported producer/consumer recovery proof does not. |
 | `FullProduct` | No | No | No | No | No | Only a complete aggregate of the six narrow capabilities plus release qualification can claim this state. |

@@ -23,7 +23,7 @@ RuntimeSample menu(std::uint64_t sample = 40u)
     return {
         sample,
         fnvxr::shared::RuntimePhaseMenu,
-        fnvxr::shared::RuntimePipBoyMenuBit,
+        fnvxr::shared::RuntimeGenericMenuBit,
         0u,
         false,
         true,
@@ -90,7 +90,7 @@ int main()
     fnvxr::product::PresentationInput advancedPresentation {};
     advancedPresentation.runtimeStateSample = 47u;
     advancedPresentation.runtimePhase = fnvxr::shared::RuntimePhaseMenu;
-    advancedPresentation.menuBits = fnvxr::shared::RuntimePipBoyMenuBit;
+    advancedPresentation.menuBits = fnvxr::shared::RuntimeGenericMenuBit;
     advancedPresentation.runtimeFresh = true;
     advancedPresentation.ui = advancedMenu.proof;
     fnvxr::product::PresentationController advancedController;

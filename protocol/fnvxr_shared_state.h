@@ -9,12 +9,12 @@
 namespace fnvxr::shared
 {
 constexpr std::uint32_t XInputSharedMagic = 0x58564e46; // FNVX
-constexpr std::uint32_t XInputSharedVersion = 3;
-inline constexpr char XInputSharedMappingName[] = "Local\\FNVXR_XInput_State_v3";
+constexpr std::uint32_t XInputSharedVersion = 4;
+inline constexpr char XInputSharedMappingName[] = "Local\\FNVXR_XInput_State_v4";
 constexpr std::uint32_t DInputSharedMagic = 0x49444e46; // FNDI
 constexpr std::uint32_t DInputSharedVersion = 10;
 inline constexpr char DInputSharedMappingName[] = "Local\\FNVXR_DInput_State_v10";
-inline constexpr char InputCoreProducerMutexName[] = "Local\\FNVXR_Input_Core_Producer_v3_v10_pose9_g2";
+inline constexpr char InputCoreProducerMutexName[] = "Local\\FNVXR_Input_Core_Producer_v4_v10_pose9_g2";
 constexpr std::uint32_t VrPoseSharedMagic = 0x52505646; // FVPR
 constexpr std::uint32_t VrPoseSharedVersion = 9;
 inline constexpr char VrPoseSharedMappingName[] = "Local\\FNVXR_VR_Pose_State_v9";
@@ -189,6 +189,8 @@ constexpr std::uint32_t RuntimeBlockingMenuBits =
     | RuntimeLoadingMenuBit
     | RuntimePipBoyMenuBit
     | RuntimeGenericMenuBit;
+constexpr std::uint32_t RuntimeWorldPresentationBlockingMenuBits =
+    RuntimeBlockingMenuBits & ~RuntimePipBoyMenuBit;
 
 enum class RuntimeControllerMode : std::uint32_t
 {
@@ -208,11 +210,43 @@ inline bool runtimeUiInputAllowed(std::uint32_t menuBits)
         && (menuBits & RuntimeLoadingMenuBit) == 0u;
 }
 
-inline bool runtimeGameplayPhase(std::uint32_t phase, std::uint32_t menuBits, std::uint32_t showroomActive)
+constexpr bool runtimeGameplayPhase(std::uint32_t phase, std::uint32_t menuBits, std::uint32_t showroomActive)
 {
     return phase == RuntimePhaseGameplay
         && showroomActive == 0u
         && (menuBits & RuntimeBlockingMenuBits) == 0u;
+}
+
+constexpr bool runtimeLivePipBoyFocus(
+    std::uint32_t phase,
+    std::uint32_t menuBits,
+    std::uint32_t showroomActive,
+    bool cameraActive)
+{
+    static_cast<void>(cameraActive);
+    // Retail marks its ordinary gameplay camera inactive while the wrist
+    // inventory is open even though the already-loaded world and first-
+    // person prop remain the presentation. The exact Pip-Boy bit plus the
+    // absence of every conflicting menu is the authority for this route.
+    return phase == RuntimePhaseMenu
+        && showroomActive == 0u
+        && (menuBits & RuntimePipBoyMenuBit) != 0u
+        && (menuBits & RuntimeWorldPresentationBlockingMenuBits) == 0u;
+}
+
+constexpr bool runtimeWorldPresentationPhase(
+    std::uint32_t phase,
+    std::uint32_t menuBits,
+    std::uint32_t showroomActive,
+    bool cameraActive)
+{
+    return (cameraActive
+            && runtimeGameplayPhase(phase, menuBits, showroomActive))
+        || runtimeLivePipBoyFocus(
+            phase,
+            menuBits,
+            showroomActive,
+            cameraActive);
 }
 
 inline bool runtimeUiActive(std::uint32_t phase, std::uint32_t menuBits, std::uint32_t showroomActive)
@@ -291,6 +325,12 @@ constexpr std::uint32_t DInputGameplayFlagMeleeOrUnarmed = 1u << 3;
 constexpr std::uint8_t XInputReservedRetailConsumed = 0;
 constexpr std::uint8_t XInputReservedAutoRun = 1;
 constexpr std::uint8_t XInputReservedMovementMode = 2; // 0 normal, 1 walk, 2 run
+constexpr std::uint8_t XInputReservedInteractionFlags = 3;
+constexpr std::uint8_t XInputReservedPipBoyScale = 4;
+constexpr std::uint8_t XInputReservedWeaponOrbitSlot = 5;
+constexpr std::uint8_t XInputReservedPipBoyDeviceU = 6;
+constexpr std::uint8_t XInputReservedPipBoyDeviceV = 7;
+static_assert(XInputReservedPipBoyDeviceV < 8u);
 constexpr std::uint32_t CommandTypeNone = 0;
 constexpr std::uint32_t CommandTypeSave = 1;
 constexpr std::uint32_t CommandTypeQuit = 2;
@@ -334,8 +374,12 @@ struct SharedXInputState
     std::int16_t rightThumbX;
     std::int16_t rightThumbY;
     std::uint8_t connected;
-    std::uint8_t reserved[3];
+    std::uint8_t reserved[8];
 };
+static_assert(
+    sizeof(((SharedXInputState*)nullptr)->reserved)
+        > XInputReservedPipBoyDeviceV,
+    "SharedXInputState interaction payload exceeds the reserved ABI");
 
 struct SharedDInputState
 {
@@ -374,9 +418,9 @@ struct SharedDInputState
 // Writers mark the sequence odd while mutating producer-owned frame fields and
 // even only after that frame is complete. Readers either copy one matching even
 // sequence or reject the sample; they must never act on a torn
-// button/trigger/stick combination. SharedXInputState::reserved is an explicit
-// exception: its three bytes are independent atomic status mailboxes owned by
-// the retail proxy/plugin, not part of the host payload transaction.
+// button/trigger/stick combination. SharedXInputState::reserved[0..2] remain
+// independent atomic status mailboxes owned by the retail proxy/plugin;
+// reserved[3..7] are host-owned interaction bytes covered by the sequence.
 inline bool beginSequencedSharedWrite(volatile LONG& sequence)
 {
     for (int attempt = 0; attempt < 1024; ++attempt)
@@ -858,7 +902,7 @@ struct SharedInputEventQueue
     SharedInputEvent events[InputEventQueueLength];
 };
 
-static_assert(sizeof(SharedXInputState) == 32, "SharedXInputState layout changed");
+static_assert(sizeof(SharedXInputState) == 40, "SharedXInputState layout changed");
 static_assert(sizeof(SharedDInputState) == 100, "SharedDInputState layout changed unexpectedly");
 static_assert(sizeof(SharedVrPoseState) == 288, "SharedVrPoseState layout changed unexpectedly");
 static_assert(sizeof(SharedVrOriginState) == 216, "SharedVrOriginState layout changed unexpectedly");

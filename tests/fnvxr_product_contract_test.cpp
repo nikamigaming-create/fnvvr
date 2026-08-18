@@ -76,7 +76,6 @@ int main()
         RuntimeRaceSexMenuBit,
         RuntimeDialogMenuBit,
         RuntimeVatsMenuBit,
-        RuntimePipBoyMenuBit,
         RuntimeGenericMenuBit,
     };
 
@@ -114,7 +113,7 @@ int main()
 
         const PresentationDecision menu = controller.advance(input(
             RuntimePhaseMenu,
-            RuntimePipBoyMenuBit,
+            RuntimeGenericMenuBit,
             {},
             priorGameplayMono,
             MenuStateSample));
@@ -183,7 +182,7 @@ int main()
         constexpr std::uint64_t GameplayStateSample = 0x3001;
         const PresentationDecision menu = controller.advance(input(
             RuntimePhaseMenu,
-            RuntimePipBoyMenuBit,
+            RuntimeGenericMenuBit,
             {},
             completeUi(700, UiStateSample),
             UiStateSample));
@@ -275,12 +274,38 @@ int main()
 
     {
         PresentationController controller;
+        const PresentationDecision livePipBoy = controller.advance(
+            input(
+                RuntimePhaseMenu,
+                RuntimePipBoyMenuBit,
+                completeStereo(90),
+                {}));
+        if (livePipBoy.mode != PresentationMode::WorldStereo
+            || !livePipBoy.gameplayVrAccepted
+            || livePipBoy.presentedUiSourceFrame != 0)
+        {
+            return fail("live Pip-Boy focus must continue fresh WorldStereo without a quad");
+        }
+
+        PresentationController conflictController;
+        const PresentationDecision conflictingMenu = conflictController.advance(
+            input(
+                RuntimePhaseMenu,
+                RuntimePipBoyMenuBit | RuntimeGenericMenuBit,
+                {},
+                completeUi(91)));
+        if (conflictingMenu.mode != PresentationMode::UiQuad)
+            return fail("a menu conflicting with the live Pip-Boy must use the front quad");
+    }
+
+    {
+        PresentationController controller;
         const PresentationDecision menu = controller.advance(
-            input(RuntimePhaseMenu, RuntimePipBoyMenuBit));
+            input(RuntimePhaseMenu, RuntimeGenericMenuBit));
         if (menu.mode != PresentationMode::UiQuad)
-            return fail("Pip-Boy must establish UI-quad mode");
+            return fail("generic menu must establish UI-quad mode");
         if (menu.presentedUiSourceFrame != 50)
-            return fail("Pip-Boy must retain the exact displayed retail source frame");
+            return fail("generic menu must retain the exact displayed retail source frame");
 
         for (std::uint32_t frame = 0; frame < MaxUiToStereoHoldFrames; ++frame)
         {
@@ -332,7 +357,7 @@ int main()
     {
         PresentationController controller;
         const PresentationDecision menu = controller.advance(
-            input(RuntimePhaseMenu, RuntimePipBoyMenuBit, {}, completeUi(71)));
+            input(RuntimePhaseMenu, RuntimeGenericMenuBit, {}, completeUi(71)));
         if (menu.mode != PresentationMode::UiQuad)
             return fail("confirmed UI fixture must display before unknown-state invalidation");
 
@@ -416,7 +441,7 @@ int main()
             return fail("cross-UI identity fixture must accept its initial gameplay frame");
         }
         if (controller.advance(
-                input(RuntimePhaseMenu, RuntimePipBoyMenuBit, {}, completeUi(401))).mode
+                input(RuntimePhaseMenu, RuntimeGenericMenuBit, {}, completeUi(401))).mode
             != PresentationMode::UiQuad)
         {
             return fail("cross-UI identity fixture must enter confirmed UI");
@@ -440,7 +465,7 @@ int main()
         }
 
         const PresentationDecision staleUi = controller.advance(
-            input(RuntimePhaseMenu, RuntimePipBoyMenuBit, {}, completeUi(499)));
+            input(RuntimePhaseMenu, RuntimeGenericMenuBit, {}, completeUi(499)));
         if (staleUi.mode != PresentationMode::SafetyBlank
             || staleUi.pointerEnabled
             || staleUi.presentedUiSourceFrame != 0
@@ -468,7 +493,7 @@ int main()
             return fail("post-UI freshness fixture must accept its baseline gameplay frame");
         }
         const PresentationDecision menu = controller.advance(
-            input(RuntimePhaseMenu, RuntimePipBoyMenuBit, {}, completeUi(1000)));
+            input(RuntimePhaseMenu, RuntimeGenericMenuBit, {}, completeUi(1000)));
         if (menu.mode != PresentationMode::UiQuad
             || menu.presentedUiSourceFrame != 1000)
         {
@@ -499,7 +524,7 @@ int main()
             return fail("expired post-UI freshness fixture must accept its baseline gameplay frame");
         }
         if (controller.advance(
-                input(RuntimePhaseMenu, RuntimePipBoyMenuBit, {}, completeUi(1000))).mode
+                input(RuntimePhaseMenu, RuntimeGenericMenuBit, {}, completeUi(1000))).mode
             != PresentationMode::UiQuad)
         {
             return fail("expired post-UI freshness fixture must enter confirmed UI");

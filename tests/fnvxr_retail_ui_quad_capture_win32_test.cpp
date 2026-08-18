@@ -249,6 +249,17 @@ int main()
             && state.publications == 2u,
         "confirmed dialogue was not admitted as MonoUiQuad");
 
+    state.frame = validFrame(shared::RuntimePhaseMenu);
+    state.frame.runtime.menuBits = shared::RuntimeMenuModeBit
+        | shared::RuntimePipBoyMenuBit;
+    require(
+        present(device, nullptr, nullptr, nullptr, nullptr) == S_FALSE
+            && state.copies == 2u
+            && state.publications == 2u
+            && state.lastWithhold
+                == d3d9::RetailUiQuadCaptureFailure::RuntimeNotConfirmedUi,
+        "live Pip-Boy was copied into the MonoUiQuad producer");
+
     state.readSucceeds = false;
     require(
         present(device, nullptr, nullptr, nullptr, nullptr) == S_FALSE

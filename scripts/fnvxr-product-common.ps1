@@ -412,6 +412,12 @@ function ConvertTo-FnvxrProductPhysicalDisplayIniText {
         "iSize H" = [string]$Height
         "iMultiSample" = "0"
         "bTransparencyMultisampling" = "0"
+        # A desktop-default 75-degree source projection reads as a small
+        # window inside the headset.  This temporary physical profile is
+        # restored byte-for-byte after every run, along with the resolution.
+        "fDefaultFOV" = "110.0000"
+        "fDefault1stPersonFOV" = "110.0000"
+        "fPipboy1stPersonFOV" = "110.0000"
     }
     $lines = [System.Collections.Generic.List[string]]::new()
     foreach ($line in [regex]::Split($Text, "`r`n|`n|`r")) {
@@ -2376,11 +2382,17 @@ function Get-FnvxrProductMinimalEnvironment {
         # the compositor does not alternate between stereo and zero layers.
         $environment.FNVXR_CPU_STEREO_MAX_SOURCE_POSE_AGE_MS = "250"
         $environment.FNVXR_PLUGIN_KEYBOARD_MOVEMENT_ENABLE = "1"
-        $environment.FNVXR_PLUGIN_MOVEMENT_DEADZONE = "9000"
+        # The live Quest sample was 0.25 forward (8,257 in XInput units),
+        # below the former 9,000 cutoff.  Six thousand still excludes normal
+        # stick drift while accepting deliberate walking input.
+        $environment.FNVXR_PLUGIN_MOVEMENT_DEADZONE = "6000"
         $environment.FNVXR_PLUGIN_MENU_KEYBOARD_FALLBACK = "1"
         $environment.FNVXR_PLUGIN_GAMEPLAY_KEYBOARD_FALLBACK = "1"
         $environment.FNVXR_PLUGIN_ACCEPT_ON_EXTERNAL_DINPUT_CLICK = "1"
         $environment.FNVXR_XINPUT_PHYSICAL_MENU_BUTTONS_ENABLE = "1"
+        # One left-controller Menu press opens the real Inventory Pip-Boy;
+        # the same button closes it while the Pip-Boy is active.
+        $environment.FNVXR_PHYSICAL_LEFT_MENU_PIPBOY_ENABLE = "1"
         $environment.FNVXR_L3_MENU_FALLBACK = "1"
         # Physical gameplay owns discrete comfort turning: one exact 30-degree
         # actor-heading change per deflection, with neutral required to rearm.
@@ -2388,7 +2400,16 @@ function Get-FnvxrProductMinimalEnvironment {
         # Full stick magnitude selects Fallout's native running movement flag
         # in every direction; shallow input remains walking speed.
         $environment.FNVXR_GAMEPLAY_RIGHT_GRIP_GRAB_ENABLE = "1"
-        $environment.FNVXR_DIRECT_UI_CLICK = "0"
+        # The host already publishes a tracked right-hand pointer into the
+        # exact retail UI lane.  Keep its hover and native accept path live.
+        $environment.FNVXR_DIRECT_UI_CLICK = "1"
+        # Keep the authored retail first-person arm, Pip-Boy casing/screen,
+        # hands, weapon state, and world in the engine's binocular transaction.
+        # Its wrist surface is interaction geometry only; screen focus never
+        # creates or submits a host Pip-Boy quad.
+        $environment.FNVXR_LIVE_PIPBOY_FOCUS_FRAMES = "12"
+        $environment.FNVXR_WEAPON_ORBIT_GRIP_THRESHOLD = "0.55"
+        $environment.FNVXR_WEAPON_ORBIT_DEADZONE = "0.35"
         $environment.FNVXR_UI_SHARED_WIDTH = "1280"
         $environment.FNVXR_UI_SHARED_HEIGHT = "720"
         $environment.FNVXR_UI_INPUT_WIDTH =
@@ -2478,6 +2499,17 @@ function Get-FnvxrProductMinimalEnvironment {
             $environment.FNVXR_HEADSET_DEMO_FIXTURE = "1"
         }
         if ($HeadsetDemoFixture) {
+            # Exercise the same no-quad source contract under the isolated
+            # process-local simulator before asking a physical headset to
+            # accept it. The demo still owns only its two fixed Tab events.
+            $environment.FNVXR_LIVE_PIPBOY_FOCUS_FRAMES = "12"
+            # Publish the already-rendered world plus authentic first-person
+            # roots at the same audited third outer caller used by physical
+            # play. This is presentation only; the demo still has no combat
+            # or general controller authority.
+            $environment.FNVXR_RETAIL_VR_FIRST_PERSON_PRIVATE_CALLER =
+                "third"
+            $environment.FNVXR_RETAIL_CENTER_INTEGRATED_FIRST_PERSON = "1"
             $environment.FNVXR_HEADSET_DEMO_GAMEPLAY_WARMUP_FRAMES =
                 [string]$HeadsetDemoGameplayWarmupFrames
             $environment.FNVXR_HEADSET_DEMO_PIPBOY_HOLD_FRAMES = "240"

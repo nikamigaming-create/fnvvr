@@ -109,6 +109,9 @@ foreach ($contract in @(
     'yaw',
     'pitch',
     'roll',
+    '[switch]$LivePipBoyFocus',
+    'axis = "pipBoyFocus"',
+    'livePipBoyFocusCommandCount',
     'headPoseMutated = $false',
     'explicit OpenXR LOCAL controller poses')) {
     if (-not $controllerSweepDriver.Contains($contract)) {

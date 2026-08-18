@@ -150,7 +150,7 @@ int main()
     RuntimeEvidence runtime {};
     runtime.sample = 8u;
     runtime.phase = fnvxr::shared::RuntimePhaseMenu;
-    runtime.menuBits = fnvxr::shared::RuntimePipBoyMenuBit;
+    runtime.menuBits = fnvxr::shared::RuntimeGenericMenuBit;
     runtime.cameraActive = false;
     runtime.fresh = true;
     const fnvxr::product::PresentationInput uiInput =
