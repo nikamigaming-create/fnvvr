@@ -571,11 +571,11 @@ if ($spatialRetailPropsRequested) {
     $retailPropPreparation =
         $preparationOutput | ConvertFrom-Json -ErrorAction Stop
     if ([string]$retailPropPreparation.schema -cne
-            "fnvxr-retail-props/v2" -or
+            "fnvxr-retail-props/v3" -or
         [string]$retailPropPreparation.coordinateBasis -cne
             "openxr-grip-minus-z" -or
         [string]$retailPropPreparation.rightHandPose -cne
-            "1hpaim@0") {
+            "1hphandgrip1@end") {
         throw "Installed retail prop preparation returned an invalid hand/socket contract."
     }
 }
@@ -1479,6 +1479,7 @@ function Get-FnvxrProductFirstPersonVisualQualityProof {
         [Parameter(Mandatory = $true)][string]$SourceRoot,
         [string]$VideoPath = "",
         [string]$PairDirectory = "",
+        [string]$HostLogPath = "",
         [switch]$RequirePipBoyScreen,
         [Parameter(Mandatory = $true)][string]$ReportPath
     )
@@ -1500,6 +1501,9 @@ function Get-FnvxrProductFirstPersonVisualQualityProof {
             "--max-red-ratio", "0.0005",
             "--max-red-jump", "0.0001",
             "--report", $ReportPath)
+        if (-not [string]::IsNullOrWhiteSpace($HostLogPath)) {
+            $pairArguments += @("--host-log", $HostLogPath)
+        }
         if ($RequirePipBoyScreen) {
             $pairArguments += "--require-pipboy-screen"
         }
@@ -1518,7 +1522,7 @@ function Get-FnvxrProductFirstPersonVisualQualityProof {
     }
     $report = Get-Content -LiteralPath $ReportPath -Raw |
         ConvertFrom-Json -ErrorAction Stop
-    if ([string]$report.schema -cne "fnvxr-first-person-visual-quality/v2") {
+    if ([string]$report.schema -cne "fnvxr-first-person-visual-quality/v4") {
         throw "First-person final-pixel analyzer returned the wrong schema."
     }
     return $report
@@ -2417,6 +2421,8 @@ function Get-FnvxrProductPipBoyOutputProof {
             -not [bool]$frame.runtimeCameraActive -and
             [bool]$frame.livePipBoy -and
             [bool]$frame.spatialHandsOverlay -and
+            [bool]$frame.rightHandGripCalibrationValid -and
+            [bool]$frame.leftPipBoyScreenCalibrationValid -and
             [bool]$frame.pipBoySpatialScreenVisible -and
             -not [bool]$frame.uiQuadVisible -and
             [bool]$frame.cpuEngineStereoActive -and
@@ -2443,6 +2449,10 @@ function Get-FnvxrProductPipBoyOutputProof {
                 runtimeState = "live-pipboy-world"
                 worldSimulationPaused = $true
                 spatialHandsOverlay = $true
+                rightHandGripCalibrationValid = $true
+                leftPipBoyScreenCalibrationValid = $true
+                leftPipBoyScreenCalibrationCommit =
+                    [uint64]$frame.leftPipBoyScreenCalibrationCommit
                 pipBoySpatialScreenVisible = $true
                 menuBits = [uint32]$frame.runtimeMenuBits
                 transaction = [uint64]$frame.cpuEngineTransaction
@@ -2456,13 +2466,161 @@ function Get-FnvxrProductPipBoyOutputProof {
     return $null
 }
 
+function Get-FnvxrProductMeasuredPipBoySimulatorAim {
+    param([Parameter(Mandatory = $true)][string]$HostLogPath)
+
+    if (-not (Test-Path -LiteralPath $HostLogPath -PathType Leaf)) {
+        return $null
+    }
+    $line = Select-String `
+        -LiteralPath $HostLogPath `
+        -Pattern '^leftPipBoyScreenCalibration valid=1 ' `
+        -ErrorAction SilentlyContinue | Select-Object -Last 1
+    if (-not $line) { return $null }
+    $match = [regex]::Match(
+        $line.Line,
+        'commit=(?<commit>\d+) pos=\((?<px>[-+0-9.eE]+),(?<py>[-+0-9.eE]+),(?<pz>[-+0-9.eE]+)\) quat=\((?<qx>[-+0-9.eE]+),(?<qy>[-+0-9.eE]+),(?<qz>[-+0-9.eE]+),(?<qw>[-+0-9.eE]+)\)')
+    if (-not $match.Success) { return $null }
+
+    $px = [double]$match.Groups['px'].Value
+    $py = [double]$match.Groups['py'].Value
+    $pz = [double]$match.Groups['pz'].Value
+    $qx = [double]$match.Groups['qx'].Value
+    $qy = [double]$match.Groups['qy'].Value
+    $qz = [double]$match.Groups['qz'].Value
+    $qw = [double]$match.Groups['qw'].Value
+    $qLength = [Math]::Sqrt(
+        $qx * $qx + $qy * $qy + $qz * $qz + $qw * $qw)
+    if ([double]::IsNaN($qLength) -or [double]::IsInfinity($qLength) -or
+        $qLength -lt 0.5 -or $qLength -gt 1.5) {
+        return $null
+    }
+    $qx /= $qLength
+    $qy /= $qLength
+    $qz /= $qLength
+    $qw /= $qLength
+
+    # Fixed owned-simulator poses. The placement offset and orientation are
+    # never guessed: they are the current runtime's stock left-hand-to-screen
+    # calibration parsed above.
+    $leftWrist = @(-0.20, 1.40, -0.40)
+    # The simulator's untouched left controller retains its authored -0.3
+    # radian pitch. Both the grip-local screen offset and screen orientation
+    # must be composed through that wrist pose.
+    $wristQx = [Math]::Sin(-0.3 * 0.5)
+    $wristQy = 0.0
+    $wristQz = 0.0
+    $wristQw = [Math]::Cos(-0.3 * 0.5)
+    $rightAimOrigin = @(0.18, 1.37, -0.24)
+    $positionTx = 2.0 * ($wristQy * $pz - $wristQz * $py)
+    $positionTy = 2.0 * ($wristQz * $px - $wristQx * $pz)
+    $positionTz = 2.0 * ($wristQx * $py - $wristQy * $px)
+    $worldOffset = @(
+        [double]($px + $wristQw * $positionTx +
+            ($wristQy * $positionTz - $wristQz * $positionTy))
+        [double]($py + $wristQw * $positionTy +
+            ($wristQz * $positionTx - $wristQx * $positionTz))
+        [double]($pz + $wristQw * $positionTz +
+            ($wristQx * $positionTy - $wristQy * $positionTx)))
+    $center = @(
+        [double]($leftWrist[0] + $worldOffset[0])
+        [double]($leftWrist[1] + $worldOffset[1])
+        [double]($leftWrist[2] + $worldOffset[2]))
+    # DirectX composes model-local screen rotation followed by the wrist as
+    # wrist * local in standard quaternion notation.
+    $screenQx = $wristQw * $qx + $wristQx * $qw +
+        $wristQy * $qz - $wristQz * $qy
+    $screenQy = $wristQw * $qy - $wristQx * $qz +
+        $wristQy * $qw + $wristQz * $qx
+    $screenQz = $wristQw * $qz + $wristQx * $qy -
+        $wristQy * $qx + $wristQz * $qw
+    $screenQw = $wristQw * $qw - $wristQx * $qx -
+        $wristQy * $qy - $wristQz * $qz
+    $focusedWidth = (5.872956 / 70.0) * 1.35
+    $localItemX = (0.08 - 0.50) * $focusedWidth
+
+    # Rotate the Items-dial panel point by the measured screen quaternion:
+    # v' = v + qw*(2*qxyz x v) + qxyz x (2*qxyz x v).
+    $vx = $localItemX
+    $vy = 0.0
+    $vz = 0.0
+    $tx = 2.0 * ($screenQy * $vz - $screenQz * $vy)
+    $ty = 2.0 * ($screenQz * $vx - $screenQx * $vz)
+    $tz = 2.0 * ($screenQx * $vy - $screenQy * $vx)
+    $itemOffset = @(
+        [double]($vx + $screenQw * $tx +
+            ($screenQy * $tz - $screenQz * $ty))
+        [double]($vy + $screenQw * $ty +
+            ($screenQz * $tx - $screenQx * $tz))
+        $vz + $screenQw * $tz +
+            ($screenQx * $ty - $screenQy * $tx))
+    $items = @(
+        [double]($center[0] + $itemOffset[0])
+        [double]($center[1] + $itemOffset[1])
+        $center[2] + $itemOffset[2])
+
+    function Get-AnalyticAimAngles {
+        param([Parameter(Mandatory = $true)][double[]]$Target)
+        $dx = $Target[0] - $rightAimOrigin[0]
+        $dy = $Target[1] - $rightAimOrigin[1]
+        $dz = $Target[2] - $rightAimOrigin[2]
+        $length = [Math]::Sqrt($dx * $dx + $dy * $dy + $dz * $dz)
+        if ([double]::IsNaN($length) -or [double]::IsInfinity($length) -or
+            $length -lt 0.01) {
+            throw "Measured Pip-Boy target is not a usable simulator ray."
+        }
+        return [pscustomobject][ordered]@{
+            yaw = [Math]::Atan2(-$dx / $length, -$dz / $length)
+            pitch = [Math]::Asin($dy / $length)
+        }
+    }
+    $screenAim = Get-AnalyticAimAngles -Target $center
+    $itemsAim = Get-AnalyticAimAngles -Target $items
+    return [pscustomobject][ordered]@{
+        source = "WeaponFrame-v3-stock-left-hand-to-screen"
+        commit = [uint64]$match.Groups['commit'].Value
+        gripLocalPosition = @($px, $py, $pz)
+        gripLocalRotation = @($qx, $qy, $qz, $qw)
+        leftWristRotation = @($wristQx, $wristQy, $wristQz, $wristQw)
+        screenTarget = $center
+        itemsTarget = $items
+        screenYaw = [double]$screenAim.yaw
+        screenPitch = [double]$screenAim.pitch
+        itemsYaw = [double]$itemsAim.yaw
+        itemsPitch = [double]$itemsAim.pitch
+    }
+}
+
 function Get-FnvxrProductLatestCpuUiFrameProof {
     param([Parameter(Mandatory = $true)][string]$RetailVrLogPath)
 
     if (-not (Test-Path -LiteralPath $RetailVrLogPath -PathType Leaf)) {
         return $null
     }
-    $lines = @(Get-Content -LiteralPath $RetailVrLogPath -Tail 12000)
+    $stream = $null
+    $reader = $null
+    try {
+        $stream = [System.IO.FileStream]::new(
+            $RetailVrLogPath,
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Read,
+            [System.IO.FileShare]::ReadWrite)
+        $reader = [System.IO.StreamReader]::new(
+            $stream,
+            [System.Text.Encoding]::UTF8,
+            $true)
+        $allLines = @($reader.ReadToEnd() -split "`r?`n")
+        if ($allLines.Count -eq 0) { return $null }
+        $first = [Math]::Max(0, $allLines.Count - 12000)
+        $lines = @($allLines[$first..($allLines.Count - 1)])
+    } catch {
+        # A live log can rotate or be between writes. No sample is safer than
+        # turning an ordinary transient read into a product-run failure.
+        return $null
+    } finally {
+        if ($reader) { $reader.Dispose() }
+        elseif ($stream) { $stream.Dispose() }
+    }
     [array]::Reverse($lines)
     foreach ($line in $lines) {
         $jsonStart = $line.IndexOf(
@@ -2993,6 +3151,19 @@ try {
             } else {
                 $null
             }
+            leftForearm = if (($environment.Keys -ccontains
+                        "FNVXR_RETAIL_LEFT_FOREARM_MESH_PATH") -and
+                    ($environment.Keys -ccontains
+                        "FNVXR_RETAIL_LEFT_FOREARM_TEXTURE_PATH")) {
+                [ordered]@{
+                    mesh = Get-FnvxrProductFileIdentity `
+                        -Path ([string]$environment.FNVXR_RETAIL_LEFT_FOREARM_MESH_PATH)
+                    diffuseTexture = Get-FnvxrProductFileIdentity `
+                        -Path ([string]$environment.FNVXR_RETAIL_LEFT_FOREARM_TEXTURE_PATH)
+                }
+            } else {
+                $null
+            }
             diffuseTexture = if ($environment.Keys -ccontains
                     "FNVXR_RETAIL_HAND_TEXTURE_PATH") {
                 Get-FnvxrProductFileIdentity `
@@ -3482,6 +3653,20 @@ try {
     # sweep can then prove the hand target remains fixed while the head moves;
     # this is the exact inverse of the controller-only proof below.
     if ($ControllerPoseSweep -and -not $HeadsetCombatVisualTrial) {
+        $pipBoySimulatorAim = $null
+        if ($HeadsetInventoryVisualTrial) {
+            $calibrationDeadline = [DateTime]::UtcNow.AddSeconds(8)
+            do {
+                $pipBoySimulatorAim =
+                    Get-FnvxrProductMeasuredPipBoySimulatorAim `
+                        -HostLogPath $hostOut
+                if ($pipBoySimulatorAim) { break }
+                Start-Sleep -Milliseconds 100
+            } while ([DateTime]::UtcNow -lt $calibrationDeadline)
+            if (-not $pipBoySimulatorAim) {
+                throw "The host never published a parseable measured retail left-hand-to-Pip-Boy screen pose. Evidence is in $runDirectory"
+            }
+        }
         $manifest.controllerPoseSweep.status = "running"
         $manifest.headsetControllerRigVisualTrial.status =
             "running-controller-only-rig-sweep"
@@ -3494,6 +3679,12 @@ try {
                 -DataDirectory $openXrSimulatorDataDirectory `
                 -Hand right `
                 -LivePipBoyFocus:$HeadsetInventoryVisualTrial `
+                -PipBoyFocusYaw $(if ($pipBoySimulatorAim) {
+                    [double]$pipBoySimulatorAim.screenYaw
+                } else { 1.178 }) `
+                -PipBoyFocusPitch $(if ($pipBoySimulatorAim) {
+                    [double]$pipBoySimulatorAim.screenPitch
+                } else { 0.159 }) `
                 -DurationSeconds $ControllerPoseSweepSeconds
         ) -join [Environment]::NewLine
         $controllerPoseSweepEvidence =
@@ -3593,6 +3784,10 @@ try {
                 & (Join-Path $PSScriptRoot `
                     "invoke-openxr-simulator-pipboy-proof.ps1") `
                     -DataDirectory $openXrSimulatorDataDirectory `
+                    -ScreenYaw ([double]$pipBoySimulatorAim.screenYaw) `
+                    -ScreenPitch ([double]$pipBoySimulatorAim.screenPitch) `
+                    -ItemsYaw ([double]$pipBoySimulatorAim.itemsYaw) `
+                    -ItemsPitch ([double]$pipBoySimulatorAim.itemsPitch) `
                     -ConsumeTimeoutMilliseconds 5000
             ) -join [Environment]::NewLine
             $pipBoyMenuEvidence =
@@ -3644,6 +3839,7 @@ try {
                 hostSubmission = $livePipBoyHostLine.Line
                 worldSimulationPaused = $true
                 exactScreenMesh = "pipboyscreen:0"
+                measuredAim = $pipBoySimulatorAim
                 menuScript = $pipBoyMenuEvidence
                 physicalControl = $physicalControlLine.Line
                 uiBefore = $uiBeforeInteraction
@@ -4177,6 +4373,7 @@ try {
             $visualQualityProof = Get-FnvxrProductFirstPersonVisualQualityProof `
                 -SourceRoot $root `
                 -PairDirectory $headsetMirrorDirectory `
+                -HostLogPath $hostOut `
                 -RequirePipBoyScreen:($HeadsetDemoFixture -or
                     $HeadsetInventoryVisualTrial) `
                 -ReportPath $visualQualityReportPath

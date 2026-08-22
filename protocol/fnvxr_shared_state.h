@@ -29,9 +29,9 @@ constexpr std::uint32_t VrOriginStateCommitted = 2;
 // that exact commit.  Keeping this separate from camera/origin state prevents
 // unrelated stereo and weapon events from being joined into a false proof.
 constexpr std::uint32_t WeaponFrameSharedMagic = 0x57585646; // FVXW
-constexpr std::uint32_t WeaponFrameSharedVersion = 2;
+constexpr std::uint32_t WeaponFrameSharedVersion = 3;
 inline constexpr char WeaponFrameSharedMappingName[] =
-    "Local\\FNVXR_Weapon_Frame_v2";
+    "Local\\FNVXR_Weapon_Frame_v3";
 constexpr std::uint32_t WeaponFrameInvalid = 0;
 constexpr std::uint32_t WeaponFramePoseCommitted = 1;
 constexpr std::uint32_t WeaponFrameRenderConsumed = 2;
@@ -42,6 +42,7 @@ constexpr std::uint32_t WeaponFrameFlagArmSolved = 1u << 2;
 constexpr std::uint32_t WeaponFrameFlagWeaponWritten = 1u << 3;
 constexpr std::uint32_t WeaponFrameFlagWeaponAligned = 1u << 4;
 constexpr std::uint32_t WeaponFrameFlagHandMeshRotationValid = 1u << 5;
+constexpr std::uint32_t WeaponFrameFlagPipBoyScreenPoseValid = 1u << 6;
 constexpr std::uint32_t WeaponFrameRequiredFlags =
     WeaponFrameFlagRightGripCurrent
     | WeaponFrameFlagRightAimCurrent
@@ -671,7 +672,8 @@ struct SharedWeaponFrameState
 {
     std::uint32_t magic;
     std::uint32_t version;
-    // Producer lane. Only xNVSE writes fields through rightHandGripLocalRot.
+    // Producer lane. Only xNVSE writes fields through
+    // leftPipBoyScreenGripLocalRot.
     volatile LONG producerSequence;
     std::uint32_t status;
     std::uint64_t commitId;
@@ -691,6 +693,12 @@ struct SharedWeaponFrameState
     // applies it to the locally derived authored grip mesh; translation stays
     // on the separately verified wrist socket.
     float rightHandGripLocalRot[4];
+    // Exact stock ScreenLit pose relative to the retail left-hand wrist,
+    // converted into the same OpenXR grip-local basis as the locally derived
+    // hand mesh. This replaces the guessed wrist offsets that could make the
+    // Pip-Boy merely touch the hand in 2D while floating away in stereo.
+    float leftPipBoyScreenGripLocalPos[3];
+    float leftPipBoyScreenGripLocalRot[4];
     // Consumer lane. Only the D3D9 first-person seam writes this lane.
     volatile LONG consumerSequence;
     std::uint32_t consumedStatus;
@@ -912,7 +920,7 @@ static_assert(sizeof(SharedXInputState) == 40, "SharedXInputState layout changed
 static_assert(sizeof(SharedDInputState) == 100, "SharedDInputState layout changed unexpectedly");
 static_assert(sizeof(SharedVrPoseState) == 288, "SharedVrPoseState layout changed unexpectedly");
 static_assert(sizeof(SharedVrOriginState) == 216, "SharedVrOriginState layout changed unexpectedly");
-static_assert(sizeof(SharedWeaponFrameState) == 176, "SharedWeaponFrameState layout changed unexpectedly");
+static_assert(sizeof(SharedWeaponFrameState) == 200, "SharedWeaponFrameState layout changed unexpectedly");
 static_assert(sizeof(SharedCameraState) == 80, "SharedCameraState layout changed");
 static_assert(sizeof(SharedRuntimeState) == 88, "SharedRuntimeState layout changed");
 static_assert(sizeof(SharedDesktopAssistUiQuadHeader) == 96, "SharedDesktopAssistUiQuadHeader layout changed");

@@ -479,6 +479,7 @@ struct RetailRigNodes
     void* rightHandMesh {};
     void* pipBoy {};
     void* pipBoyScreen {};
+    void* pipBoyScreenSurface {};
     void* projectileNode {};
     void* muzzleFlash {};
 };
@@ -525,6 +526,9 @@ struct RetailPipBoyCalibration
 {
     Matrix33 controllerToRootRotation {};
     Vec3 rootToScreenLocal {};
+    Vec3 screenGripLocalPositionMeters {};
+    Quat screenGripLocalRotation { 0.0f, 0.0f, 0.0f, 1.0f };
+    bool hostSpatialValid {};
     bool valid {};
 };
 
@@ -6541,6 +6545,11 @@ bool discoverRetailRigNodes(void* root)
     discovered.pipBoyScreen = discovered.pipBoy
         ? findUniqueNiNode(discovered.pipBoy, "ScreenLit")
         : nullptr;
+    discovered.pipBoyScreenSurface = discovered.pipBoyScreen
+        ? findUniqueNiObjectByPrefix(
+            discovered.pipBoyScreen,
+            "pipboyscreen:0")
+        : nullptr;
     discovered.projectileNode = findUniqueNiNode(root, "ProjectileNode", &projectileMatches);
     discovered.muzzleFlash = findUniqueNiNode(root, "MuzzleFlash", &muzzleMatches);
     g_retailRigNodes = discovered;
@@ -6566,7 +6575,7 @@ bool discoverRetailRigNodes(void* root)
     g_retailRigRediscoveryRequested = !complete;
 
     logTelemetry(
-        "retailRig discovery count=%llu root=%p left=(clav=%p upper=%p fore=%p hand=%p) right=(clav=%p upper=%p fore=%p hand=%p) weapon=%p weaponModel=%p weaponMatches=%lu upperBodyMesh=%p leftHandMesh=%p rightHandMesh=%p pipBoy=%p pipBoyScreen=%p projectile=%p projectileMatches=%lu muzzleFlash=%p muzzleMatches=%lu complete=%d ancestry=validated\n",
+        "retailRig discovery count=%llu root=%p left=(clav=%p upper=%p fore=%p hand=%p) right=(clav=%p upper=%p fore=%p hand=%p) weapon=%p weaponModel=%p weaponMatches=%lu upperBodyMesh=%p leftHandMesh=%p rightHandMesh=%p pipBoy=%p pipBoyScreen=%p pipBoyScreenSurface=%p projectile=%p projectileMatches=%lu muzzleFlash=%p muzzleMatches=%lu complete=%d ancestry=validated\n",
         static_cast<unsigned long long>(g_retailRigDiscoveryCount),
         root,
         discovered.left.clavicle,
@@ -6585,6 +6594,7 @@ bool discoverRetailRigNodes(void* root)
         discovered.rightHandMesh,
         discovered.pipBoy,
         discovered.pipBoyScreen,
+        discovered.pipBoyScreenSurface,
         discovered.projectileNode,
         static_cast<unsigned long>(projectileMatches),
         discovered.muzzleFlash,
@@ -6885,8 +6895,10 @@ void updateLivePipBoyInteraction(
         }
     }
 
+    const bool liveDevicePointerActive =
+        (flags & fnvxr::PoseInteractionLivePipBoyPointerActive) != 0u;
     if (focused && pipBoyVisibleFromMenuBits(menuBits)
-        && pose.menuPointerActive && rightTriggerPressed)
+        && liveDevicePointerActive && rightTriggerPressed)
     {
         const float u = static_cast<float>(pose.poseReserved[
             fnvxr::PoseReservedPipBoyDeviceU]) / 255.0f;
@@ -7133,6 +7145,100 @@ Vec3 hostSpatialHandWristWorld(
         transformVec3(controller.wristRotation, offsetGame));
 }
 
+Matrix33 nifHandToXrMeshMatrix()
+{
+    // Exact basis used by convert_nif_hand_mesh.py:
+    // (x, y, z) NIF hand-local -> (y, -z, -x) OpenXR grip-local.
+    return {
+        { { 0.0f, 1.0f, 0.0f },
+          { 0.0f, 0.0f, -1.0f },
+          { -1.0f, 0.0f, 0.0f } }
+    };
+}
+
+bool measureHostSpatialPipBoyCalibration()
+{
+    if (g_retailPipBoyCalibration.hostSpatialValid)
+        return true;
+    void* const hand = g_retailRigNodes.left.hand;
+    void* const screen = g_retailRigNodes.pipBoyScreenSurface
+        ? g_retailRigNodes.pipBoyScreenSurface
+        : g_retailRigNodes.pipBoyScreen;
+    if (!hand || !screen || niObjectKind(hand) == 0
+        || niObjectKind(screen) == 0)
+    {
+        return false;
+    }
+
+    const auto handBase = reinterpret_cast<std::uintptr_t>(hand);
+    const auto screenBase = reinterpret_cast<std::uintptr_t>(screen);
+    const Matrix33 handWorldRotation = readMatrix33(
+        handBase + NiAvObjectWorldRotationOffset);
+    const Vec3 handWorldPosition = readVec3(
+        handBase + NiAvObjectWorldTranslationOffset);
+    const float handWorldScale = readFloat(
+        handBase + NiAvObjectWorldScaleOffset,
+        0.0f);
+    const Matrix33 screenWorldRotation = readMatrix33(
+        screenBase + NiAvObjectWorldRotationOffset);
+    const Vec3 screenWorldPosition = readVec3(
+        screenBase + NiAvObjectWorldTranslationOffset);
+    if (!finiteMatrix33(handWorldRotation)
+        || !finiteVec3(handWorldPosition)
+        || !std::isfinite(handWorldScale)
+        || std::fabs(handWorldScale) < 0.0001f
+        || !finiteMatrix33(screenWorldRotation)
+        || !finiteVec3(screenWorldPosition))
+    {
+        return false;
+    }
+
+    const Matrix33 handInverse = transposeMatrix33(handWorldRotation);
+    const Vec3 screenHandLocalGameUnits = scaleVec3(
+        transformVec3(
+            handInverse,
+            subtractVec3(screenWorldPosition, handWorldPosition)),
+        1.0f / handWorldScale);
+    const Matrix33 screenHandLocalRotation = multiplyMatrix33(
+        handInverse,
+        screenWorldRotation);
+    const Matrix33 handToHost = nifHandToXrMeshMatrix();
+    const float unitsPerMeter = getFloatFromEnv(
+        "FNVXR_D3D9_GAME_UNITS_PER_METER",
+        70.0f);
+    if (!std::isfinite(unitsPerMeter) || unitsPerMeter < 1.0f)
+        return false;
+
+    g_retailPipBoyCalibration.screenGripLocalPositionMeters = scaleVec3(
+        transformVec3(handToHost, screenHandLocalGameUnits),
+        1.0f / unitsPerMeter);
+    g_retailPipBoyCalibration.screenGripLocalRotation = quatFromMatrix(
+        multiplyMatrix33(handToHost, screenHandLocalRotation));
+    const float offsetMeters = lengthVec3(
+        g_retailPipBoyCalibration.screenGripLocalPositionMeters);
+    g_retailPipBoyCalibration.hostSpatialValid = finiteVec3(
+            g_retailPipBoyCalibration.screenGripLocalPositionMeters)
+        && std::isfinite(offsetMeters)
+        && offsetMeters >= 0.02f
+        && offsetMeters <= 0.40f
+        && finiteUsableQuat(
+            g_retailPipBoyCalibration.screenGripLocalRotation);
+    logTelemetry(
+        "retailPipBoy host calibration valid=%d hand=%p screen=%p source=stock-left-hand-to-screen gripLocalPositionMeters=(%.6f %.6f %.6f) gripLocalQuat=(%.7f %.7f %.7f %.7f) offsetMeters=%.6f\n",
+        g_retailPipBoyCalibration.hostSpatialValid ? 1 : 0,
+        hand,
+        screen,
+        g_retailPipBoyCalibration.screenGripLocalPositionMeters.x,
+        g_retailPipBoyCalibration.screenGripLocalPositionMeters.y,
+        g_retailPipBoyCalibration.screenGripLocalPositionMeters.z,
+        g_retailPipBoyCalibration.screenGripLocalRotation.x,
+        g_retailPipBoyCalibration.screenGripLocalRotation.y,
+        g_retailPipBoyCalibration.screenGripLocalRotation.z,
+        g_retailPipBoyCalibration.screenGripLocalRotation.w,
+        offsetMeters);
+    return g_retailPipBoyCalibration.hostSpatialValid;
+}
+
 Quat retailRightHandMeshGripLocalRotation(
     const RetailControllerWorldPose& controller,
     const Matrix33& stockHandWorldRotation,
@@ -7156,11 +7262,7 @@ Quat retailRightHandMeshGripLocalRotation(
           { 0.0f, 0.0f, -1.0f },
           { 0.0f, 1.0f, 0.0f } }
     };
-    const Matrix33 nifHandToXrMesh {
-        { { 0.0f, 1.0f, 0.0f },
-          { 0.0f, 0.0f, -1.0f },
-          { -1.0f, 0.0f, 0.0f } }
-    };
+    const Matrix33 nifHandToXrMesh = nifHandToXrMeshMatrix();
     const Matrix33 gripToHostMesh = multiplyMatrix33(
         transposeMatrix33(xrToGame),
         multiplyMatrix33(
@@ -8277,6 +8379,9 @@ void publishWeaponFrameCommit(
     bool weaponAligned,
     bool handMeshRotationValid,
     const Quat& rightHandGripLocalRotation,
+    bool pipBoyScreenPoseValid,
+    const Vec3& pipBoyScreenGripLocalPosition,
+    const Quat& pipBoyScreenGripLocalRotation,
     const Vec3& rightHandWorld,
     const Vec3& weaponWorld,
     const Matrix33& weaponWorldRotation)
@@ -8297,6 +8402,8 @@ void publishWeaponFrameCommit(
         flags |= fnvxr::shared::WeaponFrameFlagWeaponAligned;
     if (handMeshRotationValid)
         flags |= fnvxr::shared::WeaponFrameFlagHandMeshRotationValid;
+    if (pipBoyScreenPoseValid)
+        flags |= fnvxr::shared::WeaponFrameFlagPipBoyScreenPoseValid;
     const bool complete =
         (flags & fnvxr::shared::WeaponFrameRequiredFlags)
             == fnvxr::shared::WeaponFrameRequiredFlags
@@ -8308,7 +8415,10 @@ void publishWeaponFrameCommit(
         && finiteMatrix33(weaponWorldRotation)
         && (!hostSpatialPropReplacementRequested()
             || (handMeshRotationValid
-                && finiteUsableQuat(rightHandGripLocalRotation)));
+                && finiteUsableQuat(rightHandGripLocalRotation)
+                && pipBoyScreenPoseValid
+                && finiteVec3(pipBoyScreenGripLocalPosition)
+                && finiteUsableQuat(pipBoyScreenGripLocalRotation)));
     // Fallout invokes the animation seam more than once for one OpenXR pose.
     // A later cull/stock callback can temporarily hide the arm branch after an
     // earlier callback already committed the exact current controller pose.
@@ -8384,6 +8494,30 @@ void publishWeaponFrameCommit(
         state->rightHandGripLocalRot[i] =
             complete && handMeshRotationValid
                 ? handRotation[i]
+                : (i == 3 ? 1.0f : 0.0f);
+    }
+    const float pipBoyPosition[3] {
+        pipBoyScreenGripLocalPosition.x,
+        pipBoyScreenGripLocalPosition.y,
+        pipBoyScreenGripLocalPosition.z,
+    };
+    const float pipBoyRotation[4] {
+        pipBoyScreenGripLocalRotation.x,
+        pipBoyScreenGripLocalRotation.y,
+        pipBoyScreenGripLocalRotation.z,
+        pipBoyScreenGripLocalRotation.w,
+    };
+    for (int i = 0; i < 3; ++i)
+    {
+        state->leftPipBoyScreenGripLocalPos[i] =
+            complete && pipBoyScreenPoseValid
+                ? pipBoyPosition[i] : 0.0f;
+    }
+    for (int i = 0; i < 4; ++i)
+    {
+        state->leftPipBoyScreenGripLocalRot[i] =
+            complete && pipBoyScreenPoseValid
+                ? pipBoyRotation[i]
                 : (i == 3 ? 1.0f : 0.0f);
     }
     fnvxr::shared::endSequencedSharedWrite(state->producerSequence);
@@ -8699,6 +8833,7 @@ void onRetailPostAnimation(void* animData)
             leftError);
     const bool pipBoyTracked = hostSpatialProps
         ? leftControllerUsable
+            && measureHostSpatialPipBoyCalibration()
         : leftControllerUsable
             && applyRetailTrackedPipBoy(leftController, applyWrites);
     if (hostSpatialProps && leftControllerUsable)
@@ -8806,6 +8941,9 @@ void onRetailPostAnimation(void* animData)
             weaponAligned,
             g_retailWeaponCalibration.handMeshRotationValid,
             g_retailWeaponCalibration.rightHandGripLocalRotation,
+            g_retailPipBoyCalibration.hostSpatialValid,
+            g_retailPipBoyCalibration.screenGripLocalPositionMeters,
+            g_retailPipBoyCalibration.screenGripLocalRotation,
             committedRightHandWorld,
             committedWeaponWorld,
             committedWeaponWorldRotation);
@@ -15989,6 +16127,7 @@ void processHeadsetDemoFixtureUi(const RuntimeObservation& observation)
     // event, or simulator command.
     namespace demo = fnvxr::engine::headset_demo;
     static demo::State state {};
+    static UInt64 pipBoyOpenedAtMilliseconds = 0u;
 
     const std::uint64_t gameplayWarmupFrames = static_cast<std::uint64_t>(
         std::clamp(getIntFromEnv("FNVXR_HEADSET_DEMO_GAMEPLAY_WARMUP_FRAMES", 90), 1, 1200));
@@ -16008,9 +16147,32 @@ void processHeadsetDemoFixtureUi(const RuntimeObservation& observation)
     const demo::Decision decision = demo::advance(state, input);
     if (decision.action != demo::Action::None)
     {
+        const UInt64 now = GetTickCount64();
+        const UInt64 minimumOpenMilliseconds = static_cast<UInt64>(
+            std::clamp(
+                getIntFromEnv(
+                    "FNVXR_HEADSET_DEMO_PIPBOY_MIN_HOLD_MILLISECONDS",
+                    5000),
+                1000,
+                15000));
+        if (decision.action == demo::Action::ClosePipBoy
+            && pipBoyOpenedAtMilliseconds != 0u
+            && now >= pipBoyOpenedAtMilliseconds
+            && now - pipBoyOpenedAtMilliseconds < minimumOpenMilliseconds)
+        {
+            // Engine frame rate is uncapped in the owned headless fixture.
+            // A frame-only hold closed the menu after 0.7 seconds despite a
+            // nominal 240-frame dwell. Keep the state at Open until real
+            // wall time proves sustained visible menu content.
+            return;
+        }
         const bool handled = decision.action == demo::Action::OpenPipBoy
             ? openEnginePipBoyInventory("headset-demo-fixed", observation.frame)
             : closeEnginePipBoy("headset-demo-fixed", observation.frame);
+        if (handled && decision.action == demo::Action::OpenPipBoy)
+            pipBoyOpenedAtMilliseconds = now;
+        else if (handled && decision.action == demo::Action::ClosePipBoy)
+            pipBoyOpenedAtMilliseconds = 0u;
         logTelemetry(
             "{\"event\":\"fnvxrHeadsetDemoPipBoyAction\",\"action\":\"%s\",\"handled\":%s,\"fixtureReady\":%s,\"gameplay\":%s,\"pipBoyVisible\":%s,\"frame\":%llu}\n",
             decision.action == demo::Action::OpenPipBoy ? "open" : "close",

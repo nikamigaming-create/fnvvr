@@ -2536,7 +2536,11 @@ function Get-FnvxrProductMinimalEnvironment {
         $environment.FNVXR_SHOW_RIGHT_AIM_RAY = "0"
         $environment.FNVXR_DEBUG_AXES = "0"
         $environment.FNVXR_DEBUG_LEFT_AXES = "0"
-        $environment.FNVXR_PIPBOY_WRIST_UI_WIDTH = "0.12"
+        # Physical pipboyscreen:0 width (5.872956 retail units / 70 units per
+        # meter). Runtime placement comes from the stock left-hand-to-screen
+        # transform published through WeaponFrame v3; offsets below are only
+        # an inert pre-calibration fallback.
+        $environment.FNVXR_PIPBOY_WRIST_UI_WIDTH = "0.0838993714"
         $environment.FNVXR_PIPBOY_WRIST_UI_ROT_X = "0"
         $environment.FNVXR_PIPBOY_WRIST_UI_ROT_Y = "0"
         $environment.FNVXR_PIPBOY_WRIST_UI_ROT_Z = "0"
@@ -2561,6 +2565,12 @@ function Get-FnvxrProductMinimalEnvironment {
         $retailLeftCuffTexture = Join-Path `
             $retailHandAssetRoot `
             "PipBoyGlove01.dds"
+        $retailLeftForearmMesh = Join-Path `
+            $retailHandAssetRoot `
+            "left-forearm.fhm"
+        $retailLeftForearmTexture = Join-Path `
+            $retailHandAssetRoot `
+            "UpperBodyMale.dds"
         $retailPipBoyMesh = Join-Path `
             $retailHandAssetRoot `
             "pipboyarm.fpm"
@@ -2589,6 +2599,13 @@ function Get-FnvxrProductMinimalEnvironment {
             if (Test-Path -LiteralPath $retailHandTexture -PathType Leaf) {
                 $environment.FNVXR_RETAIL_HAND_TEXTURE_PATH =
                     [System.IO.Path]::GetFullPath($retailHandTexture)
+            }
+            if ((Test-Path -LiteralPath $retailLeftForearmMesh -PathType Leaf) -and
+                (Test-Path -LiteralPath $retailLeftForearmTexture -PathType Leaf)) {
+                $environment.FNVXR_RETAIL_LEFT_FOREARM_MESH_PATH =
+                    [System.IO.Path]::GetFullPath($retailLeftForearmMesh)
+                $environment.FNVXR_RETAIL_LEFT_FOREARM_TEXTURE_PATH =
+                    [System.IO.Path]::GetFullPath($retailLeftForearmTexture)
             }
         }
         if ((Test-Path -LiteralPath $retailPipBoyMesh -PathType Leaf) -and
@@ -2682,6 +2699,8 @@ function Get-FnvxrProductMinimalEnvironment {
             $environment.FNVXR_HEADSET_DEMO_GAMEPLAY_WARMUP_FRAMES =
                 [string]$HeadsetDemoGameplayWarmupFrames
             $environment.FNVXR_HEADSET_DEMO_PIPBOY_HOLD_FRAMES = "240"
+            $environment.FNVXR_HEADSET_DEMO_PIPBOY_MIN_HOLD_MILLISECONDS =
+                "5000"
             if ($RetailVrAccumulationDiagnosticMode -cne "Full") {
                 $environment.FNVXR_RETAIL_VR_ACCUMULATION_DIAGNOSTIC_MODE =
                     switch ($RetailVrAccumulationDiagnosticMode) {

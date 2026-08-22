@@ -14,6 +14,8 @@ param(
     # opposite-wrist Pip-Boy. Repeating the same acknowledged LOCAL pose gives
     # the host's dwell focus enough real frames to scale/open the live model.
     [switch]$LivePipBoyFocus,
+    [ValidateRange(-3.2, 3.2)][double]$PipBoyFocusYaw = 1.178,
+    [ValidateRange(-1.5, 1.5)][double]$PipBoyFocusPitch = 0.159,
     [ValidateRange(100, 10000)][int]$ConsumeTimeoutMilliseconds = 5000
 )
 
@@ -61,16 +63,14 @@ if ($LivePipBoyFocus) {
     if ($Hand -cne "right") {
         throw "-LivePipBoyFocus requires -Hand right."
     }
-    # With the simulator's neutral left wrist at (-0.20, 1.40, -0.40), the
-    # retail interaction plane is centered near (-0.20, 1.46, -0.46). These
-    # poses keep a natural cross-body reach while the right controller's -Z
-    # aim axis intersects that plane. Four dwell samples make the focus/open
-    # gesture visible for roughly three seconds in the bounded recording.
+    # The caller derives these angles from the current WeaponFrame v3 stock
+    # hand-to-screen pose. Four dwell samples make the focus/open gesture
+    # visible for roughly three seconds in the bounded recording.
     $pipBoyFocus = @(
-        [ordered]@{ axis = "pipBoyFocus"; direction = 0; x = 0.18; y = 1.37; z = -0.24; yaw = 1.178; pitch = 0.159; roll = 0.0 },
-        [ordered]@{ axis = "pipBoyFocus"; direction = 0; x = 0.18; y = 1.37; z = -0.24; yaw = 1.178; pitch = 0.159; roll = 0.0 },
-        [ordered]@{ axis = "pipBoyFocus"; direction = 0; x = 0.18; y = 1.37; z = -0.24; yaw = 1.178; pitch = 0.159; roll = 0.0 },
-        [ordered]@{ axis = "pipBoyFocus"; direction = 0; x = 0.18; y = 1.37; z = -0.24; yaw = 1.178; pitch = 0.159; roll = 0.0 }
+        [ordered]@{ axis = "pipBoyFocus"; direction = 0; x = 0.18; y = 1.37; z = -0.24; yaw = $PipBoyFocusYaw; pitch = $PipBoyFocusPitch; roll = 0.0 },
+        [ordered]@{ axis = "pipBoyFocus"; direction = 0; x = 0.18; y = 1.37; z = -0.24; yaw = $PipBoyFocusYaw; pitch = $PipBoyFocusPitch; roll = 0.0 },
+        [ordered]@{ axis = "pipBoyFocus"; direction = 0; x = 0.18; y = 1.37; z = -0.24; yaw = $PipBoyFocusYaw; pitch = $PipBoyFocusPitch; roll = 0.0 },
+        [ordered]@{ axis = "pipBoyFocus"; direction = 0; x = 0.18; y = 1.37; z = -0.24; yaw = $PipBoyFocusYaw; pitch = $PipBoyFocusPitch; roll = 0.0 }
     )
     # Preserve the final neutral command as the terminal state.
     $steps = @($steps[0..($steps.Count - 2)]) +
@@ -131,6 +131,8 @@ foreach ($pose in $steps) {
     commandCount = $commands.Count
     commands = @($commands.ToArray())
     livePipBoyFocusRequested = [bool]$LivePipBoyFocus
+    livePipBoyFocusYaw = $PipBoyFocusYaw
+    livePipBoyFocusPitch = $PipBoyFocusPitch
     livePipBoyFocusCommandCount = @($commands | Where-Object {
         [string]$_.axis -ceq "pipBoyFocus"
     }).Count

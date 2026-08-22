@@ -61,6 +61,84 @@ $hostSource = Get-Content -LiteralPath $hostSourcePath -Raw
 $pluginSource = Get-Content -LiteralPath $pluginSourcePath -Raw
 $d3d9Source = Get-Content -LiteralPath $d3d9SourcePath -Raw
 
+# Execute the measured-ray helper under the same Windows PowerShell runtime
+# used by the launcher. This catches API assumptions such as Double.IsFinite,
+# which exists in newer .NET but not the product machine's framework runtime.
+$aimHelperStart = $launcher.IndexOf(
+    'function Get-FnvxrProductMeasuredPipBoySimulatorAim')
+$aimHelperEnd = $launcher.IndexOf(
+    'function Get-FnvxrProductLatestCpuUiFrameProof',
+    $aimHelperStart)
+if ($aimHelperStart -lt 0 -or $aimHelperEnd -le $aimHelperStart) {
+    throw "Could not isolate the measured Pip-Boy simulator-ray helper."
+}
+Invoke-Expression $launcher.Substring(
+    $aimHelperStart,
+    $aimHelperEnd - $aimHelperStart)
+$aimFixtureLog = [System.IO.Path]::GetTempFileName()
+try {
+    [System.IO.File]::WriteAllText(
+        $aimFixtureLog,
+        'leftPipBoyScreenCalibration valid=1 commit=3 pos=(-0.0654524,-0.0211879,0.089961) quat=(0.73714,0.0281322,-0.673703,-0.0442353)' +
+            [Environment]::NewLine,
+        [System.Text.UTF8Encoding]::new($false))
+    $measuredAim = Get-FnvxrProductMeasuredPipBoySimulatorAim `
+        -HostLogPath $aimFixtureLog
+    if (-not $measuredAim -or
+        [Math]::Abs([double]$measuredAim.screenYaw - 1.41976) -gt 0.001 -or
+        [Math]::Abs([double]$measuredAim.screenPitch - 0.08049) -gt 0.001 -or
+        [Math]::Abs([double]$measuredAim.itemsYaw - 1.52336) -gt 0.001 -or
+        [Math]::Abs([double]$measuredAim.itemsPitch - 0.10110) -gt 0.001 -or
+        [string]$measuredAim.source -cne
+            'WeaponFrame-v3-stock-left-hand-to-screen') {
+        throw "Measured Pip-Boy calibration did not produce the analytic simulator rays."
+    }
+} finally {
+    Remove-Item -LiteralPath $aimFixtureLog -Force -ErrorAction SilentlyContinue
+}
+
+$uiReaderStart = $launcher.IndexOf(
+    'function Get-FnvxrProductLatestCpuUiFrameProof')
+$uiReaderEnd = $launcher.IndexOf(
+    'function Get-FnvxrProductHeadsetDemoInputProof',
+    $uiReaderStart)
+if ($uiReaderStart -lt 0 -or $uiReaderEnd -le $uiReaderStart) {
+    throw "Could not isolate the live retail UI log reader."
+}
+Invoke-Expression $launcher.Substring(
+    $uiReaderStart,
+    $uiReaderEnd - $uiReaderStart)
+$uiFixtureLog = [System.IO.Path]::GetTempFileName()
+try {
+    $uiLine = 'prefix {"event":"fnvxrRetailEngineCenterCpuUiQuad","transaction":9,"sourceFrame":10,"poseFrame":11,"poseSequence":12,"runtimeStateSample":13,"producerMode":5,"uiActive":true,"pixelProof":true,"monoProof":true,"pixelHash":"0x1234abcd","nonBlackSamples":77}'
+    [System.IO.File]::WriteAllText(
+        $uiFixtureLog,
+        $uiLine + [Environment]::NewLine,
+        [System.Text.UTF8Encoding]::new($false))
+    $uiProof = Get-FnvxrProductLatestCpuUiFrameProof `
+        -RetailVrLogPath $uiFixtureLog
+    if (-not $uiProof -or [uint64]$uiProof.sourceFrame -ne 10 -or
+        [string]$uiProof.pixelHash -cne '0x1234abcd') {
+        throw "The shared-read live retail UI log fixture was not parsed."
+    }
+    $exclusive = [System.IO.FileStream]::new(
+        $uiFixtureLog,
+        [System.IO.FileMode]::Open,
+        [System.IO.FileAccess]::ReadWrite,
+        [System.IO.FileShare]::None)
+    try {
+        $lockedProof = Get-FnvxrProductLatestCpuUiFrameProof `
+            -RetailVrLogPath $uiFixtureLog
+        if ($lockedProof) {
+            throw "An exclusively locked live log produced false UI evidence."
+        }
+    } finally {
+        $exclusive.Dispose()
+    }
+} finally {
+    Remove-Item -LiteralPath $uiFixtureLog -Force -ErrorAction SilentlyContinue
+}
+
 foreach ($sandboxContract in @(
     'fnvxr-retail-sandbox/v1',
     'steam_appid.txt',
@@ -79,11 +157,19 @@ if (-not $launcher.Contains(
         'Automated retail headset/simulator fixture runs require an isolated')) {
     throw "Automated retail headset runs can still stage or launch the installed Library root."
 }
-if (-not $retailProps.Contains('1hpaim.kf') -or
-    -not $retailProps.Contains('rightHandPose = "1hpaim@0"') -or
-    -not $launcher.Contains('"1hpaim@0"') -or
-    $retailProps.Contains('1hphandgrip1.kf')) {
-    throw "Retail right-hand preparation no longer bakes the authored pistol aim finger pose."
+if (-not $retailProps.Contains('1hphandgrip1.kf') -or
+    -not $retailProps.Contains('rightHandPose = "1hphandgrip1@end"') -or
+    -not $launcher.Contains('"1hphandgrip1@end"') -or
+    $retailProps.Contains('1hpaim.kf')) {
+    throw "Retail right-hand preparation no longer bakes the dedicated authored closed pistol-grip finger pose."
+}
+if (-not $hostSource.Contains(
+        'PoseInteractionLivePipBoyPointerActive') -or
+    -not $pluginSource.Contains(
+        '&& liveDevicePointerActive && rightTriggerPressed') -or
+    $pluginSource.Contains(
+        '&& pose.menuPointerActive && rightTriggerPressed')) {
+    throw "Physical Pip-Boy controls are incorrectly coupled to the ordinary screen-pointer lane."
 }
 
 foreach ($hostGate in @(
@@ -715,6 +801,7 @@ $expectedHeadsetDemoEnvironment = [ordered]@{
     FNVXR_RETAIL_CENTER_INTEGRATED_FIRST_PERSON = "1"
     FNVXR_HEADSET_DEMO_GAMEPLAY_WARMUP_FRAMES = "90"
     FNVXR_HEADSET_DEMO_PIPBOY_HOLD_FRAMES = "240"
+    FNVXR_HEADSET_DEMO_PIPBOY_MIN_HOLD_MILLISECONDS = "5000"
     FNVXR_SPATIAL_HANDS_OVERLAY = "1"
     FNVXR_SHOW_BODY_RIG = "1"
     FNVXR_SHOW_FULL_ARMS = "0"

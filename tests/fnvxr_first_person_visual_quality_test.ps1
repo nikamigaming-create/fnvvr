@@ -89,7 +89,8 @@ try {
             [Parameter(Mandatory = $true)][string]$Directory,
             [int]$MissingRightHandFrame = 0,
             [switch]$VoidBackground,
-            [switch]$DetachedPipBoy
+            [switch]$DetachedPipBoy,
+            [switch]$PointContactPipBoy
         )
         New-Item -ItemType Directory -Path $Directory -Force | Out-Null
         for ($frame = 1; $frame -le 6; ++$frame) {
@@ -132,7 +133,13 @@ try {
                             $graphics.FillRectangle(
                                 $rightBrush, 174, 84, 30, 46)
                         }
-                        $housingX = if ($DetachedPipBoy) { 112 } else { 26 }
+                        $housingX = if ($DetachedPipBoy) {
+                            112
+                        } elseif ($PointContactPipBoy) {
+                            70
+                        } else {
+                            26
+                        }
                         $graphics.FillRectangle(
                             $housingBrush, $housingX, 76, 74, 25)
                         if ($frame -ge 2 -and $frame -le 5) {
@@ -166,6 +173,8 @@ try {
         --spatial-overlay `
         --require-pipboy-screen `
         --require-world-background `
+        --min-pipboy-screen-frames 4 `
+        --min-pipboy-screen-seconds 0.1 `
         --max-red-ratio 0.0005 `
         --max-red-jump 0.0001 `
         --report $spatialGoodReportPath | Out-Null
@@ -196,6 +205,8 @@ try {
         --spatial-overlay `
         --require-pipboy-screen `
         --require-world-background `
+        --min-pipboy-screen-frames 4 `
+        --min-pipboy-screen-seconds 0.1 `
         --max-red-ratio 0.0005 `
         --max-red-jump 0.0001 `
         --report $spatialVoidReportPath | Out-Null
@@ -230,8 +241,37 @@ try {
         -Raw | ConvertFrom-Json
     if ([bool]$spatialDetached.accepted -or
         -not (@($spatialDetached.failures.metric) -contains
-            "pipboy_wrist_socket_bbox_gap_pixels")) {
+            "pipboy_wrist_socket_mask_edge_gap_pixels")) {
         throw "The rejected detached Pip-Boy lacks wrist-socket evidence."
+    }
+
+    # Bounding boxes that merely touch used to produce a false attachment
+    # pass. Keep the housing edge-adjacent while giving it no meaningful
+    # wrist contact; the mask-contact gate must reject it independently of
+    # bounding-box geometry.
+    $spatialPointContactDirectory = Join-Path $testRoot "spatial-point-contact"
+    New-SpatialPairDirectory `
+        -Directory $spatialPointContactDirectory `
+        -PointContactPipBoy
+    $spatialPointContactReportPath = Join-Path `
+        $testRoot `
+        "spatial-point-contact.json"
+    & $python $analyzer `
+        --pair-directory $spatialPointContactDirectory `
+        --spatial-overlay `
+        --max-red-ratio 0.0005 `
+        --max-red-jump 0.0001 `
+        --report $spatialPointContactReportPath | Out-Null
+    if ($LASTEXITCODE -ne 2) {
+        throw "A point-contact-only Pip-Boy was not rejected."
+    }
+    $spatialPointContact = Get-Content `
+        -LiteralPath $spatialPointContactReportPath `
+        -Raw | ConvertFrom-Json
+    if ([bool]$spatialPointContact.accepted -or
+        -not (@($spatialPointContact.failures.metric) -contains
+            "pipboy_wrist_socket_contact_fraction")) {
+        throw "The point-contact rejection lacks mask-contact evidence."
     }
 
     $spatialMissingDirectory = Join-Path $testRoot "spatial-missing"

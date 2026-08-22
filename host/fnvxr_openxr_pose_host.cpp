@@ -301,6 +301,9 @@ struct Renderer
     ComPtr<ID3D11Buffer> retailLeftCuffVertexBuffer;
     UINT retailLeftCuffVertexCount = 0;
     ComPtr<ID3D11ShaderResourceView> retailLeftCuffTextureView;
+    ComPtr<ID3D11Buffer> retailLeftForearmVertexBuffer;
+    UINT retailLeftForearmVertexCount = 0;
+    ComPtr<ID3D11ShaderResourceView> retailLeftForearmTextureView;
     ComPtr<ID3D11Buffer> retailPipBoyVertexBuffer;
     UINT retailPipBoyVertexCount = 0;
     ComPtr<ID3D11ShaderResourceView> retailPipBoyTextureView;
@@ -494,6 +497,11 @@ struct HostSharedBridge
         0.0f, 0.0f, 0.0f, 1.0f };
     bool rightHandGripLocalRotationValid = false;
     std::uint64_t rightHandGripCalibrationCommitId = 0u;
+    XMFLOAT3 leftPipBoyScreenGripLocalPosition {};
+    XrQuaternionf leftPipBoyScreenGripLocalRotation {
+        0.0f, 0.0f, 0.0f, 1.0f };
+    bool leftPipBoyScreenGripLocalPoseValid = false;
+    std::uint64_t leftPipBoyScreenCalibrationCommitId = 0u;
 };
 
 struct EyeRenderProof
@@ -3931,7 +3939,7 @@ bool readSharedPlayerState(
     return false;
 }
 
-bool updateSharedRightHandGripCalibration(HostSharedBridge& bridge)
+bool updateSharedSpatialPropCalibration(HostSharedBridge& bridge)
 {
     const auto* state = bridge.weaponFrameState;
     if (!state)
@@ -3959,33 +3967,83 @@ bool updateSharedRightHandGripCalibration(HostSharedBridge& bridge)
             || candidate.version != fnvxr::shared::WeaponFrameSharedVersion
             || candidate.status
                 != fnvxr::shared::WeaponFramePoseCommitted
-            || (candidate.flags
-                    & fnvxr::shared::WeaponFrameFlagHandMeshRotationValid)
-                == 0u
             || candidate.commitId == 0u)
         {
             return false;
         }
-        const float x = candidate.rightHandGripLocalRot[0];
-        const float y = candidate.rightHandGripLocalRot[1];
-        const float z = candidate.rightHandGripLocalRot[2];
-        const float w = candidate.rightHandGripLocalRot[3];
-        const float length = std::sqrt(x * x + y * y + z * z + w * w);
-        if (!std::isfinite(length) || length < 0.5f || length > 1.5f)
-            return false;
-        bridge.rightHandGripLocalRotation = {
-            x / length, y / length, z / length, w / length };
-        bridge.rightHandGripLocalRotationValid = true;
-        if (bridge.rightHandGripCalibrationCommitId != candidate.commitId)
+        bool updated = false;
+        if ((candidate.flags
+                & fnvxr::shared::WeaponFrameFlagHandMeshRotationValid)
+            != 0u)
         {
-            bridge.rightHandGripCalibrationCommitId = candidate.commitId;
-            std::cout
-                << "rightHandGripCalibration valid=1 commit="
-                << candidate.commitId
-                << " quat=(" << x / length << "," << y / length
-                << "," << z / length << "," << w / length << ")\n";
+            const float x = candidate.rightHandGripLocalRot[0];
+            const float y = candidate.rightHandGripLocalRot[1];
+            const float z = candidate.rightHandGripLocalRot[2];
+            const float w = candidate.rightHandGripLocalRot[3];
+            const float length = std::sqrt(
+                x * x + y * y + z * z + w * w);
+            if (!std::isfinite(length) || length < 0.5f || length > 1.5f)
+                return false;
+            bridge.rightHandGripLocalRotation = {
+                x / length, y / length, z / length, w / length };
+            bridge.rightHandGripLocalRotationValid = true;
+            updated = true;
+            if (bridge.rightHandGripCalibrationCommitId != candidate.commitId)
+            {
+                bridge.rightHandGripCalibrationCommitId = candidate.commitId;
+                std::cout
+                    << "rightHandGripCalibration valid=1 commit="
+                    << candidate.commitId
+                    << " quat=(" << x / length << "," << y / length
+                    << "," << z / length << "," << w / length << ")\n";
+            }
         }
-        return true;
+        if ((candidate.flags
+                & fnvxr::shared::WeaponFrameFlagPipBoyScreenPoseValid)
+            != 0u)
+        {
+            const float px = candidate.leftPipBoyScreenGripLocalPos[0];
+            const float py = candidate.leftPipBoyScreenGripLocalPos[1];
+            const float pz = candidate.leftPipBoyScreenGripLocalPos[2];
+            const float positionLength = std::sqrt(
+                px * px + py * py + pz * pz);
+            const float x = candidate.leftPipBoyScreenGripLocalRot[0];
+            const float y = candidate.leftPipBoyScreenGripLocalRot[1];
+            const float z = candidate.leftPipBoyScreenGripLocalRot[2];
+            const float w = candidate.leftPipBoyScreenGripLocalRot[3];
+            const float rotationLength = std::sqrt(
+                x * x + y * y + z * z + w * w);
+            if (!std::isfinite(positionLength)
+                || positionLength < 0.02f || positionLength > 0.40f
+                || !std::isfinite(rotationLength)
+                || rotationLength < 0.5f || rotationLength > 1.5f)
+            {
+                return false;
+            }
+            bridge.leftPipBoyScreenGripLocalPosition = { px, py, pz };
+            bridge.leftPipBoyScreenGripLocalRotation = {
+                x / rotationLength,
+                y / rotationLength,
+                z / rotationLength,
+                w / rotationLength,
+            };
+            bridge.leftPipBoyScreenGripLocalPoseValid = true;
+            updated = true;
+            if (bridge.leftPipBoyScreenCalibrationCommitId
+                != candidate.commitId)
+            {
+                bridge.leftPipBoyScreenCalibrationCommitId =
+                    candidate.commitId;
+                std::cout
+                    << "leftPipBoyScreenCalibration valid=1 commit="
+                    << candidate.commitId
+                    << " pos=(" << px << "," << py << "," << pz << ")"
+                    << " quat=(" << x / rotationLength << ","
+                    << y / rotationLength << "," << z / rotationLength
+                    << "," << w / rotationLength << ")\n";
+            }
+        }
+        return updated;
     }
     return false;
 }
@@ -5552,21 +5610,36 @@ GamePlane gamePlaneFromHmd(const XrPosef& hmdPose)
     return plane;
 }
 
-GamePlane livePipBoyInteractionPlane(const SolvedArm& leftArm, float scale)
+GamePlane livePipBoyInteractionPlane(
+    const SolvedArm& leftArm,
+    float scale,
+    const XMFLOAT3* measuredGripLocalPosition,
+    const XrQuaternionf* measuredGripLocalRotation)
 {
     GamePlane plane {};
-    constexpr float WristPipBoyDisplayAspect = 1.60f;
-    plane.width = envFloat("FNVXR_PIPBOY_WRIST_UI_WIDTH", 0.12f)
+    // pipboyscreen:0 measures 5.872956 x 4.471702 retail game units.
+    // Preserve that physical aspect and the 70-units-per-meter scale used by
+    // the locally derived housing instead of stretching it to a guessed 1.6.
+    constexpr float WristPipBoyDisplayWidthMeters = 5.872956f / 70.0f;
+    constexpr float WristPipBoyDisplayAspect = 5.872956f / 4.471702f;
+    plane.width = envFloat(
+            "FNVXR_PIPBOY_WRIST_UI_WIDTH",
+            WristPipBoyDisplayWidthMeters)
         * std::clamp(scale, 1.0f, 1.5f);
     plane.height = plane.width / WristPipBoyDisplayAspect;
 
     const XMVECTOR wristOrientation = quat(leftArm.wrist.orientation);
     // This plane follows the tracked wrist for both the authored retail
     // screen crop and its ray/fingertip physical controls.
-    const XMVECTOR localOrientation = XMQuaternionRotationRollPitchYaw(
-        degreesToRadians(envFloat("FNVXR_PIPBOY_WRIST_UI_ROT_X", 0.0f)),
-        degreesToRadians(envFloat("FNVXR_PIPBOY_WRIST_UI_ROT_Y", 0.0f)),
-        degreesToRadians(envFloat("FNVXR_PIPBOY_WRIST_UI_ROT_Z", 0.0f)));
+    const XMVECTOR localOrientation = measuredGripLocalRotation
+        ? quat(*measuredGripLocalRotation)
+        : XMQuaternionRotationRollPitchYaw(
+            degreesToRadians(envFloat(
+                "FNVXR_PIPBOY_WRIST_UI_ROT_X", 0.0f)),
+            degreesToRadians(envFloat(
+                "FNVXR_PIPBOY_WRIST_UI_ROT_Y", 0.0f)),
+            degreesToRadians(envFloat(
+                "FNVXR_PIPBOY_WRIST_UI_ROT_Z", 0.0f)));
     const XMVECTOR orientation = XMQuaternionNormalize(
         XMQuaternionMultiply(localOrientation, wristOrientation));
     XMFLOAT4 orientationValue {};
@@ -5578,11 +5651,13 @@ GamePlane livePipBoyInteractionPlane(const SolvedArm& leftArm, float scale)
         orientationValue.w,
     };
 
-    const XMFLOAT3 localOffset {
-        envFloat("FNVXR_PIPBOY_WRIST_UI_OFFSET_X", -0.11f),
-        envFloat("FNVXR_PIPBOY_WRIST_UI_OFFSET_Y", 0.075f),
-        envFloat("FNVXR_PIPBOY_WRIST_UI_OFFSET_Z", -0.035f),
-    };
+    const XMFLOAT3 localOffset = measuredGripLocalPosition
+        ? *measuredGripLocalPosition
+        : XMFLOAT3 {
+            envFloat("FNVXR_PIPBOY_WRIST_UI_OFFSET_X", -0.11f),
+            envFloat("FNVXR_PIPBOY_WRIST_UI_OFFSET_Y", 0.075f),
+            envFloat("FNVXR_PIPBOY_WRIST_UI_OFFSET_Z", -0.035f),
+        };
     const XMVECTOR worldOffset = XMVector3Rotate(
         XMLoadFloat3(&localOffset),
         wristOrientation);
@@ -5799,6 +5874,36 @@ void drawRetailTexturedModel(
     ID3D11ShaderResourceView* empty = nullptr;
     context->PSSetShaderResources(0, 1, &empty);
     bindSolidPipeline(context, renderer);
+}
+
+void drawRetailLeftForearm(
+    ID3D11DeviceContext* context,
+    Renderer& renderer,
+    const XMMATRIX& viewProjection,
+    const SolvedArm& arm)
+{
+    if (!renderer.retailLeftForearmVertexBuffer
+        || renderer.retailLeftForearmVertexCount == 0u
+        || !renderer.retailLeftForearmTextureView)
+    {
+        return;
+    }
+    constexpr float AuthoredForearmLengthMeters = 18.12860046f / 70.0f;
+    const float longitudinalScale = std::clamp(
+        arm.forearmLength / AuthoredForearmLengthMeters,
+        0.70f,
+        1.35f);
+    drawRetailTexturedModel(
+        context,
+        renderer,
+        viewProjection,
+        modelFromPose(
+            arm.forearm,
+            { 1.0f, 1.0f, longitudinalScale }),
+        renderer.retailLeftForearmVertexBuffer.Get(),
+        renderer.retailLeftForearmVertexCount,
+        renderer.retailLeftForearmTextureView.Get(),
+        { 1.0f, 1.0f, 1.0f, SpatialAlphaLeftHand });
 }
 
 void drawHandPrimitive(
@@ -7580,6 +7685,10 @@ bool renderEye(
         || (spatialHandsOverlay && productionWorldTextureView);
     if (drawWorldProps && envEnabled("FNVXR_SHOW_BODY_RIG", true))
     {
+        // Keep the wrist device physically connected to an authored retail
+        // arm even when the debug full-arm primitives are disabled.
+        drawRetailLeftForearm(
+            context.Get(), renderer, viewProjection, bodyRig.left);
         if (envEnabled("FNVXR_SHOW_FULL_ARMS", false))
         {
             drawSolvedArm(
@@ -9199,7 +9308,14 @@ float4 PSHudOverlay(VSOutput input) : SV_TARGET
             "FHM2",
             2u,
             renderer.retailLeftCuffVertexBuffer,
-            renderer.retailLeftCuffVertexCount))
+            renderer.retailLeftCuffVertexCount)
+        || !loadRetailTexturedMesh(
+            device,
+            "FNVXR_RETAIL_LEFT_FOREARM_MESH_PATH",
+            "FHM2",
+            2u,
+            renderer.retailLeftForearmVertexBuffer,
+            renderer.retailLeftForearmVertexCount))
     {
         return false;
     }
@@ -9247,6 +9363,29 @@ float4 PSHudOverlay(VSOutput input) : SV_TARGET
         std::cout << "retailLeftCuffTexture loaded size="
                   << textureWidth << "x" << textureHeight
                   << " path=" << retailLeftCuffTexturePath << "\n";
+    }
+    const char* retailLeftForearmTexturePath =
+        std::getenv("FNVXR_RETAIL_LEFT_FOREARM_TEXTURE_PATH");
+    if (retailLeftForearmTexturePath && *retailLeftForearmTexturePath)
+    {
+        int textureWidth = 0;
+        int textureHeight = 0;
+        const std::wstring widePath(
+            retailLeftForearmTexturePath,
+            retailLeftForearmTexturePath
+                + std::strlen(retailLeftForearmTexturePath));
+        if (!loadTextureFromFile(
+                device,
+                widePath,
+                renderer.retailLeftForearmTextureView,
+                textureWidth,
+                textureHeight))
+        {
+            return false;
+        }
+        std::cout << "retailLeftForearmTexture loaded size="
+                  << textureWidth << "x" << textureHeight
+                  << " path=" << retailLeftForearmTexturePath << "\n";
     }
     if (!loadRetailTexturedMesh(
             device,
@@ -11104,7 +11243,7 @@ int main(int argc, char** argv)
                 runtimeStateSample);
         fnvxr::shared::SharedPlayerState playerSnapshot {};
         const bool havePlayerSnapshot = readSharedPlayerState(sharedBridge, playerSnapshot);
-        static_cast<void>(updateSharedRightHandGripCalibration(sharedBridge));
+        static_cast<void>(updateSharedSpatialPropCalibration(sharedBridge));
         const XrQuaternionf* rightHandGripLocalRotation =
             sharedBridge.rightHandGripLocalRotationValid
                 ? &sharedBridge.rightHandGripLocalRotation
@@ -11245,7 +11384,15 @@ int main(int argc, char** argv)
                 runtimeShowroomActive,
                 runtimeCameraActive);
         const GamePlane livePipBoyBasePlane =
-            livePipBoyInteractionPlane(bodyRig.left, 1.0f);
+            livePipBoyInteractionPlane(
+                bodyRig.left,
+                1.0f,
+                sharedBridge.leftPipBoyScreenGripLocalPoseValid
+                    ? &sharedBridge.leftPipBoyScreenGripLocalPosition
+                    : nullptr,
+                sharedBridge.leftPipBoyScreenGripLocalPoseValid
+                    ? &sharedBridge.leftPipBoyScreenGripLocalRotation
+                    : nullptr);
         const MenuPointer livePipBoyBasePointer = rightAimTracked
             ? menuPointerFromAimPose(rightAimPose, livePipBoyBasePlane)
             : MenuPointer {};
@@ -11269,7 +11416,13 @@ int main(int argc, char** argv)
         });
         const GamePlane livePipBoyPlane = livePipBoyInteractionPlane(
             bodyRig.left,
-            livePipBoyFocus.scale);
+            livePipBoyFocus.scale,
+            sharedBridge.leftPipBoyScreenGripLocalPoseValid
+                ? &sharedBridge.leftPipBoyScreenGripLocalPosition
+                : nullptr,
+            sharedBridge.leftPipBoyScreenGripLocalPoseValid
+                ? &sharedBridge.leftPipBoyScreenGripLocalRotation
+                : nullptr);
         const bool dialoguePlaneSize =
             haveRuntimeUiState
             && (runtimeMenuBits & fnvxr::shared::RuntimeDialogMenuBit) != 0
@@ -12178,6 +12331,9 @@ int main(int argc, char** argv)
             interactionFlags |= fnvxr::PoseInteractionLivePipBoyFocused;
         if (livePipBoyFocus.requestOpen)
             interactionFlags |= fnvxr::PoseInteractionLivePipBoyOpenRequest;
+        if (livePipBoyPointer.active)
+            interactionFlags |=
+                fnvxr::PoseInteractionLivePipBoyPointerActive;
         const bool weaponOrbitActive = shouldReadInput
             && runtimeGameplayActive
             && frame.rightGrip > envFloat(
@@ -13248,6 +13404,11 @@ int main(int argc, char** argv)
                         ? "true" : "false")
                 << ",\"rightHandGripCalibrationCommit\":"
                 << sharedBridge.rightHandGripCalibrationCommitId
+                << ",\"leftPipBoyScreenCalibrationValid\":"
+                << (sharedBridge.leftPipBoyScreenGripLocalPoseValid
+                        ? "true" : "false")
+                << ",\"leftPipBoyScreenCalibrationCommit\":"
+                << sharedBridge.leftPipBoyScreenCalibrationCommitId
                 << ",\"pipBoySpatialScreenVisible\":"
                 << ((pipBoySpatialScreenVisible
                         && (presentedBinocularWorld || cpuEngineStereoActive))
