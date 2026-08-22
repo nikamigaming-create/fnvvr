@@ -1,6 +1,8 @@
 # FNVVR Phase 0 capability matrix
 
-Audit baseline: `6faed4620d029803ceb129487ebacb64237111ef` on 2026-08-01.
+Architecture/status review: 2026-08-22. Exact executable source and artifact
+identity comes from `local/product-build/fnvxr-product-Release.json`; this
+human-readable matrix is never release authority by itself.
 
 `Partial` means a bounded implementation or evidence slice exists; it is not a
 release claim. `Yes` in the test columns means a retained automated proof for
@@ -11,8 +13,8 @@ until the capability's phase gate and the final aggregate release gate pass.
 |---|---|---|---|---|---|---|
 | `CameraStereoVisual` | Partial | Yes | Yes | No | No | CPU-v8 engine-center visual trial proves simulator motion only; physical body/head behavior is unproven. |
 | `ControllerInput` | Partial | Yes | Partial | No | No | The xNVSE main-game-loop consumer exists, but the release semantic map and physical action matrix are incomplete. |
-| `UiInteraction` | Partial | Yes | Partial | No | No | Other menus retain the front quad; live Pip-Boy focus/scale, screen/dial zones, and weapon-orbit selection are unit-tested but lack retained live acceptance. |
-| `VisualRig` | Partial | Yes | No | No | No | Rig discovery/FABRIK now remains eligible for the physical Pip-Boy and gameplay seams; live wrist/hand/weapon acceptance is still open. |
+| `UiInteraction` | Partial | Yes | Partial | No | No | Other menus retain the front quad; headless final-eye evidence proves native Pip-Boy open/close and a stable live wrist screen, while physical pointer/dial/equip acceptance remains open. |
+| `VisualRig` | Partial | Yes | Partial | No | No | Stock weapon-only collection plus host-spatial, locally derived retail hand meshes removes the missing/stretched collector categories in retained simulator pixels. Materials and physical hand/weapon alignment remain open. |
 | `CombatAim` | No | Partial | No | No | No | Only read-only weapon/projectile observations exist; no retail firing seam is authorized. |
 | `GpuPresentation` | Partial | Yes | No | No | No | Color ABI v5 contracts and components exist; a live supported producer/consumer recovery proof does not. |
 | `FullProduct` | No | No | No | No | No | Only a complete aggregate of the six narrow capabilities plus release qualification can claim this state. |

@@ -66,9 +66,11 @@ buttons, triggers, grips, thumbsticks, pointer position, and input intent.
 
 Retail-to-host state includes runtime/UI phase, player/body and camera
 transforms, weapon classification and rig diagnostics, plus versioned mono-UI
-or stereo GPU resource metadata. Eye pixels do not travel through a CPU ring.
-Stereo GPU metadata is published only through the fully ordered odd/even
-producer helper, and the host must observe the declared shared fence itself.
+or stereo GPU resource metadata. In the production contract, eye pixels do not
+travel through a CPU ring: stereo GPU metadata is published only through the
+fully ordered odd/even producer helper, and the host must observe the declared
+shared fence itself. The separately fused CPU-v8 route remains bounded
+visual-trial evidence and is never a failed-GPU fallback or release transport.
 
 ## Presentation Contract
 

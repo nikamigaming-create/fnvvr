@@ -74,6 +74,10 @@ Weapon acceptance gate: where the physical controller points, the visible
 barrel, retail projectile/hit result, and impact marker agree within a logged
 tolerance, including after recoil and reload.
 
+Before that gate can pass, the recorded submitted eyes must independently prove
+both hands and non-deformed arm geometry. A discovered node, a successful IK
+residual, or a queued geometry count cannot substitute for visible pixels.
+
 ## Phase 3: Keep Other UI Deliberately Front-Floating
 
 - Treat runtime UI classification as authoritative, not pixel heuristics.

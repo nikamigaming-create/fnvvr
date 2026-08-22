@@ -1,6 +1,6 @@
 # FNVVR Retail Status
 
-Last updated: 2026-08-01
+Last updated: 2026-08-22
 
 ## Direction Locked
 
@@ -48,15 +48,19 @@ distinction and each capability boundary explicit.
   rendering, input, weapon/rig, legacy replay, and OpenXR.
 - The standalone host creates a real OpenXR session and samples HMD, grip, aim,
   buttons, triggers, squeeze, and thumbsticks.
-- Shared pose ABI v5 carries independent left/right grip and aim poses with
+- Shared pose ABI v9 carries independent left/right grip and aim poses with
   active/current tracking flags. The retail right-hand rig uses grip position
   and current aim orientation, with a guarded grip-orientation fallback.
 - Pose/input shared state reaches the live retail process; retail publishes
   runtime, camera, player, menu, and weapon-class telemetry back to the host.
-- XInput v2 and DirectInput v9 use versioned mapping names and stable
+- XInput v4 and DirectInput v10 use versioned mapping names and stable
   odd/even snapshots. DirectInput look uses cumulative angle counters consumed
   once across state/buffered polling; 250 ms producer staleness neutralizes
   held buttons, triggers, sticks, grip, pointer, and look state.
+- The product manifest declares Windows foreground ownership unnecessary. Its
+  child environment pins background DirectInput plus a native fuse that blocks
+  window activation, cursor movement, `SendInput`, and `PostMessage` input in
+  both the host and game plugin, even if a dormant fallback flag is changed.
 - The flat retail frame can be presented and the shared pointer/click path has
   worked in tested menus. Generic close/back semantics and exhaustive nested or
   mod-added menu coverage are not signed off.
@@ -88,8 +92,9 @@ distinction and each capability boundary explicit.
   `E394CB96DC1F881E66DF5E11877BCCBA55033FE50A4D407FD70CCB359BB3650D`.
 - The guarded deployment transaction now invalidates prior authority, assigns
   a fresh nonce, clean-builds x64 and Win32, requires nonempty complete test
-  catalogs, hashes 110 first-party/vendored source inputs before and after the
-  build, and binds ten exact artifact/configuration identities. The July 18
+  catalogs, hashes every first-party, vendored, and product-documentation input
+  before and after the build, and binds ten exact artifact/configuration
+  identities. The July 18
   Release transaction passed 77/77 combined tests and its independent
   ValidateOnly pass matched every installed mandatory destination without
   copying or launching anything.
@@ -139,6 +144,26 @@ can remain live through distinct retail engine eye rendering and OpenXR
 submission. It does not authorize game input, player/body mutation, controller
 interaction, tracked-weapon mutation, or projectile aiming; those product gates
 remain explicitly false.
+
+An August 22 controller/HMD sweep exposed a visual false positive: the rigid
+pistol rendered, but the submitted eyes omitted the hands, stretched/flattened
+the arm geometry, and showed unstable Pip-Boy color. The structural rig and
+renderer telemetry passed because it measured discovered nodes, queued leaves,
+and transform residuals rather than semantic pixel contribution. The launcher
+now records the root mask and rejects the known bad morphology from the final
+SBS pixels. Visual-rig acceptance remains false until both eyes pass that gate.
+
+The follow-up attested run `20260822-082426-198-a396ca04a155` replaced the
+failed categories instead of mutating them again. Root mask `1` retained only
+the stock weapon; upper-body, left-hand, right-hand, and stock Pip-Boy collector
+roots were disabled. The host loaded 3,936-vertex left and right hand meshes
+derived locally from the user's installed retail BSA, rendered the live retail
+inventory crop inside a tracked wrist housing, and retained 89 binocular final
+eye pairs. Native InterfaceManager actions opened Pip-Boy at game frame 111,
+closed it at 352, and returned to gameplay at 353. The manifest records the
+derived-mesh hashes and a live wrist final-eye proof at host frame 2395. This is
+headless simulator proof, not physical-headset or full-product acceptance;
+material fidelity and physical hand/weapon alignment remain calibration gates.
 
 ### Head tracking
 
@@ -299,7 +324,8 @@ executable checks, pointer validation, logging, and fail-closed rejection.
 
 ## Safe Local Artifacts
 
-- current 224/224 product build attestation at
+- current combined product build attestation, exact test count, source digest,
+  and artifact-set digest at
   `local/product-build/fnvxr-product-Release.json`;
 - retained dynamic six-axis run manifest, raw final-eye captures, and verified
   29.75-second 2560x720 side-by-side H.264 proof under
@@ -308,7 +334,7 @@ executable checks, pointer validation, logging, and fail-closed rejection.
   `local/openxr-retail-sidecar-runs/20260718-085015-525/`;
 - independent no-copy/no-launch ValidateOnly manifest under
   `local/openxr-retail-sidecar-runs/20260718-085104-081/`;
-- current build attestation at
+- retained legacy sidecar build attestation at
   `build/fnvxr-retail-build-attestation-Release.json` (110 source inputs,
   ten artifact/config identities, 77 passed registered tests);
 - exact installed/quarantined hash inventory at
