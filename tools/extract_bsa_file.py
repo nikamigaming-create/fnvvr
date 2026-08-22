@@ -39,6 +39,13 @@ def extract_record(archive, record) -> bytes:
         file_struct = archive.compressed_file_struct
     size = record.size & archive.SIZE_MASK
     payload = archive.content[record.offset : record.offset + size]
+    if archive.container.header.archive_flags.files_prefixed:
+        if not payload:
+            raise ValueError("prefixed BSA record is empty")
+        prefix_size = payload[0]
+        if prefix_size + 1 > len(payload):
+            raise ValueError("prefixed BSA record has an invalid name length")
+        payload = payload[prefix_size + 1 :]
     return bytes(file_struct.parse(payload).data)
 
 
