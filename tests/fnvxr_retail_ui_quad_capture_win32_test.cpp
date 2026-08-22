@@ -254,17 +254,15 @@ int main()
         | shared::RuntimePipBoyMenuBit;
     require(
         present(device, nullptr, nullptr, nullptr, nullptr) == S_FALSE
-            && state.copies == 2u
-            && state.publications == 2u
-            && state.lastWithhold
-                == d3d9::RetailUiQuadCaptureFailure::RuntimeNotConfirmedUi,
-        "live Pip-Boy was copied into the MonoUiQuad producer");
+            && state.copies == 3u
+            && state.publications == 3u,
+        "live Pip-Boy screen was not copied into its auxiliary mono surface");
 
     state.readSucceeds = false;
     require(
         present(device, nullptr, nullptr, nullptr, nullptr) == S_FALSE
-            && state.copies == 2u
-            && state.publications == 2u
+            && state.copies == 3u
+            && state.publications == 3u
             && state.lastWithhold
                 == d3d9::RetailUiQuadCaptureFailure::RuntimeSampleUnavailable,
         "unstable runtime evidence reached UI capture");
@@ -273,7 +271,7 @@ int main()
     state.copySucceeds = false;
     require(
         present(device, nullptr, nullptr, nullptr, nullptr) == S_FALSE
-            && state.publications == 2u
+            && state.publications == 3u
             && state.lastWithhold
                 == d3d9::RetailUiQuadCaptureFailure::BackBufferCopyFailed,
         "failed backbuffer copy was published");
@@ -294,6 +292,6 @@ int main()
                 == entryFromPresent(&originalPresent),
         "test detach did not restore the original Present entry");
 
-    std::cout << "retail UI-only v5 Present capture passed\n";
+    std::cout << "retail UI/Pip-Boy surface Present capture passed\n";
     return EXIT_SUCCESS;
 }

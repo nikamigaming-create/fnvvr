@@ -1,5 +1,9 @@
 #include "fnvxr_retail_center_renderer_operations.h"
 
+#if defined(_WIN32)
+#include <windows.h>
+#endif
+
 #include <array>
 #include <cstring>
 #include <cstdlib>
@@ -98,6 +102,142 @@ struct QueueGeometryFixture
             sizeof(propertyFlags));
     }
 };
+
+template <typename Value>
+Value readFixtureValue(
+    const std::uint8_t* bytes,
+    std::size_t offset) noexcept
+{
+    Value value {};
+    std::memcpy(&value, bytes + offset, sizeof(value));
+    return value;
+}
+
+template <typename Value>
+void writeFixtureValue(
+    std::uint8_t* bytes,
+    std::size_t offset,
+    Value value) noexcept
+{
+    std::memcpy(bytes + offset, &value, sizeof(value));
+}
+
+void verifyFirstPersonGeometryMutationContract()
+{
+    constexpr std::uint32_t OriginalGeometryFlags = 0xA5A500C1u;
+    constexpr std::uint32_t ExpectedGeometryFlags =
+        OriginalGeometryFlags & ~0x41u;
+    constexpr std::uint16_t OriginalPropertyFlags = 0x6004u;
+    constexpr std::uint16_t ExpectedPropertyFlags =
+        static_cast<std::uint16_t>(
+            (OriginalPropertyFlags | 0x0001u) & ~0x2000u);
+
+    QueueGeometryFixture normal;
+    normal.initialize(false);
+    writeFixtureValue(
+        normal.geometry.data(), 0x30u, OriginalGeometryFlags);
+    writeFixtureValue(
+        normal.property.data(), 0x18u, OriginalPropertyFlags);
+    detail::FirstPersonGeometryMutation mutation {};
+    const abi::RetailPointer32 geometryAddress =
+        static_cast<abi::RetailPointer32>(
+            reinterpret_cast<std::uintptr_t>(normal.geometry.data()));
+    require(
+        detail::applyFirstPersonGeometryMutation(
+            geometryAddress,
+            mutation),
+        "the authenticated first-person mutation rejected writable geometry");
+    require(
+        mutation.applied
+            && readFixtureValue<std::uint32_t>(
+                   normal.geometry.data(), 0x30u)
+                == ExpectedGeometryFlags
+            && readFixtureValue<std::uint16_t>(
+                   normal.property.data(), 0x18u)
+                == ExpectedPropertyFlags,
+        "the first-person mutation changed the wrong geometry/property bits");
+    require(
+        detail::restoreFirstPersonGeometryMutation(mutation)
+            && !mutation.applied
+            && readFixtureValue<std::uint32_t>(
+                   normal.geometry.data(), 0x30u)
+                == OriginalGeometryFlags
+            && readFixtureValue<std::uint16_t>(
+                   normal.property.data(), 0x18u)
+                == OriginalPropertyFlags,
+        "the first-person mutation did not restore exact source bytes");
+    require(
+        detail::restoreFirstPersonGeometryMutation(mutation),
+        "restoring an inactive first-person mutation was not idempotent");
+
+    QueueGeometryFixture rejected;
+    rejected.initialize(false);
+    writeFixtureValue(
+        rejected.geometry.data(), 0x30u, OriginalGeometryFlags);
+    writeFixtureValue<abi::RetailPointer32>(
+        rejected.geometry.data(), 0x9Cu, 0u);
+    require(
+        !detail::applyFirstPersonGeometryMutation(
+            static_cast<abi::RetailPointer32>(
+                reinterpret_cast<std::uintptr_t>(rejected.geometry.data())),
+            mutation)
+            && !mutation.applied
+            && readFixtureValue<std::uint32_t>(
+                   rejected.geometry.data(), 0x30u)
+                == OriginalGeometryFlags,
+        "an invalid property pointer partially mutated first-person geometry");
+
+    auto* readOnlyProperty = static_cast<std::uint8_t*>(VirtualAlloc(
+        nullptr,
+        4096u,
+        MEM_COMMIT | MEM_RESERVE,
+        PAGE_READWRITE));
+    require(readOnlyProperty != nullptr,
+        "could not allocate the partial-write fault fixture");
+    QueueGeometryFixture partial;
+    partial.initialize(false);
+    writeFixtureValue(
+        partial.geometry.data(), 0x30u, OriginalGeometryFlags);
+    writeFixtureValue(
+        readOnlyProperty, 0x18u, OriginalPropertyFlags);
+    writeFixtureValue(
+        partial.geometry.data(),
+        0x9Cu,
+        static_cast<abi::RetailPointer32>(
+            reinterpret_cast<std::uintptr_t>(readOnlyProperty)));
+    DWORD previousProtection = 0u;
+    require(
+        VirtualProtect(
+            readOnlyProperty,
+            4096u,
+            PAGE_READONLY,
+            &previousProtection) != FALSE,
+        "could not protect the partial-write fault fixture");
+    require(
+        !detail::applyFirstPersonGeometryMutation(
+            static_cast<abi::RetailPointer32>(
+                reinterpret_cast<std::uintptr_t>(partial.geometry.data())),
+            mutation)
+            && !mutation.applied
+            && readFixtureValue<std::uint32_t>(
+                   partial.geometry.data(), 0x30u)
+                == OriginalGeometryFlags
+            && readFixtureValue<std::uint16_t>(
+                   readOnlyProperty, 0x18u)
+                == OriginalPropertyFlags,
+        "a property write fault leaked the preceding geometry mutation");
+    DWORD ignoredProtection = 0u;
+    require(
+        VirtualProtect(
+            readOnlyProperty,
+            4096u,
+            previousProtection,
+            &ignoredProtection) != FALSE,
+        "could not restore the partial-write fixture protection");
+    require(
+        VirtualFree(readOnlyProperty, 0u, MEM_RELEASE) != FALSE,
+        "could not release the partial-write fault fixture");
+}
 
 struct State
 {
@@ -435,6 +575,8 @@ int main()
 #else
     State state;
     gState = &state;
+
+    verifyFirstPersonGeometryMutationContract();
 
     Binding binding;
     std::array<abi::RetailPointer32, Binding::OwnedVtableEntryCount> stock {};

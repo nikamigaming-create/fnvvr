@@ -1091,6 +1091,10 @@ function Set-FnvxrSidecarEnvironment {
     # Disable the unrelated offline retail animation scanner during live VR.
     $env:NIKAMI_ORACLE_ENABLE = "0"
     $env:FNVXR_RUN_PROFILE = $Profile
+    # Never let an OpenXR sidecar take ownership of the Windows desktop. All
+    # production controller/menu input uses shared state and background
+    # DirectInput/XInput delivery instead of window activation or OS input.
+    $env:FNVXR_WINDOWS_FOREGROUND_INPUT_FORBIDDEN = "1"
     if ($RunDir) {
         $env:FNVXR_RUN_LOG_DIR = $RunDir
     }

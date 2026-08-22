@@ -221,6 +221,16 @@ struct Vertex
     float z;
 };
 
+struct LitVertex
+{
+    float x;
+    float y;
+    float z;
+    float nx;
+    float ny;
+    float nz;
+};
+
 struct TexturedVertex
 {
     float x;
@@ -241,6 +251,9 @@ struct Renderer
     ComPtr<ID3D11VertexShader> vertexShader;
     ComPtr<ID3D11PixelShader> pixelShader;
     ComPtr<ID3D11InputLayout> inputLayout;
+    ComPtr<ID3D11VertexShader> roundedVertexShader;
+    ComPtr<ID3D11PixelShader> roundedPixelShader;
+    ComPtr<ID3D11InputLayout> roundedInputLayout;
     ComPtr<ID3D11Buffer> vertexBuffer;
     ComPtr<ID3D11Buffer> constantBuffer;
     ComPtr<ID3D11VertexShader> texturedVertexShader;
@@ -250,6 +263,15 @@ struct Renderer
     ComPtr<ID3D11PixelShader> edgeSmearPixelShader;
     ComPtr<ID3D11InputLayout> texturedInputLayout;
     ComPtr<ID3D11Buffer> texturedVertexBuffer;
+    ComPtr<ID3D11Buffer> pipBoyScreenTexturedVertexBuffer;
+    ComPtr<ID3D11Buffer> roundedVertexBuffer;
+    UINT roundedVertexCount = 0;
+    ComPtr<ID3D11Buffer> handVertexBuffer;
+    UINT handVertexCount = 0;
+    ComPtr<ID3D11Buffer> retailLeftHandVertexBuffer;
+    UINT retailLeftHandVertexCount = 0;
+    ComPtr<ID3D11Buffer> retailRightHandVertexBuffer;
+    UINT retailRightHandVertexCount = 0;
     ComPtr<ID3D11Buffer> curvedTexturedVertexBuffer;
     UINT curvedTexturedVertexCount = 0;
     ComPtr<ID3D11Buffer> shieldCenterTexturedVertexBuffer;
@@ -318,6 +340,7 @@ struct Renderer
     std::uint64_t retainedUiRuntimeStateSample = 0u;
     float retainedUiTextureAspect = 16.0f / 9.0f;
     bool retainedUiHostWindowCaptured = false;
+    bool retainedUiLivePipBoySurface = false;
     std::uint64_t retainedCpuUiTransactionId = 0u;
     std::uint64_t retainedCpuUiEpoch = 0u;
     std::uint32_t retainedCpuUiProducerProcessId = 0u;
@@ -823,6 +846,11 @@ bool envEnabled(const char* name, bool fallback)
     }
 
     return value[0] != '0';
+}
+
+bool windowsForegroundInputForbidden()
+{
+    return envEnabled("FNVXR_WINDOWS_FOREGROUND_INPUT_FORBIDDEN", false);
 }
 
 enum class GamePlaneMode
@@ -4962,6 +4990,8 @@ bool loadSceneCacheIntoStereoTextures(ID3D11Device* device, Renderer& renderer)
 
 void sendHostMouseClick(HWND hwnd, POINT clientPoint)
 {
+    if (windowsForegroundInputForbidden())
+        return;
     const LPARAM lparam = MAKELPARAM(clientPoint.x, clientPoint.y);
     PostMessageW(hwnd, WM_MOUSEMOVE, 0, lparam);
     PostMessageW(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, lparam);
@@ -4980,6 +5010,8 @@ void sendHostMouseClick(HWND hwnd, POINT clientPoint)
 
 bool sendAbsoluteCursorMove(const POINT& screenTarget)
 {
+    if (windowsForegroundInputForbidden())
+        return false;
     const int virtualX = GetSystemMetrics(SM_XVIRTUALSCREEN);
     const int virtualY = GetSystemMetrics(SM_YVIRTUALSCREEN);
     const int virtualWidth = GetSystemMetrics(SM_CXVIRTUALSCREEN);
@@ -5002,6 +5034,8 @@ bool sendAbsoluteCursorMove(const POINT& screenTarget)
 
 void updateHostCursorPointer(const MenuPointer& pointer, bool click)
 {
+    if (windowsForegroundInputForbidden())
+        return;
     const bool trackPointer = envEnabled("FNVXR_HOST_CURSOR_TRACK_POINTER", false);
     const bool clickFallback = envEnabled("FNVXR_HOST_CURSOR_CLICK_FALLBACK", false);
     if (!envEnabled("FNVXR_HOST_CURSOR_CLICK_ENABLED", false))
@@ -5310,8 +5344,8 @@ GamePlane livePipBoyInteractionPlane(const SolvedArm& leftArm, float scale)
     plane.height = plane.width / WristPipBoyDisplayAspect;
 
     const XMVECTOR wristOrientation = quat(leftArm.wrist.orientation);
-    // This plane is never drawn. It follows the tracked wrist and supplies
-    // ray/fingertip UVs for the authored retail screen and physical controls.
+    // This plane follows the tracked wrist for both the authored retail
+    // screen crop and its ray/fingertip physical controls.
     const XMVECTOR localOrientation = XMQuaternionRotationRollPitchYaw(
         degreesToRadians(envFloat("FNVXR_PIPBOY_WRIST_UI_ROT_X", 0.0f)),
         degreesToRadians(envFloat("FNVXR_PIPBOY_WRIST_UI_ROT_Y", 0.0f)),
@@ -5438,6 +5472,149 @@ void drawLocalCube(
     context->Draw(36, 0);
 }
 
+void drawRoundedModel(
+    ID3D11DeviceContext* context,
+    Renderer& renderer,
+    const XMMATRIX& viewProjection,
+    const XMMATRIX& model,
+    const XMFLOAT4& color)
+{
+    if (!renderer.roundedVertexBuffer || renderer.roundedVertexCount == 0u)
+        return;
+
+    Constants constants {};
+    XMStoreFloat4x4(&constants.mvp, model * viewProjection);
+    constants.color = color;
+    context->UpdateSubresource(
+        renderer.constantBuffer.Get(),
+        0,
+        nullptr,
+        &constants,
+        0,
+        0);
+
+    const UINT stride = sizeof(LitVertex);
+    const UINT offset = 0;
+    ID3D11Buffer* rounded = renderer.roundedVertexBuffer.Get();
+    context->IASetInputLayout(renderer.roundedInputLayout.Get());
+    context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    context->IASetVertexBuffers(0, 1, &rounded, &stride, &offset);
+    context->VSSetShader(renderer.roundedVertexShader.Get(), nullptr, 0);
+    context->PSSetShader(renderer.roundedPixelShader.Get(), nullptr, 0);
+    context->VSSetConstantBuffers(0, 1, renderer.constantBuffer.GetAddressOf());
+    context->PSSetConstantBuffers(0, 1, renderer.constantBuffer.GetAddressOf());
+    context->Draw(renderer.roundedVertexCount, 0);
+
+    // The solid helpers share one pipeline and historically assume the cube
+    // vertex buffer remains bound. Restore that invariant after every rounded
+    // limb/hand primitive so later debug or interaction geometry is exact.
+    bindSolidPipeline(context, renderer);
+}
+
+void drawRounded(
+    ID3D11DeviceContext* context,
+    Renderer& renderer,
+    const XMMATRIX& viewProjection,
+    const XrPosef& pose,
+    const XMFLOAT3& scale,
+    const XMFLOAT4& color)
+{
+    drawRoundedModel(
+        context,
+        renderer,
+        viewProjection,
+        modelFromPose(pose, scale),
+        color);
+}
+
+void drawLocalRounded(
+    ID3D11DeviceContext* context,
+    Renderer& renderer,
+    const XMMATRIX& viewProjection,
+    const XrPosef& parent,
+    const XMFLOAT3& localOffset,
+    const XMFLOAT3& localEulerRadians,
+    const XMFLOAT3& scale,
+    const XMFLOAT4& color)
+{
+    drawRoundedModel(
+        context,
+        renderer,
+        viewProjection,
+        modelFromParentLocal(
+            parent,
+            localOffset,
+            localEulerRadians,
+            scale),
+        color);
+}
+
+void drawHandPrimitive(
+    ID3D11DeviceContext* context,
+    Renderer& renderer,
+    const XMMATRIX& viewProjection,
+    const XrPosef& wristPose,
+    bool left)
+{
+    ID3D11Buffer* selectedHand = left
+        ? renderer.retailLeftHandVertexBuffer.Get()
+        : renderer.retailRightHandVertexBuffer.Get();
+    UINT selectedVertexCount = left
+        ? renderer.retailLeftHandVertexCount
+        : renderer.retailRightHandVertexCount;
+    const bool retailMesh = selectedHand && selectedVertexCount != 0u;
+    if (!retailMesh)
+    {
+        selectedHand = renderer.handVertexBuffer.Get();
+        selectedVertexCount = renderer.handVertexCount;
+    }
+    if (!selectedHand || selectedVertexCount == 0u)
+        return;
+
+    const XMFLOAT3 localOffset {
+        left ? 0.0f : -0.040f,
+        -0.005f,
+        -0.010f,
+    };
+    const float retailScale = retailMesh
+        ? envFloat("FNVXR_RETAIL_HAND_MESH_SCALE", 1.0f)
+        : 1.0f;
+    const XMFLOAT3 scale = retailMesh
+        ? XMFLOAT3 { retailScale, retailScale, retailScale }
+        : XMFLOAT3 { left ? -1.0f : 1.0f, 1.0f, 1.0f };
+    Constants constants {};
+    XMStoreFloat4x4(
+        &constants.mvp,
+        modelFromParentLocal(
+            wristPose,
+            localOffset,
+            { 0.0f, 0.0f, 0.0f },
+            scale)
+            * viewProjection);
+    constants.color = retailMesh
+        ? XMFLOAT4 { 0.48f, 0.34f, 0.25f, 1.0f }
+        : XMFLOAT4 { 0.34f, 0.36f, 0.29f, 1.0f };
+    context->UpdateSubresource(
+        renderer.constantBuffer.Get(),
+        0,
+        nullptr,
+        &constants,
+        0,
+        0);
+
+    const UINT stride = sizeof(LitVertex);
+    const UINT offset = 0;
+    context->IASetInputLayout(renderer.roundedInputLayout.Get());
+    context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    context->IASetVertexBuffers(0, 1, &selectedHand, &stride, &offset);
+    context->VSSetShader(renderer.roundedVertexShader.Get(), nullptr, 0);
+    context->PSSetShader(renderer.roundedPixelShader.Get(), nullptr, 0);
+    context->VSSetConstantBuffers(0, 1, renderer.constantBuffer.GetAddressOf());
+    context->PSSetConstantBuffers(0, 1, renderer.constantBuffer.GetAddressOf());
+    context->Draw(selectedVertexCount, 0);
+    bindSolidPipeline(context, renderer);
+}
+
 void drawTexturedPlane(
     ID3D11DeviceContext* context,
     Renderer& renderer,
@@ -5518,6 +5695,29 @@ void drawTexturedVertexBuffer(
 
     ID3D11ShaderResourceView* emptyView = nullptr;
     context->PSSetShaderResources(0, 1, &emptyView);
+}
+
+void drawPipBoyScreen(
+    ID3D11DeviceContext* context,
+    Renderer& renderer,
+    const XMMATRIX& viewProjection,
+    const GamePlane& screenPlane,
+    ID3D11ShaderResourceView* sourceTextureView)
+{
+    if (!sourceTextureView || !renderer.pipBoyScreenTexturedVertexBuffer)
+        return;
+
+    drawTexturedVertexBuffer(
+        context,
+        renderer,
+        viewProjection,
+        modelFromPose(
+            screenPlane.pose,
+            { screenPlane.width, screenPlane.height, 1.0f }),
+        { 1.0f, 1.0f, 1.0f, 1.0f },
+        sourceTextureView,
+        renderer.pipBoyScreenTexturedVertexBuffer.Get(),
+        6u);
 }
 
 void drawGamePlane(
@@ -5846,6 +6046,7 @@ void commitUiTextureCandidate(
     renderer.retainedUiRuntimeStateSample = candidate.runtimeStateSample;
     renderer.retainedUiTextureAspect = candidate.aspect;
     renderer.retainedUiHostWindowCaptured = false;
+    renderer.retainedUiLivePipBoySurface = false;
     renderer.retainedCpuUiTransactionId = 0u;
     renderer.retainedCpuUiEpoch = 0u;
     renderer.retainedCpuUiProducerProcessId = 0u;
@@ -5861,6 +6062,7 @@ void clearRetainedUiResource(Renderer& renderer) noexcept
     renderer.retainedUiRuntimeStateSample = 0u;
     renderer.retainedUiTextureAspect = 16.0f / 9.0f;
     renderer.retainedUiHostWindowCaptured = false;
+    renderer.retainedUiLivePipBoySurface = false;
     renderer.retainedCpuUiTransactionId = 0u;
     renderer.retainedCpuUiEpoch = 0u;
     renderer.retainedCpuUiProducerProcessId = 0u;
@@ -6078,6 +6280,7 @@ bool uploadProductUiWindowTexture(
     renderer.retainedUiRuntimeStateSample = proof.runtimeStateSample;
     renderer.retainedUiTextureAspect = aspect;
     renderer.retainedUiHostWindowCaptured = true;
+    renderer.retainedUiLivePipBoySurface = false;
     renderer.retainedCpuUiTransactionId = 0u;
     renderer.retainedCpuUiEpoch = 0u;
     renderer.retainedCpuUiProducerProcessId = 0u;
@@ -6528,7 +6731,13 @@ void drawSegment(
         return;
 
     const XrPosef pose = poseAlongSegment(start, end, XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f));
-    drawCube(context, renderer, viewProjection, pose, { thickness, thickness, length }, color);
+    drawRounded(
+        context,
+        renderer,
+        viewProjection,
+        pose,
+        { thickness, thickness, length },
+        color);
 }
 
 void drawSolvedArm(
@@ -6542,11 +6751,29 @@ void drawSolvedArm(
     const XMVECTOR shoulder = vec3(arm.shoulder.position);
     const XMVECTOR elbow = vec3(arm.elbow.position);
     const XMVECTOR wrist = vec3(arm.wrist.position);
-    drawSegment(context, renderer, viewProjection, shoulder, elbow, upperColor, 0.035f);
-    drawSegment(context, renderer, viewProjection, elbow, wrist, lowerColor, 0.032f);
-    drawCube(context, renderer, viewProjection, arm.shoulder, { 0.045f, 0.045f, 0.045f }, upperColor);
-    drawCube(context, renderer, viewProjection, arm.elbow, { 0.040f, 0.040f, 0.040f }, { 1.0f, 0.10f, 0.95f, 1.0f });
-    drawCube(context, renderer, viewProjection, arm.wrist, { 0.070f, 0.070f, 0.070f }, lowerColor);
+    drawSegment(context, renderer, viewProjection, shoulder, elbow, upperColor, 0.095f);
+    drawSegment(context, renderer, viewProjection, elbow, wrist, lowerColor, 0.082f);
+    drawRounded(
+        context,
+        renderer,
+        viewProjection,
+        arm.shoulder,
+        { 0.105f, 0.105f, 0.105f },
+        upperColor);
+    drawRounded(
+        context,
+        renderer,
+        viewProjection,
+        arm.elbow,
+        { 0.095f, 0.095f, 0.105f },
+        lowerColor);
+    drawRounded(
+        context,
+        renderer,
+        viewProjection,
+        arm.wrist,
+        { 0.090f, 0.080f, 0.095f },
+        lowerColor);
     if (envFloat("FNVXR_DEBUG_AXES", envFloat("FNVXR_DEBUG_LEFT_AXES", 1.0f)) != 0.0f)
     {
         drawPoseAxes(context, renderer, viewProjection, arm.forearm);
@@ -6554,71 +6781,90 @@ void drawSolvedArm(
     }
 }
 
-void drawPipboyRig(ID3D11DeviceContext* context, Renderer& renderer, const XMMATRIX& viewProjection, const SolvedArm& leftArm)
+void drawPipboyRig(
+    ID3D11DeviceContext* context,
+    Renderer& renderer,
+    const XMMATRIX& viewProjection,
+    const SolvedArm& leftArm,
+    const GamePlane& screenPlane)
 {
-    const XMFLOAT3 forearmOffset {
-        envFloat("FNVXR_PIPBOY_OFFSET_X", 0.0f),
-        envFloat("FNVXR_PIPBOY_OFFSET_Y", 0.04f),
-        envFloat("FNVXR_PIPBOY_OFFSET_Z", 0.02f)
-    };
-    const XMFLOAT3 faceDown {
-        degreesToRadians(envFloat("FNVXR_PIPBOY_ROT_X", 0.0f)),
-        degreesToRadians(envFloat("FNVXR_PIPBOY_ROT_Y", 0.0f)),
-        degreesToRadians(envFloat("FNVXR_PIPBOY_ROT_Z", 0.0f))
-    };
     const float scale = envFloat("FNVXR_PIPBOY_SCALE", 1.0f);
-    const XrPosef& forearmPose = leftArm.forearm;
+    const float width = screenPlane.width;
+    const float height = screenPlane.height;
+    const XMFLOAT4 casing { 0.16f, 0.19f, 0.12f, 1.0f };
+    const XMFLOAT4 edge { 0.08f, 0.10f, 0.07f, 1.0f };
+    const XMFLOAT4 control { 0.42f, 0.46f, 0.28f, 1.0f };
 
-    if (envFloat("FNVXR_DEBUG_AXES", envFloat("FNVXR_DEBUG_LEFT_AXES", 1.0f)) != 0.0f)
-    {
-        drawPoseAxes(context, renderer, viewProjection, forearmPose);
-        drawLocalCube(
-            context,
-            renderer,
-            viewProjection,
-            forearmPose,
-            forearmOffset,
-            { 0.0f, 0.0f, 0.0f },
-            { 0.026f, 0.026f, 0.026f },
-            { 1.0f, 0.05f, 1.0f, 1.0f });
-    }
-
+    // A stable host-owned housing replaces only the stock Pip-Boy category,
+    // whose manually requeued skinning data is invalid in the private stereo
+    // collector. The authored live retail screen is drawn separately into the
+    // recessed opening below; this casing never flashes or inherits engine
+    // culling state.
     drawLocalCube(
         context,
         renderer,
         viewProjection,
-        forearmPose,
-        { forearmOffset.x, forearmOffset.y, forearmOffset.z - 0.06f },
-        faceDown,
-        { 0.155f * scale, 0.018f * scale, 0.022f * scale },
-        { 0.0f, 0.35f, 0.05f, 1.0f });
+        screenPlane.pose,
+        { 0.0f, 0.0f, 0.026f * scale },
+        { 0.0f, 0.0f, 0.0f },
+        { (width + 0.060f) * scale,
+          (height + 0.050f) * scale,
+          0.045f * scale },
+        casing);
     drawLocalCube(
         context,
         renderer,
         viewProjection,
-        forearmPose,
-        { forearmOffset.x, forearmOffset.y, forearmOffset.z + 0.06f },
-        faceDown,
-        { 0.155f * scale, 0.018f * scale, 0.022f * scale },
-        { 0.0f, 0.55f, 0.08f, 1.0f });
+        screenPlane.pose,
+        { 0.0f, 0.0f, -0.006f },
+        { 0.0f, 0.0f, 0.0f },
+        { width * scale, height * scale, 0.010f * scale },
+        { 0.015f, 0.065f, 0.035f, 1.0f });
     drawLocalCube(
         context,
         renderer,
         viewProjection,
-        forearmPose,
-        forearmOffset,
-        faceDown,
-        { 0.14f * scale, 0.026f * scale, 0.09f * scale },
-        { 0.02f, 0.7f, 0.18f, 1.0f });
+        screenPlane.pose,
+        { 0.0f, (height + 0.040f) * 0.5f, -0.004f },
+        { 0.0f, 0.0f, 0.0f },
+        { (width + 0.055f) * scale, 0.022f * scale, 0.024f * scale },
+        edge);
     drawLocalCube(
         context,
         renderer,
         viewProjection,
-        forearmPose,
-        { forearmOffset.x, forearmOffset.y + 0.016f, forearmOffset.z },
-        faceDown,
-        { 0.105f * scale, 0.004f * scale, 0.065f * scale },
-        { 0.0f, 0.95f, 1.0f, 1.0f });
+        screenPlane.pose,
+        { 0.0f, -(height + 0.040f) * 0.5f, -0.004f },
+        { 0.0f, 0.0f, 0.0f },
+        { (width + 0.055f) * scale, 0.022f * scale, 0.024f * scale },
+        edge);
+    drawLocalCube(
+        context,
+        renderer,
+        viewProjection,
+        screenPlane.pose,
+        { -(width + 0.050f) * 0.5f, 0.0f, -0.004f },
+        { 0.0f, 0.0f, 0.0f },
+        { 0.022f * scale, height * scale, 0.024f * scale },
+        edge);
+    drawLocalCube(
+        context,
+        renderer,
+        viewProjection,
+        screenPlane.pose,
+        { (width + 0.072f) * 0.5f, -height * 0.18f, 0.0f },
+        { 0.0f, 0.0f, 0.0f },
+        { 0.032f * scale, 0.050f * scale, 0.035f * scale },
+        control);
+    drawLocalRounded(
+        context,
+        renderer,
+        viewProjection,
+        leftArm.wrist,
+        { 0.0f, 0.085f, 0.030f },
+        { 0.0f, 0.0f, 0.0f },
+        { 0.105f * scale, 0.080f * scale, 0.080f * scale },
+        edge);
 }
 
 void drawHandFingers(
@@ -6630,57 +6876,12 @@ void drawHandFingers(
 {
     if (!envEnabled("FNVXR_SHOW_HAND_FINGERS", true))
         return;
-
-    const float side = left ? -1.0f : 1.0f;
-    const XMFLOAT4 palmColor = left
-        ? XMFLOAT4 { 0.05f, 0.38f, 0.85f, 1.0f }
-        : XMFLOAT4 { 0.92f, 0.48f, 0.08f, 1.0f };
-    const XMFLOAT4 fingerColor = left
-        ? XMFLOAT4 { 0.18f, 0.62f, 1.0f, 1.0f }
-        : XMFLOAT4 { 1.0f, 0.78f, 0.18f, 1.0f };
-
-    drawLocalCube(
+    drawHandPrimitive(
         context,
         renderer,
         viewProjection,
         wristPose,
-        { 0.0f, 0.0f, -0.035f },
-        { 0.0f, 0.0f, 0.0f },
-        { 0.070f, 0.030f, 0.095f },
-        palmColor);
-
-    for (int finger = 0; finger < 4; ++finger)
-    {
-        const float x = (-0.033f + static_cast<float>(finger) * 0.022f) * side;
-        drawLocalCube(
-            context,
-            renderer,
-            viewProjection,
-            wristPose,
-            { x, 0.002f, -0.105f },
-            { 0.0f, 0.0f, 0.0f },
-            { 0.010f, 0.012f, 0.085f },
-            fingerColor);
-        drawLocalCube(
-            context,
-            renderer,
-            viewProjection,
-            wristPose,
-            { x, 0.000f, -0.158f },
-            { degreesToRadians(8.0f), 0.0f, 0.0f },
-            { 0.009f, 0.010f, 0.048f },
-            fingerColor);
-    }
-
-    drawLocalCube(
-        context,
-        renderer,
-        viewProjection,
-        wristPose,
-        { 0.055f * side, -0.006f, -0.045f },
-        { 0.0f, degreesToRadians(32.0f) * side, degreesToRadians(20.0f) * side },
-        { 0.014f, 0.014f, 0.065f },
-        fingerColor);
+        left);
 }
 
 void drawPauseModeScene(
@@ -6900,6 +7101,9 @@ bool renderEye(
     const MenuPointer& menuPointer,
     const WeaponOrbitWheel& weaponOrbitWheel,
     const GamePlane& gamePlane,
+    const GamePlane& livePipBoyPlane,
+    bool pipBoyScreenVisible,
+    ID3D11ShaderResourceView* pipBoyScreenTextureView,
     const XrPosef& pauseSceneAnchor,
     bool gameUiMode,
     bool showGamePlane,
@@ -7038,27 +7242,35 @@ bool renderEye(
         renderer,
         viewProjection,
         weaponOrbitWheel);
-    const bool drawWorldProps = !productionWorldTextureView
+    const bool spatialHandsOverlay =
+        envEnabled("FNVXR_SPATIAL_HANDS_OVERLAY", false);
+    const bool drawLegacyWorldProps = !productionWorldTextureView
         && !productionUiTextureView
         && envEnabled("FNVXR_SHOW_WORLD_PROPS", false)
-        && (!drawFullscreen || envEnabled("FNVXR_OVERLAY_PROPS_ON_FULLSCREEN", false));
+        && (!drawFullscreen
+            || envEnabled("FNVXR_OVERLAY_PROPS_ON_FULLSCREEN", false));
+    const bool drawWorldProps = drawLegacyWorldProps
+        || (spatialHandsOverlay && productionWorldTextureView);
     if (drawWorldProps && envEnabled("FNVXR_SHOW_BODY_RIG", true))
     {
-        drawSolvedArm(
-            context.Get(),
-            renderer,
-            viewProjection,
-            bodyRig.left,
-            { 0.05f, 0.35f, 1.0f, 1.0f },
-            { 0.02f, 0.85f, 0.20f, 1.0f });
+        if (envEnabled("FNVXR_SHOW_FULL_ARMS", false))
+        {
+            drawSolvedArm(
+                context.Get(),
+                renderer,
+                viewProjection,
+                bodyRig.left,
+                { 0.26f, 0.28f, 0.23f, 1.0f },
+                { 0.20f, 0.22f, 0.18f, 1.0f });
+            drawSolvedArm(
+                context.Get(),
+                renderer,
+                viewProjection,
+                bodyRig.right,
+                { 0.26f, 0.28f, 0.23f, 1.0f },
+                { 0.20f, 0.22f, 0.18f, 1.0f });
+        }
         drawHandFingers(context.Get(), renderer, viewProjection, bodyRig.left.wrist, true);
-        drawSolvedArm(
-            context.Get(),
-            renderer,
-            viewProjection,
-            bodyRig.right,
-            { 1.0f, 0.42f, 0.08f, 1.0f },
-            { 1.0f, 0.76f, 0.05f, 1.0f });
         drawHandFingers(context.Get(), renderer, viewProjection, bodyRig.right.wrist, false);
     }
     else if (drawWorldProps)
@@ -7069,11 +7281,31 @@ bool renderEye(
         drawHandFingers(context.Get(), renderer, viewProjection, rightPose, false);
     }
     if (drawWorldProps && envEnabled("FNVXR_SHOW_PIPBOY_RIG", true))
-        drawPipboyRig(context.Get(), renderer, viewProjection, bodyRig.left);
+        drawPipboyRig(
+            context.Get(),
+            renderer,
+            viewProjection,
+            bodyRig.left,
+            livePipBoyPlane);
     if (drawWorldProps && envEnabled("FNVXR_SHOW_LEFT_AIM_RAY", false))
         drawAimRay(context.Get(), renderer, viewProjection, leftAimPose);
     if (drawWorldProps && envEnabled("FNVXR_SHOW_RIGHT_AIM_RAY", true))
         drawAimRay(context.Get(), renderer, viewProjection, rightAimPose);
+    if (drawWorldProps && pipBoyScreenVisible)
+    {
+        // The texture is the fresh retail eye source for this exact frame.
+        // Its authored screen crop is spatialized on the tracked wrist after
+        // the stable housing, with depth disabled so the bezel cannot z-fight
+        // or blink the live screen away.
+        context->OMSetDepthStencilState(renderer.gamePlaneDepthState.Get(), 0);
+        drawPipBoyScreen(
+            context.Get(),
+            renderer,
+            viewProjection,
+            livePipBoyPlane,
+            pipBoyScreenTextureView);
+        context->OMSetDepthStencilState(renderer.depthState.Get(), 0);
+    }
 
     const bool outputProven = captureSwapchainRenderProof(
         device,
@@ -7846,6 +8078,221 @@ std::vector<TexturedVertex> makeEdgeSmearGamePlaneVertices()
     return vertices;
 }
 
+std::vector<LitVertex> makeRoundedPrimitiveVertices()
+{
+    constexpr int Slices = 16;
+    constexpr int Stacks = 10;
+    constexpr float Radius = 0.5f;
+    std::vector<LitVertex> vertices;
+    vertices.reserve(Slices * Stacks * 6);
+
+    auto point = [=](float latitude, float longitude) -> LitVertex
+    {
+        const float ring = std::cos(latitude) * Radius;
+        const float x = ring * std::cos(longitude);
+        const float y = std::sin(latitude) * Radius;
+        const float z = ring * std::sin(longitude);
+        return {
+            x,
+            y,
+            z,
+            x / Radius,
+            y / Radius,
+            z / Radius,
+        };
+    };
+
+    for (int stack = 0; stack < Stacks; ++stack)
+    {
+        const float latitude0 = -XM_PIDIV2
+            + XM_PI * static_cast<float>(stack)
+                / static_cast<float>(Stacks);
+        const float latitude1 = -XM_PIDIV2
+            + XM_PI * static_cast<float>(stack + 1)
+                / static_cast<float>(Stacks);
+        for (int slice = 0; slice < Slices; ++slice)
+        {
+            const float longitude0 = XM_2PI * static_cast<float>(slice)
+                / static_cast<float>(Slices);
+            const float longitude1 = XM_2PI * static_cast<float>(slice + 1)
+                / static_cast<float>(Slices);
+            const LitVertex a = point(latitude0, longitude0);
+            const LitVertex b = point(latitude1, longitude0);
+            const LitVertex c = point(latitude1, longitude1);
+            const LitVertex d = point(latitude0, longitude1);
+            vertices.insert(vertices.end(), { a, b, c, a, c, d });
+        }
+    }
+    return vertices;
+}
+
+void appendLitBox(
+    std::vector<LitVertex>& vertices,
+    float minX,
+    float minY,
+    float minZ,
+    float maxX,
+    float maxY,
+    float maxZ)
+{
+    auto vertex = [](float x, float y, float z, float nx, float ny, float nz)
+    {
+        return LitVertex { x, y, z, nx, ny, nz };
+    };
+    auto face = [&](const LitVertex& a, const LitVertex& b,
+                    const LitVertex& c, const LitVertex& d)
+    {
+        vertices.insert(vertices.end(), { a, b, c, a, c, d });
+    };
+
+    face(
+        vertex(minX, minY, minZ, 0, 0, -1),
+        vertex(minX, maxY, minZ, 0, 0, -1),
+        vertex(maxX, maxY, minZ, 0, 0, -1),
+        vertex(maxX, minY, minZ, 0, 0, -1));
+    face(
+        vertex(minX, minY, maxZ, 0, 0, 1),
+        vertex(maxX, minY, maxZ, 0, 0, 1),
+        vertex(maxX, maxY, maxZ, 0, 0, 1),
+        vertex(minX, maxY, maxZ, 0, 0, 1));
+    face(
+        vertex(minX, minY, minZ, -1, 0, 0),
+        vertex(minX, minY, maxZ, -1, 0, 0),
+        vertex(minX, maxY, maxZ, -1, 0, 0),
+        vertex(minX, maxY, minZ, -1, 0, 0));
+    face(
+        vertex(maxX, minY, minZ, 1, 0, 0),
+        vertex(maxX, maxY, minZ, 1, 0, 0),
+        vertex(maxX, maxY, maxZ, 1, 0, 0),
+        vertex(maxX, minY, maxZ, 1, 0, 0));
+    face(
+        vertex(minX, minY, minZ, 0, -1, 0),
+        vertex(maxX, minY, minZ, 0, -1, 0),
+        vertex(maxX, minY, maxZ, 0, -1, 0),
+        vertex(minX, minY, maxZ, 0, -1, 0));
+    face(
+        vertex(minX, maxY, minZ, 0, 1, 0),
+        vertex(minX, maxY, maxZ, 0, 1, 0),
+        vertex(maxX, maxY, maxZ, 0, 1, 0),
+        vertex(maxX, maxY, minZ, 0, 1, 0));
+}
+
+std::vector<LitVertex> makeHandPrimitiveVertices()
+{
+    std::vector<LitVertex> vertices;
+    vertices.reserve(8u * 36u);
+
+    // One compact glove mesh: cuff, palm, four attached fingers, and thumb.
+    // Keeping the digits joined to the palm avoids the floating bead/skeleton
+    // look of the former debug primitives while retaining a readable hand
+    // silhouette from the simulator's front-facing controller pose.
+    appendLitBox(vertices, -0.045f, 0.052f, -0.034f,
+                 0.045f, 0.125f, 0.034f);
+    appendLitBox(vertices, -0.058f, -0.060f, -0.032f,
+                 0.058f, 0.060f, 0.032f);
+    constexpr float centers[4] { -0.043f, -0.015f, 0.015f, 0.043f };
+    constexpr float tips[4] { -0.133f, -0.158f, -0.163f, -0.145f };
+    for (int index = 0; index < 4; ++index)
+    {
+        appendLitBox(
+            vertices,
+            centers[index] - 0.010f,
+            tips[index],
+            -0.026f,
+            centers[index] + 0.010f,
+            -0.050f,
+            0.026f);
+    }
+    appendLitBox(vertices, 0.052f, -0.040f, -0.028f,
+                 0.112f, 0.015f, 0.028f);
+    return vertices;
+}
+
+bool loadRetailHandMesh(
+    ID3D11Device* device,
+    const char* environmentName,
+    ComPtr<ID3D11Buffer>& buffer,
+    UINT& vertexCount)
+{
+    buffer.Reset();
+    vertexCount = 0u;
+    const char* path = std::getenv(environmentName);
+    if (!path || !*path)
+        return true;
+
+    struct Header
+    {
+        char magic[4];
+        std::uint32_t version;
+        std::uint32_t vertexCount;
+        std::uint32_t reserved;
+    };
+    static_assert(sizeof(Header) == 16u);
+    std::ifstream stream(path, std::ios::binary | std::ios::ate);
+    if (!stream)
+        return false;
+    const std::streamoff length = stream.tellg();
+    stream.seekg(0, std::ios::beg);
+    Header header {};
+    if (length < static_cast<std::streamoff>(sizeof(header))
+        || !stream.read(
+            reinterpret_cast<char*>(&header),
+            sizeof(header))
+        || std::memcmp(header.magic, "FHM1", 4u) != 0
+        || header.version != 1u
+        || header.reserved != 0u
+        || header.vertexCount < 300u
+        || header.vertexCount > 100000u
+        || header.vertexCount % 3u != 0u
+        || length != static_cast<std::streamoff>(
+            sizeof(header)
+            + static_cast<std::uint64_t>(header.vertexCount)
+                * sizeof(LitVertex)))
+    {
+        return false;
+    }
+
+    std::vector<LitVertex> vertices(header.vertexCount);
+    if (!stream.read(
+            reinterpret_cast<char*>(vertices.data()),
+            static_cast<std::streamsize>(
+                vertices.size() * sizeof(LitVertex))))
+    {
+        return false;
+    }
+    for (const LitVertex& vertex : vertices)
+    {
+        const float values[] {
+            vertex.x, vertex.y, vertex.z,
+            vertex.nx, vertex.ny, vertex.nz,
+        };
+        for (float value : values)
+        {
+            if (!std::isfinite(value) || std::fabs(value) > 2.0f)
+                return false;
+        }
+    }
+
+    D3D11_BUFFER_DESC description {};
+    description.ByteWidth = static_cast<UINT>(
+        vertices.size() * sizeof(LitVertex));
+    description.Usage = D3D11_USAGE_DEFAULT;
+    description.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+    D3D11_SUBRESOURCE_DATA initial {};
+    initial.pSysMem = vertices.data();
+    if (FAILED(device->CreateBuffer(
+            &description,
+            &initial,
+            &buffer)))
+    {
+        return false;
+    }
+    vertexCount = header.vertexCount;
+    std::cout << "retailHandMesh loaded env=" << environmentName
+              << " vertices=" << vertexCount << " path=" << path << "\n";
+    return true;
+}
+
 bool createRenderer(ID3D11Device* device, Renderer& renderer)
 {
     const char* shaderSource = R"(
@@ -7894,6 +8341,86 @@ float4 PSMain(VSOutput input) : SV_TARGET
     };
     if (FAILED(device->CreateInputLayout(&inputElement, 1, vertexBlob->GetBufferPointer(), vertexBlob->GetBufferSize(), &renderer.inputLayout)))
         return false;
+
+    const char* roundedShaderSource = R"(
+cbuffer ConstantsBuffer : register(b0)
+{
+    row_major float4x4 mvp;
+    float4 color;
+};
+
+struct VSInput
+{
+    float3 position : POSITION;
+    float3 normal : NORMAL;
+};
+
+struct VSOutput
+{
+    float4 position : SV_POSITION;
+    float3 normal : NORMAL;
+};
+
+VSOutput VSMain(VSInput input)
+{
+    VSOutput output;
+    output.position = mul(float4(input.position, 1.0), mvp);
+    output.normal = input.normal;
+    return output;
+}
+
+float4 PSMain(VSOutput input) : SV_TARGET
+{
+    float3 normal = normalize(input.normal);
+    float diffuse = saturate(dot(normal, normalize(float3(-0.35, 0.72, -0.58))));
+    float rim = pow(saturate(1.0 - abs(normal.z)), 2.0);
+    float light = 0.30 + diffuse * 0.62 + rim * 0.08;
+    return float4(color.rgb * light, color.a);
+}
+)";
+    ComPtr<ID3DBlob> roundedVertexBlob;
+    ComPtr<ID3DBlob> roundedPixelBlob;
+    if (!compileShader(
+            roundedShaderSource,
+            "VSMain",
+            "vs_5_0",
+            &roundedVertexBlob)
+        || !compileShader(
+            roundedShaderSource,
+            "PSMain",
+            "ps_5_0",
+            &roundedPixelBlob))
+    {
+        return false;
+    }
+    if (FAILED(device->CreateVertexShader(
+            roundedVertexBlob->GetBufferPointer(),
+            roundedVertexBlob->GetBufferSize(),
+            nullptr,
+            &renderer.roundedVertexShader))
+        || FAILED(device->CreatePixelShader(
+            roundedPixelBlob->GetBufferPointer(),
+            roundedPixelBlob->GetBufferSize(),
+            nullptr,
+            &renderer.roundedPixelShader)))
+    {
+        return false;
+    }
+    D3D11_INPUT_ELEMENT_DESC roundedInputElements[] {
+        { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0,
+          D3D11_INPUT_PER_VERTEX_DATA, 0 },
+        { "NORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0,
+          sizeof(float) * 3, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+    };
+    if (FAILED(device->CreateInputLayout(
+            roundedInputElements,
+            static_cast<UINT>(std::size(roundedInputElements)),
+            roundedVertexBlob->GetBufferPointer(),
+            roundedVertexBlob->GetBufferSize(),
+            &renderer.roundedInputLayout)))
+    {
+        return false;
+    }
 
     const char* texturedShaderSource = R"(
 cbuffer ConstantsBuffer : register(b0)
@@ -8088,6 +8615,59 @@ float4 PSHudOverlay(VSOutput input) : SV_TARGET
     if (FAILED(device->CreateBuffer(&vertexDesc, &vertexData, &renderer.vertexBuffer)))
         return false;
 
+    const std::vector<LitVertex> roundedVertices =
+        makeRoundedPrimitiveVertices();
+    if (roundedVertices.empty())
+        return false;
+    D3D11_BUFFER_DESC roundedDesc {};
+    roundedDesc.ByteWidth = static_cast<UINT>(
+        roundedVertices.size() * sizeof(LitVertex));
+    roundedDesc.Usage = D3D11_USAGE_DEFAULT;
+    roundedDesc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+    D3D11_SUBRESOURCE_DATA roundedData {};
+    roundedData.pSysMem = roundedVertices.data();
+    if (FAILED(device->CreateBuffer(
+            &roundedDesc,
+            &roundedData,
+            &renderer.roundedVertexBuffer)))
+    {
+        return false;
+    }
+    renderer.roundedVertexCount = static_cast<UINT>(roundedVertices.size());
+
+    const std::vector<LitVertex> handVertices =
+        makeHandPrimitiveVertices();
+    if (handVertices.empty())
+        return false;
+    D3D11_BUFFER_DESC handDesc {};
+    handDesc.ByteWidth = static_cast<UINT>(
+        handVertices.size() * sizeof(LitVertex));
+    handDesc.Usage = D3D11_USAGE_DEFAULT;
+    handDesc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+    D3D11_SUBRESOURCE_DATA handData {};
+    handData.pSysMem = handVertices.data();
+    if (FAILED(device->CreateBuffer(
+            &handDesc,
+            &handData,
+            &renderer.handVertexBuffer)))
+    {
+        return false;
+    }
+    renderer.handVertexCount = static_cast<UINT>(handVertices.size());
+    if (!loadRetailHandMesh(
+            device,
+            "FNVXR_RETAIL_LEFT_HAND_MESH_PATH",
+            renderer.retailLeftHandVertexBuffer,
+            renderer.retailLeftHandVertexCount)
+        || !loadRetailHandMesh(
+            device,
+            "FNVXR_RETAIL_RIGHT_HAND_MESH_PATH",
+            renderer.retailRightHandVertexBuffer,
+            renderer.retailRightHandVertexCount))
+    {
+        return false;
+    }
+
     const TexturedVertex gamePlaneVertices[] = {
         { -0.5f, -0.5f, 0.0f, 0.0f, 1.0f },
         { -0.5f,  0.5f, 0.0f, 0.0f, 0.0f },
@@ -8105,6 +8685,30 @@ float4 PSHudOverlay(VSOutput input) : SV_TARGET
     gamePlaneData.pSysMem = gamePlaneVertices;
     if (FAILED(device->CreateBuffer(&gamePlaneDesc, &gamePlaneData, &renderer.texturedVertexBuffer)))
         return false;
+
+    constexpr auto pipBoyCrop = fnvxr::pipboy::RetailScreenCrop;
+    static_assert(fnvxr::pipboy::validScreenCrop(pipBoyCrop));
+    const TexturedVertex pipBoyScreenVertices[] = {
+        { -0.5f, -0.5f, 0.0f, pipBoyCrop.left,  pipBoyCrop.bottom },
+        { -0.5f,  0.5f, 0.0f, pipBoyCrop.left,  pipBoyCrop.top },
+        {  0.5f,  0.5f, 0.0f, pipBoyCrop.right, pipBoyCrop.top },
+        { -0.5f, -0.5f, 0.0f, pipBoyCrop.left,  pipBoyCrop.bottom },
+        {  0.5f,  0.5f, 0.0f, pipBoyCrop.right, pipBoyCrop.top },
+        {  0.5f, -0.5f, 0.0f, pipBoyCrop.right, pipBoyCrop.bottom },
+    };
+    D3D11_BUFFER_DESC pipBoyScreenDesc {};
+    pipBoyScreenDesc.ByteWidth = sizeof(pipBoyScreenVertices);
+    pipBoyScreenDesc.Usage = D3D11_USAGE_DEFAULT;
+    pipBoyScreenDesc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+    D3D11_SUBRESOURCE_DATA pipBoyScreenData {};
+    pipBoyScreenData.pSysMem = pipBoyScreenVertices;
+    if (FAILED(device->CreateBuffer(
+            &pipBoyScreenDesc,
+            &pipBoyScreenData,
+            &renderer.pipBoyScreenTexturedVertexBuffer)))
+    {
+        return false;
+    }
 
     const std::vector<TexturedVertex> curvedGamePlaneVertices = makeCurvedGamePlaneVertices();
     if (!curvedGamePlaneVertices.empty())
@@ -10313,52 +10917,70 @@ int main(int argc, char** argv)
         if (cpuUiRecordRead
             && cpu_presentation::flatUiBoundaryValid(incomingCpuUi.identity))
         {
-            // Record the boundary even when texture upload fails: gameplay
-            // must wait for a later world transaction rather than reviving a
-            // pair captured before this menu.
-            renderer.cpuUiBoundaryTransactionId =
-                incomingCpuUi.identity.transactionId;
-            renderer.cpuUiBoundarySourceFrame =
-                incomingCpuUi.identity.sourceFrame;
-            renderer.cpuUiBoundaryRuntimeStateSample =
-                incomingCpuUi.identity.runtimeStateSample;
-            fnvxr::host::gpu_color::RuntimeEvidence
-                cpuUiSourceRuntimeEvidence {};
-            cpuUiIncomingRuntimeLineage =
-                runtimeEvidenceHistory.findStableSource(
-                    incomingCpuUi.identity.runtimeStateSample,
-                    cpuCurrentRuntimeEvidence,
-                    cpuUiSourceRuntimeEvidence,
-                    &cpuUiIncomingRuntimeLineageBracketed);
-            const cpu_presentation::RuntimeSample cpuUiSourceRuntime {
-                cpuUiSourceRuntimeEvidence.sample,
-                cpuUiSourceRuntimeEvidence.phase,
-                cpuUiSourceRuntimeEvidence.menuBits,
-                cpuUiSourceRuntimeEvidence.showroomActive,
-                cpuUiSourceRuntimeEvidence.cameraActive,
-                cpuUiSourceRuntimeEvidence.fresh,
-            };
-            if (renderer.cpuPresentationMode
-                    == cpu_presentation::RuntimeMode::Ui
-                && cpuUiIncomingRuntimeLineage
-                && cpu_presentation::flatUiFrameEligible(
-                    incomingCpuUi.identity,
-                    cpuUiSourceRuntime))
+            if (livePipBoyScreenFocused)
             {
+                // This mono record is an auxiliary copy of the authored live
+                // wrist display, not a presentation-mode boundary. Keep the
+                // last verified binocular world transaction and update only
+                // the texture sampled by the tracked Pip-Boy screen.
                 cpuUiTextureUploadAttempted = true;
                 cpuUiTextureUploadSucceeded = uploadCpuEngineUiTexture(
                     device.Get(),
                     renderer,
                     incomingCpuUi);
                 if (cpuUiTextureUploadSucceeded)
+                    renderer.retainedUiLivePipBoySurface = true;
+            }
+            else
+            {
+                // Record the boundary even when texture upload fails:
+                // gameplay must wait for a later world transaction rather
+                // than reviving a pair captured before this ordinary menu.
+                renderer.cpuUiBoundaryTransactionId =
+                    incomingCpuUi.identity.transactionId;
+                renderer.cpuUiBoundarySourceFrame =
+                    incomingCpuUi.identity.sourceFrame;
+                renderer.cpuUiBoundaryRuntimeStateSample =
+                    incomingCpuUi.identity.runtimeStateSample;
+                fnvxr::host::gpu_color::RuntimeEvidence
+                    cpuUiSourceRuntimeEvidence {};
+                cpuUiIncomingRuntimeLineage =
+                    runtimeEvidenceHistory.findStableSource(
+                        incomingCpuUi.identity.runtimeStateSample,
+                        cpuCurrentRuntimeEvidence,
+                        cpuUiSourceRuntimeEvidence,
+                        &cpuUiIncomingRuntimeLineageBracketed);
+                const cpu_presentation::RuntimeSample cpuUiSourceRuntime {
+                    cpuUiSourceRuntimeEvidence.sample,
+                    cpuUiSourceRuntimeEvidence.phase,
+                    cpuUiSourceRuntimeEvidence.menuBits,
+                    cpuUiSourceRuntimeEvidence.showroomActive,
+                    cpuUiSourceRuntimeEvidence.cameraActive,
+                    cpuUiSourceRuntimeEvidence.fresh,
+                };
+                if (renderer.cpuPresentationMode
+                        == cpu_presentation::RuntimeMode::Ui
+                    && cpuUiIncomingRuntimeLineage
+                    && cpu_presentation::flatUiFrameEligible(
+                        incomingCpuUi.identity,
+                        cpuUiSourceRuntime))
                 {
-                    renderer.retainedCpuUiTransactionId =
-                        incomingCpuUi.identity.transactionId;
-                    renderer.retainedCpuUiEpoch = renderer.cpuUiEpoch;
-                    renderer.retainedCpuUiProducerProcessId =
-                        renderer.stereoProducerProcessId;
-                    renderer.retainedCpuUiCapturedRuntime =
-                        cpuUiSourceRuntime;
+                    cpuUiTextureUploadAttempted = true;
+                    cpuUiTextureUploadSucceeded = uploadCpuEngineUiTexture(
+                        device.Get(),
+                        renderer,
+                        incomingCpuUi);
+                    if (cpuUiTextureUploadSucceeded)
+                    {
+                        renderer.retainedUiLivePipBoySurface = false;
+                        renderer.retainedCpuUiTransactionId =
+                            incomingCpuUi.identity.transactionId;
+                        renderer.retainedCpuUiEpoch = renderer.cpuUiEpoch;
+                        renderer.retainedCpuUiProducerProcessId =
+                            renderer.stereoProducerProcessId;
+                        renderer.retainedCpuUiCapturedRuntime =
+                            cpuUiSourceRuntime;
+                    }
                 }
             }
         }
@@ -10529,6 +11151,11 @@ int main(int argc, char** argv)
                 == fnvxr::host::gpu_color::RoutedContent::BinocularWorld
             && productComposition.bindLeftEyeView
             && productComposition.bindRightEyeView;
+        const bool pipBoySpatialScreenVisible =
+            envEnabled("FNVXR_SPATIAL_HANDS_OVERLAY", false)
+            && pipBoyMenuMode
+            && renderer.retainedUiLivePipBoySurface
+            && renderer.retainedUiTextureView;
         using StereoVisualTrial =
             fnvxr::host::stereo_visual_trial::Input;
         const StereoVisualTrial stereoVisualTrialInput {
@@ -11349,7 +11976,16 @@ int main(int argc, char** argv)
                     && haveSharedStereoUiState)
                 || (productionCpuEngineStereo
                     && haveRuntimeUiState
-                    && haveSharedStereoUiState);
+                    && haveSharedStereoUiState)
+                // Opening retail Pip-Boy pauses new world publication and
+                // clears cameraActive by design. A previously verified world
+                // pair remains the correct background while the host draws
+                // the live wrist screen. This is presentation continuity,
+                // not a claim that the CPU producer advanced a fresh proof.
+                || (productionCpuEngineStereo
+                    && livePipBoyScreenFocused
+                    && cpuEngineStereoActive
+                    && haveRuntimeUiState);
             if ((legacyImageDiagnostics || productionCpuEngineStereo)
                 && stereoFullscreenEverActive
                 && runtimeGameplayActive
@@ -11525,7 +12161,9 @@ int main(int argc, char** argv)
             // A demo recording is evidence for WorldStereo only. Retain no
             // generic menu, splash, or fallback-quad frame merely because it
             // happened to be visible while capture was enabled. The live
-            // Pip-Boy is already part of the fresh binocular engine pair.
+            // Pip-Boy remains a binocular-world capture. Its live retail
+            // screen crop is composed at the tracked wrist inside each final
+            // eye, never retained as an ordinary front-facing menu quad.
             const bool headsetMirrorCaptureEligible =
                 presentedBinocularWorld
                 || cpuEngineStereoActive;
@@ -11583,6 +12221,9 @@ int main(int argc, char** argv)
                     menuPointer,
                     weaponWheel,
                     gamePlane,
+                    livePipBoyPlane,
+                    pipBoySpatialScreenVisible,
+                    renderer.retainedUiTextureView.Get(),
                     pauseSceneAnchor,
                     renderLegacyUiScene,
                     displayGamePlane,
@@ -11609,6 +12250,9 @@ int main(int argc, char** argv)
                     menuPointer,
                     weaponWheel,
                     gamePlane,
+                    livePipBoyPlane,
+                    pipBoySpatialScreenVisible,
+                    renderer.retainedUiTextureView.Get(),
                     pauseSceneAnchor,
                     renderLegacyUiScene,
                     displayGamePlane,
@@ -11898,6 +12542,15 @@ int main(int argc, char** argv)
                 << ",\"livePipBoyHovered\":"
                 << (livePipBoyFocus.hovered ? "true" : "false")
                 << ",\"livePipBoyScale\":" << livePipBoyFocus.scale
+                << ",\"spatialHandsOverlay\":"
+                << (envEnabled("FNVXR_SPATIAL_HANDS_OVERLAY", false)
+                        ? "true"
+                        : "false")
+                << ",\"pipBoySpatialScreenVisible\":"
+                << ((pipBoySpatialScreenVisible
+                        && (presentedBinocularWorld || cpuEngineStereoActive))
+                        ? "true"
+                        : "false")
                 << ",\"uiQuadVisible\":" << (uiQuadVisible ? "true" : "false")
                 << ",\"productionUiQuadActive\":"
                 << (productionUiQuadActive ? "true" : "false")

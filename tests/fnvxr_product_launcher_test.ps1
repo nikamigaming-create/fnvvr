@@ -22,6 +22,26 @@ function Require-Throws {
     throw "Expected failure containing '$Fragment'."
 }
 
+function Require-NativeGate {
+    param(
+        [Parameter(Mandatory = $true)][string]$Source,
+        [Parameter(Mandatory = $true)][string]$Start,
+        [Parameter(Mandatory = $true)][string]$End,
+        [Parameter(Mandatory = $true)][string]$Description
+    )
+    $startIndex = $Source.IndexOf($Start)
+    $endIndex = if ($startIndex -ge 0) {
+        $Source.IndexOf($End, $startIndex + $Start.Length)
+    } else { -1 }
+    if ($startIndex -lt 0 -or $endIndex -le $startIndex) {
+        throw "Could not isolate native unfocused-input gate: $Description"
+    }
+    $block = $Source.Substring($startIndex, $endIndex - $startIndex)
+    if (-not $block.Contains('windowsForegroundInputForbidden()')) {
+        throw "Native OS-window path lacks the production foreground-input fuse: $Description"
+    }
+}
+
 $launcherPath = Join-Path $SourceRoot "scripts\start-fnvxr-product.ps1"
 $fixtureLauncherPath = Join-Path $SourceRoot "scripts\start-fnvxr-retail-fixture.ps1"
 $buildPath = Join-Path $SourceRoot "scripts\build-fnvxr-product.ps1"
@@ -36,6 +56,35 @@ $common = Get-Content -LiteralPath $commonPath -Raw
 $hostSource = Get-Content -LiteralPath $hostSourcePath -Raw
 $pluginSource = Get-Content -LiteralPath $pluginSourcePath -Raw
 $d3d9Source = Get-Content -LiteralPath $d3d9SourcePath -Raw
+
+foreach ($hostGate in @(
+        @('void sendHostMouseClick(', 'bool sendAbsoluteCursorMove(', 'host mouse click'),
+        @('bool sendAbsoluteCursorMove(', 'void updateHostCursorPointer(', 'host absolute cursor move'),
+        @('void updateHostCursorPointer(', 'XMMATRIX projectionFromFov(', 'host window pointer'))) {
+    Require-NativeGate `
+        -Source $hostSource `
+        -Start $hostGate[0] `
+        -End $hostGate[1] `
+        -Description $hostGate[2]
+}
+foreach ($pluginGate in @(
+        @('bool focusProcessWindow(', 'std::int16_t thumbValue(', 'game-window activation'),
+        @('void postMenuKey(', 'POINT mapSharedPointerToWindow(', 'posted menu key'),
+        @('bool sendForegroundKey(', 'bool ensureClickForeground(', 'foreground key input'),
+        @('bool ensureClickForeground(', 'void logClickWindow(', 'click focus repair'),
+        @('bool sendForegroundMouseClickAt(', 'bool postWindowMouseClick(', 'foreground mouse input'),
+        @('bool postWindowMouseClick(', 'bool holdDirectInputKey(', 'posted mouse input'),
+        @('void updateMenuPointer(', 'void executeAcceptClickOnGameThread(', 'plugin cursor tracking'),
+        @('void executeAcceptClickOnGameThread(', 'void requestAcceptClick(', 'plugin click fallback'),
+        @('void executeImmediateInputClick(', 'UInt64 nowMilliseconds(', 'immediate OS click'),
+        @('void syncExternalDInputPointer(', 'UInt32 externalXInputNavMask(', 'external pointer window message'),
+        @('void tapKey(', 'void injectRisingEdgeInput(', 'legacy foreground key tap'))) {
+    Require-NativeGate `
+        -Source $pluginSource `
+        -Start $pluginGate[0] `
+        -End $pluginGate[1] `
+        -Description $pluginGate[2]
+}
 
 if (-not $hostSource.Contains(
         'envEnabled("FNVXR_GAME_PLANE_SHARP_FILTER", false)')) {
@@ -312,6 +361,33 @@ if ([string]$defaultEnvironment.FNVXR_RUN_PROFILE -cne "stereo-visual-trial-v5" 
     [string]$defaultEnvironment.FNVXR_OPENXR_LOADER_HINT -cne
         "C:\fnvxr-default-contract\openxr_loader.dll") {
     throw "Default visual-trial environment lost its explicit normal VR profile."
+}
+$expectedUnfocusedEnvironment = [ordered]@{
+    FNVXR_WINDOWS_FOREGROUND_INPUT_FORBIDDEN = "1"
+    FNVXR_DINPUT_FORCE_BACKGROUND = "1"
+    FNVXR_DINPUT_VIRTUAL_OWNER = "1"
+    FNVXR_CURSOR_TRACK_POINTER = "0"
+    FNVXR_CURSOR_FOCUS = "0"
+    FNVXR_CLICK_FOCUS_ON_CLICK = "0"
+    FNVXR_CLICK_SENDINPUT_MOUSE = "0"
+    FNVXR_PLUGIN_SENDINPUT_CLICK = "0"
+    FNVXR_POST_MENU_KEYS = "0"
+    FNVXR_POST_WINDOW_MOUSE_FALLBACK = "0"
+    FNVXR_IMMEDIATE_OS_CLICK = "0"
+    FNVXR_HOST_CURSOR_CLICK_ENABLED = "0"
+    FNVXR_HOST_CURSOR_SET_POS = "0"
+    FNVXR_HOST_CURSOR_ABSOLUTE_MOVE = "0"
+    FNVXR_HOST_CURSOR_TRACK_POINTER = "0"
+    FNVXR_HOST_CURSOR_FOCUS = "0"
+    FNVXR_HOST_SENDINPUT_CLICK = "0"
+    FNVXR_HOST_CURSOR_CLICK_FALLBACK = "0"
+}
+foreach ($key in $expectedUnfocusedEnvironment.Keys) {
+    if (-not ($defaultEnvironment.Keys -ccontains $key) -or
+        [string]$defaultEnvironment[$key] -cne
+            [string]$expectedUnfocusedEnvironment[$key]) {
+        throw "Product environment lost its unfocused Windows-input fuse: $key"
+    }
 }
 foreach ($defaultForbiddenKey in @(
     "FNVXR_STEREO_VISUAL_TRIAL_AUTOMATE_RECOVERY_LOAD",
@@ -610,6 +686,15 @@ $expectedHeadsetDemoEnvironment = [ordered]@{
     FNVXR_RETAIL_CENTER_INTEGRATED_FIRST_PERSON = "1"
     FNVXR_HEADSET_DEMO_GAMEPLAY_WARMUP_FRAMES = "90"
     FNVXR_HEADSET_DEMO_PIPBOY_HOLD_FRAMES = "240"
+    FNVXR_SPATIAL_HANDS_OVERLAY = "1"
+    FNVXR_SHOW_BODY_RIG = "1"
+    FNVXR_SHOW_FULL_ARMS = "0"
+    FNVXR_SHOW_HAND_FINGERS = "1"
+    FNVXR_SHOW_PIPBOY_RIG = "1"
+    FNVXR_SHOW_LEFT_AIM_RAY = "0"
+    FNVXR_SHOW_RIGHT_AIM_RAY = "0"
+    FNVXR_DEBUG_AXES = "0"
+    FNVXR_PIPBOY_WRIST_UI_ROT_X = "0"
     FNVXR_HMD_MIRROR_CAPTURE_DIR = "C:\fnvxr-headset-demo-contract\headset-mirror"
     FNVXR_HMD_MIRROR_CAPTURE_EVERY_N_FRAMES = "6"
     FNVXR_HMD_MIRROR_CAPTURE_MAX_PAIRS = "300"
@@ -684,6 +769,47 @@ if ([string]$headsetWorldWeaponDrawEnvironment.FNVXR_HEADSET_DEMO_FIXTURE -cne "
 if ([string]$headsetWorldWeaponDrawEnvironment.FNVXR_RETAIL_VR_FIRST_PERSON_PRIVATE_CALLER -cne "primary") {
     throw "Headset world weapon draw did not carry the selected primary first-person caller proof route."
 }
+$stockFirstPersonBaselineEnvironment = Get-FnvxrProductMinimalEnvironment `
+    -RunId "stock-first-person-baseline-contract" `
+    -RunDirectory "C:\fnvxr-stock-first-person-baseline-contract" `
+    -OpenXrLoaderPath "C:\fnvxr-stock-first-person-baseline-contract\openxr_loader.dll" `
+    -SessionReadyTimeoutSeconds 60 `
+    -AutomateRetailFixture `
+    -HeadsetWorldOnlyCapture `
+    -HeadsetFixtureWeaponDraw `
+    -RetailVrFirstPersonPrivateCaller Third `
+    -StockFirstPersonBaseline `
+    -RetailFixtureAction "load" `
+    -RetailFixtureSaveName "FNVXR_AutoRetail_L1_Pistol" `
+    -RetailFixtureWeapon "Pistol" `
+    -HeadlessRuntimeManifest "C:\fnvxr-stock-first-person-baseline-contract\openxr_simulator.json"
+$expectedStockBaselineEnvironment = [ordered]@{
+    FNVXR_STOCK_FIRST_PERSON_BASELINE = "1"
+    FNVXR_RETAIL_VR_FIRST_PERSON_PRIVATE_CALLER = "third"
+    FNVXR_RETAIL_CENTER_INTEGRATED_FIRST_PERSON = "0"
+    FNVXR_RETAIL_RIG_ENABLE = "0"
+    FNVXR_RETAIL_RIG_APPLY = "0"
+    FNVXR_RETAIL_WEAPON_APPLY = "0"
+}
+foreach ($key in $expectedStockBaselineEnvironment.Keys) {
+    if (-not ($stockFirstPersonBaselineEnvironment.Keys -ccontains $key) -or
+        [string]$stockFirstPersonBaselineEnvironment[$key] -cne
+            [string]$expectedStockBaselineEnvironment[$key]) {
+        throw "Stock first-person baseline lost its exact no-mutation environment: $key"
+    }
+}
+$stockBaselineGate = $d3d9Source.IndexOf(
+    'if (!readRawEnvBool(')
+$stockBaselineName = $d3d9Source.IndexOf(
+    '"FNVXR_STOCK_FIRST_PERSON_BASELINE"',
+    [Math]::Max(0, $stockBaselineGate))
+$centerIntegratedName = $d3d9Source.IndexOf(
+    '"FNVXR_RETAIL_CENTER_INTEGRATED_FIRST_PERSON"',
+    [Math]::Max(0, $stockBaselineName))
+if ($stockBaselineGate -lt 0 -or $stockBaselineName -le $stockBaselineGate -or
+    $centerIntegratedName -le $stockBaselineName) {
+    throw "The D3D bridge can still enter center-integrated manual first-person publication during the stock baseline."
+}
 $headsetControllerRigEnvironment = Get-FnvxrProductMinimalEnvironment `
     -RunId "headset-controller-rig-contract" `
     -RunDirectory "C:\fnvxr-headset-controller-rig-contract" `
@@ -734,7 +860,11 @@ $physicalHeadsetEnvironment = Get-FnvxrProductMinimalEnvironment `
     -PhysicalRuntimeManifest "C:\fnvxr-physical-headset-play-contract\oculus_openxr_64.json"
 if ([string]$physicalHeadsetEnvironment.FNVXR_RETAIL_VR_FIRST_PERSON_PRIVATE_CALLER -cne "third" -or
     [string]$physicalHeadsetEnvironment.FNVXR_PHYSICAL_HEADSET_PLAY -cne "1" -or
-    [string]$physicalHeadsetEnvironment.FNVXR_RETAIL_CENTER_INTEGRATED_FIRST_PERSON -cne "1") {
+    [string]$physicalHeadsetEnvironment.FNVXR_RETAIL_CENTER_INTEGRATED_FIRST_PERSON -cne "1" -or
+    [string]$physicalHeadsetEnvironment.FNVXR_SPATIAL_HANDS_OVERLAY -cne "1" -or
+    [string]$physicalHeadsetEnvironment.FNVXR_SHOW_LEFT_AIM_RAY -cne "0" -or
+    [string]$physicalHeadsetEnvironment.FNVXR_SHOW_RIGHT_AIM_RAY -cne "0" -or
+    [string]$physicalHeadsetEnvironment.FNVXR_DEBUG_AXES -cne "0") {
     throw "Physical headset play must select one product mode and the observed center-integrated publication seam."
 }
 if (-not $pluginSource.Contains(
@@ -1068,9 +1198,23 @@ foreach ($forbiddenAutomationMechanism in @(
     "keybd_event",
     "mouse_event",
     "SetForegroundWindow",
-    "SetCursorPos")) {
+    "SetCursorPos",
+    "ShowWindow",
+    "StartWindowIsolation",
+    "HideProcessWindows")) {
     if ($launcher.Contains($forbiddenAutomationMechanism)) {
         throw "Product launcher must not control the simulator/game through OS input: $forbiddenAutomationMechanism"
+    }
+}
+foreach ($unfocusedManifestContract in @(
+        'windowsDesktopOwnership = [ordered]@{',
+        'foregroundRequired = $false',
+        'activationAllowed = $false',
+        'osWindowInputAllowed = $false',
+        'inputDelivery = "OpenXR shared state plus background DirectInput/XInput bridges"',
+        'openXrSessionFocusIsDesktopFocus = $false')) {
+    if (-not $launcher.Contains($unfocusedManifestContract)) {
+        throw "Product manifest lost its unfocused Windows-desktop contract: $unfocusedManifestContract"
     }
 }
 
@@ -1228,8 +1372,10 @@ if ([string]::IsNullOrWhiteSpace($headsetDemoFunction)) {
 }
 foreach ($requiredHeadsetDemoInputText in @(
     'headsetDemoUiProfileSelected()',
-    'tapDirectInputKey(DIK_TAB)',
-    'fnvxrHeadsetDemoPipBoyTap',
+    'openEnginePipBoyInventory("headset-demo-fixed"',
+    'closeEnginePipBoy("headset-demo-fixed"',
+    'fnvxrHeadsetDemoPipBoyAction',
+    'handled',
     'fnvxrHeadsetDemoPipBoyStage',
     'g_headsetDemoFixtureReady')) {
     if (-not $headsetDemoFunction.Contains($requiredHeadsetDemoInputText)) {
@@ -1237,6 +1383,7 @@ foreach ($requiredHeadsetDemoInputText in @(
     }
 }
 foreach ($forbiddenHeadsetDemoInputText in @(
+    'tapDirectInputKey',
     'SendInput',
     'SendKeys',
     'PostMessage',
@@ -1344,6 +1491,52 @@ foreach ($required in @(
     if (-not ($launcher.Contains($required) -or $builder.Contains($required) -or
         (Get-Content -LiteralPath (Join-Path $SourceRoot "scripts\fnvxr-product-common.ps1") -Raw).Contains($required))) {
         throw "Product scripts are missing required contract text: $required"
+    }
+}
+foreach ($firstPersonDiagnosticContract in @(
+        '[switch]$StockFirstPersonBaseline',
+        '[ValidateRange(0, 31)][int]$FirstPersonRootMask = 1',
+        '$PSBoundParameters.ContainsKey("FirstPersonRootMask")',
+        'First-person root mask 0 is valid only for a headless world-only diagnostic capture.',
+        'The stock first-person baseline requires first-person root mask 0.',
+        'unmodified stock RenderFirstPerson baseline; world first-person mask 0; manual requeue and controller-rig writes disabled',
+        'stockFirstPersonBaseline = [bool]$StockFirstPersonBaseline',
+        'firstPersonRootMask = $effectiveFirstPersonRootMask',
+        'visualQualityAccepted = $false',
+        'semantic final-pixel quality remains separately gated',
+        'Get-FnvxrProductFirstPersonVisualQualityProof',
+        'tools\analyze_first_person_visual.py',
+        'structural rig telemetry is not accepted as visible hands/arms/Pip-Boy proof')) {
+    if (-not $launcher.Contains($firstPersonDiagnosticContract)) {
+        throw "Product launcher lost the isolated first-person visual diagnostic contract: $firstPersonDiagnosticContract"
+    }
+}
+foreach ($stockBaselinePluginContract in @(
+        'bool readOnlyFirstPersonSemanticsRequested()',
+        'const bool stockPrivateBaseline =',
+        'const bool stockCenterCollection =',
+        '&& (!readOnlyFirstPersonSemanticsRequested() || g_playerState)',
+        'if (readOnlyFirstPersonSemanticsRequested())',
+        'static_cast<void>(discoverRetailRigNodes(playerNode));',
+        'if (headsetDemoUiProfileSelected())',
+        'initSharedInputEvents();',
+        '&& g_inputEvents != nullptr',
+        'updateSharedPlayer(observation.frame, observation.phase);',
+        'manual roots, controller rig, IK, Pip-Boy transforms, input, and window control remain disabled')) {
+    if (-not $pluginSource.Contains($stockBaselinePluginContract)) {
+        throw "Stock first-person baseline lost its read-only semantic publication contract: $stockBaselinePluginContract"
+    }
+}
+$productSourceSnapshot = Get-FnvxrProductSourceSnapshot -Root $SourceRoot
+$productSourceKeys = @($productSourceSnapshot.records | ForEach-Object { [string]$_.key })
+foreach ($requiredSourceKey in @(
+        "readme.md",
+        "docs/architecture-v2.md",
+        "docs/status.md",
+        "docs/capability-matrix.md",
+        "docs/mutation-site-inventory.md")) {
+    if ($productSourceKeys -notcontains $requiredSourceKey) {
+        throw "Product source attestation omitted release documentation: $requiredSourceKey"
     }
 }
 foreach ($environmentProviderConsumer in @(

@@ -10919,7 +10919,10 @@ void __cdecl retailVrBeforeFirstPersonAdapter(
         logRetailVrLine(message);
     }
 
-    if (readRawEnvBool(
+    if (!readRawEnvBool(
+            "FNVXR_STOCK_FIRST_PERSON_BASELINE",
+            false)
+        && readRawEnvBool(
             "FNVXR_RETAIL_CENTER_INTEGRATED_FIRST_PERSON",
             false))
     {
@@ -16102,7 +16105,7 @@ bool publishRetailVrCpuMonoUiQuad(
     IDirect3DDevice9* device = context ? context->device : nullptr;
     if (!device
         || transactionId == 0u
-        || !fnvxr::engine::validateRetailTrackedUiFrame(tracked).complete()
+        || !fnvxr::engine::validateRetailTrackedUiSurfaceFrame(tracked).complete()
         || device != gRetailEngineEyeTargetDevice
         || !gLeftEyeSurface
         || !gRightEyeSurface

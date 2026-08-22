@@ -52,11 +52,11 @@ int main()
         "post-interruption gameplay did not start a fresh warmup");
 
     input.frame = 25u;
-    input.inGameTapAvailable = false;
+    input.engineActionAvailable = false;
     require(
         advance(state, input).action == Action::None,
         "unavailable in-game tap opened Pip-Boy");
-    input.inGameTapAvailable = true;
+    input.engineActionAvailable = true;
     Decision opened = advance(state, input);
     require(
         opened.action == Action::OpenPipBoy

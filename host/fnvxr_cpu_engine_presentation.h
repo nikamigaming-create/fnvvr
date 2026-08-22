@@ -73,11 +73,11 @@ constexpr bool runtimeGameplayConfirmed(const RuntimeSample& runtime) noexcept
 {
     return runtime.fresh
         && runtime.sample != 0u
-        && runtime.cameraActive
-        && (shared::runtimeGameplayPhase(
+        && ((runtime.cameraActive
+                && shared::runtimeGameplayPhase(
                 runtime.phase,
                 runtime.menuBits,
-                runtime.showroomActive)
+                runtime.showroomActive))
             || engine::live_pipboy::worldPresentationContinues(
                 runtime.phase,
                 runtime.menuBits,

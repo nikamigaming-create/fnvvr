@@ -42,7 +42,9 @@ presentation::RuntimeSample pipBoyRuntime(std::uint64_t sample)
     runtime.phase = fnvxr::shared::RuntimePhaseMenu;
     runtime.menuBits = fnvxr::shared::RuntimeMenuModeBit
         | fnvxr::shared::RuntimePipBoyMenuBit;
-    runtime.cameraActive = true;
+    // Retail disables the ordinary gameplay camera flag while the live wrist
+    // inventory is open; the exact Pip-Boy route remains binocular.
+    runtime.cameraActive = false;
     runtime.fresh = true;
     return runtime;
 }

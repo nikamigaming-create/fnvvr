@@ -111,12 +111,18 @@ int main()
         validateRetailTrackedUiFrame(frame).failure
             == RetailTrackedFrameFailure::RuntimeNotUi,
         "focused live Pip-Boy remained eligible for MonoUiQuad");
+    require(
+        validateRetailTrackedUiSurfaceFrame(frame).complete(),
+        "focused live Pip-Boy screen surface was not capturable");
     frame.runtime.cameraActive = 0u;
     require(
         validateRetailTrackedGameplayFrame(frame).complete()
             && retailTrackedPresentationRoute(frame)
                 == RetailTrackedPresentationRoute::BinocularWorld,
         "retail camera-inactive Pip-Boy focus did not retain binocular world");
+    require(
+        validateRetailTrackedUiSurfaceFrame(frame).complete(),
+        "camera-inactive live Pip-Boy screen surface was not capturable");
     frame.runtime.cameraActive = 1u;
     frame.runtime.menuBits |= fnvxr::shared::RuntimeGenericMenuBit;
     require(

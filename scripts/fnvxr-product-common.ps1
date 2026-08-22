@@ -1226,7 +1226,8 @@ function Get-FnvxrProductSourceSnapshot {
     $rootPrefix = $resolvedRoot + '\'
     $paths = New-Object 'System.Collections.Generic.List[string]'
     $paths.Add((Join-Path $resolvedRoot "CMakeLists.txt"))
-    foreach ($name in @("host", "plugin", "protocol", "renderhook", "runtime", "scripts", "tests", "tools")) {
+    $paths.Add((Join-Path $resolvedRoot "README.md"))
+    foreach ($name in @("docs", "host", "plugin", "protocol", "renderhook", "runtime", "scripts", "tests", "tools")) {
         $directory = Join-Path $resolvedRoot $name
         if (-not (Test-Path -LiteralPath $directory -PathType Container)) {
             throw "Build source directory is missing: $directory"
@@ -2161,6 +2162,7 @@ function Get-FnvxrProductMinimalEnvironment {
         [switch]$HeadsetFixtureWeaponDraw,
         [ValidateSet("None", "Primary", "Alternate", "Third")]
         [string]$RetailVrFirstPersonPrivateCaller = "None",
+        [switch]$StockFirstPersonBaseline,
         [switch]$HeadsetControllerRigVisualTrial,
         [switch]$HeadsetInventoryVisualTrial,
         [switch]$HeadsetCombatVisualTrial,
@@ -2260,6 +2262,18 @@ function Get-FnvxrProductMinimalEnvironment {
     if (-not $HeadsetFixtureWeaponDraw -and $RetailVrFirstPersonPrivateCaller -cne "None") {
         throw "The private first-person caller selector requires the headset fixture weapon draw."
     }
+    if ($StockFirstPersonBaseline -and
+        (-not $HeadsetWorldOnlyCapture -or
+         -not $HeadsetFixtureWeaponDraw -or
+         -not $AutomateRetailFixture -or
+         [string]::IsNullOrWhiteSpace($HeadlessRuntimeManifest))) {
+        throw "The stock first-person baseline requires the headless world-only fixture weapon capture."
+    }
+    if ($StockFirstPersonBaseline -and
+        ($RetailVrFirstPersonPrivateCaller -cne "Third" -or
+         $HeadsetControllerRigVisualTrial -or $PhysicalHeadsetPlay)) {
+        throw "The stock first-person baseline requires the Third caller and forbids controller-rig/physical mutation."
+    }
     if ($PhysicalHeadsetPlay -and -not $AutomateRetailFixture) {
         throw "Physical headset play requires an owned retail-fixture load."
     }
@@ -2324,6 +2338,28 @@ function Get-FnvxrProductMinimalEnvironment {
         FNVXR_HOST_MODE = $hostMode
         FNVXR_RUN_ID = $RunId
         FNVXR_RUN_LOG_DIR = $RunDirectory
+        # Product input is delivered through OpenXR/shared memory and the
+        # background-capable DirectInput/XInput bridges.  This fuse is checked
+        # again inside both native processes before any OS window activation,
+        # cursor movement, SendInput, or PostMessage fallback.
+        FNVXR_WINDOWS_FOREGROUND_INPUT_FORBIDDEN = "1"
+        FNVXR_DINPUT_FORCE_BACKGROUND = "1"
+        FNVXR_DINPUT_VIRTUAL_OWNER = "1"
+        FNVXR_CURSOR_TRACK_POINTER = "0"
+        FNVXR_CURSOR_FOCUS = "0"
+        FNVXR_CLICK_FOCUS_ON_CLICK = "0"
+        FNVXR_CLICK_SENDINPUT_MOUSE = "0"
+        FNVXR_PLUGIN_SENDINPUT_CLICK = "0"
+        FNVXR_POST_MENU_KEYS = "0"
+        FNVXR_POST_WINDOW_MOUSE_FALLBACK = "0"
+        FNVXR_IMMEDIATE_OS_CLICK = "0"
+        FNVXR_HOST_CURSOR_CLICK_ENABLED = "0"
+        FNVXR_HOST_CURSOR_SET_POS = "0"
+        FNVXR_HOST_CURSOR_ABSOLUTE_MOVE = "0"
+        FNVXR_HOST_CURSOR_TRACK_POINTER = "0"
+        FNVXR_HOST_CURSOR_FOCUS = "0"
+        FNVXR_HOST_SENDINPUT_CLICK = "0"
+        FNVXR_HOST_CURSOR_CLICK_FALLBACK = "0"
         FNVXR_SESSION_READY_TIMEOUT_SECONDS = [string]$SessionReadyTimeoutSeconds
         FNVXR_ENABLE_LEGACY_IMAGE_DIAGNOSTICS = "0"
         FNVXR_ENABLE_ENGINE_CENTER_STEREO = $engineCenterStereo
@@ -2403,10 +2439,10 @@ function Get-FnvxrProductMinimalEnvironment {
         # The host already publishes a tracked right-hand pointer into the
         # exact retail UI lane.  Keep its hover and native accept path live.
         $environment.FNVXR_DIRECT_UI_CLICK = "1"
-        # Keep the authored retail first-person arm, Pip-Boy casing/screen,
-        # hands, weapon state, and world in the engine's binocular transaction.
-        # Its wrist surface is interaction geometry only; screen focus never
-        # creates or submits a host Pip-Boy quad.
+        # Keep the authored stock weapon and world in the engine binocular
+        # transaction. The host-owned tracked categories above replace the
+        # unstable arm/hand/Pip-Boy collector roots and spatialize the live
+        # retail screen crop directly on the opposite wrist.
         $environment.FNVXR_LIVE_PIPBOY_FOCUS_FRAMES = "12"
         $environment.FNVXR_WEAPON_ORBIT_GRIP_THRESHOLD = "0.55"
         $environment.FNVXR_WEAPON_ORBIT_DEADZONE = "0.35"
@@ -2439,6 +2475,52 @@ function Get-FnvxrProductMinimalEnvironment {
         $environment.FNVXR_DINPUT_RIGHT_STICK_LOOK_ENABLE = "0"
         $environment.FNVXR_DINPUT_RIGHT_STICK_PITCH_ENABLE = "0"
         $environment.FNVXR_XINPUT_RIGHT_STICK_Y_ENABLE = "0"
+    }
+    if (($headsetFixtureVisualTrial -and -not $StockFirstPersonBaseline) -or
+        $PhysicalHeadsetPlay) {
+        # The manual center collector can preserve the stock weapon root, but
+        # its separately skinned arm/hand/Pip-Boy categories have invalid
+        # transient skinning state and visibly blink or stretch. Replace only
+        # those failed categories in the final OpenXR eye pass. The overlay is
+        # driven directly from tracked OpenXR poses and samples the live retail
+        # Pip-Boy screen crop; it has no window, focus, cursor, or OS-input lane.
+        $environment.FNVXR_SPATIAL_HANDS_OVERLAY = "1"
+        $environment.FNVXR_SHOW_WORLD_PROPS = "1"
+        $environment.FNVXR_SHOW_BODY_RIG = "1"
+        $environment.FNVXR_SHOW_FULL_ARMS = "0"
+        $environment.FNVXR_SHOW_HAND_FINGERS = "1"
+        $environment.FNVXR_SHOW_PIPBOY_RIG = "1"
+        $environment.FNVXR_SHOW_LEFT_AIM_RAY = "0"
+        $environment.FNVXR_SHOW_RIGHT_AIM_RAY = "0"
+        $environment.FNVXR_DEBUG_AXES = "0"
+        $environment.FNVXR_DEBUG_LEFT_AXES = "0"
+        $environment.FNVXR_PIPBOY_WRIST_UI_WIDTH = "0.24"
+        $environment.FNVXR_PIPBOY_WRIST_UI_ROT_X = "0"
+        $environment.FNVXR_PIPBOY_WRIST_UI_ROT_Y = "0"
+        $environment.FNVXR_PIPBOY_WRIST_UI_ROT_Z = "0"
+        $environment.FNVXR_PIPBOY_WRIST_UI_OFFSET_X = "0"
+        $environment.FNVXR_PIPBOY_WRIST_UI_OFFSET_Y = "0.065"
+        $environment.FNVXR_PIPBOY_WRIST_UI_OFFSET_Z = "-0.025"
+        $retailHandAssetRoot = Join-Path `
+            (Get-FnvxrProductRoot) `
+            "local\retail-assets"
+        $retailLeftHandMesh = Join-Path `
+            $retailHandAssetRoot `
+            "lefthand1st.fhm"
+        $retailRightHandMesh = Join-Path `
+            $retailHandAssetRoot `
+            "righthand1st.fhm"
+        if ((Test-Path -LiteralPath $retailLeftHandMesh -PathType Leaf) -and
+            (Test-Path -LiteralPath $retailRightHandMesh -PathType Leaf)) {
+            # These are local derived meshes generated from the user's own
+            # installed retail BSA. They are never staged into the game or
+            # distributed by the source tree; the host validates their exact
+            # binary schema before creating immutable vertex buffers.
+            $environment.FNVXR_RETAIL_LEFT_HAND_MESH_PATH =
+                [System.IO.Path]::GetFullPath($retailLeftHandMesh)
+            $environment.FNVXR_RETAIL_RIGHT_HAND_MESH_PATH =
+                [System.IO.Path]::GetFullPath($retailRightHandMesh)
+        }
     }
     if ($AutomateRecoveryLoad) {
         # This opt-in does not enable the general command or input bridge.
@@ -2501,7 +2583,8 @@ function Get-FnvxrProductMinimalEnvironment {
         if ($HeadsetDemoFixture) {
             # Exercise the same no-quad source contract under the isolated
             # process-local simulator before asking a physical headset to
-            # accept it. The demo still owns only its two fixed Tab events.
+            # accept it. The demo still owns only its two fixed native
+            # InterfaceManager open/close actions.
             $environment.FNVXR_LIVE_PIPBOY_FOCUS_FRAMES = "12"
             # Publish the already-rendered world plus authentic first-person
             # roots at the same audited third outer caller used by physical
@@ -2553,6 +2636,14 @@ function Get-FnvxrProductMinimalEnvironment {
                 $environment.FNVXR_RETAIL_VR_FIRST_PERSON_PRIVATE_CALLER =
                     $RetailVrFirstPersonPrivateCaller.ToLowerInvariant()
             }
+        }
+        if ($StockFirstPersonBaseline) {
+            $environment.FNVXR_STOCK_FIRST_PERSON_BASELINE = "1"
+            $environment.FNVXR_RETAIL_VR_FIRST_PERSON_PRIVATE_CALLER = "third"
+            $environment.FNVXR_RETAIL_CENTER_INTEGRATED_FIRST_PERSON = "0"
+            $environment.FNVXR_RETAIL_RIG_ENABLE = "0"
+            $environment.FNVXR_RETAIL_RIG_APPLY = "0"
+            $environment.FNVXR_RETAIL_WEAPON_APPLY = "0"
         }
         if ($HeadsetControllerRigVisualTrial) {
             # A fixture-only visual lease. The OpenXR host still owns pose

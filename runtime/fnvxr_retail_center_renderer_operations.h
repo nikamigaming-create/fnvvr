@@ -239,6 +239,136 @@ class RetailCenterRendererOperationsContext;
 
 namespace detail
 {
+struct FirstPersonGeometryMutation
+{
+    abi::RetailPointer32 geometry = 0u;
+    abi::RetailPointer32 property = 0u;
+    std::uint32_t geometryFlags = 0u;
+    std::uint16_t propertyFlags = 0u;
+    bool applied = false;
+};
+
+inline bool restoreFirstPersonGeometryMutation(
+    FirstPersonGeometryMutation& mutation) noexcept
+{
+#if defined(_MSC_VER) && defined(_M_IX86)
+    bool restored = !mutation.applied;
+    if (mutation.applied)
+    {
+        __try
+        {
+            auto* geometry = reinterpret_cast<std::uint8_t*>(
+                static_cast<std::uintptr_t>(mutation.geometry));
+            auto* property = reinterpret_cast<std::uint8_t*>(
+                static_cast<std::uintptr_t>(mutation.property));
+            std::memcpy(
+                geometry + 0x30u,
+                &mutation.geometryFlags,
+                sizeof(mutation.geometryFlags));
+            std::memcpy(
+                property + 0x18u,
+                &mutation.propertyFlags,
+                sizeof(mutation.propertyFlags));
+            restored = true;
+        }
+        __except (1)
+        {
+            // Best effort is intentional. The geometry write precedes the
+            // property write, so a read-only/invalid property still leaves
+            // the independently writable geometry flags restored.
+            restored = false;
+        }
+    }
+    mutation = {};
+    return restored;
+#else
+    mutation = {};
+    return false;
+#endif
+}
+
+inline bool applyFirstPersonGeometryMutation(
+    abi::RetailPointer32 geometryAddress,
+    FirstPersonGeometryMutation& mutation) noexcept
+{
+    mutation = {};
+#if defined(_MSC_VER) && defined(_M_IX86)
+    constexpr std::uint32_t GeometryAppCulled = 0x01u;
+    constexpr std::uint32_t GeometryImmediateDispatch = 0x40u;
+    constexpr std::uint16_t PropertyAccumulatorQueue = 0x0001u;
+    constexpr std::uint16_t PropertyModeExcluded = 0x2000u;
+    if (geometryAddress < 0x00010000u)
+        return false;
+
+    __try
+    {
+        auto* geometry = reinterpret_cast<std::uint8_t*>(
+            static_cast<std::uintptr_t>(geometryAddress));
+        std::memcpy(
+            &mutation.property,
+            geometry + 0x9Cu,
+            sizeof(mutation.property));
+        if (mutation.property < 0x00010000u)
+        {
+            mutation = {};
+            return false;
+        }
+        auto* property = reinterpret_cast<std::uint8_t*>(
+            static_cast<std::uintptr_t>(mutation.property));
+        mutation.geometry = geometryAddress;
+        std::memcpy(
+            &mutation.geometryFlags,
+            geometry + 0x30u,
+            sizeof(mutation.geometryFlags));
+        std::memcpy(
+            &mutation.propertyFlags,
+            property + 0x18u,
+            sizeof(mutation.propertyFlags));
+    }
+    __except (1)
+    {
+        mutation = {};
+        return false;
+    }
+
+    mutation.applied = true;
+    bool applied = false;
+    __try
+    {
+        auto* geometry = reinterpret_cast<std::uint8_t*>(
+            static_cast<std::uintptr_t>(mutation.geometry));
+        auto* property = reinterpret_cast<std::uint8_t*>(
+            static_cast<std::uintptr_t>(mutation.property));
+        const std::uint32_t queuedGeometryFlags =
+            mutation.geometryFlags
+            & ~(GeometryAppCulled | GeometryImmediateDispatch);
+        const std::uint16_t queuedPropertyFlags =
+            static_cast<std::uint16_t>(
+                (mutation.propertyFlags | PropertyAccumulatorQueue)
+                & ~PropertyModeExcluded);
+        std::memcpy(
+            geometry + 0x30u,
+            &queuedGeometryFlags,
+            sizeof(queuedGeometryFlags));
+        std::memcpy(
+            property + 0x18u,
+            &queuedPropertyFlags,
+            sizeof(queuedPropertyFlags));
+        applied = true;
+    }
+    __except (1)
+    {
+        applied = false;
+    }
+    if (!applied)
+        static_cast<void>(restoreFirstPersonGeometryMutation(mutation));
+    return applied;
+#else
+    static_cast<void>(geometryAddress);
+    return false;
+#endif
+}
+
 template <std::size_t CollectorCapacity>
 struct RetailCenterRendererOperationsAdapter;
 }
@@ -515,15 +645,6 @@ public:
     }
 
 private:
-    struct FirstPersonGeometryMutation
-    {
-        abi::RetailPointer32 geometry = 0u;
-        abi::RetailPointer32 property = 0u;
-        std::uint32_t geometryFlags = 0u;
-        std::uint16_t propertyFlags = 0u;
-        bool applied = false;
-    };
-
     struct EngineAccumulatorSnapshot
     {
         abi::RetailRendererAccumulatorOwnerLayout* renderer = nullptr;
@@ -582,7 +703,7 @@ private:
         mFirstPersonImmediateGeometryPointers {};
     std::array<abi::RetailPointer32, CollectorCapacity>
         mFirstPersonQueueSafeGeometryPointers {};
-    std::array<FirstPersonGeometryMutation, CollectorCapacity>
+    std::array<detail::FirstPersonGeometryMutation, CollectorCapacity>
         mFirstPersonGeometryMutations {};
     std::uint32_t mFirstPersonImmediateGeometryCount = 0u;
     std::uint32_t mFirstPersonQueueSafeGeometryCount = 0u;
@@ -1822,57 +1943,20 @@ struct RetailCenterRendererOperationsAdapter
             // in the __finally block below.
             if (context->mFirstPersonRootNodeCount != 0u)
             {
-                constexpr std::uint32_t GeometryAppCulled = 0x01u;
-                constexpr std::uint32_t GeometryImmediateDispatch = 0x40u;
-                constexpr std::uint16_t PropertyAccumulatorQueue = 0x0001u;
-                constexpr std::uint16_t PropertyModeExcluded = 0x2000u;
                 for (std::uint32_t index = 0u;
                      index < context->mFirstPersonImmediateGeometryCount;
                      ++index)
                 {
                     const abi::RetailPointer32 geometryAddress =
                         context->mFirstPersonImmediateGeometryPointers[index];
-                    auto* geometry = reinterpret_cast<std::uint8_t*>(
-                        static_cast<std::uintptr_t>(geometryAddress));
-                    abi::RetailPointer32 propertyAddress = 0u;
-                    std::memcpy(
-                        &propertyAddress,
-                        geometry + 0x9Cu,
-                        sizeof(propertyAddress));
-                    if (propertyAddress < 0x00010000u)
-                        continue;
-                    auto* property = reinterpret_cast<std::uint8_t*>(
-                        static_cast<std::uintptr_t>(propertyAddress));
                     auto& mutation = context->mFirstPersonGeometryMutations[
                         mutationCount];
-                    mutation.geometry = geometryAddress;
-                    mutation.property = propertyAddress;
-                    std::memcpy(
-                        &mutation.geometryFlags,
-                        geometry + 0x30u,
-                        sizeof(mutation.geometryFlags));
-                    std::memcpy(
-                        &mutation.propertyFlags,
-                        property + 0x18u,
-                        sizeof(mutation.propertyFlags));
-                    const std::uint32_t queuedGeometryFlags =
-                        mutation.geometryFlags
-                        & ~(GeometryAppCulled | GeometryImmediateDispatch);
-                    const std::uint16_t queuedPropertyFlags =
-                        static_cast<std::uint16_t>(
-                            (mutation.propertyFlags
-                                | PropertyAccumulatorQueue)
-                            & ~PropertyModeExcluded);
-                    std::memcpy(
-                        geometry + 0x30u,
-                        &queuedGeometryFlags,
-                        sizeof(queuedGeometryFlags));
-                    std::memcpy(
-                        property + 0x18u,
-                        &queuedPropertyFlags,
-                        sizeof(queuedPropertyFlags));
-                    mutation.applied = true;
-                    ++mutationCount;
+                    if (detail::applyFirstPersonGeometryMutation(
+                            geometryAddress,
+                            mutation))
+                    {
+                        ++mutationCount;
+                    }
                 }
             }
             context->mCalls.accumulateScene(
@@ -1968,22 +2052,8 @@ struct RetailCenterRendererOperationsAdapter
             {
                 auto& mutation = context->mFirstPersonGeometryMutations[
                     --mutationCount];
-                if (mutation.applied)
-                {
-                    auto* geometry = reinterpret_cast<std::uint8_t*>(
-                        static_cast<std::uintptr_t>(mutation.geometry));
-                    auto* property = reinterpret_cast<std::uint8_t*>(
-                        static_cast<std::uintptr_t>(mutation.property));
-                    std::memcpy(
-                        geometry + 0x30u,
-                        &mutation.geometryFlags,
-                        sizeof(mutation.geometryFlags));
-                    std::memcpy(
-                        property + 0x18u,
-                        &mutation.propertyFlags,
-                        sizeof(mutation.propertyFlags));
-                    mutation = {};
-                }
+                static_cast<void>(
+                    detail::restoreFirstPersonGeometryMutation(mutation));
             }
             privateCuller->base.vtable = cloneVtable;
         }

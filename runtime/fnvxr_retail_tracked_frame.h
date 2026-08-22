@@ -220,6 +220,31 @@ inline RetailTrackedFrameValidation validateRetailTrackedUiFrame(
     return { RetailTrackedFrameFailure::None };
 }
 
+// A live Pip-Boy is still a binocular-world presentation route, but its
+// authored screen pixels are produced in the ordinary retail backbuffer at
+// Present. Permit that exact surface to use the mono pixel transport as an
+// auxiliary wrist-screen texture without relabeling the runtime as flat UI.
+inline RetailTrackedFrameValidation validateRetailTrackedUiSurfaceFrame(
+    const RetailTrackedFrame& frame) noexcept
+{
+    const RetailTrackedFrameValidation published =
+        validateRetailTrackedPublishedFrame(frame);
+    if (!published.complete())
+        return published;
+    const bool livePipBoy = live_pipboy::worldPresentationContinues(
+        frame.runtime.phase,
+        frame.runtime.menuBits,
+        frame.runtime.showroomActive,
+        frame.runtime.cameraActive != 0u);
+    if (!livePipBoy
+        && retailTrackedPublishedPresentationRoute(frame)
+            != RetailTrackedPresentationRoute::MonoUiQuad)
+    {
+        return { RetailTrackedFrameFailure::RuntimeNotUi };
+    }
+    return { RetailTrackedFrameFailure::None };
+}
+
 inline RetailTrackedFrameValidation validateRetailTrackedGameplayFrame(
     const RetailTrackedFrame& frame) noexcept
 {

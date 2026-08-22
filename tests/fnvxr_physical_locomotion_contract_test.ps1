@@ -111,11 +111,21 @@ foreach ($required in @(
         'HighProcessForceFireWeaponOffset',
         'finalConsumer=HighProcess::forceFireWeapon',
         'controllerOwnedHand',
-        'solverResultUsable || controllerOwnedHand',
+        'if (!solverResultUsable)',
+        'if (!upperAligned || !forearmAligned)',
         'applyHeadRelativeLocomotion',
         'applyControllerSnapTurn',
         'desiredHandLocalPosition')) {
     Require-Text -Text $plugin -Required $required -Reason "physical tracked weapon and trigger consumer"
+}
+
+foreach ($forbiddenRigShortcut in @(
+        'if (controllerOwnedHand)`r`n    {`r`n        // A tracked VR wrist owns',
+        'if (!solverResultUsable && !controllerOwnedHand)',
+        'if ((!upperAligned || !forearmAligned) && !controllerOwnedHand)')) {
+    if ($plugin.Contains($forbiddenRigShortcut.Replace('`r`n', "`r`n"))) {
+        throw "Controller-owned hands bypassed the retail arm-chain solve: $forbiddenRigShortcut"
+    }
 }
 
 $legacyStart = $plugin.IndexOf('void updateControllerAxes(')

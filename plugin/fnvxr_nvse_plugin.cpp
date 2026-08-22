@@ -495,6 +495,12 @@ struct RetailHandCalibration
     Matrix33 controllerToHandRotation {};
     Vec3 controllerToWristLocal {};
     Vec3 controllerToWristBodyLocal {};
+    // Capture the stock skeleton's anatomical lengths before the first VR
+    // write. Re-measuring these from a controller-owned wrist on the next
+    // frame makes the prior extension look like a new, longer arm and causes
+    // the render-bound reapply to oscillate between solved and rejected.
+    float upperArmLength {};
+    float forearmLength {};
 };
 
 struct RetailWeaponCalibration
@@ -1044,6 +1050,11 @@ bool retailSidecarProfile()
 
 bool envEnabled(const char* name, bool fallback);
 
+bool windowsForegroundInputForbidden()
+{
+    return envEnabled("FNVXR_WINDOWS_FOREGROUND_INPUT_FORBIDDEN", false);
+}
+
 bool desktopAssistProfileSelected()
 {
     return runProfileIs("desktop-assist");
@@ -1127,6 +1138,24 @@ bool headsetWorldOnlyFixtureWeaponDrawRequested()
 {
     return headsetWorldOnlyCaptureProfileSelected()
         && envEnabled("FNVXR_HEADSET_FIXTURE_DRAW_WEAPON", false);
+}
+
+bool readOnlyFirstPersonSemanticsRequested()
+{
+    // Read-only semantic publication for the guide-mandated intact fallback.
+    // This mode gives the renderer player/weapon/root identity so it can lease
+    // the complete stock RenderFirstPerson call; it never authorizes the
+    // post-animation rig hook or any transform write.
+    const bool stockPrivateBaseline =
+        headsetWorldOnlyFixtureWeaponDrawRequested()
+        && envEnabled("FNVXR_STOCK_FIRST_PERSON_BASELINE", false);
+    const bool stockCenterCollection =
+        headsetDemoFixtureProfileSelected()
+        && envEnabled("FNVXR_RETAIL_CENTER_INTEGRATED_FIRST_PERSON", false);
+    return (stockPrivateBaseline || stockCenterCollection)
+        && envEnabled("OPENXR_SIMULATOR_HEADLESS", false)
+        && !envEnabled("FNVXR_HEADSET_CONTROLLER_RIG_VISUAL_TRIAL", false)
+        && !envEnabled("FNVXR_PHYSICAL_HEADSET_PLAY", false);
 }
 
 bool headsetControllerRigVisualTrialRequested()
@@ -2027,7 +2056,8 @@ void logCameraTelemetry(std::uint64_t frame, UInt32 menuBits, bool force = false
 void logInputConfig()
 {
     logTelemetry(
-        "inputConfig cursorTrack=%d cursorFocus=%d sendInputMouse=%d postKeys=%d immediate=%d queue=%d acceptRepeat=%d cooldown=%.1f pointerScale=(%.3f,%.3f) pointerOffset=(%.3f,%.3f) uiShared=%dx%d uiInput=%dx%d\n",
+        "inputConfig windowsForegroundInputForbidden=%d cursorTrack=%d cursorFocus=%d sendInputMouse=%d postKeys=%d immediate=%d queue=%d acceptRepeat=%d cooldown=%.1f pointerScale=(%.3f,%.3f) pointerOffset=(%.3f,%.3f) uiShared=%dx%d uiInput=%dx%d\n",
+        static_cast<int>(windowsForegroundInputForbidden()),
         static_cast<int>(envEnabled("FNVXR_CURSOR_TRACK_POINTER", false)),
         static_cast<int>(envEnabled("FNVXR_CURSOR_FOCUS", false)),
         static_cast<int>(envEnabled("FNVXR_CLICK_SENDINPUT_MOUSE", false)),
@@ -2070,7 +2100,7 @@ bool currentProcessHasActiveWindow()
 
 bool focusProcessWindow(HWND hwnd)
 {
-    if (!hwnd)
+    if (windowsForegroundInputForbidden() || !hwnd)
         return false;
     if (currentProcessHasForegroundWindow())
         return true;
@@ -4337,6 +4367,8 @@ void updateSharedCamera(UInt64 frame, UInt32 menuBits)
     }
 }
 
+bool discoverRetailRigNodes(void* root);
+
 void updateSharedPlayer(UInt64 frame, RuntimePhase phase)
 {
     if (!g_playerState || !gamePluginProducerLeaseHeldByCurrentThread())
@@ -4387,6 +4419,24 @@ void updateSharedPlayer(UInt64 frame, RuntimePhase phase)
     g_playerState->reserved[fnvxr::shared::PlayerSharedWeaponClassReservedIndex] = weaponClass;
     g_playerState->reserved[fnvxr::shared::PlayerSharedEquippedWeaponFormIdReservedIndex] = g_lastKnownWeaponFormId;
     g_playerState->reserved[fnvxr::shared::PlayerSharedEquippedFavoriteSlotReservedIndex] = g_lastKnownWeaponFavoriteSlot;
+    void* playerNode = player
+        ? readPointer(
+            reinterpret_cast<std::uintptr_t>(player)
+                + PlayerCharacterFirstPersonNodeOffset)
+        : nullptr;
+    if (readOnlyFirstPersonSemanticsRequested()
+        && looksLikeNiObject(playerNode)
+        && (g_retailRigNodes.root != playerNode
+            || !looksLikeNiObject(g_retailRigNodes.weapon)
+            || !looksLikeNiObject(g_retailRigNodes.leftHandMesh)
+            || !looksLikeNiObject(g_retailRigNodes.rightHandMesh)
+            || !looksLikeNiObject(g_retailRigNodes.pipBoy)))
+    {
+        // Read-only discovery is the semantic recorder for the intact stock
+        // fallback. It traverses the live first-person tree but installs no
+        // post-animation hook and performs no transform/culling write.
+        static_cast<void>(discoverRetailRigNodes(playerNode));
+    }
     void* firstPersonSceneRoot = g_retailRigNodes.weapon;
     if (looksLikeNiObject(firstPersonSceneRoot))
     {
@@ -4445,9 +4495,6 @@ void updateSharedPlayer(UInt64 frame, RuntimePhase phase)
                 sharedPointerAddress(published.object);
     }
 
-    void* playerNode = player
-        ? readPointer(reinterpret_cast<std::uintptr_t>(player) + PlayerCharacterFirstPersonNodeOffset)
-        : nullptr;
     if (looksLikeNiObject(playerNode))
     {
         g_playerState->playerNodeAddress = sharedPointerAddress(playerNode);
@@ -7009,11 +7056,23 @@ void ensureRetailHandCalibration(
     const auto handBase = reinterpret_cast<std::uintptr_t>(arm.hand);
     const Matrix33 handWorldRotation = readMatrix33(handBase + NiAvObjectWorldRotationOffset);
     const Vec3 handWorldPosition = readVec3(handBase + NiAvObjectWorldTranslationOffset);
+    const Vec3 upperArmWorldPosition = readVec3(
+        reinterpret_cast<std::uintptr_t>(arm.upperArm)
+            + NiAvObjectWorldTranslationOffset);
+    const Vec3 forearmWorldPosition = readVec3(
+        reinterpret_cast<std::uintptr_t>(arm.forearm)
+            + NiAvObjectWorldTranslationOffset);
     calibration.controllerToHandRotation = multiplyMatrix33(
         transposeMatrix33(controller.wristRotation),
         handWorldRotation);
     calibration.usesAimOrientation = false;
     calibration.controllerToWristLocal = configuredControllerToWristOffset(left);
+    calibration.upperArmLength = lengthVec3(subtractVec3(
+        forearmWorldPosition,
+        upperArmWorldPosition));
+    calibration.forearmLength = lengthVec3(subtractVec3(
+        handWorldPosition,
+        forearmWorldPosition));
     const bool bodyAnchoredControllerRig =
         (headsetControllerRigVisualTrialRequested()
             && headlessStereoRigVisualTrialLeaseCurrent())
@@ -7039,11 +7098,15 @@ void ensureRetailHandCalibration(
             calibration.controllerToWristLocal = measured;
     }
     calibration.valid = finiteMatrix33(calibration.controllerToHandRotation)
+        && std::isfinite(calibration.upperArmLength)
+        && std::isfinite(calibration.forearmLength)
+        && calibration.upperArmLength >= 0.01f
+        && calibration.forearmLength >= 0.01f
         && (calibration.usesStageLocalBodyPositionAnchor
             ? finiteVec3(calibration.controllerToWristBodyLocal)
             : finiteVec3(calibration.controllerToWristLocal));
     logTelemetry(
-        "retailRig calibration side=%s valid=%d orientationSource=%s wristLocal=(%.3f %.3f %.3f) wristBodyLocal=(%.3f %.3f %.3f) positionAnchor=%s autoPosition=%d\n",
+        "retailRig calibration side=%s valid=%d orientationSource=%s wristLocal=(%.3f %.3f %.3f) wristBodyLocal=(%.3f %.3f %.3f) anatomicalLengths=(%.4f %.4f) positionAnchor=%s autoPosition=%d\n",
         left ? "left" : "right",
         calibration.valid ? 1 : 0,
         calibration.usesAimOrientation ? "aim" : "grip",
@@ -7053,6 +7116,8 @@ void ensureRetailHandCalibration(
         calibration.controllerToWristBodyLocal.x,
         calibration.controllerToWristBodyLocal.y,
         calibration.controllerToWristBodyLocal.z,
+        calibration.upperArmLength,
+        calibration.forearmLength,
         calibration.usesStageLocalBodyPositionAnchor
             ? "absolute-controller-body"
             : "controller-local",
@@ -7096,72 +7161,6 @@ bool applyRetailArmFabrik(
             || (headsetControllerRigVisualTrialRequested()
                 && headlessStereoRigVisualTrialLeaseCurrent());
 
-    if (controllerOwnedHand)
-    {
-        // A tracked VR wrist owns a six-degree-of-freedom terminal transform,
-        // not a point constrained to Fallout's short two-bone arm sphere. The
-        // stock upper arms may keep animating for visual continuity; cancel
-        // each parent transform here and put both hands exactly at their
-        // current grip poses. The Pip-Boy has its own tracked-left-wrist
-        // attachment below, matching the OpenMW lab's direct surface model.
-        if (!applyWrites)
-            return true;
-        void* handParent = readPointer(
-            reinterpret_cast<std::uintptr_t>(arm.hand)
-                + NiAvObjectParentOffset);
-        if (!handParent)
-            return false;
-        const auto parentBase = reinterpret_cast<std::uintptr_t>(handParent);
-        const Matrix33 parentWorldRotation = readMatrix33(
-            parentBase + NiAvObjectWorldRotationOffset);
-        const Vec3 parentWorldPosition = readVec3(
-            parentBase + NiAvObjectWorldTranslationOffset);
-        const float parentWorldScale = readFloat(
-            parentBase + NiAvObjectWorldScaleOffset,
-            0.0f);
-        const Matrix33 desiredHandWorldRotation = multiplyMatrix33(
-            controller.wristRotation,
-            calibration.controllerToHandRotation);
-        const Matrix33 desiredHandLocalRotation = multiplyMatrix33(
-            transposeMatrix33(parentWorldRotation),
-            desiredHandWorldRotation);
-        Vec3 desiredHandLocalPosition = transformVec3(
-            transposeMatrix33(parentWorldRotation),
-            subtractVec3(target, parentWorldPosition));
-        if (!finiteMatrix33(parentWorldRotation)
-            || !finiteVec3(parentWorldPosition)
-            || !std::isfinite(parentWorldScale)
-            || std::fabs(parentWorldScale) < 0.0001f
-            || !finiteMatrix33(desiredHandLocalRotation))
-        {
-            return false;
-        }
-        desiredHandLocalPosition = scaleVec3(
-            desiredHandLocalPosition,
-            1.0f / parentWorldScale);
-        if (!finiteVec3(desiredHandLocalPosition)
-            || !writeVec3(
-                reinterpret_cast<std::uintptr_t>(arm.hand)
-                    + NiAvObjectLocalTranslationOffset,
-                desiredHandLocalPosition)
-            || !writeMatrix33(
-                reinterpret_cast<std::uintptr_t>(arm.hand)
-                    + NiAvObjectLocalRotationOffset,
-                desiredHandLocalRotation))
-        {
-            return false;
-        }
-        forwardKinematics(arm.hand);
-        const Vec3 appliedWrist = readVec3(
-            reinterpret_cast<std::uintptr_t>(arm.hand)
-                + NiAvObjectWorldTranslationOffset);
-        finalError = lengthVec3(subtractVec3(appliedWrist, target));
-        const float maximumFinalError = getFloatFromEnv(
-            "FNVXR_RETAIL_RIG_MAX_FINAL_ERROR_UNITS",
-            0.25f);
-        return std::isfinite(finalError) && finalError <= maximumFinalError;
-    }
-
     const Vec3 shoulder = readVec3(
         reinterpret_cast<std::uintptr_t>(arm.upperArm) + NiAvObjectWorldTranslationOffset);
     const Vec3 elbow = readVec3(
@@ -7169,8 +7168,8 @@ bool applyRetailArmFabrik(
     const Vec3 wrist = readVec3(
         reinterpret_cast<std::uintptr_t>(arm.hand) + NiAvObjectWorldTranslationOffset);
     const float lengths[2] {
-        lengthVec3(subtractVec3(elbow, shoulder)),
-        lengthVec3(subtractVec3(wrist, elbow))
+        calibration.upperArmLength,
+        calibration.forearmLength
     };
     const float maxSegment = getFloatFromEnv("FNVXR_RETAIL_RIG_MAX_SEGMENT_UNITS", 80.0f);
     if (lengths[0] < 0.01f || lengths[1] < 0.01f
@@ -7216,34 +7215,65 @@ bool applyRetailArmFabrik(
                 reachableDistance));
     }
 
+    // Solve in shoulder-relative coordinates. Fallout world coordinates can
+    // be tens of thousands of units from zero, while the convergence budget
+    // is a fraction of one unit; translating the chain avoids needless float
+    // precision loss without changing any solved direction.
+    const Vec3 elbowFromShoulder = subtractVec3(elbow, shoulder);
+    const Vec3 wristFromShoulder = subtractVec3(wrist, shoulder);
+    const Vec3 solveTargetFromShoulder = subtractVec3(solveTarget, shoulder);
+    const Vec3 poleFromShoulder = subtractVec3(pole, shoulder);
     fnvxr::ik::Vec3 joints[3] {
-        { shoulder.x, shoulder.y, shoulder.z },
-        { elbow.x, elbow.y, elbow.z },
-        { wrist.x, wrist.y, wrist.z }
+        { 0.0f, 0.0f, 0.0f },
+        { elbowFromShoulder.x, elbowFromShoulder.y, elbowFromShoulder.z },
+        { wristFromShoulder.x, wristFromShoulder.y, wristFromShoulder.z }
     };
     fnvxr::ik::SolveOptions options {};
-    options.maxIterations = static_cast<int>(getFloatFromEnv("FNVXR_RETAIL_RIG_FABRIK_ITERATIONS", 12.0f));
+    options.maxIterations = static_cast<int>(getFloatFromEnv("FNVXR_RETAIL_RIG_FABRIK_ITERATIONS", 48.0f));
     options.tolerance = getFloatFromEnv("FNVXR_RETAIL_RIG_FABRIK_TOLERANCE", 0.05f);
     options.poleWeight = getFloatFromEnv("FNVXR_RETAIL_RIG_ELBOW_POLE_WEIGHT", 1.0f);
     const auto result = fnvxr::ik::solveFabrik(
         joints,
         3,
         lengths,
-        { solveTarget.x, solveTarget.y, solveTarget.z },
-        { pole.x, pole.y, pole.z },
+        { solveTargetFromShoulder.x, solveTargetFromShoulder.y, solveTargetFromShoulder.z },
+        { poleFromShoulder.x, poleFromShoulder.y, poleFromShoulder.z },
         options);
     const float maximumFinalError = getFloatFromEnv(
         "FNVXR_RETAIL_RIG_MAX_FINAL_ERROR_UNITS",
         0.25f);
     const bool solverResultUsable =
-        result.solved && std::isfinite(result.error)
+        result.iterations > 0
+        && fnvxr::ik::finite(joints[0])
+        && fnvxr::ik::finite(joints[1])
+        && fnvxr::ik::finite(joints[2])
+        && std::isfinite(result.error)
         && result.error <= maximumFinalError;
-    if (!solverResultUsable && !controllerOwnedHand)
+    if (!solverResultUsable)
+    {
+        static LONG solverFailureCount = 0;
+        const LONG failure = InterlockedIncrement(&solverFailureCount);
+        if (failure <= 12 || failure % 120 == 0)
+        {
+            logTelemetry(
+                "retailRig FABRIK rejected count=%ld side=%s solved=%d reachable=%d iterations=%d error=%.4f tolerance=%.4f shoulderTarget=%.4f maximumReach=%.4f targetClamped=%d\n",
+                failure,
+                left ? "left" : "right",
+                result.solved ? 1 : 0,
+                result.reachable ? 1 : 0,
+                result.iterations,
+                result.error,
+                options.tolerance,
+                shoulderTargetDistance,
+                maximumReach,
+                targetOutsideArmReach ? 1 : 0);
+        }
         return false;
+    }
 
     finalError = solverResultUsable ? result.error : shoulderTargetDistance;
     if (!applyWrites)
-        return solverResultUsable || controllerOwnedHand;
+        return solverResultUsable;
 
     const Vec3 solvedShoulder { joints[0].x, joints[0].y, joints[0].z };
     const Vec3 solvedElbow { joints[1].x, joints[1].y, joints[1].z };
@@ -7258,7 +7288,7 @@ bool applyRetailArmFabrik(
             arm.forearm,
             arm.hand,
             subtractVec3(solvedWrist, solvedElbow));
-    if ((!upperAligned || !forearmAligned) && !controllerOwnedHand)
+    if (!upperAligned || !forearmAligned)
         return false;
 
     void* handParent = readPointer(
@@ -10411,7 +10441,9 @@ bool dispatchActiveMenuClick()
 
 void postMenuKey(HWND hwnd, WPARAM virtualKey)
 {
-    if (!hwnd || !envEnabled("FNVXR_POST_MENU_KEYS", false))
+    if (windowsForegroundInputForbidden()
+        || !hwnd
+        || !envEnabled("FNVXR_POST_MENU_KEYS", false))
         return;
 
     PostMessageA(hwnd, WM_KEYDOWN, virtualKey, 1);
@@ -10460,7 +10492,8 @@ POINT mapSharedPointerToWindow(HWND hwnd, POINT point)
 
 bool sendForegroundKey(WORD virtualKey)
 {
-    if (!currentProcessHasForegroundWindow())
+    if (windowsForegroundInputForbidden()
+        || !currentProcessHasForegroundWindow())
         return false;
 
     INPUT inputs[2] {};
@@ -10474,7 +10507,7 @@ bool sendForegroundKey(WORD virtualKey)
 
 bool ensureClickForeground(HWND hwnd)
 {
-    if (!hwnd)
+    if (windowsForegroundInputForbidden() || !hwnd)
         return false;
 
     if (currentProcessHasForegroundWindow())
@@ -10537,6 +10570,8 @@ void logClickWindow(HWND hwnd, POINT clientPoint)
 
 bool sendForegroundMouseClickAt(HWND hwnd, POINT clientPoint)
 {
+    if (windowsForegroundInputForbidden())
+        return false;
     clientPoint = mapSharedPointerToWindow(hwnd, clientPoint);
     logClickWindow(hwnd, clientPoint);
     if (!ensureClickForeground(hwnd))
@@ -10571,7 +10606,7 @@ bool sendForegroundMouseClickAt(HWND hwnd, POINT clientPoint)
 
 bool postWindowMouseClick(HWND hwnd, POINT clientPoint)
 {
-    if (!hwnd)
+    if (windowsForegroundInputForbidden() || !hwnd)
         return false;
 
     clientPoint = mapSharedPointerToWindow(hwnd, clientPoint);
@@ -11731,7 +11766,8 @@ void updateMenuPointer(const fnvxr::PoseFrame& pose)
     // the native DirectInput hit-test position.
     const POINT windowPointer = mapSharedPointerToWindow(hwnd, g_lastMenuPointerClient);
 
-    if (envEnabled("FNVXR_CURSOR_TRACK_POINTER", false))
+    if (!windowsForegroundInputForbidden()
+        && envEnabled("FNVXR_CURSOR_TRACK_POINTER", false))
     {
         POINT screenPoint = windowPointer;
         if (ClientToScreen(hwnd, &screenPoint))
@@ -11813,7 +11849,8 @@ void executeAcceptClickOnGameThread()
         const POINT windowPointer = mapSharedPointerToWindow(hwnd, g_lastMenuPointerClient);
         BOOL postDown = FALSE;
         BOOL postUp = FALSE;
-        if (envEnabled("FNVXR_POST_WINDOW_MOUSE_FALLBACK", false))
+        if (!windowsForegroundInputForbidden()
+            && envEnabled("FNVXR_POST_WINDOW_MOUSE_FALLBACK", false))
         {
             const LPARAM point =
                 MAKELPARAM(static_cast<WORD>(windowPointer.x), static_cast<WORD>(windowPointer.y));
@@ -11832,14 +11869,18 @@ void executeAcceptClickOnGameThread()
             static_cast<int>(currentProcessHasForegroundWindow()));
 
         POINT screenPoint = windowPointer;
-        if (envEnabled("FNVXR_CURSOR_TRACK_POINTER", false) && ClientToScreen(hwnd, &screenPoint))
+        if (!windowsForegroundInputForbidden()
+            && envEnabled("FNVXR_CURSOR_TRACK_POINTER", false)
+            && ClientToScreen(hwnd, &screenPoint))
         {
             if (envEnabled("FNVXR_CURSOR_FOCUS", false))
                 SetForegroundWindow(hwnd);
             SetCursorPos(screenPoint.x, screenPoint.y);
         }
 
-        if (envEnabled("FNVXR_PLUGIN_SENDINPUT_CLICK", false) && currentProcessHasForegroundWindow())
+        if (!windowsForegroundInputForbidden()
+            && envEnabled("FNVXR_PLUGIN_SENDINPUT_CLICK", false)
+            && currentProcessHasForegroundWindow())
         {
             INPUT inputs[2] {};
             inputs[0].type = INPUT_MOUSE;
@@ -11857,7 +11898,8 @@ void executeAcceptClickOnGameThread()
         return;
     }
 
-    if (!currentProcessHasForegroundWindow())
+    if (windowsForegroundInputForbidden()
+        || !currentProcessHasForegroundWindow())
         return;
 
     INPUT inputs[2] {};
@@ -11884,7 +11926,8 @@ void requestAcceptClick()
 
 void executeImmediateInputClick()
 {
-    if (!envEnabled("FNVXR_IMMEDIATE_OS_CLICK", false))
+    if (windowsForegroundInputForbidden()
+        || !envEnabled("FNVXR_IMMEDIATE_OS_CLICK", false))
         return;
     if (!g_hasMenuPointer)
         return;
@@ -12659,11 +12702,14 @@ void syncExternalDInputPointer(
         // the DirectInput relative deltas. Keep the established native menu
         // cursor path synchronized with the same controller pointer sample so
         // the rendered cursor, Gamebryo hover state, and injected click agree.
-        PostMessageA(
-            hwnd,
-            WM_MOUSEMOVE,
-            0,
-            MAKELPARAM(static_cast<WORD>(windowPointer.x), static_cast<WORD>(windowPointer.y)));
+        if (!windowsForegroundInputForbidden())
+        {
+            PostMessageA(
+                hwnd,
+                WM_MOUSEMOVE,
+                0,
+                MAKELPARAM(static_cast<WORD>(windowPointer.x), static_cast<WORD>(windowPointer.y)));
+        }
         updateGameCursorTile(hwnd);
     }
     if (directUiClickEnabled() || pointerTileFallbackEnabled())
@@ -14218,6 +14264,7 @@ bool ensureAuthorizedRuntimeObservationStarted()
     {
         return gamePluginProducerLeaseHeldByCurrentThread()
             && g_runtimeState
+            && (!readOnlyFirstPersonSemanticsRequested() || g_playerState)
             && (!fixedCommandAutomationRequested || g_commandState);
     }
 
@@ -14264,6 +14311,10 @@ bool ensureAuthorizedRuntimeObservationStarted()
     if (!acquireGamePluginProducerLease())
         return false;
     initSharedRuntime();
+    if (readOnlyFirstPersonSemanticsRequested())
+        initSharedPlayer();
+    if (headsetDemoUiProfileSelected())
+        initSharedInputEvents();
     // Mapping this mailbox is not general command authority.  Its only
     // consumers are the separately opted-in, fixed-command automation gates.
     // The publication-only visual-trial consumer is reached later with the
@@ -14271,6 +14322,18 @@ bool ensureAuthorizedRuntimeObservationStarted()
     if (fixedCommandAutomationRequested)
         initSharedCommand();
     g_authorizedRuntimeObservationStarted = g_runtimeState != nullptr;
+    if (readOnlyFirstPersonSemanticsRequested())
+    {
+        g_authorizedRuntimeObservationStarted =
+            g_authorizedRuntimeObservationStarted && g_playerState != nullptr;
+    }
+    if (headsetDemoUiProfileSelected())
+    {
+        g_authorizedRuntimeObservationStarted =
+            g_authorizedRuntimeObservationStarted
+            && g_inputEvents != nullptr
+            && g_inputEventWriterMutex != nullptr;
+    }
     if (fixedCommandAutomationRequested)
         g_authorizedRuntimeObservationStarted = g_authorizedRuntimeObservationStarted
             && g_commandState != nullptr;
@@ -15611,16 +15674,13 @@ void processHeadsetDemoFixtureUi(const RuntimeObservation& observation)
         return;
 
     // Apart from the separately bounded exact official-pack acknowledgement
-    // above, the headset demo has exactly two in-game events, both Tab: one
-    // after a loaded owned fixture reaches stable gameplay and one after
-    // Pip-Boy has remained visibly open for a bounded interval. The event is
-    // published to the staged in-process DirectInput queue; it is never an
-    // OS key, desktop/window operation, controller signal, or simulator
-    // command.
+    // above, the headset demo has exactly two native engine actions: open the
+    // inventory Pip-Boy after stable gameplay, then close it after the bounded
+    // hold. This invokes the retail InterfaceManager directly on the game
+    // thread; it is never an OS key, desktop/window operation, input-device
+    // event, or simulator command.
     namespace demo = fnvxr::engine::headset_demo;
     static demo::State state {};
-    if (g_headsetDemoFixtureReady && !g_inputEvents)
-        initSharedInputEvents();
 
     const std::uint64_t gameplayWarmupFrames = static_cast<std::uint64_t>(
         std::clamp(getIntFromEnv("FNVXR_HEADSET_DEMO_GAMEPLAY_WARMUP_FRAMES", 90), 1, 1200));
@@ -15632,7 +15692,7 @@ void processHeadsetDemoFixtureUi(const RuntimeObservation& observation)
         g_headsetDemoFixtureReady,
         realRetailFixtureFreshGameplayState(observation),
         pipBoyVisible,
-        g_inputEvents != nullptr && g_inputEventWriterMutex != nullptr,
+        g_headsetDemoFixtureReady,
         observation.frame,
         gameplayWarmupFrames,
         pipBoyHoldFrames,
@@ -15640,16 +15700,18 @@ void processHeadsetDemoFixtureUi(const RuntimeObservation& observation)
     const demo::Decision decision = demo::advance(state, input);
     if (decision.action != demo::Action::None)
     {
-        const bool tapped = tapDirectInputKey(DIK_TAB);
+        const bool handled = decision.action == demo::Action::OpenPipBoy
+            ? openEnginePipBoyInventory("headset-demo-fixed", observation.frame)
+            : closeEnginePipBoy("headset-demo-fixed", observation.frame);
         logTelemetry(
-            "{\"event\":\"fnvxrHeadsetDemoPipBoyTap\",\"action\":\"%s\",\"tapped\":%s,\"fixtureReady\":%s,\"gameplay\":%s,\"pipBoyVisible\":%s,\"frame\":%llu}\n",
+            "{\"event\":\"fnvxrHeadsetDemoPipBoyAction\",\"action\":\"%s\",\"handled\":%s,\"fixtureReady\":%s,\"gameplay\":%s,\"pipBoyVisible\":%s,\"frame\":%llu}\n",
             decision.action == demo::Action::OpenPipBoy ? "open" : "close",
-            tapped ? "true" : "false",
+            handled ? "true" : "false",
             g_headsetDemoFixtureReady ? "true" : "false",
             input.gameplay ? "true" : "false",
             pipBoyVisible ? "true" : "false",
             static_cast<unsigned long long>(observation.frame));
-        if (!tapped)
+        if (!handled)
             return;
     }
     if (state.stage != decision.next.stage
@@ -16718,6 +16780,8 @@ void handleNvseMessage(NVSEMessagingInterface::Message* message)
         {
             processRetailFixtureAutomation(observation);
             processHeadsetWorldOnlyFixtureWeaponDraw(observation);
+            if (readOnlyFirstPersonSemanticsRequested())
+                updateSharedPlayer(observation.frame, observation.phase);
             recoverFocusLossPause(
                 observation.frame,
                 observation.menuBits,
@@ -16754,8 +16818,9 @@ void handleNvseMessage(NVSEMessagingInterface::Message* message)
                         }
                         else
                         {
-                            logTelemetry(
-                                "headset world-only fixture runtime publication ready; OpenXR display remains host-owned and the fixture finisher is limited to one save of the same owned loaded fixture after exact stock-notice settlement plus one fixed JIP SetWeaponOut command for its named weapon; no Pip-Boy, desktop, keyboard, controller, mouse, simulator, camera, or rig input is enabled\n");
+                            logTelemetry(readOnlyFirstPersonSemanticsRequested()
+                                ? "stock first-person baseline publication ready; read-only player/weapon/root semantics feed the complete stock RenderFirstPerson lease; manual roots, controller rig, IK, Pip-Boy transforms, input, and window control remain disabled\n"
+                                : "headset world-only fixture runtime publication ready; OpenXR display remains host-owned and the fixture finisher is limited to one save of the same owned loaded fixture after exact stock-notice settlement plus one fixed JIP SetWeaponOut command for its named weapon; no Pip-Boy, desktop, keyboard, controller, mouse, simulator, camera, or rig input is enabled\n");
                         }
                     }
                     else
@@ -16841,7 +16906,8 @@ void handleNvseMessage(NVSEMessagingInterface::Message* message)
 
 void tapKey(WORD virtualKey)
 {
-    if (!currentProcessHasForegroundWindow())
+    if (windowsForegroundInputForbidden()
+        || !currentProcessHasForegroundWindow())
         return;
 
     INPUT inputs[2] {};

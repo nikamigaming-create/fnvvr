@@ -958,7 +958,7 @@ public:
         const engine::RetailTrackedFrame& tracked) noexcept
     {
         if (!ready()
-            || !engine::validateRetailTrackedUiFrame(tracked).complete())
+            || !engine::validateRetailTrackedUiSurfaceFrame(tracked).complete())
         {
             return false;
         }

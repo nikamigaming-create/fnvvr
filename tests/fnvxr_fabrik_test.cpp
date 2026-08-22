@@ -90,6 +90,37 @@ int main()
     if (!segmentLengthsPreserved(singular, armLengths, 3))
         return fail("singularity recovery must preserve arm lengths");
 
+    // The retail first-person skeleton routinely places controller targets
+    // just inside full extension. This converges much more slowly than the
+    // compact poses above and was previously rejected after 12 iterations,
+    // leaving both hands unsolved at the render-bound restore seam.
+    Vec3 nearExtension[3] {
+        { 0.0f, 0.0f, 0.0f },
+        { -8.391f, -5.028f, -14.346f },
+        { -14.727f, -9.655f, -30.689f }
+    };
+    const float retailArmLengths[2] {
+        fnvxr::ik::distance(nearExtension[0], nearExtension[1]),
+        fnvxr::ik::distance(nearExtension[1], nearExtension[2])
+    };
+    const float retailReach = retailArmLengths[0] + retailArmLengths[1];
+    Vec3 nearDirection { -23.469f, 27.617f, -9.610f };
+    nearDirection = nearDirection * (1.0f / fnvxr::ik::length(nearDirection));
+    const Vec3 nearTarget = nearDirection * (retailReach - 0.1f);
+    fnvxr::ik::SolveOptions nearOptions {};
+    nearOptions.tolerance = 0.05f;
+    const auto nearResult = fnvxr::ik::solveFabrik(
+        nearExtension,
+        3,
+        retailArmLengths,
+        nearTarget,
+        { -20.0f, -15.0f, -25.0f },
+        nearOptions);
+    if (!nearResult.solved || nearResult.iterations <= 12)
+        return fail("near-extension retail arm should converge with the bounded 48-iteration budget");
+    if (!segmentLengthsPreserved(nearExtension, retailArmLengths, 3))
+        return fail("near-extension retail solve must preserve arm lengths");
+
     Vec3 leftPole[3] {
         { 0.0f, 0.0f, 0.0f },
         { 0.30f, 0.10f, 0.0f },
