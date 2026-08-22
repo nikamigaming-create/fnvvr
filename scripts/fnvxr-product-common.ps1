@@ -1717,6 +1717,47 @@ function Assert-FnvxrProductGameRoot {
     $loader = Get-FnvxrProductFileIdentity -Path (Join-Path $resolved "nvse_loader.exe") -RequirePe
     if ($loader.peMachine -cne "0x014c") { throw "nvse_loader.exe is not Win32: $($loader.path)" }
 
+    $sandbox = $null
+    $sandboxManifestPath = Join-Path $resolved "fnvxr-retail-sandbox-manifest.json"
+    if (Test-Path -LiteralPath $sandboxManifestPath -PathType Leaf) {
+        $sandboxManifest = Get-Content -LiteralPath $sandboxManifestPath -Raw |
+            ConvertFrom-Json -ErrorAction Stop
+        if ([string]$sandboxManifest.schema -cne "fnvxr-retail-sandbox/v1" -or
+            -not [string]::Equals(
+                [System.IO.Path]::GetFullPath([string]$sandboxManifest.sandboxRoot),
+                $resolved,
+                [System.StringComparison]::OrdinalIgnoreCase) -or
+            [bool]$sandboxManifest.sourceRootsMutated -or
+            [bool]$sandboxManifest.processOrUiControl) {
+            throw "Retail sandbox manifest does not retain its isolated/no-control contract: $sandboxManifestPath"
+        }
+        $sourceRoot = [System.IO.Path]::GetFullPath(
+            [string]$sandboxManifest.sourceRoot)
+        if ([string]::Equals(
+                $sourceRoot,
+                $resolved,
+                [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "Retail sandbox source and destination roots must be distinct: $resolved"
+        }
+        $steamAppIdPath = Join-Path $resolved "steam_appid.txt"
+        if (-not (Test-Path -LiteralPath $steamAppIdPath -PathType Leaf) -or
+            (Get-Content -LiteralPath $steamAppIdPath -Raw).Trim() -cne "22380") {
+            throw "Retail sandbox must contain steam_appid.txt with only AppID 22380 so Steam cannot redirect the run into the installed Library copy: $steamAppIdPath"
+        }
+        if ([string]$sandboxManifest.falloutSha256 -cne $fallout.sha256) {
+            throw "Retail sandbox Fallout hash no longer matches its manifest."
+        }
+        $sandbox = [pscustomobject][ordered]@{
+            manifest = Get-FnvxrProductFileIdentity -Path $sandboxManifestPath
+            sourceRoot = $sourceRoot
+            steamAppId = "22380"
+            steamAppIdFile = Get-FnvxrProductFileIdentity -Path $steamAppIdPath
+            steamLibraryRedirectForbidden = $true
+            sourceRootsMutated = $false
+            processOrUiControl = $false
+        }
+    }
+
     $pluginRoot = Join-Path $resolved "Data\NVSE\Plugins"
     $compatibility = @(
         [pscustomobject]@{ name = "jip_nvse.dll"; length = 502272; sha256 = "9d2779647ed0ce63043390f47fc978e3234af8e558dc6cb6bcb231478a2d74d4" },
@@ -1737,6 +1778,7 @@ function Assert-FnvxrProductGameRoot {
         fallout = $fallout
         nvseLoader = $loader
         compatibilityModules = $modules
+        sandbox = $sandbox
     }
 }
 
@@ -2494,11 +2536,11 @@ function Get-FnvxrProductMinimalEnvironment {
         $environment.FNVXR_SHOW_RIGHT_AIM_RAY = "0"
         $environment.FNVXR_DEBUG_AXES = "0"
         $environment.FNVXR_DEBUG_LEFT_AXES = "0"
-        $environment.FNVXR_PIPBOY_WRIST_UI_WIDTH = "0.24"
+        $environment.FNVXR_PIPBOY_WRIST_UI_WIDTH = "0.12"
         $environment.FNVXR_PIPBOY_WRIST_UI_ROT_X = "0"
         $environment.FNVXR_PIPBOY_WRIST_UI_ROT_Y = "0"
         $environment.FNVXR_PIPBOY_WRIST_UI_ROT_Z = "0"
-        $environment.FNVXR_PIPBOY_WRIST_UI_OFFSET_X = "0"
+        $environment.FNVXR_PIPBOY_WRIST_UI_OFFSET_X = "-0.11"
         $environment.FNVXR_PIPBOY_WRIST_UI_OFFSET_Y = "0.065"
         $environment.FNVXR_PIPBOY_WRIST_UI_OFFSET_Z = "-0.025"
         $retailHandAssetRoot = Join-Path `
@@ -2506,12 +2548,32 @@ function Get-FnvxrProductMinimalEnvironment {
             "local\retail-assets"
         $retailLeftHandMesh = Join-Path `
             $retailHandAssetRoot `
-            "lefthand1st.fhm"
+            "lefthandpipboy-hand.fhm"
         $retailRightHandMesh = Join-Path `
             $retailHandAssetRoot `
-            "righthand1st.fhm"
+            "righthand1st-grip.fhm"
+        $retailHandTexture = Join-Path `
+            $retailHandAssetRoot `
+            "HandMale.dds"
+        $retailLeftCuffMesh = Join-Path `
+            $retailHandAssetRoot `
+            "lefthandpipboy-cuff.fhm"
+        $retailLeftCuffTexture = Join-Path `
+            $retailHandAssetRoot `
+            "PipBoyGlove01.dds"
+        $retailPipBoyMesh = Join-Path `
+            $retailHandAssetRoot `
+            "pipboyarm.fpm"
+        $retailPipBoyScreenMesh = Join-Path `
+            $retailHandAssetRoot `
+            "pipboyscreen.fps"
+        $retailPipBoyTexture = Join-Path `
+            $retailHandAssetRoot `
+            "PipBoyArm01.dds"
         if ((Test-Path -LiteralPath $retailLeftHandMesh -PathType Leaf) -and
-            (Test-Path -LiteralPath $retailRightHandMesh -PathType Leaf)) {
+            (Test-Path -LiteralPath $retailRightHandMesh -PathType Leaf) -and
+            (Test-Path -LiteralPath $retailLeftCuffMesh -PathType Leaf) -and
+            (Test-Path -LiteralPath $retailLeftCuffTexture -PathType Leaf)) {
             # These are local derived meshes generated from the user's own
             # installed retail BSA. They are never staged into the game or
             # distributed by the source tree; the host validates their exact
@@ -2520,7 +2582,31 @@ function Get-FnvxrProductMinimalEnvironment {
                 [System.IO.Path]::GetFullPath($retailLeftHandMesh)
             $environment.FNVXR_RETAIL_RIGHT_HAND_MESH_PATH =
                 [System.IO.Path]::GetFullPath($retailRightHandMesh)
+            $environment.FNVXR_RETAIL_LEFT_CUFF_MESH_PATH =
+                [System.IO.Path]::GetFullPath($retailLeftCuffMesh)
+            $environment.FNVXR_RETAIL_LEFT_CUFF_TEXTURE_PATH =
+                [System.IO.Path]::GetFullPath($retailLeftCuffTexture)
+            if (Test-Path -LiteralPath $retailHandTexture -PathType Leaf) {
+                $environment.FNVXR_RETAIL_HAND_TEXTURE_PATH =
+                    [System.IO.Path]::GetFullPath($retailHandTexture)
+            }
         }
+        if ((Test-Path -LiteralPath $retailPipBoyMesh -PathType Leaf) -and
+            (Test-Path -LiteralPath $retailPipBoyScreenMesh -PathType Leaf) -and
+            (Test-Path -LiteralPath $retailPipBoyTexture -PathType Leaf)) {
+            $environment.FNVXR_RETAIL_PIPBOY_MESH_PATH =
+                [System.IO.Path]::GetFullPath($retailPipBoyMesh)
+            $environment.FNVXR_RETAIL_PIPBOY_SCREEN_MESH_PATH =
+                [System.IO.Path]::GetFullPath($retailPipBoyScreenMesh)
+            $environment.FNVXR_RETAIL_PIPBOY_TEXTURE_PATH =
+                [System.IO.Path]::GetFullPath($retailPipBoyTexture)
+        }
+        $environment.FNVXR_RETAIL_LEFT_HAND_OFFSET_X = "0"
+        $environment.FNVXR_RETAIL_LEFT_HAND_OFFSET_Y = "0"
+        $environment.FNVXR_RETAIL_LEFT_HAND_OFFSET_Z = "0"
+        $environment.FNVXR_RETAIL_RIGHT_HAND_OFFSET_X = "-0.040"
+        $environment.FNVXR_RETAIL_RIGHT_HAND_OFFSET_Y = "0.026"
+        $environment.FNVXR_RETAIL_RIGHT_HAND_OFFSET_Z = "0"
     }
     if ($AutomateRecoveryLoad) {
         # This opt-in does not enable the general command or input bridge.
@@ -2648,8 +2734,8 @@ function Get-FnvxrProductMinimalEnvironment {
         if ($HeadsetControllerRigVisualTrial) {
             # A fixture-only visual lease. The OpenXR host still owns pose
             # sampling and final presentation; the D3D bridge owns stereo
-            # cameras. xNVSE may only restore/apply first-person hand and
-            # weapon transforms from current grip/aim pose samples.
+            # cameras. The host owns its retail-derived hands/Pip-Boy, while
+            # xNVSE may restore only the stock weapon from current aim poses.
             $environment.FNVXR_HEADSET_CONTROLLER_RIG_VISUAL_TRIAL = "1"
             # Select the observed outer seam so the already accumulated
             # engine-center eye pair can be published there. The center-
@@ -2685,6 +2771,8 @@ function Get-FnvxrProductMinimalEnvironment {
                 $environment.FNVXR_PLUGIN_KEYBOARD_MOVEMENT_ENABLE = "1"
                 $environment.FNVXR_PLUGIN_MENU_KEYBOARD_FALLBACK = "1"
                 $environment.FNVXR_PLUGIN_GAMEPLAY_KEYBOARD_FALLBACK = "1"
+                $environment.FNVXR_PLUGIN_ACCEPT_ON_EXTERNAL_DINPUT_CLICK = "1"
+                $environment.FNVXR_DIRECT_UI_CLICK = "1"
                 $environment.FNVXR_BUFFERED_DIRECTINPUT_CALL = "1"
             }
             if ($HeadsetCombatVisualTrial) {

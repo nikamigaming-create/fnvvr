@@ -29,9 +29,9 @@ constexpr std::uint32_t VrOriginStateCommitted = 2;
 // that exact commit.  Keeping this separate from camera/origin state prevents
 // unrelated stereo and weapon events from being joined into a false proof.
 constexpr std::uint32_t WeaponFrameSharedMagic = 0x57585646; // FVXW
-constexpr std::uint32_t WeaponFrameSharedVersion = 1;
+constexpr std::uint32_t WeaponFrameSharedVersion = 2;
 inline constexpr char WeaponFrameSharedMappingName[] =
-    "Local\\FNVXR_Weapon_Frame_v1";
+    "Local\\FNVXR_Weapon_Frame_v2";
 constexpr std::uint32_t WeaponFrameInvalid = 0;
 constexpr std::uint32_t WeaponFramePoseCommitted = 1;
 constexpr std::uint32_t WeaponFrameRenderConsumed = 2;
@@ -41,6 +41,7 @@ constexpr std::uint32_t WeaponFrameFlagRightAimCurrent = 1u << 1;
 constexpr std::uint32_t WeaponFrameFlagArmSolved = 1u << 2;
 constexpr std::uint32_t WeaponFrameFlagWeaponWritten = 1u << 3;
 constexpr std::uint32_t WeaponFrameFlagWeaponAligned = 1u << 4;
+constexpr std::uint32_t WeaponFrameFlagHandMeshRotationValid = 1u << 5;
 constexpr std::uint32_t WeaponFrameRequiredFlags =
     WeaponFrameFlagRightGripCurrent
     | WeaponFrameFlagRightAimCurrent
@@ -670,7 +671,7 @@ struct SharedWeaponFrameState
 {
     std::uint32_t magic;
     std::uint32_t version;
-    // Producer lane. Only xNVSE writes fields through weaponWorldRot.
+    // Producer lane. Only xNVSE writes fields through rightHandGripLocalRot.
     volatile LONG producerSequence;
     std::uint32_t status;
     std::uint64_t commitId;
@@ -685,6 +686,11 @@ struct SharedWeaponFrameState
     float rightHandWorldPos[3];
     float weaponWorldPos[3];
     float weaponWorldRot[9];
+    // Exact retail stock-hand orientation relative to the OpenXR grip pose,
+    // expressed as an OpenXR local quaternion (x, y, z, w). The compositor
+    // applies it to the locally derived authored grip mesh; translation stays
+    // on the separately verified wrist socket.
+    float rightHandGripLocalRot[4];
     // Consumer lane. Only the D3D9 first-person seam writes this lane.
     volatile LONG consumerSequence;
     std::uint32_t consumedStatus;
@@ -906,7 +912,7 @@ static_assert(sizeof(SharedXInputState) == 40, "SharedXInputState layout changed
 static_assert(sizeof(SharedDInputState) == 100, "SharedDInputState layout changed unexpectedly");
 static_assert(sizeof(SharedVrPoseState) == 288, "SharedVrPoseState layout changed unexpectedly");
 static_assert(sizeof(SharedVrOriginState) == 216, "SharedVrOriginState layout changed unexpectedly");
-static_assert(sizeof(SharedWeaponFrameState) == 160, "SharedWeaponFrameState layout changed unexpectedly");
+static_assert(sizeof(SharedWeaponFrameState) == 176, "SharedWeaponFrameState layout changed unexpectedly");
 static_assert(sizeof(SharedCameraState) == 80, "SharedCameraState layout changed");
 static_assert(sizeof(SharedRuntimeState) == 88, "SharedRuntimeState layout changed");
 static_assert(sizeof(SharedDesktopAssistUiQuadHeader) == 96, "SharedDesktopAssistUiQuadHeader layout changed");

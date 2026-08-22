@@ -1,4 +1,5 @@
 #include "fnvxr_cpu_engine_presentation.h"
+#include "fnvxr_pipboy_panel_contract.h"
 
 #include <cstdlib>
 #include <iostream>
@@ -83,18 +84,36 @@ presentation::FrameIdentity worldFrame(
 
 int main()
 {
+    require(
+        fnvxr::pipboy::screenPixelsReady({ 100u, 0.82f, 0.0f, 34.0f }),
+        "authored dark Pip-Boy pixels did not pass the screen-ready gate");
+    require(
+        !fnvxr::pipboy::screenPixelsReady({ 100u, 0.95f, 0.0f, 88.0f })
+            && !fnvxr::pipboy::screenPixelsReady(
+                { 100u, 0.02f, 0.0f, 2.0f })
+            && !fnvxr::pipboy::screenPixelsReady(
+                { 100u, 0.82f, 0.32f, 34.0f }),
+        "world, blank, or blue fallback pixels escaped the Pip-Boy gate");
+
     namespace liveContract = fnvxr::engine::live_pipboy;
     const liveContract::FocusDecision hover = liveContract::assessFocus({
-        true, false, 6u, 12u,
+        true, true, false, 6u, 12u,
     });
     const liveContract::FocusDecision focus = liveContract::assessFocus({
-        true, false, 12u, 12u,
+        true, true, false, 12u, 12u,
+    });
+    const liveContract::FocusDecision noGrip = liveContract::assessFocus({
+        true, false, false, 12u, 12u,
     });
     require(
         hover.hovered && !hover.focused && hover.scale > 1.0f
             && focus.focused && focus.requestOpen
             && focus.scale > hover.scale,
         "pointing did not smoothly focus and enlarge the live Pip-Boy");
+    require(
+        !noGrip.hovered && !noGrip.focused && !noGrip.requestOpen
+            && noGrip.scale == 1.0f,
+        "pointing without the activation grip opened the live Pip-Boy");
     require(
         liveContract::weaponOrbitSlot(0.0f, 1.0f) == 0
             && liveContract::weaponOrbitSlot(1.0f, 0.0f) == 2

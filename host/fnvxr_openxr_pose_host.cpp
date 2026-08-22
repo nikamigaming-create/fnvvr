@@ -231,6 +231,18 @@ struct LitVertex
     float nz;
 };
 
+struct RetailHandVertex
+{
+    float x;
+    float y;
+    float z;
+    float nx;
+    float ny;
+    float nz;
+    float u;
+    float v;
+};
+
 struct TexturedVertex
 {
     float x;
@@ -246,6 +258,14 @@ struct Constants
     XMFLOAT4 color;
 };
 
+// The compositor uses XR_ENVIRONMENT_BLEND_MODE_OPAQUE, so swapchain alpha is
+// presentation-inert. Preserve category IDs there for final-eye QA: unlike
+// scene-graph telemetry, these values prove the hands/device reached pixels.
+constexpr float SpatialAlphaLeftHand = 0.20f;
+constexpr float SpatialAlphaRightHand = 0.40f;
+constexpr float SpatialAlphaPipBoyHousing = 0.60f;
+constexpr float SpatialAlphaPipBoyScreen = 0.80f;
+
 struct Renderer
 {
     ComPtr<ID3D11VertexShader> vertexShader;
@@ -254,16 +274,21 @@ struct Renderer
     ComPtr<ID3D11VertexShader> roundedVertexShader;
     ComPtr<ID3D11PixelShader> roundedPixelShader;
     ComPtr<ID3D11InputLayout> roundedInputLayout;
+    ComPtr<ID3D11VertexShader> retailHandVertexShader;
+    ComPtr<ID3D11PixelShader> retailHandPixelShader;
+    ComPtr<ID3D11InputLayout> retailHandInputLayout;
     ComPtr<ID3D11Buffer> vertexBuffer;
     ComPtr<ID3D11Buffer> constantBuffer;
     ComPtr<ID3D11VertexShader> texturedVertexShader;
     ComPtr<ID3D11PixelShader> texturedPixelShader;
+    ComPtr<ID3D11PixelShader> forcedAlphaPixelShader;
     ComPtr<ID3D11PixelShader> centerNoHudPixelShader;
     ComPtr<ID3D11PixelShader> hudOverlayPixelShader;
     ComPtr<ID3D11PixelShader> edgeSmearPixelShader;
     ComPtr<ID3D11InputLayout> texturedInputLayout;
     ComPtr<ID3D11Buffer> texturedVertexBuffer;
     ComPtr<ID3D11Buffer> pipBoyScreenTexturedVertexBuffer;
+    UINT pipBoyScreenTexturedVertexCount = 0;
     ComPtr<ID3D11Buffer> roundedVertexBuffer;
     UINT roundedVertexCount = 0;
     ComPtr<ID3D11Buffer> handVertexBuffer;
@@ -272,6 +297,13 @@ struct Renderer
     UINT retailLeftHandVertexCount = 0;
     ComPtr<ID3D11Buffer> retailRightHandVertexBuffer;
     UINT retailRightHandVertexCount = 0;
+    ComPtr<ID3D11ShaderResourceView> retailHandTextureView;
+    ComPtr<ID3D11Buffer> retailLeftCuffVertexBuffer;
+    UINT retailLeftCuffVertexCount = 0;
+    ComPtr<ID3D11ShaderResourceView> retailLeftCuffTextureView;
+    ComPtr<ID3D11Buffer> retailPipBoyVertexBuffer;
+    UINT retailPipBoyVertexCount = 0;
+    ComPtr<ID3D11ShaderResourceView> retailPipBoyTextureView;
     ComPtr<ID3D11Buffer> curvedTexturedVertexBuffer;
     UINT curvedTexturedVertexCount = 0;
     ComPtr<ID3D11Buffer> shieldCenterTexturedVertexBuffer;
@@ -341,6 +373,7 @@ struct Renderer
     float retainedUiTextureAspect = 16.0f / 9.0f;
     bool retainedUiHostWindowCaptured = false;
     bool retainedUiLivePipBoySurface = false;
+    std::uint32_t livePipBoyUiUploadCount = 0u;
     std::uint64_t retainedCpuUiTransactionId = 0u;
     std::uint64_t retainedCpuUiEpoch = 0u;
     std::uint32_t retainedCpuUiProducerProcessId = 0u;
@@ -444,6 +477,8 @@ struct HostSharedBridge
     fnvxr::shared::SharedVrPoseState* vrPoseState = nullptr;
     HANDLE playerMapping = nullptr;
     fnvxr::shared::SharedPlayerState* playerState = nullptr;
+    HANDLE weaponFrameMapping = nullptr;
+    fnvxr::shared::SharedWeaponFrameState* weaponFrameState = nullptr;
     std::uint32_t xinputPacket = 0;
     std::uint32_t dinputMouseClickPacket = 0;
     std::int32_t dinputHeadLookX = 0;
@@ -455,6 +490,10 @@ struct HostSharedBridge
     std::uint64_t lastPlayerFrame = 0;
     std::chrono::steady_clock::time_point playerAdvancedAt {};
     bool playerStateExpired = false;
+    XrQuaternionf rightHandGripLocalRotation {
+        0.0f, 0.0f, 0.0f, 1.0f };
+    bool rightHandGripLocalRotationValid = false;
+    std::uint64_t rightHandGripCalibrationCommitId = 0u;
 };
 
 struct EyeRenderProof
@@ -2580,6 +2619,79 @@ bool isMostlyBlackFrame(const std::vector<std::uint32_t>& pixels)
     return nonBlackSamples < minNonBlackSamples;
 }
 
+fnvxr::pipboy::ScreenPixelEvidence analyzePipBoyScreenPixels(
+    const CpuMonoUiFrame& frame)
+{
+    fnvxr::pipboy::ScreenPixelEvidence evidence {};
+    if (frame.width <= 0
+        || frame.height <= 0
+        || frame.pixels.size()
+            != static_cast<size_t>(frame.width)
+                * static_cast<size_t>(frame.height)
+        || !fnvxr::pipboy::validScreenCrop(
+            fnvxr::pipboy::RetailScreenCrop))
+    {
+        return evidence;
+    }
+
+    const auto& crop = fnvxr::pipboy::RetailScreenCrop;
+    const int left = std::clamp(
+        static_cast<int>(std::floor(crop.left * frame.width)),
+        0,
+        frame.width - 1);
+    const int right = std::clamp(
+        static_cast<int>(std::ceil(crop.right * frame.width)),
+        left + 1,
+        frame.width);
+    const int top = std::clamp(
+        static_cast<int>(std::floor(crop.top * frame.height)),
+        0,
+        frame.height - 1);
+    const int bottom = std::clamp(
+        static_cast<int>(std::ceil(crop.bottom * frame.height)),
+        top + 1,
+        frame.height);
+    const int stride = std::max(
+        1,
+        envInt("FNVXR_LIVE_PIPBOY_PIXEL_SAMPLE_STRIDE", 3));
+    std::uint32_t nonBlack = 0u;
+    std::uint32_t blueDominant = 0u;
+    double luma = 0.0;
+    for (int y = top; y < bottom; y += stride)
+    {
+        const size_t row = static_cast<size_t>(y)
+            * static_cast<size_t>(frame.width);
+        for (int x = left; x < right; x += stride)
+        {
+            const std::uint32_t pixel = frame.pixels[
+                row + static_cast<size_t>(x)];
+            const float blue = static_cast<float>(pixel & 0xffu);
+            const float green = static_cast<float>((pixel >> 8) & 0xffu);
+            const float red = static_cast<float>((pixel >> 16) & 0xffu);
+            if (std::max({ red, green, blue }) > 12.0f)
+                ++nonBlack;
+            if (blue > 50.0f
+                && blue > green * 1.10f
+                && blue > red * 1.10f)
+            {
+                ++blueDominant;
+            }
+            luma += blue * 0.114 + green * 0.587 + red * 0.299;
+            ++evidence.sampleCount;
+        }
+    }
+    if (evidence.sampleCount != 0u)
+    {
+        const float denominator = static_cast<float>(evidence.sampleCount);
+        evidence.nonBlackFraction = static_cast<float>(nonBlack) / denominator;
+        evidence.blueDominantFraction =
+            static_cast<float>(blueDominant) / denominator;
+        evidence.meanLuma = static_cast<float>(
+            luma / static_cast<double>(evidence.sampleCount));
+    }
+    return evidence;
+}
+
 bool readSharedD3D9StereoFrame(
     Renderer& renderer,
     std::array<std::vector<std::uint32_t>, 2>& eyePixels,
@@ -3494,6 +3606,7 @@ bool initHostSharedBridge(HostSharedBridge& bridge)
     bool dinputExisted = false;
     bool vrPoseExisted = false;
     bool playerExisted = false;
+    bool weaponFrameExisted = false;
     bridge.xinputState = mapOrCreateSharedState<fnvxr::shared::SharedXInputState>(
         bridge.xinputMapping,
         fnvxr::shared::XInputSharedMappingName,
@@ -3510,8 +3623,14 @@ bool initHostSharedBridge(HostSharedBridge& bridge)
         bridge.playerMapping,
         "Local\\FNVXR_Player_State",
         playerExisted);
+    bridge.weaponFrameState =
+        mapOrCreateSharedState<fnvxr::shared::SharedWeaponFrameState>(
+            bridge.weaponFrameMapping,
+            fnvxr::shared::WeaponFrameSharedMappingName,
+            weaponFrameExisted);
 
-    if (!bridge.xinputState || !bridge.dinputState || !bridge.vrPoseState || !bridge.playerState)
+    if (!bridge.xinputState || !bridge.dinputState || !bridge.vrPoseState
+        || !bridge.playerState || !bridge.weaponFrameState)
         return false;
 
     const bool retainedVrPoseIdentity = vrPoseExisted
@@ -3812,6 +3931,65 @@ bool readSharedPlayerState(
     return false;
 }
 
+bool updateSharedRightHandGripCalibration(HostSharedBridge& bridge)
+{
+    const auto* state = bridge.weaponFrameState;
+    if (!state)
+        return false;
+    for (int attempt = 0; attempt < 4; ++attempt)
+    {
+        const LONG sequenceBefore = state->producerSequence;
+        if (!fnvxr::shared::sequencedValueIsPublished(sequenceBefore))
+        {
+            YieldProcessor();
+            continue;
+        }
+        MemoryBarrier();
+        fnvxr::shared::SharedWeaponFrameState candidate {};
+        std::memcpy(&candidate, state, sizeof(candidate));
+        MemoryBarrier();
+        const LONG sequenceAfter = state->producerSequence;
+        if (sequenceBefore != sequenceAfter
+            || !fnvxr::shared::sequencedValueIsPublished(sequenceAfter))
+        {
+            YieldProcessor();
+            continue;
+        }
+        if (candidate.magic != fnvxr::shared::WeaponFrameSharedMagic
+            || candidate.version != fnvxr::shared::WeaponFrameSharedVersion
+            || candidate.status
+                != fnvxr::shared::WeaponFramePoseCommitted
+            || (candidate.flags
+                    & fnvxr::shared::WeaponFrameFlagHandMeshRotationValid)
+                == 0u
+            || candidate.commitId == 0u)
+        {
+            return false;
+        }
+        const float x = candidate.rightHandGripLocalRot[0];
+        const float y = candidate.rightHandGripLocalRot[1];
+        const float z = candidate.rightHandGripLocalRot[2];
+        const float w = candidate.rightHandGripLocalRot[3];
+        const float length = std::sqrt(x * x + y * y + z * z + w * w);
+        if (!std::isfinite(length) || length < 0.5f || length > 1.5f)
+            return false;
+        bridge.rightHandGripLocalRotation = {
+            x / length, y / length, z / length, w / length };
+        bridge.rightHandGripLocalRotationValid = true;
+        if (bridge.rightHandGripCalibrationCommitId != candidate.commitId)
+        {
+            bridge.rightHandGripCalibrationCommitId = candidate.commitId;
+            std::cout
+                << "rightHandGripCalibration valid=1 commit="
+                << candidate.commitId
+                << " quat=(" << x / length << "," << y / length
+                << "," << z / length << "," << w / length << ")\n";
+        }
+        return true;
+    }
+    return false;
+}
+
 void writePoseToShared(const XrPosef& pose, float rot[4], float pos[3])
 {
     rot[0] = pose.orientation.x;
@@ -3964,6 +4142,16 @@ void closeHostSharedBridge(HostSharedBridge& bridge)
     {
         CloseHandle(bridge.playerMapping);
         bridge.playerMapping = nullptr;
+    }
+    if (bridge.weaponFrameState)
+    {
+        UnmapViewOfFile(bridge.weaponFrameState);
+        bridge.weaponFrameState = nullptr;
+    }
+    if (bridge.weaponFrameMapping)
+    {
+        CloseHandle(bridge.weaponFrameMapping);
+        bridge.weaponFrameMapping = nullptr;
     }
     if (bridge.inputProducerMutex)
     {
@@ -5198,6 +5386,35 @@ XMMATRIX modelFromParentLocal(
             parent.position.z + rotatedOffset.z);
 }
 
+XMMATRIX modelFromParentLocalCalibration(
+    const XrPosef& parent,
+    const XMFLOAT3& localOffset,
+    const XrQuaternionf* localCalibration,
+    const XMFLOAT3& localEulerRadians,
+    const XMFLOAT3& scale)
+{
+    const XMVECTOR parentOrientation = quat(parent.orientation);
+    const XMVECTOR offset = XMVector3Rotate(
+        XMLoadFloat3(&localOffset),
+        parentOrientation);
+    XMFLOAT3 rotatedOffset {};
+    XMStoreFloat3(&rotatedOffset, offset);
+    const XMVECTOR calibration = localCalibration
+        ? quat(*localCalibration)
+        : XMQuaternionIdentity();
+    return XMMatrixScaling(scale.x, scale.y, scale.z)
+        * XMMatrixRotationQuaternion(calibration)
+        * XMMatrixRotationRollPitchYaw(
+            localEulerRadians.x,
+            localEulerRadians.y,
+            localEulerRadians.z)
+        * XMMatrixRotationQuaternion(parentOrientation)
+        * XMMatrixTranslation(
+            parent.position.x + rotatedOffset.x,
+            parent.position.y + rotatedOffset.y,
+            parent.position.z + rotatedOffset.z);
+}
+
 XrPosef poseFromBasis(XMVECTOR position, XMVECTOR xAxis, XMVECTOR yAxis, XMVECTOR zAxis)
 {
     xAxis = safeNormalize3(xAxis, XMVectorSet(1.0f, 0.0f, 0.0f, 0.0f));
@@ -5339,7 +5556,7 @@ GamePlane livePipBoyInteractionPlane(const SolvedArm& leftArm, float scale)
 {
     GamePlane plane {};
     constexpr float WristPipBoyDisplayAspect = 1.60f;
-    plane.width = envFloat("FNVXR_PIPBOY_WRIST_UI_WIDTH", 0.34f)
+    plane.width = envFloat("FNVXR_PIPBOY_WRIST_UI_WIDTH", 0.12f)
         * std::clamp(scale, 1.0f, 1.5f);
     plane.height = plane.width / WristPipBoyDisplayAspect;
 
@@ -5362,7 +5579,7 @@ GamePlane livePipBoyInteractionPlane(const SolvedArm& leftArm, float scale)
     };
 
     const XMFLOAT3 localOffset {
-        envFloat("FNVXR_PIPBOY_WRIST_UI_OFFSET_X", 0.0f),
+        envFloat("FNVXR_PIPBOY_WRIST_UI_OFFSET_X", -0.11f),
         envFloat("FNVXR_PIPBOY_WRIST_UI_OFFSET_Y", 0.075f),
         envFloat("FNVXR_PIPBOY_WRIST_UI_OFFSET_Z", -0.035f),
     };
@@ -5549,12 +5766,48 @@ void drawLocalRounded(
         color);
 }
 
+void drawRetailTexturedModel(
+    ID3D11DeviceContext* context,
+    Renderer& renderer,
+    const XMMATRIX& viewProjection,
+    const XMMATRIX& model,
+    ID3D11Buffer* vertexBuffer,
+    UINT vertexCount,
+    ID3D11ShaderResourceView* textureView,
+    const XMFLOAT4& color)
+{
+    if (!vertexBuffer || vertexCount == 0u || !textureView)
+        return;
+    Constants constants {};
+    XMStoreFloat4x4(&constants.mvp, model * viewProjection);
+    constants.color = color;
+    context->UpdateSubresource(
+        renderer.constantBuffer.Get(), 0, nullptr, &constants, 0, 0);
+
+    const UINT stride = sizeof(RetailHandVertex);
+    const UINT offset = 0;
+    context->IASetInputLayout(renderer.retailHandInputLayout.Get());
+    context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    context->IASetVertexBuffers(0, 1, &vertexBuffer, &stride, &offset);
+    context->VSSetShader(renderer.retailHandVertexShader.Get(), nullptr, 0);
+    context->PSSetShader(renderer.retailHandPixelShader.Get(), nullptr, 0);
+    context->VSSetConstantBuffers(0, 1, renderer.constantBuffer.GetAddressOf());
+    context->PSSetConstantBuffers(0, 1, renderer.constantBuffer.GetAddressOf());
+    context->PSSetShaderResources(0, 1, &textureView);
+    context->PSSetSamplers(0, 1, renderer.gameSampler.GetAddressOf());
+    context->Draw(vertexCount, 0);
+    ID3D11ShaderResourceView* empty = nullptr;
+    context->PSSetShaderResources(0, 1, &empty);
+    bindSolidPipeline(context, renderer);
+}
+
 void drawHandPrimitive(
     ID3D11DeviceContext* context,
     Renderer& renderer,
     const XMMATRIX& viewProjection,
     const XrPosef& wristPose,
-    bool left)
+    bool left,
+    const XrQuaternionf* rightHandGripLocalRotation)
 {
     ID3D11Buffer* selectedHand = left
         ? renderer.retailLeftHandVertexBuffer.Get()
@@ -5571,10 +5824,24 @@ void drawHandPrimitive(
     if (!selectedHand || selectedVertexCount == 0u)
         return;
 
+    const char* sideToken = left ? "LEFT" : "RIGHT";
+    auto sideFloat = [&](const char* suffix, float fallback)
+    {
+        std::string name = "FNVXR_RETAIL_";
+        name += sideToken;
+        name += "_HAND_";
+        name += suffix;
+        return envFloat(name.c_str(), fallback);
+    };
     const XMFLOAT3 localOffset {
-        left ? 0.0f : -0.040f,
-        -0.005f,
-        -0.010f,
+        sideFloat("OFFSET_X", left ? 0.0f : -0.040f),
+        sideFloat("OFFSET_Y", left ? 0.0f : 0.026f),
+        sideFloat("OFFSET_Z", 0.0f),
+    };
+    const XMFLOAT3 localRotation {
+        degreesToRadians(sideFloat("ROT_X", 0.0f)),
+        degreesToRadians(sideFloat("ROT_Y", 0.0f)),
+        degreesToRadians(sideFloat("ROT_Z", 0.0f)),
     };
     const float retailScale = retailMesh
         ? envFloat("FNVXR_RETAIL_HAND_MESH_SCALE", 1.0f)
@@ -5582,18 +5849,51 @@ void drawHandPrimitive(
     const XMFLOAT3 scale = retailMesh
         ? XMFLOAT3 { retailScale, retailScale, retailScale }
         : XMFLOAT3 { left ? -1.0f : 1.0f, 1.0f, 1.0f };
+    const XMMATRIX model = modelFromParentLocalCalibration(
+        wristPose,
+        localOffset,
+        left ? nullptr : rightHandGripLocalRotation,
+        localRotation,
+        scale);
+    const float spatialAlpha = left
+        ? SpatialAlphaLeftHand : SpatialAlphaRightHand;
+    const bool texturedRetail = retailMesh
+        && renderer.retailHandTextureView;
+    if (texturedRetail)
+    {
+        drawRetailTexturedModel(
+            context,
+            renderer,
+            viewProjection,
+            model,
+            selectedHand,
+            selectedVertexCount,
+            renderer.retailHandTextureView.Get(),
+            { 1.0f, 1.0f, 1.0f, spatialAlpha });
+        if (left
+            && renderer.retailLeftCuffVertexBuffer
+            && renderer.retailLeftCuffVertexCount != 0u
+            && renderer.retailLeftCuffTextureView)
+        {
+            drawRetailTexturedModel(
+                context,
+                renderer,
+                viewProjection,
+                model,
+                renderer.retailLeftCuffVertexBuffer.Get(),
+                renderer.retailLeftCuffVertexCount,
+                renderer.retailLeftCuffTextureView.Get(),
+                { 1.0f, 1.0f, 1.0f, spatialAlpha });
+        }
+        return;
+    }
     Constants constants {};
     XMStoreFloat4x4(
         &constants.mvp,
-        modelFromParentLocal(
-            wristPose,
-            localOffset,
-            { 0.0f, 0.0f, 0.0f },
-            scale)
-            * viewProjection);
+        model * viewProjection);
     constants.color = retailMesh
-        ? XMFLOAT4 { 0.48f, 0.34f, 0.25f, 1.0f }
-        : XMFLOAT4 { 0.34f, 0.36f, 0.29f, 1.0f };
+        ? XMFLOAT4 { 0.48f, 0.34f, 0.25f, spatialAlpha }
+        : XMFLOAT4 { 0.34f, 0.36f, 0.29f, spatialAlpha };
     context->UpdateSubresource(
         renderer.constantBuffer.Get(),
         0,
@@ -5602,7 +5902,8 @@ void drawHandPrimitive(
         0,
         0);
 
-    const UINT stride = sizeof(LitVertex);
+    const UINT stride = retailMesh
+        ? sizeof(RetailHandVertex) : sizeof(LitVertex);
     const UINT offset = 0;
     context->IASetInputLayout(renderer.roundedInputLayout.Get());
     context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -5714,10 +6015,11 @@ void drawPipBoyScreen(
         modelFromPose(
             screenPlane.pose,
             { screenPlane.width, screenPlane.height, 1.0f }),
-        { 1.0f, 1.0f, 1.0f, 1.0f },
+        { 1.0f, 1.0f, 1.0f, SpatialAlphaPipBoyScreen },
         sourceTextureView,
         renderer.pipBoyScreenTexturedVertexBuffer.Get(),
-        6u);
+        renderer.pipBoyScreenTexturedVertexCount,
+        renderer.forcedAlphaPixelShader.Get());
 }
 
 void drawGamePlane(
@@ -6047,6 +6349,7 @@ void commitUiTextureCandidate(
     renderer.retainedUiTextureAspect = candidate.aspect;
     renderer.retainedUiHostWindowCaptured = false;
     renderer.retainedUiLivePipBoySurface = false;
+    renderer.livePipBoyUiUploadCount = 0u;
     renderer.retainedCpuUiTransactionId = 0u;
     renderer.retainedCpuUiEpoch = 0u;
     renderer.retainedCpuUiProducerProcessId = 0u;
@@ -6063,6 +6366,7 @@ void clearRetainedUiResource(Renderer& renderer) noexcept
     renderer.retainedUiTextureAspect = 16.0f / 9.0f;
     renderer.retainedUiHostWindowCaptured = false;
     renderer.retainedUiLivePipBoySurface = false;
+    renderer.livePipBoyUiUploadCount = 0u;
     renderer.retainedCpuUiTransactionId = 0u;
     renderer.retainedCpuUiEpoch = 0u;
     renderer.retainedCpuUiProducerProcessId = 0u;
@@ -6791,9 +7095,29 @@ void drawPipboyRig(
     const float scale = envFloat("FNVXR_PIPBOY_SCALE", 1.0f);
     const float width = screenPlane.width;
     const float height = screenPlane.height;
-    const XMFLOAT4 casing { 0.16f, 0.19f, 0.12f, 1.0f };
-    const XMFLOAT4 edge { 0.08f, 0.10f, 0.07f, 1.0f };
-    const XMFLOAT4 control { 0.42f, 0.46f, 0.28f, 1.0f };
+    if (renderer.retailPipBoyVertexBuffer
+        && renderer.retailPipBoyVertexCount != 0u
+        && renderer.retailPipBoyTextureView)
+    {
+        drawRetailTexturedModel(
+            context,
+            renderer,
+            viewProjection,
+            modelFromPose(
+                screenPlane.pose,
+                { width * scale, height * scale, width * scale }),
+            renderer.retailPipBoyVertexBuffer.Get(),
+            renderer.retailPipBoyVertexCount,
+            renderer.retailPipBoyTextureView.Get(),
+            { 1.0f, 1.0f, 1.0f, SpatialAlphaPipBoyHousing });
+        return;
+    }
+    const XMFLOAT4 casing {
+        0.16f, 0.19f, 0.12f, SpatialAlphaPipBoyHousing };
+    const XMFLOAT4 edge {
+        0.08f, 0.10f, 0.07f, SpatialAlphaPipBoyHousing };
+    const XMFLOAT4 control {
+        0.42f, 0.46f, 0.28f, SpatialAlphaPipBoyHousing };
 
     // A stable host-owned housing replaces only the stock Pip-Boy category,
     // whose manually requeued skinning data is invalid in the private stereo
@@ -6819,7 +7143,7 @@ void drawPipboyRig(
         { 0.0f, 0.0f, -0.006f },
         { 0.0f, 0.0f, 0.0f },
         { width * scale, height * scale, 0.010f * scale },
-        { 0.015f, 0.065f, 0.035f, 1.0f });
+        { 0.015f, 0.065f, 0.035f, SpatialAlphaPipBoyHousing });
     drawLocalCube(
         context,
         renderer,
@@ -6872,7 +7196,8 @@ void drawHandFingers(
     Renderer& renderer,
     const XMMATRIX& viewProjection,
     const XrPosef& wristPose,
-    bool left)
+    bool left,
+    const XrQuaternionf* rightHandGripLocalRotation)
 {
     if (!envEnabled("FNVXR_SHOW_HAND_FINGERS", true))
         return;
@@ -6881,7 +7206,8 @@ void drawHandFingers(
         renderer,
         viewProjection,
         wristPose,
-        left);
+        left,
+        rightHandGripLocalRotation);
 }
 
 void drawPauseModeScene(
@@ -7097,6 +7423,7 @@ bool renderEye(
     const XrPosef& rightPose,
     const XrPosef& leftAimPose,
     const XrPosef& rightAimPose,
+    const XrQuaternionf* rightHandGripLocalRotation,
     const BodyRig& bodyRig,
     const MenuPointer& menuPointer,
     const WeaponOrbitWheel& weaponOrbitWheel,
@@ -7270,15 +7597,23 @@ bool renderEye(
                 { 0.26f, 0.28f, 0.23f, 1.0f },
                 { 0.20f, 0.22f, 0.18f, 1.0f });
         }
-        drawHandFingers(context.Get(), renderer, viewProjection, bodyRig.left.wrist, true);
-        drawHandFingers(context.Get(), renderer, viewProjection, bodyRig.right.wrist, false);
+        drawHandFingers(
+            context.Get(), renderer, viewProjection,
+            bodyRig.left.wrist, true, nullptr);
+        drawHandFingers(
+            context.Get(), renderer, viewProjection,
+            bodyRig.right.wrist, false, rightHandGripLocalRotation);
     }
     else if (drawWorldProps)
     {
         drawCube(context.Get(), renderer, viewProjection, leftPose, { 0.08f, 0.08f, 0.08f }, { 0.05f, 0.35f, 1.0f, 1.0f });
         drawCube(context.Get(), renderer, viewProjection, rightPose, { 0.08f, 0.08f, 0.08f }, { 1.0f, 0.42f, 0.08f, 1.0f });
-        drawHandFingers(context.Get(), renderer, viewProjection, leftPose, true);
-        drawHandFingers(context.Get(), renderer, viewProjection, rightPose, false);
+        drawHandFingers(
+            context.Get(), renderer, viewProjection,
+            leftPose, true, nullptr);
+        drawHandFingers(
+            context.Get(), renderer, viewProjection,
+            rightPose, false, rightHandGripLocalRotation);
     }
     if (drawWorldProps && envEnabled("FNVXR_SHOW_PIPBOY_RIG", true))
         drawPipboyRig(
@@ -8208,9 +8543,11 @@ std::vector<LitVertex> makeHandPrimitiveVertices()
     return vertices;
 }
 
-bool loadRetailHandMesh(
+bool loadRetailTexturedMesh(
     ID3D11Device* device,
     const char* environmentName,
+    const char expectedMagic[4],
+    std::uint32_t expectedVersion,
     ComPtr<ID3D11Buffer>& buffer,
     UINT& vertexCount)
 {
@@ -8238,8 +8575,8 @@ bool loadRetailHandMesh(
         || !stream.read(
             reinterpret_cast<char*>(&header),
             sizeof(header))
-        || std::memcmp(header.magic, "FHM1", 4u) != 0
-        || header.version != 1u
+        || std::memcmp(header.magic, expectedMagic, 4u) != 0
+        || header.version != expectedVersion
         || header.reserved != 0u
         || header.vertexCount < 300u
         || header.vertexCount > 100000u
@@ -8247,35 +8584,42 @@ bool loadRetailHandMesh(
         || length != static_cast<std::streamoff>(
             sizeof(header)
             + static_cast<std::uint64_t>(header.vertexCount)
-                * sizeof(LitVertex)))
+                * sizeof(RetailHandVertex)))
     {
         return false;
     }
 
-    std::vector<LitVertex> vertices(header.vertexCount);
+    std::vector<RetailHandVertex> vertices(header.vertexCount);
     if (!stream.read(
             reinterpret_cast<char*>(vertices.data()),
             static_cast<std::streamsize>(
-                vertices.size() * sizeof(LitVertex))))
+                vertices.size() * sizeof(RetailHandVertex))))
     {
         return false;
     }
-    for (const LitVertex& vertex : vertices)
+    for (const RetailHandVertex& vertex : vertices)
     {
-        const float values[] {
+        const float spatialValues[] {
             vertex.x, vertex.y, vertex.z,
             vertex.nx, vertex.ny, vertex.nz,
         };
-        for (float value : values)
+        for (float value : spatialValues)
         {
             if (!std::isfinite(value) || std::fabs(value) > 2.0f)
                 return false;
+        }
+        if (!std::isfinite(vertex.u)
+            || !std::isfinite(vertex.v)
+            || std::fabs(vertex.u) > 16.0f
+            || std::fabs(vertex.v) > 16.0f)
+        {
+            return false;
         }
     }
 
     D3D11_BUFFER_DESC description {};
     description.ByteWidth = static_cast<UINT>(
-        vertices.size() * sizeof(LitVertex));
+        vertices.size() * sizeof(RetailHandVertex));
     description.Usage = D3D11_USAGE_DEFAULT;
     description.BindFlags = D3D11_BIND_VERTEX_BUFFER;
     D3D11_SUBRESOURCE_DATA initial {};
@@ -8288,8 +8632,82 @@ bool loadRetailHandMesh(
         return false;
     }
     vertexCount = header.vertexCount;
-    std::cout << "retailHandMesh loaded env=" << environmentName
+    std::cout << "retailTexturedMesh loaded env=" << environmentName
               << " vertices=" << vertexCount << " path=" << path << "\n";
+    return true;
+}
+
+bool loadRetailPipBoyScreenMesh(
+    ID3D11Device* device,
+    ComPtr<ID3D11Buffer>& buffer,
+    UINT& vertexCount)
+{
+    buffer.Reset();
+    vertexCount = 0u;
+    const char* path = std::getenv(
+        "FNVXR_RETAIL_PIPBOY_SCREEN_MESH_PATH");
+    if (!path || !*path)
+        return true;
+
+    struct Header
+    {
+        char magic[4];
+        std::uint32_t version;
+        std::uint32_t vertexCount;
+        std::uint32_t reserved;
+    };
+    static_assert(sizeof(Header) == 16u);
+    std::ifstream stream(path, std::ios::binary | std::ios::ate);
+    if (!stream)
+        return false;
+    const std::streamoff length = stream.tellg();
+    stream.seekg(0, std::ios::beg);
+    Header header {};
+    if (length < static_cast<std::streamoff>(sizeof(header))
+        || !stream.read(reinterpret_cast<char*>(&header), sizeof(header))
+        || std::memcmp(header.magic, "FPS1", 4u) != 0
+        || header.version != 1u
+        || header.reserved != 0u
+        || header.vertexCount < 3u
+        || header.vertexCount > 10000u
+        || header.vertexCount % 3u != 0u
+        || length != static_cast<std::streamoff>(
+            sizeof(header)
+            + static_cast<std::uint64_t>(header.vertexCount)
+                * sizeof(TexturedVertex)))
+    {
+        return false;
+    }
+    std::vector<TexturedVertex> vertices(header.vertexCount);
+    if (!stream.read(
+            reinterpret_cast<char*>(vertices.data()),
+            static_cast<std::streamsize>(
+                vertices.size() * sizeof(TexturedVertex))))
+    {
+        return false;
+    }
+    for (const TexturedVertex& vertex : vertices)
+    {
+        const float values[] {
+            vertex.x, vertex.y, vertex.z, vertex.u, vertex.v };
+        for (float value : values)
+        {
+            if (!std::isfinite(value) || std::fabs(value) > 2.0f)
+                return false;
+        }
+    }
+    D3D11_BUFFER_DESC description {};
+    description.ByteWidth = static_cast<UINT>(
+        vertices.size() * sizeof(TexturedVertex));
+    description.Usage = D3D11_USAGE_DEFAULT;
+    description.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+    D3D11_SUBRESOURCE_DATA initial {};
+    initial.pSysMem = vertices.data();
+    if (FAILED(device->CreateBuffer(&description, &initial, &buffer)))
+        return false;
+    vertexCount = header.vertexCount;
+    std::cout << "retailPipBoyScreenMesh loaded vertices="
+              << vertexCount << " path=" << path << "\n";
     return true;
 }
 
@@ -8422,6 +8840,97 @@ float4 PSMain(VSOutput input) : SV_TARGET
         return false;
     }
 
+    const char* retailHandShaderSource = R"(
+cbuffer ConstantsBuffer : register(b0)
+{
+    row_major float4x4 mvp;
+    float4 color;
+};
+
+Texture2D diffuseTexture : register(t0);
+SamplerState diffuseSampler : register(s0);
+
+struct VSInput
+{
+    float3 position : POSITION;
+    float3 normal : NORMAL;
+    float2 uv : TEXCOORD0;
+};
+
+struct VSOutput
+{
+    float4 position : SV_POSITION;
+    float3 normal : NORMAL;
+    float2 uv : TEXCOORD0;
+};
+
+VSOutput VSMain(VSInput input)
+{
+    VSOutput output;
+    output.position = mul(float4(input.position, 1.0), mvp);
+    output.normal = input.normal;
+    output.uv = input.uv;
+    return output;
+}
+
+float4 PSMain(VSOutput input) : SV_TARGET
+{
+    float4 diffuse = diffuseTexture.Sample(diffuseSampler, input.uv);
+    float3 normal = normalize(input.normal);
+    float lambert = saturate(dot(
+        normal,
+        normalize(float3(-0.35, 0.72, -0.58))));
+    float rim = pow(saturate(1.0 - abs(normal.z)), 2.0);
+    float light = 0.42 + lambert * 0.50 + rim * 0.08;
+    return float4(diffuse.rgb * color.rgb * light, diffuse.a * color.a);
+}
+)";
+    ComPtr<ID3DBlob> retailHandVertexBlob;
+    ComPtr<ID3DBlob> retailHandPixelBlob;
+    if (!compileShader(
+            retailHandShaderSource,
+            "VSMain",
+            "vs_5_0",
+            &retailHandVertexBlob)
+        || !compileShader(
+            retailHandShaderSource,
+            "PSMain",
+            "ps_5_0",
+            &retailHandPixelBlob))
+    {
+        return false;
+    }
+    if (FAILED(device->CreateVertexShader(
+            retailHandVertexBlob->GetBufferPointer(),
+            retailHandVertexBlob->GetBufferSize(),
+            nullptr,
+            &renderer.retailHandVertexShader))
+        || FAILED(device->CreatePixelShader(
+            retailHandPixelBlob->GetBufferPointer(),
+            retailHandPixelBlob->GetBufferSize(),
+            nullptr,
+            &renderer.retailHandPixelShader)))
+    {
+        return false;
+    }
+    D3D11_INPUT_ELEMENT_DESC retailHandInputElements[] {
+        { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0,
+          D3D11_INPUT_PER_VERTEX_DATA, 0 },
+        { "NORMAL", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0,
+          sizeof(float) * 3, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+        { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0,
+          sizeof(float) * 6, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+    };
+    if (FAILED(device->CreateInputLayout(
+            retailHandInputElements,
+            static_cast<UINT>(std::size(retailHandInputElements)),
+            retailHandVertexBlob->GetBufferPointer(),
+            retailHandVertexBlob->GetBufferSize(),
+            &renderer.retailHandInputLayout)))
+    {
+        return false;
+    }
+
     const char* texturedShaderSource = R"(
 cbuffer ConstantsBuffer : register(b0)
 {
@@ -8455,6 +8964,12 @@ VSOutput VSMain(VSInput input)
 float4 PSMain(VSOutput input) : SV_TARGET
 {
     return gameTexture.Sample(gameSampler, input.uv) * color;
+}
+
+float4 PSForcedAlpha(VSOutput input) : SV_TARGET
+{
+    float4 sampleColor = gameTexture.Sample(gameSampler, input.uv);
+    return float4(sampleColor.rgb * color.rgb, color.a);
 }
 
 float hudKeyMask(float3 sampleColor)
@@ -8540,11 +9055,13 @@ float4 PSHudOverlay(VSOutput input) : SV_TARGET
 
     ComPtr<ID3DBlob> texturedVertexBlob;
     ComPtr<ID3DBlob> texturedPixelBlob;
+    ComPtr<ID3DBlob> forcedAlphaPixelBlob;
     ComPtr<ID3DBlob> centerNoHudPixelBlob;
     ComPtr<ID3DBlob> hudOverlayPixelBlob;
     ComPtr<ID3DBlob> edgeSmearPixelBlob;
     if (!compileShader(texturedShaderSource, "VSMain", "vs_5_0", &texturedVertexBlob)
         || !compileShader(texturedShaderSource, "PSMain", "ps_5_0", &texturedPixelBlob)
+        || !compileShader(texturedShaderSource, "PSForcedAlpha", "ps_5_0", &forcedAlphaPixelBlob)
         || !compileShader(texturedShaderSource, "PSCenterNoHud", "ps_5_0", &centerNoHudPixelBlob)
         || !compileShader(texturedShaderSource, "PSHudOverlay", "ps_5_0", &hudOverlayPixelBlob)
         || !compileShader(texturedShaderSource, "PSEdgeSmear", "ps_5_0", &edgeSmearPixelBlob))
@@ -8554,6 +9071,14 @@ float4 PSHudOverlay(VSOutput input) : SV_TARGET
         return false;
     if (FAILED(device->CreatePixelShader(texturedPixelBlob->GetBufferPointer(), texturedPixelBlob->GetBufferSize(), nullptr, &renderer.texturedPixelShader)))
         return false;
+    if (FAILED(device->CreatePixelShader(
+            forcedAlphaPixelBlob->GetBufferPointer(),
+            forcedAlphaPixelBlob->GetBufferSize(),
+            nullptr,
+            &renderer.forcedAlphaPixelShader)))
+    {
+        return false;
+    }
     if (FAILED(device->CreatePixelShader(
             centerNoHudPixelBlob->GetBufferPointer(),
             centerNoHudPixelBlob->GetBufferSize(),
@@ -8654,18 +9179,106 @@ float4 PSHudOverlay(VSOutput input) : SV_TARGET
         return false;
     }
     renderer.handVertexCount = static_cast<UINT>(handVertices.size());
-    if (!loadRetailHandMesh(
+    if (!loadRetailTexturedMesh(
             device,
             "FNVXR_RETAIL_LEFT_HAND_MESH_PATH",
+            "FHM2",
+            2u,
             renderer.retailLeftHandVertexBuffer,
             renderer.retailLeftHandVertexCount)
-        || !loadRetailHandMesh(
+        || !loadRetailTexturedMesh(
             device,
             "FNVXR_RETAIL_RIGHT_HAND_MESH_PATH",
+            "FHM2",
+            2u,
             renderer.retailRightHandVertexBuffer,
-            renderer.retailRightHandVertexCount))
+            renderer.retailRightHandVertexCount)
+        || !loadRetailTexturedMesh(
+            device,
+            "FNVXR_RETAIL_LEFT_CUFF_MESH_PATH",
+            "FHM2",
+            2u,
+            renderer.retailLeftCuffVertexBuffer,
+            renderer.retailLeftCuffVertexCount))
     {
         return false;
+    }
+    const char* retailHandTexturePath =
+        std::getenv("FNVXR_RETAIL_HAND_TEXTURE_PATH");
+    if (retailHandTexturePath && *retailHandTexturePath)
+    {
+        int textureWidth = 0;
+        int textureHeight = 0;
+        const std::wstring widePath(
+            retailHandTexturePath,
+            retailHandTexturePath + std::strlen(retailHandTexturePath));
+        if (!loadTextureFromFile(
+                device,
+                widePath,
+                renderer.retailHandTextureView,
+                textureWidth,
+                textureHeight))
+        {
+            return false;
+        }
+        std::cout << "retailHandTexture loaded size="
+                  << textureWidth << "x" << textureHeight
+                  << " path=" << retailHandTexturePath << "\n";
+    }
+    const char* retailLeftCuffTexturePath =
+        std::getenv("FNVXR_RETAIL_LEFT_CUFF_TEXTURE_PATH");
+    if (retailLeftCuffTexturePath && *retailLeftCuffTexturePath)
+    {
+        int textureWidth = 0;
+        int textureHeight = 0;
+        const std::wstring widePath(
+            retailLeftCuffTexturePath,
+            retailLeftCuffTexturePath
+                + std::strlen(retailLeftCuffTexturePath));
+        if (!loadTextureFromFile(
+                device,
+                widePath,
+                renderer.retailLeftCuffTextureView,
+                textureWidth,
+                textureHeight))
+        {
+            return false;
+        }
+        std::cout << "retailLeftCuffTexture loaded size="
+                  << textureWidth << "x" << textureHeight
+                  << " path=" << retailLeftCuffTexturePath << "\n";
+    }
+    if (!loadRetailTexturedMesh(
+            device,
+            "FNVXR_RETAIL_PIPBOY_MESH_PATH",
+            "FPM1",
+            1u,
+            renderer.retailPipBoyVertexBuffer,
+            renderer.retailPipBoyVertexCount))
+    {
+        return false;
+    }
+    const char* retailPipBoyTexturePath =
+        std::getenv("FNVXR_RETAIL_PIPBOY_TEXTURE_PATH");
+    if (retailPipBoyTexturePath && *retailPipBoyTexturePath)
+    {
+        int textureWidth = 0;
+        int textureHeight = 0;
+        const std::wstring widePath(
+            retailPipBoyTexturePath,
+            retailPipBoyTexturePath + std::strlen(retailPipBoyTexturePath));
+        if (!loadTextureFromFile(
+                device,
+                widePath,
+                renderer.retailPipBoyTextureView,
+                textureWidth,
+                textureHeight))
+        {
+            return false;
+        }
+        std::cout << "retailPipBoyTexture loaded size="
+                  << textureWidth << "x" << textureHeight
+                  << " path=" << retailPipBoyTexturePath << "\n";
     }
 
     const TexturedVertex gamePlaneVertices[] = {
@@ -8686,28 +9299,40 @@ float4 PSHudOverlay(VSOutput input) : SV_TARGET
     if (FAILED(device->CreateBuffer(&gamePlaneDesc, &gamePlaneData, &renderer.texturedVertexBuffer)))
         return false;
 
-    constexpr auto pipBoyCrop = fnvxr::pipboy::RetailScreenCrop;
-    static_assert(fnvxr::pipboy::validScreenCrop(pipBoyCrop));
-    const TexturedVertex pipBoyScreenVertices[] = {
-        { -0.5f, -0.5f, 0.0f, pipBoyCrop.left,  pipBoyCrop.bottom },
-        { -0.5f,  0.5f, 0.0f, pipBoyCrop.left,  pipBoyCrop.top },
-        {  0.5f,  0.5f, 0.0f, pipBoyCrop.right, pipBoyCrop.top },
-        { -0.5f, -0.5f, 0.0f, pipBoyCrop.left,  pipBoyCrop.bottom },
-        {  0.5f,  0.5f, 0.0f, pipBoyCrop.right, pipBoyCrop.top },
-        {  0.5f, -0.5f, 0.0f, pipBoyCrop.right, pipBoyCrop.bottom },
-    };
-    D3D11_BUFFER_DESC pipBoyScreenDesc {};
-    pipBoyScreenDesc.ByteWidth = sizeof(pipBoyScreenVertices);
-    pipBoyScreenDesc.Usage = D3D11_USAGE_DEFAULT;
-    pipBoyScreenDesc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
-    D3D11_SUBRESOURCE_DATA pipBoyScreenData {};
-    pipBoyScreenData.pSysMem = pipBoyScreenVertices;
-    if (FAILED(device->CreateBuffer(
-            &pipBoyScreenDesc,
-            &pipBoyScreenData,
-            &renderer.pipBoyScreenTexturedVertexBuffer)))
+    if (!loadRetailPipBoyScreenMesh(
+            device,
+            renderer.pipBoyScreenTexturedVertexBuffer,
+            renderer.pipBoyScreenTexturedVertexCount))
     {
         return false;
+    }
+    if (!renderer.pipBoyScreenTexturedVertexBuffer)
+    {
+        constexpr auto pipBoyCrop = fnvxr::pipboy::RetailScreenCrop;
+        static_assert(fnvxr::pipboy::validScreenCrop(pipBoyCrop));
+        const TexturedVertex pipBoyScreenVertices[] = {
+            { -0.5f, -0.5f, 0.0f, pipBoyCrop.left,  pipBoyCrop.bottom },
+            { -0.5f,  0.5f, 0.0f, pipBoyCrop.left,  pipBoyCrop.top },
+            {  0.5f,  0.5f, 0.0f, pipBoyCrop.right, pipBoyCrop.top },
+            { -0.5f, -0.5f, 0.0f, pipBoyCrop.left,  pipBoyCrop.bottom },
+            {  0.5f,  0.5f, 0.0f, pipBoyCrop.right, pipBoyCrop.top },
+            {  0.5f, -0.5f, 0.0f, pipBoyCrop.right, pipBoyCrop.bottom },
+        };
+        D3D11_BUFFER_DESC pipBoyScreenDesc {};
+        pipBoyScreenDesc.ByteWidth = sizeof(pipBoyScreenVertices);
+        pipBoyScreenDesc.Usage = D3D11_USAGE_DEFAULT;
+        pipBoyScreenDesc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+        D3D11_SUBRESOURCE_DATA pipBoyScreenData {};
+        pipBoyScreenData.pSysMem = pipBoyScreenVertices;
+        if (FAILED(device->CreateBuffer(
+                &pipBoyScreenDesc,
+                &pipBoyScreenData,
+                &renderer.pipBoyScreenTexturedVertexBuffer)))
+        {
+            return false;
+        }
+        renderer.pipBoyScreenTexturedVertexCount =
+            static_cast<UINT>(std::size(pipBoyScreenVertices));
     }
 
     const std::vector<TexturedVertex> curvedGamePlaneVertices = makeCurvedGamePlaneVertices();
@@ -9887,6 +10512,7 @@ int main(int argc, char** argv)
     bool lastSharedPlayerWeaponOut = false;
     bool previousLoggedGameplayPlaneSize = false;
     bool previousLoggedPipBoyMenuMode = false;
+    bool previousPipBoyUiWarmupMode = false;
     float previousLoggedGamePlaneWidth = -1.0f;
     float previousLoggedGamePlaneHeight = -1.0f;
     float previousLoggedGamePlaneOffsetZ = 1000.0f;
@@ -10478,6 +11104,11 @@ int main(int argc, char** argv)
                 runtimeStateSample);
         fnvxr::shared::SharedPlayerState playerSnapshot {};
         const bool havePlayerSnapshot = readSharedPlayerState(sharedBridge, playerSnapshot);
+        static_cast<void>(updateSharedRightHandGripCalibration(sharedBridge));
+        const XrQuaternionf* rightHandGripLocalRotation =
+            sharedBridge.rightHandGripLocalRotationValid
+                ? &sharedBridge.rightHandGripLocalRotation
+                : nullptr;
         if (havePlayerSnapshot)
             sharedPlayerReadMisses = 0;
         else
@@ -10601,6 +11232,12 @@ int main(int argc, char** argv)
         const bool pipBoyMenuMode =
             haveRuntimeUiState
             && (runtimeMenuBits & fnvxr::shared::RuntimePipBoyMenuBit) != 0;
+        if (pipBoyMenuMode != previousPipBoyUiWarmupMode)
+        {
+            previousPipBoyUiWarmupMode = pipBoyMenuMode;
+            renderer.livePipBoyUiUploadCount = 0u;
+            renderer.retainedUiLivePipBoySurface = false;
+        }
         const bool livePipBoyScreenFocused =
             fnvxr::engine::live_pipboy::worldPresentationContinues(
                 runtimePhase,
@@ -10612,12 +11249,18 @@ int main(int argc, char** argv)
         const MenuPointer livePipBoyBasePointer = rightAimTracked
             ? menuPointerFromAimPose(rightAimPose, livePipBoyBasePlane)
             : MenuPointer {};
-        if (livePipBoyBasePointer.active)
+        const bool livePipBoyActivationGripHeld = rightGrip.active
+            && rightGrip.value >= envFloat(
+                "FNVXR_LIVE_PIPBOY_GRIP_THRESHOLD",
+                0.55f);
+        if (livePipBoyBasePointer.active
+            && livePipBoyActivationGripHeld)
             ++livePipBoyHoverFrames;
         else
             livePipBoyHoverFrames = 0u;
         livePipBoyFocus = fnvxr::engine::live_pipboy::assessFocus({
             livePipBoyBasePointer.active,
+            livePipBoyActivationGripHeld,
             pipBoyMenuMode,
             livePipBoyHoverFrames,
             static_cast<std::uint32_t>((std::max)(
@@ -10914,6 +11557,8 @@ int main(int argc, char** argv)
         bool cpuUiIncomingRuntimeLineageBracketed = false;
         bool cpuUiTextureUploadAttempted = false;
         bool cpuUiTextureUploadSucceeded = false;
+        fnvxr::pipboy::ScreenPixelEvidence pipBoyScreenPixelEvidence {};
+        bool pipBoyScreenPixelsReady = false;
         if (cpuUiRecordRead
             && cpu_presentation::flatUiBoundaryValid(incomingCpuUi.identity))
         {
@@ -10923,13 +11568,49 @@ int main(int argc, char** argv)
                 // wrist display, not a presentation-mode boundary. Keep the
                 // last verified binocular world transaction and update only
                 // the texture sampled by the tracked Pip-Boy screen.
-                cpuUiTextureUploadAttempted = true;
-                cpuUiTextureUploadSucceeded = uploadCpuEngineUiTexture(
-                    device.Get(),
-                    renderer,
+                pipBoyScreenPixelEvidence = analyzePipBoyScreenPixels(
                     incomingCpuUi);
-                if (cpuUiTextureUploadSucceeded)
-                    renderer.retainedUiLivePipBoySurface = true;
+                pipBoyScreenPixelsReady = fnvxr::pipboy::screenPixelsReady(
+                    pipBoyScreenPixelEvidence,
+                    envFloat(
+                        "FNVXR_LIVE_PIPBOY_MIN_NONBLACK_FRACTION",
+                        0.30f),
+                    envFloat(
+                        "FNVXR_LIVE_PIPBOY_MAX_BLUE_DOMINANT_FRACTION",
+                        0.20f),
+                    envFloat(
+                        "FNVXR_LIVE_PIPBOY_MAX_MEAN_LUMA",
+                        60.0f));
+                if (pipBoyScreenPixelsReady)
+                {
+                    cpuUiTextureUploadAttempted = true;
+                    cpuUiTextureUploadSucceeded = uploadCpuEngineUiTexture(
+                        device.Get(),
+                        renderer,
+                        incomingCpuUi);
+                    if (cpuUiTextureUploadSucceeded)
+                    {
+                        ++renderer.livePipBoyUiUploadCount;
+                        renderer.retainedUiLivePipBoySurface =
+                            renderer.livePipBoyUiUploadCount
+                                >= static_cast<std::uint32_t>(std::max(
+                                    1,
+                                    envInt(
+                                        "FNVXR_LIVE_PIPBOY_UI_WARMUP_UPLOADS",
+                                        3)));
+                    }
+                    else if (!renderer.retainedUiLivePipBoySurface)
+                    {
+                        renderer.livePipBoyUiUploadCount = 0u;
+                    }
+                }
+                else if (!renderer.retainedUiLivePipBoySurface)
+                {
+                    // The first menu frames can still contain the outdoor
+                    // world or an all-black transition. Keep the bezel closed
+                    // until consecutive copies prove authored Pip-Boy pixels.
+                    renderer.livePipBoyUiUploadCount = 0u;
+                }
             }
             else
             {
@@ -12217,6 +12898,7 @@ int main(int argc, char** argv)
                     rightPose,
                     leftAimPose,
                     rightAimPose,
+                    rightHandGripLocalRotation,
                     bodyRig,
                     menuPointer,
                     weaponWheel,
@@ -12246,6 +12928,7 @@ int main(int argc, char** argv)
                     rightPose,
                     leftAimPose,
                     rightAimPose,
+                    rightHandGripLocalRotation,
                     bodyRig,
                     menuPointer,
                     weaponWheel,
@@ -12470,6 +13153,16 @@ int main(int argc, char** argv)
                 << (cpuUiTextureUploadAttempted ? "true" : "false")
                 << ",\"cpuUiTextureUploadSucceeded\":"
                 << (cpuUiTextureUploadSucceeded ? "true" : "false")
+                << ",\"pipBoyScreenPixelsReady\":"
+                << (pipBoyScreenPixelsReady ? "true" : "false")
+                << ",\"pipBoyScreenPixelSamples\":"
+                << pipBoyScreenPixelEvidence.sampleCount
+                << ",\"pipBoyScreenNonBlackFraction\":"
+                << pipBoyScreenPixelEvidence.nonBlackFraction
+                << ",\"pipBoyScreenBlueDominantFraction\":"
+                << pipBoyScreenPixelEvidence.blueDominantFraction
+                << ",\"pipBoyScreenMeanLuma\":"
+                << pipBoyScreenPixelEvidence.meanLuma
                 << ",\"cpuUiRetainedEpoch\":"
                 << renderer.retainedCpuUiEpoch
                 << ",\"cpuUiRetainedTransaction\":"
@@ -12537,15 +13230,24 @@ int main(int argc, char** argv)
                 << ",\"runtimeUi\":" << (runtimeUiActive ? "true" : "false")
                 << ",\"runtimePhase\":" << runtimePhase
                 << ",\"runtimeMenuBits\":" << runtimeMenuBits
+                << ",\"runtimeCameraActive\":"
+                << (runtimeCameraActive ? "true" : "false")
                 << ",\"livePipBoy\":"
                 << (livePipBoyScreenFocused ? "true" : "false")
                 << ",\"livePipBoyHovered\":"
                 << (livePipBoyFocus.hovered ? "true" : "false")
+                << ",\"livePipBoyActivationGrip\":"
+                << (livePipBoyActivationGripHeld ? "true" : "false")
                 << ",\"livePipBoyScale\":" << livePipBoyFocus.scale
                 << ",\"spatialHandsOverlay\":"
                 << (envEnabled("FNVXR_SPATIAL_HANDS_OVERLAY", false)
                         ? "true"
                         : "false")
+                << ",\"rightHandGripCalibrationValid\":"
+                << (sharedBridge.rightHandGripLocalRotationValid
+                        ? "true" : "false")
+                << ",\"rightHandGripCalibrationCommit\":"
+                << sharedBridge.rightHandGripCalibrationCommitId
                 << ",\"pipBoySpatialScreenVisible\":"
                 << ((pipBoySpatialScreenVisible
                         && (presentedBinocularWorld || cpuEngineStereoActive))

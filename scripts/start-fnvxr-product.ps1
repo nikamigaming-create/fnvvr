@@ -554,6 +554,31 @@ if ($UseAttestedBuild) {
 }
 
 $game = Assert-FnvxrProductGameRoot -GameRoot $GameRoot
+if ($headsetFixtureOpenXrRun -and $retailFixtureRequested -and
+    $null -eq $game.sandbox) {
+    throw "Automated retail headset/simulator fixture runs require an isolated fnvxr-retail-sandbox/v1 GameRoot with Steam redirect suppression; the installed Library root is never staged or launched by this path."
+}
+$spatialRetailPropsRequested = [bool](
+    (($headsetFixtureVisualTrial -and -not $StockFirstPersonBaseline) -or
+     $PhysicalHeadsetPlay))
+$retailPropPreparation = $null
+if ($spatialRetailPropsRequested) {
+    $preparationOutput = @(
+        & (Join-Path $PSScriptRoot "prepare-fnvxr-retail-props.ps1") `
+            -GameRoot $game.root `
+            -ValidateOnly:$ValidateOnly
+    ) -join [Environment]::NewLine
+    $retailPropPreparation =
+        $preparationOutput | ConvertFrom-Json -ErrorAction Stop
+    if ([string]$retailPropPreparation.schema -cne
+            "fnvxr-retail-props/v2" -or
+        [string]$retailPropPreparation.coordinateBasis -cne
+            "openxr-grip-minus-z" -or
+        [string]$retailPropPreparation.rightHandPose -cne
+            "1hpaim@0") {
+        throw "Installed retail prop preparation returned an invalid hand/socket contract."
+    }
+}
 $ttwCoreProfilePlan = [ordered]@{
     requested = [bool]$TtwCore
     fixtureFamily = $fixtureFamily
@@ -1033,6 +1058,8 @@ $manifest = [ordered]@{
         categorySplit =
             "stock weapon root only; host-spatial left/right hands and wrist Pip-Boy"
         retailDerivedMeshes = $null
+        preparation = $retailPropPreparation
+        finalPixelProof = $null
         status = if ((($headsetFixtureVisualTrial -and
                     -not $StockFirstPersonBaseline) -or
                 $PhysicalHeadsetPlay)) {
@@ -1077,6 +1104,8 @@ $manifest = [ordered]@{
         everyFrames = $HeadsetMirrorCaptureEveryFrames
         maximumPairs = $HeadsetMirrorCaptureMaxPairs
         status = if ($CaptureHeadsetMirror) { "directory-created" } else { "disabled" }
+        captureProof = $null
+        visualQualityProof = $null
     }
     simulatorSbsVideo = [ordered]@{
         requested = [bool]$RecordSimulatorSbs
@@ -1137,7 +1166,7 @@ $manifest = [ordered]@{
         } elseif ($HeadsetInventoryVisualTrial) {
             "headless owned-fixture live-prop proof: one-to-one tracked hands, stock weapon on the right hand, and the real Pip-Boy on the opposite wrist with a bounded right-ray focus gesture; no desktop, window, mouse, simulator GUI, camera hook, replay, firing, or physical-headset route"
         } else {
-            "headless owned-fixture visual rig only: right OpenXR grip/aim may drive stock first-person hand/weapon transforms while engine-center stereo retains final-eye authority; no input, firing, projectile, hit, camera hook, replay, UI, or physical-headset route"
+            "headless owned-fixture visual rig only: host-spatial retail hands follow OpenXR grip poses while right aim drives only the stock first-person weapon; engine-center stereo retains final-eye authority; no input, firing, projectile, hit, camera hook, replay, UI, or physical-headset route"
         }
         status = if ($HeadsetControllerRigVisualTrial) {
             "pending-owned-fixture-weapon-and-rig-proof"
@@ -1448,7 +1477,9 @@ function Complete-FnvxrSimulatorSbsRecorder {
 function Get-FnvxrProductFirstPersonVisualQualityProof {
     param(
         [Parameter(Mandatory = $true)][string]$SourceRoot,
-        [Parameter(Mandatory = $true)][string]$VideoPath,
+        [string]$VideoPath = "",
+        [string]$PairDirectory = "",
+        [switch]$RequirePipBoyScreen,
         [Parameter(Mandatory = $true)][string]$ReportPath
     )
 
@@ -1457,10 +1488,26 @@ function Get-FnvxrProductFirstPersonVisualQualityProof {
     if (-not (Test-Path -LiteralPath $analyzer -PathType Leaf)) {
         throw "First-person final-pixel analyzer is missing: $analyzer"
     }
-    $output = @(
-        & $python.Source $analyzer `
-            --video $VideoPath `
-            --report $ReportPath 2>&1)
+    if ([string]::IsNullOrWhiteSpace($VideoPath) -eq
+        [string]::IsNullOrWhiteSpace($PairDirectory)) {
+        throw "Exactly one visual-quality video or final-eye pair directory is required."
+    }
+    $arguments = if (-not [string]::IsNullOrWhiteSpace($PairDirectory)) {
+        $pairArguments = @(
+            "--pair-directory", $PairDirectory,
+            "--spatial-overlay",
+            "--require-world-background",
+            "--max-red-ratio", "0.0005",
+            "--max-red-jump", "0.0001",
+            "--report", $ReportPath)
+        if ($RequirePipBoyScreen) {
+            $pairArguments += "--require-pipboy-screen"
+        }
+        $pairArguments
+    } else {
+        @("--video", $VideoPath, "--report", $ReportPath)
+    }
+    $output = @(& $python.Source $analyzer @arguments 2>&1)
     $exitCode = $LASTEXITCODE
     if ($exitCode -notin @(0, 2) -or
         -not (Test-Path -LiteralPath $ReportPath -PathType Leaf)) {
@@ -1471,7 +1518,7 @@ function Get-FnvxrProductFirstPersonVisualQualityProof {
     }
     $report = Get-Content -LiteralPath $ReportPath -Raw |
         ConvertFrom-Json -ErrorAction Stop
-    if ([string]$report.schema -cne "fnvxr-first-person-visual-quality/v1") {
+    if ([string]$report.schema -cne "fnvxr-first-person-visual-quality/v2") {
         throw "First-person final-pixel analyzer returned the wrong schema."
     }
     return $report
@@ -2367,6 +2414,7 @@ function Get-FnvxrProductPipBoyOutputProof {
         if ([bool]$frame.runtimeUi -and
             [uint32]$frame.runtimePhase -eq 1 -and
             $pipBoyVisible -and
+            -not [bool]$frame.runtimeCameraActive -and
             [bool]$frame.livePipBoy -and
             [bool]$frame.spatialHandsOverlay -and
             [bool]$frame.pipBoySpatialScreenVisible -and
@@ -2393,6 +2441,7 @@ function Get-FnvxrProductPipBoyOutputProof {
             return [ordered]@{
                 frame = [uint64]$frame.frame
                 runtimeState = "live-pipboy-world"
+                worldSimulationPaused = $true
                 spatialHandsOverlay = $true
                 pipBoySpatialScreenVisible = $true
                 menuBits = [uint32]$frame.runtimeMenuBits
@@ -2402,6 +2451,46 @@ function Get-FnvxrProductPipBoyOutputProof {
                 rightOutputHash = [string]$frame.rightOutputHash
                 observedAtUtc = [DateTime]::UtcNow.ToString("o")
             }
+        }
+    }
+    return $null
+}
+
+function Get-FnvxrProductLatestCpuUiFrameProof {
+    param([Parameter(Mandatory = $true)][string]$RetailVrLogPath)
+
+    if (-not (Test-Path -LiteralPath $RetailVrLogPath -PathType Leaf)) {
+        return $null
+    }
+    $lines = @(Get-Content -LiteralPath $RetailVrLogPath -Tail 12000)
+    [array]::Reverse($lines)
+    foreach ($line in $lines) {
+        $jsonStart = $line.IndexOf(
+            '{"event":"fnvxrRetailEngineCenterCpuUiQuad"')
+        if ($jsonStart -lt 0) { continue }
+        try {
+            $frame = $line.Substring($jsonStart) |
+                ConvertFrom-Json -ErrorAction Stop
+        } catch {
+            continue
+        }
+        if ([uint32]$frame.producerMode -ne 5 -or
+            -not [bool]$frame.uiActive -or
+            -not [bool]$frame.pixelProof -or
+            -not [bool]$frame.monoProof -or
+            [uint64]$frame.sourceFrame -eq 0 -or
+            [string]$frame.pixelHash -in @("0x0", "0x00000000")) {
+            continue
+        }
+        return [ordered]@{
+            transaction = [uint64]$frame.transaction
+            sourceFrame = [uint64]$frame.sourceFrame
+            poseFrame = [uint64]$frame.poseFrame
+            poseSequence = [uint32]$frame.poseSequence
+            runtimeStateSample = [uint64]$frame.runtimeStateSample
+            pixelHash = [string]$frame.pixelHash
+            nonBlackSamples = [uint32]$frame.nonBlackSamples
+            observedAtUtc = [DateTime]::UtcNow.ToString("o")
         }
     }
     return $null
@@ -2891,6 +2980,46 @@ try {
                 -Path ([string]$environment.FNVXR_RETAIL_LEFT_HAND_MESH_PATH)
             right = Get-FnvxrProductFileIdentity `
                 -Path ([string]$environment.FNVXR_RETAIL_RIGHT_HAND_MESH_PATH)
+            leftCuff = if (($environment.Keys -ccontains
+                        "FNVXR_RETAIL_LEFT_CUFF_MESH_PATH") -and
+                    ($environment.Keys -ccontains
+                        "FNVXR_RETAIL_LEFT_CUFF_TEXTURE_PATH")) {
+                [ordered]@{
+                    mesh = Get-FnvxrProductFileIdentity `
+                        -Path ([string]$environment.FNVXR_RETAIL_LEFT_CUFF_MESH_PATH)
+                    diffuseTexture = Get-FnvxrProductFileIdentity `
+                        -Path ([string]$environment.FNVXR_RETAIL_LEFT_CUFF_TEXTURE_PATH)
+                }
+            } else {
+                $null
+            }
+            diffuseTexture = if ($environment.Keys -ccontains
+                    "FNVXR_RETAIL_HAND_TEXTURE_PATH") {
+                Get-FnvxrProductFileIdentity `
+                    -Path ([string]$environment.FNVXR_RETAIL_HAND_TEXTURE_PATH)
+            } else {
+                $null
+            }
+            pipBoyHousing = if (($environment.Keys -ccontains
+                        "FNVXR_RETAIL_PIPBOY_MESH_PATH") -and
+                    ($environment.Keys -ccontains
+                        "FNVXR_RETAIL_PIPBOY_TEXTURE_PATH")) {
+                [ordered]@{
+                    mesh = Get-FnvxrProductFileIdentity `
+                        -Path ([string]$environment.FNVXR_RETAIL_PIPBOY_MESH_PATH)
+                    screenMesh = if ($environment.Keys -ccontains
+                            "FNVXR_RETAIL_PIPBOY_SCREEN_MESH_PATH") {
+                        Get-FnvxrProductFileIdentity `
+                            -Path ([string]$environment.FNVXR_RETAIL_PIPBOY_SCREEN_MESH_PATH)
+                    } else {
+                        $null
+                    }
+                    diffuseTexture = Get-FnvxrProductFileIdentity `
+                        -Path ([string]$environment.FNVXR_RETAIL_PIPBOY_TEXTURE_PATH)
+                }
+            } else {
+                $null
+            }
         }
     }
     if ($selectedRuntimeIdentity) {
@@ -3392,9 +3521,34 @@ try {
         if ($directRigEvents.Count -lt 1) {
             throw "The direct controller-to-stock-weapon rig path did not apply during the commanded sweep. Evidence is in $runDirectory"
         }
+        $socketedRigEvents = @(
+            foreach ($match in $directRigEvents) {
+                try {
+                    $event = $match.Line | ConvertFrom-Json -ErrorAction Stop
+                    if ([bool]$event.weaponAligned -and
+                        [bool]$event.wristSocketMeasured -and
+                        [bool]$event.handMeshRotationValid -and
+                        [double]$event.wristSocketResidualUnits -le 0.25) {
+                        $event
+                    }
+                } catch {
+                    # A non-JSON diagnostic line cannot prove a grip socket.
+                }
+            }
+        )
+        if ($socketedRigEvents.Count -lt 1) {
+            throw "The stock pistol never proved its measured wrist socket against the host-spatial hand during the commanded sweep. Evidence is in $runDirectory"
+        }
+        $maximumSocketResidual = [double](
+            $socketedRigEvents |
+                Measure-Object -Property wristSocketResidualUnits -Maximum
+        ).Maximum
         $directRigProof = [ordered]@{
             appliedEventCount = $directRigEvents.Count
-            path = "OpenXR right controller -> post-animation right hand -> stock weapon"
+            socketedEventCount = $socketedRigEvents.Count
+            maximumWristSocketResidualUnits = $maximumSocketResidual
+            handMeshRotation = "measured retail stock-hand orientation published as OpenXR grip-local quaternion"
+            path = "OpenXR grip -> measured retail hand mesh orientation and wrist socket; stock pistol root -> measured weapon-to-wrist socket; OpenXR aim -> muzzle rotation"
             centerRestored = [bool]$controllerPoseSweepEvidence.centerRestored
             observedAtUtc = [DateTime]::UtcNow.ToString("o")
         }
@@ -3408,6 +3562,7 @@ try {
             $livePipBoyDeadline = [DateTime]::UtcNow.AddSeconds(8)
             $livePipBoyOpenLine = $null
             $livePipBoyHostLine = $null
+            $livePipBoyGripLine = $null
             do {
                 $livePipBoyOpenLine = Select-String `
                     -LiteralPath $headsetDemoInputTelemetryLog `
@@ -3415,25 +3570,94 @@ try {
                     -ErrorAction SilentlyContinue | Select-Object -Last 1
                 $livePipBoyHostLine = Select-String `
                     -LiteralPath $hostOut `
-                    -Pattern '"livePipBoy":true.*"livePipBoyScale":1\.[1-9][0-9]*.*"uiQuadVisible":false' `
+                    -Pattern '"runtimeCameraActive":false.*"livePipBoy":true.*"livePipBoyScale":1\.[1-9][0-9]*.*"uiQuadVisible":false' `
                     -ErrorAction SilentlyContinue | Select-Object -Last 1
-                if ($livePipBoyOpenLine -and $livePipBoyHostLine) { break }
+                $livePipBoyGripLine = Select-String `
+                    -LiteralPath $hostOut `
+                    -Pattern '"livePipBoyHovered":true.*"livePipBoyActivationGrip":true.*"livePipBoyScale":1\.[0-9]+' `
+                    -ErrorAction SilentlyContinue | Select-Object -Last 1
+                if ($livePipBoyOpenLine -and $livePipBoyHostLine -and
+                    $livePipBoyGripLine) { break }
                 Start-Sleep -Milliseconds 100
             } while ([DateTime]::UtcNow -lt $livePipBoyDeadline)
-            if (-not $livePipBoyOpenLine -or -not $livePipBoyHostLine) {
-                throw "The opposite-wrist pointing gesture did not prove a scaled live Pip-Boy with the old UI quad absent. Evidence is in $runDirectory"
+            if (-not $livePipBoyOpenLine -or -not $livePipBoyHostLine -or
+                -not $livePipBoyGripLine) {
+                throw "The grip-gated opposite-wrist ray did not prove enlargement, native paused Pip-Boy state, and absence of the old UI quad. Evidence is in $runDirectory"
+            }
+            $uiBeforeInteraction = Get-FnvxrProductLatestCpuUiFrameProof `
+                -RetailVrLogPath $retailVrLog
+            if (-not $uiBeforeInteraction) {
+                throw "The native Pip-Boy opened without a current pixel-complete retail UI surface. Evidence is in $runDirectory"
+            }
+            $pipBoyMenuOutput = @(
+                & (Join-Path $PSScriptRoot `
+                    "invoke-openxr-simulator-pipboy-proof.ps1") `
+                    -DataDirectory $openXrSimulatorDataDirectory `
+                    -ConsumeTimeoutMilliseconds 5000
+            ) -join [Environment]::NewLine
+            $pipBoyMenuEvidence =
+                $pipBoyMenuOutput | ConvertFrom-Json -ErrorAction Stop
+            if ([string]$pipBoyMenuEvidence.schema -cne
+                    "fnvxr-headless-pipboy-menu-proof/v1" -or
+                -not [bool]$pipBoyMenuEvidence.gripGated -or
+                [int]$pipBoyMenuEvidence.commandCount -lt 9) {
+                throw "The bounded Pip-Boy pointer/control script did not retain its complete input sequence."
+            }
+            $interactionDeadline = [DateTime]::UtcNow.AddSeconds(8)
+            $physicalControlLine = $null
+            $closeLine = $null
+            $resumeLine = $null
+            $uiAfterInteraction = $null
+            do {
+                $physicalControlLine = Select-String `
+                    -LiteralPath $headsetDemoInputTelemetryLog `
+                    -Pattern 'livePipBoy physical control .*handled=1' `
+                    -ErrorAction SilentlyContinue | Select-Object -Last 1
+                $closeLine = Select-String `
+                    -LiteralPath $headsetDemoInputTelemetryLog `
+                    -Pattern 'enginePipBoy close .*source=(pose:B|externalXInput:B)' `
+                    -ErrorAction SilentlyContinue | Select-Object -Last 1
+                $resumeLine = Select-String `
+                    -LiteralPath $hostOut `
+                    -Pattern '"runtimeGameplay":true.*"runtimeCameraActive":true.*"livePipBoy":false.*"spatialHandsOverlay":true.*"projectionLayerSubmitted":true' `
+                    -ErrorAction SilentlyContinue | Select-Object -Last 1
+                $uiAfterInteraction =
+                    Get-FnvxrProductLatestCpuUiFrameProof `
+                        -RetailVrLogPath $retailVrLog
+                $uiChanged = $uiAfterInteraction -and
+                    [uint64]$uiAfterInteraction.sourceFrame -gt
+                        [uint64]$uiBeforeInteraction.sourceFrame -and
+                    [string]$uiAfterInteraction.pixelHash -cne
+                        [string]$uiBeforeInteraction.pixelHash
+                if ($physicalControlLine -and $closeLine -and $resumeLine -and
+                    $uiChanged) { break }
+                Start-Sleep -Milliseconds 100
+            } while ([DateTime]::UtcNow -lt $interactionDeadline)
+            if (-not $physicalControlLine -or -not $closeLine -or
+                -not $resumeLine -or -not $uiChanged) {
+                throw "The live Pip-Boy did not prove a windowless raycast physical control, changed retail UI pixels, native close, and resumed gameplay. Evidence is in $runDirectory"
             }
             $livePipBoyProof = [ordered]@{
-                pointingGesture = "right tracked aim ray -> opposite tracked wrist"
+                pointingGesture = "right grip + tracked aim ray -> opposite tracked wrist"
+                activationGrip = $livePipBoyGripLine.Line
                 engineOpen = $livePipBoyOpenLine.Line
                 hostSubmission = $livePipBoyHostLine.Line
+                worldSimulationPaused = $true
+                exactScreenMesh = "pipboyscreen:0"
+                menuScript = $pipBoyMenuEvidence
+                physicalControl = $physicalControlLine.Line
+                uiBefore = $uiBeforeInteraction
+                uiAfter = $uiAfterInteraction
+                engineClose = $closeLine.Line
+                resumedGameplay = $resumeLine.Line
                 oldPipBoyQuadVisible = $false
+                desktopWindowRequired = $false
                 observedAtUtc = [DateTime]::UtcNow.ToString("o")
             }
             $manifest.headsetControllerRigVisualTrial.livePipBoyProof =
                 $livePipBoyProof
             Write-SupervisorLog (
-                "opposite-wrist live Pip-Boy focus proven: engine opened from tracked dwell, scale exceeded 1.0, old UI quad absent")
+                "live Pip-Boy menu proven end-to-end: grip-gated enlargement, native pause/open, windowless raycast physical tab, changed retail UI hash, native close, gameplay resume")
         }
         Write-FnvxrProductJsonAtomic -Value $manifest -Path $manifestPath
         Write-SupervisorLog (
@@ -3817,21 +4041,30 @@ try {
             if ($HeadsetFixtureWeaponDraw -and
                 $effectiveRetailVrFirstPersonPrivateCaller -cne "None" -and
                 -not $retailFirstPersonRenderProof) {
-                $retailFirstPersonRenderProof =
+                $retailFirstPersonRenderProof = if (
+                    $HeadsetControllerRigVisualTrial) {
+                    Get-FnvxrProductCenterIntegratedFirstPersonProof `
+                        -RetailVrLogPath $retailVrLog
+                } else {
                     Get-FnvxrProductRetailFirstPersonRenderProof `
                         -RetailVrLogPath $retailVrLog `
                         -WeaponTelemetryLogPath $headsetDemoInputTelemetryLog `
                         -RequiredCaller $effectiveRetailVrFirstPersonPrivateCaller
+                }
                 if ($retailFirstPersonRenderProof) {
                     $manifest.headsetWorldCapture.firstPersonRenderProof =
                         $retailFirstPersonRenderProof
+                    if ($HeadsetControllerRigVisualTrial) {
+                        $manifest.headsetWorldCapture.centerIntegratedFirstPersonProof =
+                            $retailFirstPersonRenderProof
+                    }
                     Write-FnvxrProductJsonAtomic `
                         -Value $manifest `
                         -Path $manifestPath
                     Write-SupervisorLog (
-                        "selected first-person caller {0} proved an engine-rendered two-eye weapon transaction={1} poseFrame={2}; stock backbuffer route remains disabled" -f
+                        "selected first-person caller {0} proved the center-integrated engine-rendered weapon publication poseSequence={1} poseFrame={2}; privateEyeCalls=0 and the stock backbuffer route remains disabled" -f
                         $effectiveRetailVrFirstPersonPrivateCaller,
-                        $retailFirstPersonRenderProof.transaction,
+                        $retailFirstPersonRenderProof.poseSequence,
                         $retailFirstPersonRenderProof.poseFrame)
                 }
             }
@@ -3920,7 +4153,7 @@ try {
     if ($HeadsetFixtureWeaponDraw -and
         $effectiveRetailVrFirstPersonPrivateCaller -ne "None" -and
         -not $retailFirstPersonRenderProof) {
-        throw "The selected outer RenderFirstPerson caller did not prove a published two-eye engine-rendered weapon transaction; no weapon video is claimed. Evidence is in $runDirectory"
+        throw "The selected outer RenderFirstPerson caller did not prove its center-integrated or private two-eye engine-rendered weapon publication; no weapon output is claimed. Evidence is in $runDirectory"
     }
     if ($RecordSimulatorSbs -and
         (-not $centerIntegratedFirstPersonProof -or
@@ -3937,6 +4170,30 @@ try {
         }
         $manifest.headsetMirror.status = "captured"
         $manifest.headsetMirror.captureProof = $headsetMirrorCaptureProof
+        if ($headsetFixtureVisualTrial -and -not $StockFirstPersonBaseline) {
+            $visualQualityReportPath = Join-Path `
+                $runDirectory `
+                "spatial-overlay-final-pixel-quality.json"
+            $visualQualityProof = Get-FnvxrProductFirstPersonVisualQualityProof `
+                -SourceRoot $root `
+                -PairDirectory $headsetMirrorDirectory `
+                -RequirePipBoyScreen:($HeadsetDemoFixture -or
+                    $HeadsetInventoryVisualTrial) `
+                -ReportPath $visualQualityReportPath
+            $manifest.headsetMirror.visualQualityProof = $visualQualityProof
+            $manifest.spatialHandsOverlay.finalPixelProof =
+                $visualQualityProof
+            if ($HeadsetControllerRigVisualTrial) {
+                $manifest.headsetControllerRigVisualTrial.visualQualityProof =
+                    $visualQualityProof
+                $manifest.headsetControllerRigVisualTrial.visualQualityAccepted =
+                    [bool]$visualQualityProof.accepted
+            }
+            Write-FnvxrProductJsonAtomic -Value $manifest -Path $manifestPath
+            if (-not [bool]$visualQualityProof.accepted) {
+                throw "Final submitted-eye pixels lost a hand/Pip-Boy category or exceeded the strict red-flash continuity limit. Structural telemetry is not accepted as pixel proof. Evidence is in $visualQualityReportPath"
+            }
+        }
     }
     if ($RecordSimulatorSbs) {
         if (-not $simulatorSbsRecorderProcess) {

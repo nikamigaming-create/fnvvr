@@ -45,6 +45,7 @@ constexpr bool worldPresentationContinues(
 struct FocusInput
 {
     bool rayIntersectsDevice = false;
+    bool activationGripHeld = false;
     bool retailScreenOpen = false;
     std::uint32_t hoverFrames = 0u;
     std::uint32_t focusFrames = 0u;
@@ -60,18 +61,22 @@ struct FocusDecision
 
 inline FocusDecision assessFocus(const FocusInput& input) noexcept
 {
-    const bool focusFromPointing = input.rayIntersectsDevice
+    const bool activationHover = input.rayIntersectsDevice
+        && input.activationGripHeld;
+    const bool focusFromPointing = activationHover
         && input.hoverFrames >= input.focusFrames;
     const bool focused = input.retailScreenOpen || focusFromPointing;
-    const float progress = input.focusFrames == 0u
-        ? (input.rayIntersectsDevice ? 1.0f : 0.0f)
+    const float progress = !activationHover
+        ? 0.0f
+        : input.focusFrames == 0u
+        ? 1.0f
         : std::clamp(
             static_cast<float>(input.hoverFrames)
                 / static_cast<float>(input.focusFrames),
             0.0f,
             1.0f);
     return {
-        input.rayIntersectsDevice,
+        activationHover,
         focused,
         focusFromPointing && !input.retailScreenOpen,
         1.0f + 0.35f * (focused ? 1.0f : progress),

@@ -928,7 +928,8 @@ add_executable(fnvxr_cpu_engine_presentation_test
     tests/fnvxr_cpu_engine_presentation_test.cpp)
 target_include_directories(fnvxr_cpu_engine_presentation_test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/host
-    ${CMAKE_CURRENT_SOURCE_DIR}/protocol)
+    ${CMAKE_CURRENT_SOURCE_DIR}/protocol
+    ${CMAKE_CURRENT_SOURCE_DIR}/runtime)
 if(MSVC)
     target_compile_options(
         fnvxr_cpu_engine_presentation_test PRIVATE /W4 /WX)

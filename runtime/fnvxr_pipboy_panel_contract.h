@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdint>
+
 namespace fnvxr::pipboy
 {
 struct ScreenCrop
@@ -10,9 +12,17 @@ struct ScreenCrop
     float bottom {};
 };
 
+struct ScreenPixelEvidence
+{
+    std::uint32_t sampleCount {};
+    float nonBlackFraction {};
+    float blueDominantFraction {};
+    float meanLuma {};
+};
+
 // Retail's live screen occupies this region of its own UI source. The host
-// never renders that source as a Pip-Boy quad; it only maps wrist-device UVs
-// into the ordinary retail screen/pointer coordinate space.
+// maps it onto the locally derived pipboyscreen:0 geometry and uses this same
+// crop for pointer coordinates, keeping pixels and interaction in one space.
 inline constexpr ScreenCrop RetailScreenCrop {
     0.255f,
     0.315f,
@@ -53,5 +63,22 @@ constexpr float sourceVFromPanel(
     const ScreenCrop& crop = RetailScreenCrop) noexcept
 {
     return crop.top + panelV * (crop.bottom - crop.top);
+}
+
+// A runtime menu bit is structural evidence, not proof that the copied
+// surface has finished changing from the last world frame into the authored
+// Pip-Boy UI.  The exact screen crop must be populated, dark enough to reject
+// the outdoor world, and free of the historical blue fallback before it can
+// become visible on the wrist.
+constexpr bool screenPixelsReady(
+    const ScreenPixelEvidence& evidence,
+    float minimumNonBlackFraction = 0.30f,
+    float maximumBlueDominantFraction = 0.20f,
+    float maximumMeanLuma = 60.0f) noexcept
+{
+    return evidence.sampleCount != 0u
+        && evidence.nonBlackFraction >= minimumNonBlackFraction
+        && evidence.blueDominantFraction <= maximumBlueDominantFraction
+        && evidence.meanLuma <= maximumMeanLuma;
 }
 }

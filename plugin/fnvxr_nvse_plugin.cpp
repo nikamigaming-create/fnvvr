@@ -507,9 +507,18 @@ struct RetailWeaponCalibration
 {
     bool valid {};
     bool usesStageLocalBodyPositionAnchor {};
+    bool usesTrackedWristSocketPositionAnchor {};
+    bool handMeshRotationValid {};
     Matrix33 controllerToWeaponRotation {};
     Vec3 controllerToWeaponPosition {};
     Vec3 controllerToWeaponBodyLocal {};
+    // Stock Fallout already authors the exact relationship between the
+    // anatomical wrist and the stable Weapon attachment.  Preserve the
+    // wrist point in weapon-local space so aim rotation pivots the gun about
+    // its grip instead of orbiting the whole model around a stale controller
+    // delta captured in one pose.
+    Vec3 weaponToWristLocal {};
+    Quat rightHandGripLocalRotation { 0.0f, 0.0f, 0.0f, 1.0f };
 };
 
 struct RetailPipBoyCalibration
@@ -1099,6 +1108,16 @@ bool physicalHeadsetEngineCenterRigRequested()
         && envEnabled("FNVXR_ENABLE_ENGINE_CENTER_STEREO", false);
 }
 
+bool hostSpatialPropReplacementRequested()
+{
+    // The final OpenXR eye owns these replacement categories directly. The
+    // retail scene seam may still move the stock weapon, but must not also
+    // mutate hidden arm/hand/Pip-Boy nodes and create two transform owners.
+    return envEnabled("FNVXR_SPATIAL_HANDS_OVERLAY", false)
+        && (stereoVisualTrialProfileSelected()
+            || physicalHeadsetPlayProfileSelected());
+}
+
 bool retailFixtureProfileSelected()
 {
     // These profiles exist solely for command-line-owned save fixtures. They
@@ -1651,6 +1670,60 @@ Matrix33 matrixFromQuat(Quat q)
     result.m[2][1] = 2.0f * (yz + wx);
     result.m[2][2] = 1.0f - 2.0f * (xx + yy);
     return result;
+}
+
+Quat quatFromMatrix(const Matrix33& matrix)
+{
+    const float trace = matrix.m[0][0] + matrix.m[1][1] + matrix.m[2][2];
+    Quat result {};
+    if (trace > 0.0f)
+    {
+        const float scale = 2.0f * std::sqrt((std::max)(0.0f, trace + 1.0f));
+        if (scale < 0.000001f)
+            return { 0.0f, 0.0f, 0.0f, 1.0f };
+        result.w = 0.25f * scale;
+        result.x = (matrix.m[2][1] - matrix.m[1][2]) / scale;
+        result.y = (matrix.m[0][2] - matrix.m[2][0]) / scale;
+        result.z = (matrix.m[1][0] - matrix.m[0][1]) / scale;
+    }
+    else if (matrix.m[0][0] > matrix.m[1][1]
+        && matrix.m[0][0] > matrix.m[2][2])
+    {
+        const float scale = 2.0f * std::sqrt((std::max)(
+            0.0f,
+            1.0f + matrix.m[0][0] - matrix.m[1][1] - matrix.m[2][2]));
+        if (scale < 0.000001f)
+            return { 0.0f, 0.0f, 0.0f, 1.0f };
+        result.w = (matrix.m[2][1] - matrix.m[1][2]) / scale;
+        result.x = 0.25f * scale;
+        result.y = (matrix.m[0][1] + matrix.m[1][0]) / scale;
+        result.z = (matrix.m[0][2] + matrix.m[2][0]) / scale;
+    }
+    else if (matrix.m[1][1] > matrix.m[2][2])
+    {
+        const float scale = 2.0f * std::sqrt((std::max)(
+            0.0f,
+            1.0f + matrix.m[1][1] - matrix.m[0][0] - matrix.m[2][2]));
+        if (scale < 0.000001f)
+            return { 0.0f, 0.0f, 0.0f, 1.0f };
+        result.w = (matrix.m[0][2] - matrix.m[2][0]) / scale;
+        result.x = (matrix.m[0][1] + matrix.m[1][0]) / scale;
+        result.y = 0.25f * scale;
+        result.z = (matrix.m[1][2] + matrix.m[2][1]) / scale;
+    }
+    else
+    {
+        const float scale = 2.0f * std::sqrt((std::max)(
+            0.0f,
+            1.0f + matrix.m[2][2] - matrix.m[0][0] - matrix.m[1][1]));
+        if (scale < 0.000001f)
+            return { 0.0f, 0.0f, 0.0f, 1.0f };
+        result.w = (matrix.m[1][0] - matrix.m[0][1]) / scale;
+        result.x = (matrix.m[0][2] + matrix.m[2][0]) / scale;
+        result.y = (matrix.m[1][2] + matrix.m[2][1]) / scale;
+        result.z = 0.25f * scale;
+    }
+    return normalizeQuat(result);
 }
 
 Matrix33 multiplyMatrix33(const Matrix33& a, const Matrix33& b)
@@ -6769,7 +6842,8 @@ void updateLivePipBoyInteraction(
     const bool openRequested =
         (flags & fnvxr::PoseInteractionLivePipBoyOpenRequest) != 0u;
     void* const pipBoy = g_retailRigNodes.pipBoy;
-    if (pipBoy && niObjectKind(pipBoy) != 0)
+    if (!hostSpatialPropReplacementRequested()
+        && pipBoy && niObjectKind(pipBoy) != 0)
     {
         const auto base = reinterpret_cast<std::uintptr_t>(pipBoy);
         if (g_livePipBoyScaleNode != pipBoy)
@@ -7026,6 +7100,73 @@ RetailControllerWorldPose retailControllerWorldPose(
         xrDeltaToGamebryoMatrix(recenteredControllerRotation));
     result.usesAimOrientation = rightAimTracked;
     return result;
+}
+
+Vec3 hostSpatialHandWristWorld(
+    const RetailControllerWorldPose& controller,
+    bool left)
+{
+    const char* xName = left
+        ? "FNVXR_RETAIL_LEFT_HAND_OFFSET_X"
+        : "FNVXR_RETAIL_RIGHT_HAND_OFFSET_X";
+    const char* yName = left
+        ? "FNVXR_RETAIL_LEFT_HAND_OFFSET_Y"
+        : "FNVXR_RETAIL_RIGHT_HAND_OFFSET_Y";
+    const char* zName = left
+        ? "FNVXR_RETAIL_LEFT_HAND_OFFSET_Z"
+        : "FNVXR_RETAIL_RIGHT_HAND_OFFSET_Z";
+    const Vec3 offsetMeters {
+        getFloatFromEnv(xName, left ? 0.0f : -0.040f),
+        getFloatFromEnv(yName, left ? 0.0f : 0.026f),
+        getFloatFromEnv(zName, 0.0f),
+    };
+    Vec3 offsetGame = xrDeltaToGamebryoVector(offsetMeters);
+    offsetGame.x *= getFloatFromEnv("FNVXR_D3D9_POSE_X_SIGN", 1.0f);
+    offsetGame.y *= getFloatFromEnv("FNVXR_D3D9_POSE_Y_SIGN", 1.0f);
+    offsetGame.z *= getFloatFromEnv("FNVXR_D3D9_POSE_Z_SIGN", 1.0f);
+    offsetGame = scaleVec3(
+        offsetGame,
+        getFloatFromEnv("FNVXR_D3D9_GAME_UNITS_PER_METER", 70.0f)
+            * getFloatFromEnv("FNVXR_RETAIL_RIG_POSITION_SCALE", 1.0f));
+    return addVec3(
+        controller.wristPosition,
+        transformVec3(controller.wristRotation, offsetGame));
+}
+
+Quat retailRightHandMeshGripLocalRotation(
+    const RetailControllerWorldPose& controller,
+    const Matrix33& stockHandWorldRotation,
+    const Matrix33& stockWeaponWorldRotation,
+    const Matrix33& desiredWeaponWorldRotation)
+{
+    // Preserve Fallout's authored hand-to-weapon orientation, then express
+    // it in the OpenXR grip-local basis used by the host mesh.  P maps an
+    // OpenXR local vector to Gamebryo (x,-z,y); Q is the converter's exact
+    // NIF-hand -> OpenXR-mesh basis (y,-z,-x).
+    const Matrix33 desiredHandWorldRotation = multiplyMatrix33(
+        desiredWeaponWorldRotation,
+        multiplyMatrix33(
+            transposeMatrix33(stockWeaponWorldRotation),
+            stockHandWorldRotation));
+    const Matrix33 gripToNifHand = multiplyMatrix33(
+        transposeMatrix33(controller.wristRotation),
+        desiredHandWorldRotation);
+    const Matrix33 xrToGame {
+        { { 1.0f, 0.0f, 0.0f },
+          { 0.0f, 0.0f, -1.0f },
+          { 0.0f, 1.0f, 0.0f } }
+    };
+    const Matrix33 nifHandToXrMesh {
+        { { 0.0f, 1.0f, 0.0f },
+          { 0.0f, 0.0f, -1.0f },
+          { -1.0f, 0.0f, 0.0f } }
+    };
+    const Matrix33 gripToHostMesh = multiplyMatrix33(
+        transposeMatrix33(xrToGame),
+        multiplyMatrix33(
+            gripToNifHand,
+            transposeMatrix33(nifHandToXrMesh)));
+    return quatFromMatrix(gripToHostMesh);
 }
 
 Vec3 configuredControllerToWristOffset(bool left)
@@ -7509,12 +7650,16 @@ struct RetailWeaponApplyResult
     bool writeVerified {};
     bool endpointMeasured {};
     bool endpointInWeaponBranch {};
+    bool wristSocketMeasured {};
     float positionResidualUnits {};
     float angularResidualRadians {};
     float endpointAimResidualRadians {};
+    float wristSocketResidualUnits {};
     Vec3 desiredWorldPosition {};
     Vec3 actualWorldPosition {};
     Vec3 endpointWorldPosition {};
+    Vec3 wristSocketWorldPosition {};
+    Vec3 wristSocketTargetWorldPosition {};
     Vec3 aimForward {};
     Vec3 endpointForward {};
     Matrix33 desiredWorldRotation {};
@@ -7543,6 +7688,7 @@ RetailWeaponApplyResult applyRetailWeaponAim(
             (headsetControllerRigVisualTrialRequested()
                 && headlessStereoRigVisualTrialLeaseCurrent())
             || physicalHeadsetEngineCenterRigRequested();
+        const bool hostSpatialProps = hostSpatialPropReplacementRequested();
         void* endpoint = g_retailRigNodes.projectileNode
             ? g_retailRigNodes.projectileNode
             : g_retailRigNodes.muzzleFlash;
@@ -7581,7 +7727,48 @@ RetailWeaponApplyResult applyRetailWeaponAim(
         g_retailWeaponCalibration.controllerToWeaponPosition = transformVec3(
             transposeMatrix33(controller.rotation),
             subtractVec3(weaponWorldPosition, controller.position));
-        if (bodyAnchoredControllerRig)
+        if (bodyAnchoredControllerRig && hostSpatialProps
+            && g_retailRigNodes.right.hand)
+        {
+            const Vec3 stockWristWorld = readVec3(
+                reinterpret_cast<std::uintptr_t>(
+                    g_retailRigNodes.right.hand)
+                    + NiAvObjectWorldTranslationOffset);
+            const Matrix33 stockHandWorldRotation = readMatrix33(
+                reinterpret_cast<std::uintptr_t>(
+                    g_retailRigNodes.right.hand)
+                    + NiAvObjectWorldRotationOffset);
+            if (finiteVec3(stockWristWorld)
+                && finiteMatrix33(stockHandWorldRotation))
+            {
+                g_retailWeaponCalibration.weaponToWristLocal = transformVec3(
+                    transposeMatrix33(weaponWorldRotation),
+                    subtractVec3(stockWristWorld, weaponWorldPosition));
+                g_retailWeaponCalibration
+                    .usesTrackedWristSocketPositionAnchor =
+                        finiteVec3(
+                            g_retailWeaponCalibration.weaponToWristLocal)
+                        && lengthVec3(
+                            g_retailWeaponCalibration.weaponToWristLocal)
+                            <= getFloatFromEnv(
+                                "FNVXR_RETAIL_WEAPON_MAX_SOCKET_UNITS",
+                                48.0f);
+                const Matrix33 desiredWeaponWorldRotation = multiplyMatrix33(
+                    controller.rotation,
+                    g_retailWeaponCalibration.controllerToWeaponRotation);
+                g_retailWeaponCalibration.rightHandGripLocalRotation =
+                    retailRightHandMeshGripLocalRotation(
+                        controller,
+                        stockHandWorldRotation,
+                        weaponWorldRotation,
+                        desiredWeaponWorldRotation);
+                g_retailWeaponCalibration.handMeshRotationValid =
+                    finiteUsableQuat(
+                        g_retailWeaponCalibration
+                            .rightHandGripLocalRotation);
+            }
+        }
+        else if (bodyAnchoredControllerRig)
         {
             // The weapon is a child of the tracked hand.  Its translation is
             // therefore inherited from the newly attached hand, while this
@@ -7593,9 +7780,19 @@ RetailWeaponApplyResult applyRetailWeaponAim(
         }
         g_retailWeaponCalibration.valid = finiteMatrix33(
                 g_retailWeaponCalibration.controllerToWeaponRotation)
-            && (g_retailWeaponCalibration.usesStageLocalBodyPositionAnchor
+            && (bodyAnchoredControllerRig && hostSpatialProps
+                ? g_retailWeaponCalibration
+                        .usesTrackedWristSocketPositionAnchor
+                    && finiteVec3(
+                        g_retailWeaponCalibration.weaponToWristLocal)
+                    && g_retailWeaponCalibration.handMeshRotationValid
+                : g_retailWeaponCalibration.usesStageLocalBodyPositionAnchor
                 ? finiteVec3(
                     g_retailWeaponCalibration.controllerToWeaponBodyLocal)
+                : g_retailWeaponCalibration
+                        .usesTrackedWristSocketPositionAnchor
+                ? finiteVec3(
+                    g_retailWeaponCalibration.weaponToWristLocal)
                 : (finiteVec3(g_retailWeaponCalibration.controllerToWeaponPosition)
                     && lengthVec3(
                         g_retailWeaponCalibration.controllerToWeaponPosition)
@@ -7603,7 +7800,7 @@ RetailWeaponApplyResult applyRetailWeaponAim(
                             "FNVXR_RETAIL_WEAPON_MAX_CALIBRATION_UNITS",
                             48.0f)));
         logTelemetry(
-            "retailWeapon calibration valid=%d source=right-aim fullSE3=1 weapon=%p localPosition=(%.4f %.4f %.4f) bodyPosition=(%.4f %.4f %.4f) positionAnchor=%s endpointAxisCalibration=%d endpoint=%p\n",
+            "retailWeapon calibration valid=%d source=right-aim fullSE3=1 weapon=%p localPosition=(%.4f %.4f %.4f) bodyPosition=(%.4f %.4f %.4f) weaponToWrist=(%.4f %.4f %.4f) handGripLocalQuat=(%.6f %.6f %.6f %.6f) handMeshRotationValid=%d positionAnchor=%s endpointAxisCalibration=%d endpoint=%p\n",
             g_retailWeaponCalibration.valid ? 1 : 0,
             weapon,
             g_retailWeaponCalibration.controllerToWeaponPosition.x,
@@ -7612,8 +7809,19 @@ RetailWeaponApplyResult applyRetailWeaponAim(
             g_retailWeaponCalibration.controllerToWeaponBodyLocal.x,
             g_retailWeaponCalibration.controllerToWeaponBodyLocal.y,
             g_retailWeaponCalibration.controllerToWeaponBodyLocal.z,
+            g_retailWeaponCalibration.weaponToWristLocal.x,
+            g_retailWeaponCalibration.weaponToWristLocal.y,
+            g_retailWeaponCalibration.weaponToWristLocal.z,
+            g_retailWeaponCalibration.rightHandGripLocalRotation.x,
+            g_retailWeaponCalibration.rightHandGripLocalRotation.y,
+            g_retailWeaponCalibration.rightHandGripLocalRotation.z,
+            g_retailWeaponCalibration.rightHandGripLocalRotation.w,
+            g_retailWeaponCalibration.handMeshRotationValid ? 1 : 0,
             g_retailWeaponCalibration.usesStageLocalBodyPositionAnchor
                 ? "tracked-hand-child"
+                : g_retailWeaponCalibration
+                        .usesTrackedWristSocketPositionAnchor
+                ? "measured-stock-wrist-socket"
                 : "controller-local",
             endpointAxisCalibration ? 1 : 0,
             endpoint);
@@ -7629,6 +7837,12 @@ RetailWeaponApplyResult applyRetailWeaponAim(
         // applyRetailArmFabrik has already updated the hand and propagated
         // its child transforms. Retain that attached weapon translation.
         ? weaponWorldPosition
+        : g_retailWeaponCalibration.usesTrackedWristSocketPositionAnchor
+        ? subtractVec3(
+            hostSpatialHandWristWorld(controller, false),
+            transformVec3(
+                desiredWorldRotation,
+                g_retailWeaponCalibration.weaponToWristLocal))
         : addVec3(
             controller.position,
             transformVec3(
@@ -7686,6 +7900,25 @@ RetailWeaponApplyResult applyRetailWeaponAim(
     result.angularResidualRadians = finiteMatrix33(result.actualWorldRotation)
         ? matrixAngularDistance(result.desiredWorldRotation, result.actualWorldRotation)
         : 3.14159265f;
+    if (g_retailWeaponCalibration.usesTrackedWristSocketPositionAnchor
+        && finiteMatrix33(result.actualWorldRotation)
+        && finiteVec3(result.actualWorldPosition))
+    {
+        result.wristSocketTargetWorldPosition =
+            hostSpatialHandWristWorld(controller, false);
+        result.wristSocketWorldPosition = addVec3(
+            result.actualWorldPosition,
+            transformVec3(
+                result.actualWorldRotation,
+                g_retailWeaponCalibration.weaponToWristLocal));
+        result.wristSocketResidualUnits = lengthVec3(subtractVec3(
+            result.wristSocketWorldPosition,
+            result.wristSocketTargetWorldPosition));
+        result.wristSocketMeasured =
+            finiteVec3(result.wristSocketWorldPosition)
+            && finiteVec3(result.wristSocketTargetWorldPosition)
+            && std::isfinite(result.wristSocketResidualUnits);
+    }
     result.writeVerified = result.writeRequested
         && result.writeCommitted
         && std::isfinite(result.positionResidualUnits)
@@ -8042,6 +8275,8 @@ void publishWeaponFrameCommit(
     bool rightSolved,
     bool weaponWritten,
     bool weaponAligned,
+    bool handMeshRotationValid,
+    const Quat& rightHandGripLocalRotation,
     const Vec3& rightHandWorld,
     const Vec3& weaponWorld,
     const Matrix33& weaponWorldRotation)
@@ -8060,6 +8295,8 @@ void publishWeaponFrameCommit(
         flags |= fnvxr::shared::WeaponFrameFlagWeaponWritten;
     if (weaponAligned)
         flags |= fnvxr::shared::WeaponFrameFlagWeaponAligned;
+    if (handMeshRotationValid)
+        flags |= fnvxr::shared::WeaponFrameFlagHandMeshRotationValid;
     const bool complete =
         (flags & fnvxr::shared::WeaponFrameRequiredFlags)
             == fnvxr::shared::WeaponFrameRequiredFlags
@@ -8068,7 +8305,10 @@ void publishWeaponFrameCommit(
         && g_retailRigNodes.weapon
         && finiteVec3(rightHandWorld)
         && finiteVec3(weaponWorld)
-        && finiteMatrix33(weaponWorldRotation);
+        && finiteMatrix33(weaponWorldRotation)
+        && (!hostSpatialPropReplacementRequested()
+            || (handMeshRotationValid
+                && finiteUsableQuat(rightHandGripLocalRotation)));
     // Fallout invokes the animation seam more than once for one OpenXR pose.
     // A later cull/stock callback can temporarily hide the arm branch after an
     // earlier callback already committed the exact current controller pose.
@@ -8133,6 +8373,19 @@ void publishWeaponFrameCommit(
     }
     for (int i = 0; i < 9; ++i)
         state->weaponWorldRot[i] = complete ? rotation[i] : 0.0f;
+    const float handRotation[4] {
+        rightHandGripLocalRotation.x,
+        rightHandGripLocalRotation.y,
+        rightHandGripLocalRotation.z,
+        rightHandGripLocalRotation.w,
+    };
+    for (int i = 0; i < 4; ++i)
+    {
+        state->rightHandGripLocalRot[i] =
+            complete && handMeshRotationValid
+                ? handRotation[i]
+                : (i == 3 ? 1.0f : 0.0f);
+    }
     fnvxr::shared::endSequencedSharedWrite(state->producerSequence);
 }
 
@@ -8421,27 +8674,40 @@ void onRetailPostAnimation(void* animData)
         pose, false, bodyAnchorWorld, bodyWorldRotation);
     const bool applyWrites = physicalHeadsetPlayRequested()
         || envEnabled("FNVXR_RETAIL_RIG_APPLY", false);
+    const bool hostSpatialProps = hostSpatialPropReplacementRequested();
     float leftError = 0.0f;
     float rightError = 0.0f;
-    const bool rightSolved = rightControllerUsable && applyRetailArmFabrik(
-        g_retailRigNodes.right,
-        g_retailRightCalibration,
-        rightController,
-        bodyWorldRotation,
-        false,
-        applyWrites,
-        rightError);
-    const bool leftSolved = leftControllerUsable && applyRetailArmFabrik(
-        g_retailRigNodes.left,
-        g_retailLeftCalibration,
-        leftController,
-        bodyWorldRotation,
-        true,
-        applyWrites,
-        leftError);
-    const bool pipBoyTracked = leftControllerUsable
-        && applyRetailTrackedPipBoy(leftController, applyWrites);
-    if (leftSolved && g_retailRigNodes.left.hand)
+    const bool rightSolved = hostSpatialProps
+        ? rightControllerUsable
+        : rightControllerUsable && applyRetailArmFabrik(
+            g_retailRigNodes.right,
+            g_retailRightCalibration,
+            rightController,
+            bodyWorldRotation,
+            false,
+            applyWrites,
+            rightError);
+    const bool leftSolved = hostSpatialProps
+        ? leftControllerUsable
+        : leftControllerUsable && applyRetailArmFabrik(
+            g_retailRigNodes.left,
+            g_retailLeftCalibration,
+            leftController,
+            bodyWorldRotation,
+            true,
+            applyWrites,
+            leftError);
+    const bool pipBoyTracked = hostSpatialProps
+        ? leftControllerUsable
+        : leftControllerUsable
+            && applyRetailTrackedPipBoy(leftController, applyWrites);
+    if (hostSpatialProps && leftControllerUsable)
+    {
+        g_latestTrackedLeftHandWorld = leftController.wristPosition;
+        g_latestTrackedLeftHandValid = finiteVec3(
+            g_latestTrackedLeftHandWorld);
+    }
+    else if (leftSolved && g_retailRigNodes.left.hand)
     {
         g_latestTrackedLeftHandWorld = readVec3(
             reinterpret_cast<std::uintptr_t>(g_retailRigNodes.left.hand)
@@ -8454,7 +8720,7 @@ void onRetailPostAnimation(void* animData)
         g_latestCompleteTrackedPropsApplied ? pose.sequence : 0;
     g_latestCompleteTrackedPropsPoseFrame =
         g_latestCompleteTrackedPropsApplied ? pose.frame : 0u;
-    if (applyWrites)
+    if (applyWrites && !hostSpatialProps)
     {
         makeRetailVrSurfaceVisible(g_retailRigNodes.upperBodyMesh);
         makeRetailVrSurfaceVisible(g_retailRigNodes.leftHandMesh);
@@ -8471,7 +8737,8 @@ void onRetailPostAnimation(void* animData)
             applyWrites)
         : RetailWeaponApplyResult {};
     bool continuityReplayed = false;
-    if ((headlessStereoRigVisualTrial || physicalHeadsetEngineCenterRigRequested())
+    if (!hostSpatialProps
+        && (headlessStereoRigVisualTrial || physicalHeadsetEngineCenterRigRequested())
         && applyWrites)
     {
         if (rightSolved && weaponResult.writeVerified)
@@ -8490,6 +8757,12 @@ void onRetailPostAnimation(void* animData)
     const bool weaponAligned = weaponResult.writeVerified
         && weaponResult.endpointMeasured
         && weaponResult.endpointInWeaponBranch
+        && (!hostSpatialProps
+            || (weaponResult.wristSocketMeasured
+                && weaponResult.wristSocketResidualUnits
+                    <= getFloatFromEnv(
+                        "FNVXR_RETAIL_WEAPON_MAX_SOCKET_RESIDUAL_UNITS",
+                        0.25f)))
         && niObjectAncestorChainVisible(g_retailRigNodes.weapon, g_retailRigNodes.root)
         && niObjectAncestorChainVisible(
             g_retailRigNodes.projectileNode
@@ -8504,7 +8777,9 @@ void onRetailPostAnimation(void* animData)
     g_lastRetailRigAnimData = animData;
     ++g_retailRigSolveCount;
 
-    const Vec3 committedRightHandWorld = g_retailRigNodes.right.hand
+    const Vec3 committedRightHandWorld = hostSpatialProps
+        ? hostSpatialHandWristWorld(rightController, false)
+        : g_retailRigNodes.right.hand
         ? readVec3(
             reinterpret_cast<std::uintptr_t>(g_retailRigNodes.right.hand)
                 + NiAvObjectWorldTranslationOffset)
@@ -8529,6 +8804,8 @@ void onRetailPostAnimation(void* animData)
             rightSolved,
             weaponResult.writeVerified,
             weaponAligned,
+            g_retailWeaponCalibration.handMeshRotationValid,
+            g_retailWeaponCalibration.rightHandGripLocalRotation,
             committedRightHandWorld,
             committedWeaponWorld,
             committedWeaponWorldRotation);
@@ -8545,7 +8822,9 @@ void onRetailPostAnimation(void* animData)
             pose.hmdRot);
         const Matrix33 inverseBodyRotation = transposeMatrix33(bodyWorldRotation);
         const Vec3 rightHandWorld = committedRightHandWorld;
-        const Vec3 rightHandTargetWorld =
+        const Vec3 rightHandTargetWorld = hostSpatialProps
+            ? hostSpatialHandWristWorld(rightController, false)
+            :
             g_retailRightCalibration.usesStageLocalBodyPositionAnchor
             ? addVec3(
                 rightController.wristPosition,
@@ -8663,7 +8942,7 @@ void onRetailPostAnimation(void* animData)
                 "\"originSource\":\"%s\","
                 "\"anchorSource\":\"%s\","
                 "\"cameraInput\":\"hmd-only\",\"rigInput\":\"controller-only\","
-                "\"apply\":%s,\"leftSolved\":%s,\"rightSolved\":%s,\"pipBoyTracked\":%s,\"continuityReplayed\":%s,\"weaponAligned\":%s,"
+                "\"apply\":%s,\"leftSolved\":%s,\"rightSolved\":%s,\"pipBoyTracked\":%s,\"continuityReplayed\":%s,\"weaponAligned\":%s,\"handMeshRotationValid\":%s,"
                 "\"weaponWriteRequested\":%s,\"weaponWriteAttempted\":%s,\"weaponWriteApplied\":%s,"
                 "\"headLocalMeters\":[%.6f,%.6f,%.6f],"
                 "\"controllerLocalMeters\":[%.6f,%.6f,%.6f],"
@@ -8683,7 +8962,10 @@ void onRetailPostAnimation(void* animData)
                 "\"headOnly\":%s,\"controllerOnly\":%s},"
                 "\"samples\":{\"headOnly\":%llu,\"controllerOnly\":%llu},"
                 "\"handTargetErrorUnits\":%.6f,\"weaponPositionResidualUnits\":%.6f,"
-                "\"weaponAngularResidualRadians\":%.7f,\"muzzleMeasured\":%s,"
+                "\"weaponAngularResidualRadians\":%.7f,\"wristSocketMeasured\":%s,"
+                "\"wristSocketResidualUnits\":%.6f,"
+                "\"wristSocketWorld\":[%.5f,%.5f,%.5f],"
+                "\"wristSocketTargetWorld\":[%.5f,%.5f,%.5f],\"muzzleMeasured\":%s,"
                 "\"muzzleInWeaponBranch\":%s,\"muzzleAimResidualRadians\":%.7f,"
                 "\"muzzleWorld\":[%.5f,%.5f,%.5f],\"aimForward\":[%.7f,%.7f,%.7f],"
                 "\"muzzleForward\":[%.7f,%.7f,%.7f],\"projectileNodeConsumeHookInstalled\":%s,"
@@ -8711,6 +8993,8 @@ void onRetailPostAnimation(void* animData)
                 pipBoyTracked ? "true" : "false",
                 continuityReplayed ? "true" : "false",
                 weaponAligned ? "true" : "false",
+                g_retailWeaponCalibration.handMeshRotationValid
+                    ? "true" : "false",
                 weaponResult.writeRequested ? "true" : "false",
                 weaponResult.writeAttempted ? "true" : "false",
                 weaponResult.writeVerified ? "true" : "false",
@@ -8773,6 +9057,14 @@ void onRetailPostAnimation(void* animData)
                 lengthVec3(subtractVec3(rightHandWorld, rightHandTargetWorld)),
                 weaponResult.positionResidualUnits,
                 weaponResult.angularResidualRadians,
+                weaponResult.wristSocketMeasured ? "true" : "false",
+                weaponResult.wristSocketResidualUnits,
+                weaponResult.wristSocketWorldPosition.x,
+                weaponResult.wristSocketWorldPosition.y,
+                weaponResult.wristSocketWorldPosition.z,
+                weaponResult.wristSocketTargetWorldPosition.x,
+                weaponResult.wristSocketTargetWorldPosition.y,
+                weaponResult.wristSocketTargetWorldPosition.z,
                 weaponResult.endpointMeasured ? "true" : "false",
                 weaponResult.endpointInWeaponBranch ? "true" : "false",
                 weaponResult.endpointAimResidualRadians,
@@ -11662,6 +11954,11 @@ BOOL CALLBACK findCurrentProcessWindow(HWND hwnd, LPARAM outWindow)
 
 HWND gameWindow()
 {
+    // Product input is normalized OpenXR/shared-state input. Do not even
+    // enumerate or inspect HWND state when the foreground-input fuse is set;
+    // the native menu path below does not require a desktop window.
+    if (windowsForegroundInputForbidden())
+        return nullptr;
     if (HWND foreground = currentProcessWindow())
         return foreground;
 
@@ -11695,31 +11992,33 @@ void updateMenuPointer(const fnvxr::PoseFrame& pose)
         return;
     }
 
-    HWND hwnd = gameWindow();
-    if (!hwnd)
-    {
-        g_latestPointerValid.store(false);
-        return;
-    }
-
-    RECT client {};
-    if (!GetClientRect(hwnd, &client))
-    {
-        g_latestPointerValid.store(false);
-        return;
-    }
-
-    const int width = client.right - client.left;
-    const int height = client.bottom - client.top;
-    if (width <= 0 || height <= 0)
-    {
-        g_latestPointerValid.store(false);
-        return;
-    }
     const int sharedWidth = getIntFromEnv("FNVXR_UI_SHARED_WIDTH", SharedVideoPointerWidth);
     const int sharedHeight = getIntFromEnv("FNVXR_UI_SHARED_HEIGHT", SharedVideoPointerHeight);
-    const int inputWidth = getIntFromEnv("FNVXR_UI_INPUT_WIDTH", width);
-    const int inputHeight = getIntFromEnv("FNVXR_UI_INPUT_HEIGHT", height);
+    const int inputWidth = getIntFromEnv(
+        "FNVXR_UI_INPUT_WIDTH", SharedVideoPointerWidth);
+    const int inputHeight = getIntFromEnv(
+        "FNVXR_UI_INPUT_HEIGHT", SharedVideoPointerHeight);
+    HWND hwnd = gameWindow();
+    int width = inputWidth;
+    int height = inputHeight;
+    if (hwnd)
+    {
+        RECT client {};
+        if (!GetClientRect(hwnd, &client))
+        {
+            g_latestPointerValid.store(false);
+            return;
+        }
+        width = client.right - client.left;
+        height = client.bottom - client.top;
+    }
+    if (width <= 0 || height <= 0
+        || sharedWidth <= 0 || sharedHeight <= 0
+        || inputWidth <= 0 || inputHeight <= 0)
+    {
+        g_latestPointerValid.store(false);
+        return;
+    }
 
     const float pointerX = calibratedPointerAxis(
         pose.menuPointerX,
@@ -11764,11 +12063,13 @@ void updateMenuPointer(const fnvxr::PoseFrame& pose)
     // publishes the requested canonical coordinate; duplicating it through
     // WM_MOUSEMOVE or cursor-tile writes lets the visible cursor diverge from
     // the native DirectInput hit-test position.
-    const POINT windowPointer = mapSharedPointerToWindow(hwnd, g_lastMenuPointerClient);
-
-    if (!windowsForegroundInputForbidden()
+    if (hwnd
+        && !windowsForegroundInputForbidden()
         && envEnabled("FNVXR_CURSOR_TRACK_POINTER", false))
     {
+        const POINT windowPointer = mapSharedPointerToWindow(
+            hwnd,
+            g_lastMenuPointerClient);
         POINT screenPoint = windowPointer;
         if (ClientToScreen(hwnd, &screenPoint))
         {
@@ -11796,8 +12097,15 @@ void executeAcceptClickOnGameThread()
         g_lastMenuPointerClient.y = g_latestPointerY.load();
     }
 
+    const bool windowInputFused = windowsForegroundInputForbidden();
     HWND hwnd = g_hasMenuPointer ? gameWindow() : nullptr;
-    const bool focusedForClick = hwnd ? ensureClickForeground(hwnd) : currentProcessHasForegroundWindow();
+    const bool focusedForClick = windowInputFused
+        ? false
+        : hwnd
+        ? ensureClickForeground(hwnd)
+        : currentProcessHasForegroundWindow();
+    const bool foregroundObserved = windowInputFused
+        ? false : currentProcessHasForegroundWindow();
     const bool uiClick = dispatchActiveMenuClick();
     if (retailSidecarProfile() && g_hasMenuPointer && !uiClick)
     {
@@ -11816,7 +12124,7 @@ void executeAcceptClickOnGameThread()
             static_cast<int>(diMouseTap),
             static_cast<int>(postedMouse),
             static_cast<int>(focusedForClick),
-            static_cast<int>(currentProcessHasForegroundWindow()));
+            static_cast<int>(foregroundObserved));
         return;
     }
 
@@ -11836,7 +12144,7 @@ void executeAcceptClickOnGameThread()
         static_cast<int>(uiClick),
         static_cast<int>(sendInputMouse),
         g_directInputHook,
-        static_cast<int>(currentProcessHasForegroundWindow()));
+        static_cast<int>(foregroundObserved));
 
     if (g_hasMenuPointer && allowLegacyFallback)
     {
@@ -17026,7 +17334,19 @@ void injectRisingEdgeInput(
         uiInputAllowed
         && !(uiFavoriteAssignPressed & fnvxr::ButtonA)
         && (pressed & fnvxr::ButtonA);
-    const bool pointerClickPressed = uiInputAllowed && rightTriggerPressed && pose.menuPointerActive;
+    const float liveDeviceU = static_cast<float>(pose.poseReserved[
+        fnvxr::PoseReservedPipBoyDeviceU]) / 255.0f;
+    const float liveDeviceV = static_cast<float>(pose.poseReserved[
+        fnvxr::PoseReservedPipBoyDeviceV]) / 255.0f;
+    const bool pointerTargetsLiveScreen = !pipBoyVisible
+        || fnvxr::engine::live_pipboy::physicalControl(
+                liveDeviceU,
+                liveDeviceV)
+            == fnvxr::engine::live_pipboy::PhysicalControl::Screen;
+    const bool pointerClickPressed = uiInputAllowed
+        && rightTriggerPressed
+        && pose.menuPointerActive
+        && pointerTargetsLiveScreen;
     const bool acceptRepeat =
         envEnabled("FNVXR_ACCEPT_REPEAT", false) && buttonAcceptHeld && pose.frame >= lastAcceptFrame + 18;
     const bool fallbackAcceptPressed = menuKeyboardFallback && buttonAcceptPressed;
@@ -17449,9 +17769,15 @@ FNVXR_ApplyWeaponFrameForRender(
         MemoryBarrier();
         const LONG after = InterlockedCompareExchange(
             &state->producerSequence, 0, 0);
-        return before == after
-            && identityMatches
-            && fnvxr::weapon_frame::committedPoseOwnsLiveRigTransforms(
+        const bool transformStillOwned = hostSpatialPropReplacementRequested()
+            ? fnvxr::weapon_frame::committedPoseOwnsLiveWeaponTransform(
+                liveWeapon,
+                state->weaponWorldPos,
+                liveRotation,
+                state->weaponWorldRot,
+                0.02f,
+                0.001f)
+            : fnvxr::weapon_frame::committedPoseOwnsLiveRigTransforms(
                 liveHand,
                 state->rightHandWorldPos,
                 liveWeapon,
@@ -17461,6 +17787,7 @@ FNVXR_ApplyWeaponFrameForRender(
                 0.02f,
                 0.02f,
                 0.001f);
+        return before == after && identityMatches && transformStillOwned;
     };
     // Reapply the complete prop set at this exact render boundary every time.
     // A right-hand/weapon commit alone cannot prove that stock animation did
@@ -17470,9 +17797,10 @@ FNVXR_ApplyWeaponFrameForRender(
     onRetailPostAnimation(g_lastRetailRigAnimData);
     g_renderRigPoseOverrideActive = false;
     const bool completeTrackedPropsRestored =
-        g_latestCompleteTrackedPropsApplied
-        && g_latestCompleteTrackedPropsPoseSequence == poseSequence
-        && g_latestCompleteTrackedPropsPoseFrame == pose.frame;
+        hostSpatialPropReplacementRequested()
+        || (g_latestCompleteTrackedPropsApplied
+            && g_latestCompleteTrackedPropsPoseSequence == poseSequence
+            && g_latestCompleteTrackedPropsPoseFrame == pose.frame);
     const bool restored = committedPoseStillOwnsLiveTransforms()
         && completeTrackedPropsRestored;
     static LONG restoreAttempts = 0;

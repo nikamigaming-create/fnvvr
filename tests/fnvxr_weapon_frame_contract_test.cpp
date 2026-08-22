@@ -98,6 +98,35 @@ int main()
     {
         return fail();
     }
+    if (!fnvxr::weapon_frame::committedPoseOwnsLiveWeaponTransform(
+            stableWeaponPosition,
+            committedTransform,
+            stableWeaponRotation,
+            committedWeaponRotation,
+            0.02f,
+            0.01f))
+    {
+        return fail();
+    }
+    // A host-spatial hand deliberately ignores stock hand animation while
+    // retaining the exact committed weapon pose.
+    if (!fnvxr::weapon_frame::committedPoseOwnsLiveWeaponTransform(
+            stableWeaponPosition,
+            committedTransform,
+            stableWeaponRotation,
+            committedWeaponRotation,
+            0.02f,
+            0.01f)
+        || fnvxr::weapon_frame::committedPoseOwnsLiveWeaponTransform(
+            overwrittenTransform,
+            committedTransform,
+            stableWeaponRotation,
+            committedWeaponRotation,
+            0.02f,
+            0.01f))
+    {
+        return fail();
+    }
     if (!fnvxr::weapon_frame::duplicatePoseSolveCanBeSkipped(42, 42, false))
         return fail();
     if (fnvxr::weapon_frame::duplicatePoseSolveCanBeSkipped(42, 42, true))

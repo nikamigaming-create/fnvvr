@@ -188,16 +188,17 @@ int main()
     {
         return fail("SharedVrOriginState authoritative recenter layout mismatch");
 
-    if (sizeof(fnvxr::shared::SharedWeaponFrameState) != 160
+    if (sizeof(fnvxr::shared::SharedWeaponFrameState) != 176
         || offsetof(fnvxr::shared::SharedWeaponFrameState, producerSequence) != 8
         || offsetof(fnvxr::shared::SharedWeaponFrameState, commitId) != 16
         || offsetof(fnvxr::shared::SharedWeaponFrameState, poseSequence) != 24
         || offsetof(fnvxr::shared::SharedWeaponFrameState, rightHandAddress) != 56
         || offsetof(fnvxr::shared::SharedWeaponFrameState, rightHandWorldPos) != 64
         || offsetof(fnvxr::shared::SharedWeaponFrameState, weaponWorldRot) != 88
-        || offsetof(fnvxr::shared::SharedWeaponFrameState, consumerSequence) != 124
-        || offsetof(fnvxr::shared::SharedWeaponFrameState, consumedCommitId) != 136
-        || offsetof(fnvxr::shared::SharedWeaponFrameState, consumedPoseFrame) != 152)
+        || offsetof(fnvxr::shared::SharedWeaponFrameState, rightHandGripLocalRot) != 124
+        || offsetof(fnvxr::shared::SharedWeaponFrameState, consumerSequence) != 140
+        || offsetof(fnvxr::shared::SharedWeaponFrameState, consumedCommitId) != 152
+        || offsetof(fnvxr::shared::SharedWeaponFrameState, consumedPoseFrame) != 168)
         return fail("SharedWeaponFrameState producer/consumer lane layout mismatch");
     }
 

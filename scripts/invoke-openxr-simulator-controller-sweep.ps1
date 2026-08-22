@@ -67,10 +67,10 @@ if ($LivePipBoyFocus) {
     # aim axis intersects that plane. Four dwell samples make the focus/open
     # gesture visible for roughly three seconds in the bounded recording.
     $pipBoyFocus = @(
-        [ordered]@{ axis = "pipBoyFocus"; direction = 0; x = 0.18; y = 1.37; z = -0.24; yaw = 1.054; pitch = 0.205; roll = 0.0 },
-        [ordered]@{ axis = "pipBoyFocus"; direction = 0; x = 0.18; y = 1.37; z = -0.24; yaw = 1.054; pitch = 0.205; roll = 0.0 },
-        [ordered]@{ axis = "pipBoyFocus"; direction = 0; x = 0.18; y = 1.37; z = -0.24; yaw = 1.054; pitch = 0.205; roll = 0.0 },
-        [ordered]@{ axis = "pipBoyFocus"; direction = 0; x = 0.18; y = 1.37; z = -0.24; yaw = 1.054; pitch = 0.205; roll = 0.0 }
+        [ordered]@{ axis = "pipBoyFocus"; direction = 0; x = 0.18; y = 1.37; z = -0.24; yaw = 1.178; pitch = 0.159; roll = 0.0 },
+        [ordered]@{ axis = "pipBoyFocus"; direction = 0; x = 0.18; y = 1.37; z = -0.24; yaw = 1.178; pitch = 0.159; roll = 0.0 },
+        [ordered]@{ axis = "pipBoyFocus"; direction = 0; x = 0.18; y = 1.37; z = -0.24; yaw = 1.178; pitch = 0.159; roll = 0.0 },
+        [ordered]@{ axis = "pipBoyFocus"; direction = 0; x = 0.18; y = 1.37; z = -0.24; yaw = 1.178; pitch = 0.159; roll = 0.0 }
     )
     # Preserve the final neutral command as the terminal state.
     $steps = @($steps[0..($steps.Count - 2)]) +
@@ -94,6 +94,7 @@ foreach ($pose in $steps) {
         Yaw = [double]$pose.yaw
         Pitch = [double]$pose.pitch
         Roll = [double]$pose.roll
+        Grip = if ([string]$pose.axis -ceq "pipBoyFocus") { 1.0 } else { 0.0 }
         WaitMilliseconds = $ConsumeTimeoutMilliseconds
     }
     $output = @(& $inputDriver @invokeArguments) -join [Environment]::NewLine

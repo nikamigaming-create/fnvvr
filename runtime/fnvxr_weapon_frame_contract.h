@@ -85,6 +85,27 @@ inline bool committedPoseOwnsLiveRigTransforms(
             liveWeaponRotation, committedWeaponRotation, 9, rotationTolerance);
 }
 
+// When the OpenXR host replaces the unstable stock hand category in the final
+// eye, the retail mutation seam owns only the stock weapon. Stock animation is
+// free to move or cull the unused engine hand; that must not invalidate an
+// otherwise exact weapon commit or cause the hook to rewrite the hidden arm.
+inline bool committedPoseOwnsLiveWeaponTransform(
+    const float* liveWeaponPosition,
+    const float* committedWeaponPosition,
+    const float* liveWeaponRotation,
+    const float* committedWeaponRotation,
+    float weaponPositionTolerance,
+    float rotationTolerance) noexcept
+{
+    return transformMatches(
+            liveWeaponPosition,
+            committedWeaponPosition,
+            3,
+            weaponPositionTolerance)
+        && transformMatches(
+            liveWeaponRotation, committedWeaponRotation, 9, rotationTolerance);
+}
+
 // Normal animation callbacks solve one controller pose once. The renderer is
 // the exception: if stock animation overwrote that same pose before the eye
 // traversal, it must be allowed to restore it at the render boundary.
