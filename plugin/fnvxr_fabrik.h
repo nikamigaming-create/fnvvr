@@ -15,7 +15,11 @@ struct Vec3
 
 struct SolveOptions
 {
-    int maxIterations { 12 };
+    // Near-full-extension two-bone chains converge much more slowly than the
+    // compact unit-test poses.  Forty-eight iterations is still a tiny,
+    // bounded amount of work for two retail arms, while avoiding a false
+    // failure at ordinary controller reach.
+    int maxIterations { 48 };
     float tolerance { 0.01f };
     float poleWeight { 1.0f };
 };

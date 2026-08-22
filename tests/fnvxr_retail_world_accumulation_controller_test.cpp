@@ -205,6 +205,34 @@ int main()
                 && ui.events == std::vector<Event> { Event::Read },
             "confirmed UI entered the private world transaction");
 
+        State pipBoy;
+        pipBoy.tracked = gameplayFrame();
+        pipBoy.tracked.runtime.phase = fnvxr::shared::RuntimePhaseMenu;
+        pipBoy.tracked.runtime.menuBits =
+            fnvxr::shared::RuntimeMenuModeBit
+            | fnvxr::shared::RuntimePipBoyMenuBit;
+        pipBoy.nextTransaction = 21u;
+        RetailWorldAccumulationController pipBoyController;
+        require(
+            pipBoyController.initialize(operations(pipBoy)),
+            "live Pip-Boy init failed");
+        const RetailWorldAccumulationControllerResult pipBoyResult =
+            pipBoyController.dispatch(
+                { &pipBoy.camera, &pipBoy.scene, &pipBoy.culler });
+        require(
+            pipBoyResult.complete()
+                && pipBoyResult.disposition
+                    == RetailWorldHookDisposition::StereoWorldComplete
+                && pipBoyResult.transactionId == 21u
+                && pipBoy.events == std::vector<Event> {
+                    Event::Read,
+                    Event::Claim,
+                    Event::Prepare,
+                    Event::Render,
+                    Event::Publish,
+                },
+            "live Pip-Boy did not execute the private binocular transaction");
+
         State mismatch;
         mismatch.tracked = gameplayFrame();
         mismatch.mismatch = true;

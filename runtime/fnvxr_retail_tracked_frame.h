@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../protocol/fnvxr_shared_state.h"
+#include "fnvxr_live_pipboy_contract.h"
 
 #include <cmath>
 #include <cstdint>
@@ -177,6 +178,14 @@ inline bool retailTrackedRuntimeUiConfirmed(
 inline RetailTrackedPresentationRoute retailTrackedPublishedPresentationRoute(
     const RetailTrackedFrame& frame) noexcept
 {
+    if (live_pipboy::worldPresentationContinues(
+            frame.runtime.phase,
+            frame.runtime.menuBits,
+            frame.runtime.showroomActive,
+            frame.runtime.cameraActive != 0u))
+    {
+        return RetailTrackedPresentationRoute::BinocularWorld;
+    }
     if (retailTrackedRuntimeUiConfirmed(frame.runtime))
         return RetailTrackedPresentationRoute::MonoUiQuad;
     if (shared::runtimeGameplayPhase(
@@ -208,6 +217,31 @@ inline RetailTrackedFrameValidation validateRetailTrackedUiFrame(
     if (retailTrackedPublishedPresentationRoute(frame)
         != RetailTrackedPresentationRoute::MonoUiQuad)
         return { RetailTrackedFrameFailure::RuntimeNotUi };
+    return { RetailTrackedFrameFailure::None };
+}
+
+// A live Pip-Boy is still a binocular-world presentation route, but its
+// authored screen pixels are produced in the ordinary retail backbuffer at
+// Present. Permit that exact surface to use the mono pixel transport as an
+// auxiliary wrist-screen texture without relabeling the runtime as flat UI.
+inline RetailTrackedFrameValidation validateRetailTrackedUiSurfaceFrame(
+    const RetailTrackedFrame& frame) noexcept
+{
+    const RetailTrackedFrameValidation published =
+        validateRetailTrackedPublishedFrame(frame);
+    if (!published.complete())
+        return published;
+    const bool livePipBoy = live_pipboy::worldPresentationContinues(
+        frame.runtime.phase,
+        frame.runtime.menuBits,
+        frame.runtime.showroomActive,
+        frame.runtime.cameraActive != 0u);
+    if (!livePipBoy
+        && retailTrackedPublishedPresentationRoute(frame)
+            != RetailTrackedPresentationRoute::MonoUiQuad)
+    {
+        return { RetailTrackedFrameFailure::RuntimeNotUi };
+    }
     return { RetailTrackedFrameFailure::None };
 }
 

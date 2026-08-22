@@ -44,12 +44,13 @@ These pieces are diagnostic until a live transform and firing proof passes.
 6. Verify alignment after recoil, reload, weapon swaps, crouch, movement, turn,
    recenter, and tracking loss.
 
-## Flat UI Rule
+## UI Rule
 
-No spatial Pip-Boy or native stereo menu is required for this milestone.
-Startup, pause, inventory, Pip-Boy, dialogue, VATS, loading, and any unknown UI
-state use the retail mono surface. The right-hand ray may point and click that
-surface, but the host does not recreate menu behavior.
+The Pip-Boy is always a live wrist prop inside `WorldStereo`; pointing scales
+and focuses it, while trigger/fingertip hits drive its retail screen and
+physical controls. Startup, pause, containers, dialogue, VATS, loading,
+conflicting menus, and any unknown UI state use the retail mono quad floating
+in front. The host does not recreate menu behavior.
 
 ## Acceptance
 

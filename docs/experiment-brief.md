@@ -48,14 +48,15 @@ producer. Consumers reject invalid headers, unstable snapshots, and
 incompatible runtime phases. This is a bridge acceptance requirement, not a
 blanket claim that every current mapping already satisfies it.
 
-The XInput v2 and DirectInput v9 frame fields now use odd/even sequence guards.
+The XInput v4 and DirectInput v10 frame fields use odd/even sequence guards.
 Their producers finish all buttons, triggers, sticks, pointer, and gameplay
 fields before publishing an even sequence; the plugin and retail proxies use
-stable local snapshots or reject that poll. The three XInput reserved bytes
+stable local snapshots or reject that poll. The first three XInput reserved bytes
 are explicitly separate consumer/plugin-owned acknowledgement and movement
-status lanes rather than producer-frame fields.
+status lanes rather than producer-frame fields; bytes 3 through 7 carry the
+sequenced live Pip-Boy/orbit interaction payload.
 
-DirectInput v9 publishes head/hand look as cumulative signed angle counters.
+DirectInput v10 publishes head/hand look as cumulative signed angle counters.
 The retail proxy differences each producer frame once, so polling the same
 frame cannot repeat a delta and skipped producer frames do not discard the
 intervening tracked rotation.
@@ -65,16 +66,20 @@ buttons, triggers, grips, thumbsticks, pointer position, and input intent.
 
 Retail-to-host state includes runtime/UI phase, player/body and camera
 transforms, weapon classification and rig diagnostics, plus versioned mono-UI
-or stereo GPU resource metadata. Eye pixels do not travel through a CPU ring.
-Stereo GPU metadata is published only through the fully ordered odd/even
-producer helper, and the host must observe the declared shared fence itself.
+or stereo GPU resource metadata. In the production contract, eye pixels do not
+travel through a CPU ring: stereo GPU metadata is published only through the
+fully ordered odd/even producer helper, and the host must observe the declared
+shared fence itself. The separately fused CPU-v8 route remains bounded
+visual-trial evidence and is never a failed-GPU fallback or release transport.
 
 ## Presentation Contract
 
-The normal retail mono frame is the UI source. Confirmed startup/menu, pause,
-Pip-Boy/inventory, dialogue, VATS, and loading states are shown flat in the
-headset. Unknown/stale runtime fails blank and cannot manufacture an allowed
-quad. UI input remains ordinary retail mouse/keyboard/controller input.
+The normal retail mono frame supplies every non-Pip-Boy blocking UI as a stable
+quad floating in front of the player. The Pip-Boy is a persistent live wrist
+prop in fresh binocular rendering; pointing/fingertip focus drives its screen
+and controls without creating a presentation state. Unknown/stale runtime fails
+blank and cannot manufacture either route. UI input remains ordinary retail
+input.
 
 All non-blocking gameplay requires native stereo with no persistent gameplay
 HUD. A world transition requires a fresh, complete, pose-matched same-frame

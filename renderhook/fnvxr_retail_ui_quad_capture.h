@@ -75,7 +75,7 @@ public:
             return withhold(
                 RetailUiQuadCaptureFailure::RuntimeSampleUnavailable);
         }
-        if (!engine::validateRetailTrackedUiFrame(frame).complete())
+        if (!engine::validateRetailTrackedUiSurfaceFrame(frame).complete())
         {
             return withhold(
                 RetailUiQuadCaptureFailure::RuntimeNotConfirmedUi);

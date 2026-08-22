@@ -112,6 +112,14 @@ if(WIN32)
             -SourceRoot ${CMAKE_CURRENT_SOURCE_DIR}
     )
     add_test(
+        NAME fnvxr_first_person_visual_quality_test
+        COMMAND powershell.exe
+            -NoProfile
+            -ExecutionPolicy Bypass
+            -File ${CMAKE_CURRENT_SOURCE_DIR}/tests/fnvxr_first_person_visual_quality_test.ps1
+            -SourceRoot ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    add_test(
         NAME fnvxr_phase1_6dof_verifier_test
         COMMAND powershell.exe
             -NoProfile

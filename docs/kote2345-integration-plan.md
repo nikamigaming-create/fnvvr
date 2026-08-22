@@ -1,6 +1,6 @@
 # FNVVR full 6DoF integration and release plan
 
-Audit date: 2026-08-01
+Audit date: 2026-08-22
 
 This is the implementation plan for turning the current exact-retail visual
 trial into a playable and releasable Fallout: New Vegas VR product: physical
@@ -10,16 +10,18 @@ and GPU-native presentation.
 
 ## Audited baseline
 
-- FNVVR checkout: `6faed4620d029803ceb129487ebacb64237111ef`
-  (`codex/private-stereo-live-support`).
+- FNVVR implementation baseline: `3121598799a6890968d2c345631523c47d2eee7a`
+  (`codex/live-pipboy-hands`). The next product attestation supersedes this
+  planning identifier and binds the complete working source/document set.
 - Donor research checkout: `kote2345/fnv_vr` at
   `589b2d3fd98218ad233255e9649f903514613643`.
-- Current x64 build catalog: 111 registered tests. The retained combined
-  source checkpoint described in `docs/status.md` passed 224/224 tests on
-  2026-07-29.
-- Current shared protocols include pose v8, origin v6, D3D9 stereo CPU v8,
-  GPU frame v4, and GPU color v5. These versions must not be mixed or silently
-  upgraded.
+- Current catalogs contain 119 x64 and 121 Win32 registered tests. The previous
+  August 22 build recorded 238/238 passes; the final-pixel gate raises the next
+  clean catalog to 240 tests, and only a newly generated exact
+  attestation can authorize later source or artifact changes.
+- Current shared protocols include XInput v4, DirectInput v10, pose v9, origin
+  v6, D3D9 stereo CPU v8, GPU frame v4, and GPU color v5. These versions must
+  not be mixed or silently upgraded.
 - The retained headless run
   `20260729-120130-129-4a961da02e23` proved deterministic six-axis simulator
   motion through engine stereo and OpenXR. It did not prove physical head/body
@@ -48,9 +50,10 @@ item below without a manual code/configuration change between tests.
 3. The player can move, turn, activate, crouch, jump, fire, aim/block, reload,
    holster, use VATS, use favorites, open the Pip-Boy, pause, and back out using
    tracked controllers with no duplicate input path.
-4. Every blocking retail UI is usable on a stable mono `UiQuad`, including
-   pointer, hover, click, drag, scroll/zoom, accept, back, and controller
-   navigation where that menu requires it.
+4. The retail Pip-Boy remains a live binocular wrist device with tracked
+   screen/dial interaction. Every other blocking retail UI is usable on a
+   stable mono `UiQuad`, including pointer, hover, click, drag, scroll/zoom,
+   accept, back, and controller navigation where that menu requires it.
 5. Both hands and the visible first-person weapon are body-anchored and stable.
    Grip poses drive wrists; the independent aim pose drives the weapon/muzzle.
 6. The visible barrel, retail muzzle, engine projectile or hit ray, spread,
@@ -78,8 +81,10 @@ item below without a manual code/configuration change between tests.
   validated and consumed inside the retail process.
 - Mono gameplay is never a successful fallback. Unknown or stale gameplay
   state produces a visible safety blank.
-- Blocking UI is deliberately flat retail UI. Do not rebuild Fallout menus in
-  the host and do not require a spatial Pip-Boy for the first product release.
+- The retail Pip-Boy is a persistent live wrist device in `WorldStereo`;
+  opening or focusing it changes retail input ownership, not presentation
+  mode. Every other blocking UI is deliberately flat retail UI. Do not rebuild
+  Fallout menus in the host.
 - Head look never continuously writes the player actor rotation. Body yaw
   changes only through deliberate snap turn, smooth turn, locomotion policy,
   or explicit recenter.
@@ -208,6 +213,7 @@ and calibration revision.
 |---|---|---|---|
 | Startup or loading | Latest current `UiQuad`, otherwise safety blank | Neutral except an explicitly valid retail UI action | No camera, rig, weapon, or firing write |
 | Interactive retail UI | Current `UiQuad` | Exactly one UI route: ray/pointer or menu navigation | Suspend world props; restore all temporary world state |
+| Live Pip-Boy focus | Fresh `WorldStereo` with the wrist device | Tracked fingertip/screen/dial actions through retail | Keep authenticated hands, weapon, Pip-Boy root, and both eyes current |
 | UI-to-world handoff | Hold last valid quad for the bounded window, then blank | Neutral until the new mode is authoritative | Wait for a strictly newer complete stereo transaction |
 | Gameplay ready | `WorldStereo` | Gameplay action map | Head-local cameras, hands, weapon, and retail combat authority active |
 | Tracking stale/lost | Safety blank or current blocking UI quad | Release every held action within 250 ms | Restore/suspend camera, rig, weapon and firing writes |
@@ -392,36 +398,40 @@ or tracking producer stops.
   bad image but may not classify gameplay as UI.
 - Expand the classifier/acceptance matrix to cover:
   - startup, main, pause, settings, save/load, message boxes and DLC notices;
-  - Pip-Boy Items/Stats/Data/Map, inventory, container, barter, repair,
-    crafting, companion and quantity/slider submenus;
+  - live-wrist Pip-Boy Items/Stats/Data/Map, including screen, tab-dial,
+    scroll/zoom, focus, and weapon-orbit interaction;
+  - inventory, container, barter, repair, crafting, companion and
+    quantity/slider submenus on `UiQuad`;
   - dialogue, VATS, terminals/hacking, lockpicking, wait/sleep, level-up,
     perks, race/character creation, death, credits and loading;
   - console and mod-added TileMenus, which default to `UiQuad` until validated.
-- Use one current 16:9 retail UI texture, aspect-fit without cropping, and bind
-  its runtime-state sample, source frame, pose epoch, capture ordinal, and
-  pixel-completeness evidence.
-- Make the controller ray intersect the exact displayed quad. Keep render and
-  input dimensions explicit so DPI, window size, backbuffer size, and client
-  coordinates cannot drift.
+- For non-Pip-Boy UI, use one current 16:9 retail texture, aspect-fit without
+  cropping, and bind its runtime-state sample, source frame, pose epoch,
+  capture ordinal, and pixel-completeness evidence.
+- Make the controller ray intersect either the exact displayed quad or the
+  authenticated wrist screen/control plane selected by the classifier. Keep
+  render and input dimensions explicit so DPI, window size, backbuffer size,
+  client coordinates, and wrist-local coordinates cannot drift.
 - Complete pointer hover, press/release, drag, sliders, scroll wheel, map zoom,
   accept, cancel/back, key repeat, D-pad/stick navigation, and pointer capture
   loss. Never feed ray and gamepad navigation simultaneously unless the menu
   has a tested split contract.
-- Treat unknown/stale UI as a quad with input neutral until menu identity is
-  validated. Never expose stale world stereo behind an unknown interactive
-  menu.
-- On UI entry, suspend/restore hands, weapon and combat input before presenting
-  the quad. On UI exit, retain the quad until a strictly newer complete stereo
-  transaction is ready, then switch atomically.
+- Treat unknown or stale runtime/UI evidence as a safety blank with neutral
+  input. Never manufacture a quad or expose stale world stereo from an
+  unclassified interactive state.
+- On non-Pip-Boy UI entry, suspend/restore hands, weapon and combat input before
+  presenting the quad. Pip-Boy focus instead retains authenticated world props
+  and changes only retail input focus. On quad exit, retain the quad until a
+  strictly newer complete stereo transaction is ready, then switch atomically.
 - Add an automated menu traversal fixture where possible and a retained manual
   checklist for menus that require quest/game context.
 
 ### Exit gate
 
-The complete menu matrix passes open, interact, nested interact, back, close,
-and world-handoff tests with no black frame, cropped menu, lost pointer,
-double click, stuck key, stereo menu, gameplay fire, stale world frame, or
-unrecoverable focus loss.
+The live wrist Pip-Boy and complete non-Pip-Boy menu matrix pass open,
+interact, nested interact, back, close, and world-handoff tests with no black
+frame, cropped menu, lost pointer, double click, stuck key, accidental stereo
+menu, gameplay fire, stale world frame, or unrecoverable focus loss.
 
 ## Phase 5 - Body-anchored hands and visual weapon chain
 

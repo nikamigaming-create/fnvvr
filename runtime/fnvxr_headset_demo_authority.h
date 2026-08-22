@@ -5,8 +5,9 @@
 namespace fnvxr::engine::headset_demo
 {
 // The demo is deliberately a tiny, deterministic in-game sequence: after an
-// owned fixture reaches real gameplay, one Tab event opens Pip-Boy, it stays
-// visible for a bounded interval, and one Tab event closes it.  This policy
+// owned fixture reaches real gameplay, one native engine action opens Pip-Boy,
+// it stays visible for a bounded interval, and one engine action closes it.
+// This policy
 // cannot express movement, aiming, firing, arbitrary menu navigation, desktop
 // input, controller input, or simulator control.
 enum class Stage : std::uint8_t
@@ -38,7 +39,7 @@ struct Input
     bool fixtureReady = false;
     bool gameplay = false;
     bool pipBoyVisible = false;
-    bool inGameTapAvailable = false;
+    bool engineActionAvailable = false;
     std::uint64_t frame = 0u;
     std::uint64_t gameplayWarmupFrames = 0u;
     std::uint64_t pipBoyHoldFrames = 0u;
@@ -83,7 +84,7 @@ constexpr Decision advance(const State& state, const Input& input) noexcept
             return { next, Action::None };
         }
         if (input.frame < next.stageFrame + input.gameplayWarmupFrames
-            || !input.inGameTapAvailable)
+            || !input.engineActionAvailable)
         {
             return { next, Action::None };
         }
@@ -107,7 +108,7 @@ constexpr Decision advance(const State& state, const Input& input) noexcept
             return { next, Action::None };
         }
         if (input.frame < next.stageFrame + input.pipBoyHoldFrames
-            || !input.inGameTapAvailable)
+            || !input.engineActionAvailable)
         {
             return { next, Action::None };
         }

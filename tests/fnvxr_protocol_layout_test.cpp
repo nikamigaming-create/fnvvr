@@ -62,8 +62,8 @@ int main()
     if (sizeof(fnvxr::shared::SharedInputEventQueue) != 2088)
         return fail("SharedInputEventQueue size mismatch");
 
-    if (sizeof(fnvxr::shared::SharedXInputState) != 32
-        || fnvxr::shared::XInputSharedVersion != 3
+    if (sizeof(fnvxr::shared::SharedXInputState) != 40
+        || fnvxr::shared::XInputSharedVersion != 4
         || offsetof(fnvxr::shared::SharedXInputState, sequence) != 8
         || offsetof(fnvxr::shared::SharedXInputState, packet) != 12
         || offsetof(fnvxr::shared::SharedXInputState, buttons) != 16

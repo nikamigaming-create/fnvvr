@@ -56,14 +56,14 @@ foreach(forbidden IN ITEMS
     forbid_text(
         "${isolated_text}"
         "${forbidden}"
-        "The isolated UI-only Present seam must not reach legacy replay/readback/configuration paths")
+        "The isolated UI/Pip-Boy surface Present seam must not reach legacy replay/readback/configuration paths")
 endforeach()
 
 require_text(
     "${controller_text}"
-    "validateRetailTrackedUiFrame(frame)"
-    "Every UI copy must require a stable, explicitly classified retail UI frame")
-string(FIND "${controller_text}" "validateRetailTrackedUiFrame(frame)" validation_at)
+    "validateRetailTrackedUiSurfaceFrame(frame)"
+    "Every UI surface copy must require stable retail UI or exact live Pip-Boy evidence")
+string(FIND "${controller_text}" "validateRetailTrackedUiSurfaceFrame(frame)" validation_at)
 string(FIND "${controller_text}" "copyBackBufferToMonoTargets(" copy_at)
 string(FIND "${controller_text}" "publishMonoUiQuad(" publish_at)
 if(validation_at EQUAL -1
@@ -244,4 +244,4 @@ if(bootstrap_at EQUAL -1
         "The one-slot Present bootstrap must be installed before any initial bridge attempt")
 endif()
 
-message(STATUS "Retail UI-only Present capture source fuse PASS")
+message(STATUS "Retail UI/Pip-Boy surface Present capture source fuse PASS")

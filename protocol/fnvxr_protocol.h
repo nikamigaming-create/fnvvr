@@ -35,6 +35,16 @@ enum ButtonBits : std::uint64_t
     RightThumbstick = 1ull << 7,
 };
 
+constexpr std::uint8_t PoseReservedInteractionFlags = 0;
+constexpr std::uint8_t PoseReservedPipBoyScale = 1;
+constexpr std::uint8_t PoseReservedWeaponOrbitSlot = 2;
+constexpr std::uint8_t PoseReservedPipBoyDeviceU = 3;
+constexpr std::uint8_t PoseReservedPipBoyDeviceV = 4;
+constexpr std::uint8_t PoseInteractionLivePipBoyHovered = 1u << 0;
+constexpr std::uint8_t PoseInteractionLivePipBoyFocused = 1u << 1;
+constexpr std::uint8_t PoseInteractionLivePipBoyOpenRequest = 1u << 2;
+constexpr std::uint8_t PoseInteractionWeaponOrbitActive = 1u << 3;
+
 #pragma pack(push, 1)
 struct PoseFrame
 {

@@ -654,6 +654,16 @@ public:
             ? mPendingFirstPerson.tracked.pose.frame : 0u;
     }
 
+    bool pendingFirstPersonLivePipBoy() const noexcept
+    {
+        return firstPersonPublicationPendingForCurrentThread(1u)
+            && engine::live_pipboy::worldPresentationContinues(
+                mPendingFirstPerson.tracked.runtime.phase,
+                mPendingFirstPerson.tracked.runtime.menuBits,
+                mPendingFirstPerson.tracked.runtime.showroomActive,
+                mPendingFirstPerson.tracked.runtime.cameraActive != 0u);
+    }
+
     bool preparePendingControllerRigForRender() noexcept
     {
         return firstPersonPublicationPendingForCurrentThread(1u)
@@ -948,7 +958,7 @@ public:
         const engine::RetailTrackedFrame& tracked) noexcept
     {
         if (!ready()
-            || !engine::validateRetailTrackedUiFrame(tracked).complete())
+            || !engine::validateRetailTrackedUiSurfaceFrame(tracked).complete())
         {
             return false;
         }

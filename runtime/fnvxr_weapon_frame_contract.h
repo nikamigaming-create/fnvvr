@@ -58,6 +58,80 @@ inline bool transformMatches(
     return true;
 }
 
+// A render transaction may visit the controller-rig seam more than once for
+// one OpenXR pose. Skip the second write only when the live hand and weapon
+// still agree with the committed controller pose. Gamebryo can overwrite the
+// hand while leaving the child's cached world transform untouched, so checking
+// only the weapon produces a thresholded "moves once in a while" result.
+inline bool committedPoseOwnsLiveRigTransforms(
+    const float* liveHandPosition,
+    const float* committedHandPosition,
+    const float* liveWeaponPosition,
+    const float* committedWeaponPosition,
+    const float* liveWeaponRotation,
+    const float* committedWeaponRotation,
+    float handPositionTolerance,
+    float weaponPositionTolerance,
+    float rotationTolerance) noexcept
+{
+    return transformMatches(
+            liveHandPosition, committedHandPosition, 3, handPositionTolerance)
+        && transformMatches(
+            liveWeaponPosition,
+            committedWeaponPosition,
+            3,
+            weaponPositionTolerance)
+        && transformMatches(
+            liveWeaponRotation, committedWeaponRotation, 9, rotationTolerance);
+}
+
+// Normal animation callbacks solve one controller pose once. The renderer is
+// the exception: if stock animation overwrote that same pose before the eye
+// traversal, it must be allowed to restore it at the render boundary.
+constexpr bool duplicatePoseSolveCanBeSkipped(
+    std::int32_t poseSequence,
+    std::int32_t lastSolvedPoseSequence,
+    bool rendererRestoreActive) noexcept
+{
+    return poseSequence == lastSolvedPoseSequence && !rendererRestoreActive;
+}
+
+// The first-person "Weapon" node is a stable hand attachment. Fallout swaps
+// the model beneath it when an inventory equip completes, so wrapper identity
+// alone cannot prove that the calibration still belongs to the equipped gun.
+constexpr bool weaponBindingMustBeRecalibrated(
+    bool explicitRefresh,
+    std::uint32_t previousEquippedFormId,
+    std::uint32_t currentEquippedFormId,
+    std::uintptr_t previousWeaponNode,
+    std::uintptr_t currentWeaponNode,
+    std::uintptr_t previousModelNode,
+    std::uintptr_t currentModelNode,
+    std::uintptr_t previousEndpointNode,
+    std::uintptr_t currentEndpointNode) noexcept
+{
+    return explicitRefresh
+        || previousEquippedFormId != currentEquippedFormId
+        || previousWeaponNode != currentWeaponNode
+        || previousModelNode != currentModelNode
+        || previousEndpointNode != currentEndpointNode;
+}
+
+constexpr bool weaponBindingReady(
+    bool weaponNodePresent,
+    bool modelNodePresent,
+    bool endpointInCurrentModel,
+    std::uint32_t equippedFormId,
+    std::uint32_t modelFormId) noexcept
+{
+    return weaponNodePresent
+        && modelNodePresent
+        && endpointInCurrentModel
+        && (equippedFormId == 0u
+            || modelFormId == 0u
+            || equippedFormId == modelFormId);
+}
+
 constexpr bool preserveCommittedPose(
     std::uint32_t status,
     std::uint32_t committedStatus,

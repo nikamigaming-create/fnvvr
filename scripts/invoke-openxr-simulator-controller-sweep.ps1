@@ -9,7 +9,12 @@ param(
     [ValidateRange(0.0, 60.0)][double]$YawAmplitudeDegrees = 15.0,
     [ValidateRange(0.0, 45.0)][double]$PitchAmplitudeDegrees = 15.0,
     [ValidateRange(0.0, 30.0)][double]$RollAmplitudeDegrees = 15.0,
-    [ValidateRange(100, 5000)][int]$ConsumeTimeoutMilliseconds = 2000
+    # Optional product-video gesture: keep the left controller at its normal
+    # tracked wrist pose and point the right aim ray at the center of that
+    # opposite-wrist Pip-Boy. Repeating the same acknowledged LOCAL pose gives
+    # the host's dwell focus enough real frames to scale/open the live model.
+    [switch]$LivePipBoyFocus,
+    [ValidateRange(100, 10000)][int]$ConsumeTimeoutMilliseconds = 5000
 )
 
 $ErrorActionPreference = "Stop"
@@ -52,6 +57,25 @@ $steps = @(
     [ordered]@{ axis = "roll"; direction = 1; x = $baseline.x; y = $baseline.y; z = $baseline.z; yaw = $baseline.yaw; pitch = $baseline.pitch; roll = $baseline.roll + $RollAmplitudeDegrees * $radiansPerDegree },
     [ordered]@{ axis = "center"; direction = 0; x = $baseline.x; y = $baseline.y; z = $baseline.z; yaw = $baseline.yaw; pitch = $baseline.pitch; roll = $baseline.roll }
 )
+if ($LivePipBoyFocus) {
+    if ($Hand -cne "right") {
+        throw "-LivePipBoyFocus requires -Hand right."
+    }
+    # With the simulator's neutral left wrist at (-0.20, 1.40, -0.40), the
+    # retail interaction plane is centered near (-0.20, 1.46, -0.46). These
+    # poses keep a natural cross-body reach while the right controller's -Z
+    # aim axis intersects that plane. Four dwell samples make the focus/open
+    # gesture visible for roughly three seconds in the bounded recording.
+    $pipBoyFocus = @(
+        [ordered]@{ axis = "pipBoyFocus"; direction = 0; x = 0.18; y = 1.37; z = -0.24; yaw = 1.054; pitch = 0.205; roll = 0.0 },
+        [ordered]@{ axis = "pipBoyFocus"; direction = 0; x = 0.18; y = 1.37; z = -0.24; yaw = 1.054; pitch = 0.205; roll = 0.0 },
+        [ordered]@{ axis = "pipBoyFocus"; direction = 0; x = 0.18; y = 1.37; z = -0.24; yaw = 1.054; pitch = 0.205; roll = 0.0 },
+        [ordered]@{ axis = "pipBoyFocus"; direction = 0; x = 0.18; y = 1.37; z = -0.24; yaw = 1.054; pitch = 0.205; roll = 0.0 }
+    )
+    # Preserve the final neutral command as the terminal state.
+    $steps = @($steps[0..($steps.Count - 2)]) +
+        $pipBoyFocus + @($steps[$steps.Count - 1])
+}
 $holdMilliseconds = [Math]::Max(
     100,
     [int][Math]::Floor(($DurationSeconds * 1000.0) / $steps.Count))
@@ -98,13 +122,17 @@ foreach ($pose in $steps) {
 
 [pscustomobject][ordered]@{
     schema = "fnvxr-headless-simulator-controller-sweep-v1"
-    scope = "per-run file IPC only; explicit OpenXR LOCAL controller poses; no HMD, window, focus, keyboard, mouse, registry, game, or simulator GUI control"
+    scope = "per-run file IPC only; explicit OpenXR LOCAL controller poses and optional opposite-wrist live Pip-Boy pointing gesture; no HMD, window, focus, keyboard, mouse, registry, or simulator GUI control"
     dataDirectory = $DataDirectory
     hand = $Hand
     poseSpace = "local"
     durationSeconds = [double]($holdMilliseconds * ($steps.Count - 1)) / 1000.0
     commandCount = $commands.Count
     commands = @($commands.ToArray())
+    livePipBoyFocusRequested = [bool]$LivePipBoyFocus
+    livePipBoyFocusCommandCount = @($commands | Where-Object {
+        [string]$_.axis -ceq "pipBoyFocus"
+    }).Count
     headPoseMutated = $false
     centerRestored = $true
 } | ConvertTo-Json -Depth 6

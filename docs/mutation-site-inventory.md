@@ -1,6 +1,8 @@
 # FNVVR Phase 0 mutation-site inventory
 
-Audit baseline: `6faed4620d029803ceb129487ebacb64237111ef` on 2026-08-01.
+Architecture/status review: 2026-08-22. Exact executable source and artifact
+identity comes from `local/product-build/fnvxr-product-Release.json`; this
+inventory is never release authority by itself.
 
 This inventory records all currently known FNVVR mutation seams and their
 restoration boundary. An entry without an exact retail-manifest key is blocked
@@ -12,7 +14,7 @@ function. The exact byte hashes below are owned by
 |---|---|---|---|---|
 | Camera | `plugin/fnvxr_nvse_plugin.cpp::installCameraHook` | `PlayerCharacter::UpdateCamera` | Full-product gate is false; desktop-assist is separately narrowed. | Restore camera basis/pose on every rejected frame, UI/load/cell/device transition, and shutdown; remove trampoline when the owning lease ends. |
 | World stereo | `renderhook/fnvxr_d3d9_proxy.cpp` retail accumulation bridge | `RenderWorldSceneGraph`, `AccumulateScene`, `BSCullingProcess::ProcessAlt`, `NiAccumulator::*` | CPU-v8 visual trial only; legacy replay remains blocked. | Restore camera, culler, visible array, accumulators, targets, depth/stencil, viewport, shaders, and hook bytes before publication/teardown. |
-| First-person render | retail `RenderFirstPerson` observation/transaction seam | `RenderFirstPerson` | No product first-person authorization. | Restore every eye-local first-person transform and target before the other eye, UI, load, or shutdown. |
+| First-person render | retail `RenderFirstPerson` observation/transaction seam plus authenticated private-eye geometry population | `RenderFirstPerson` and exact first-person node ancestry | No product first-person authorization. | Restore every eye-local first-person transform and target before the other eye, UI, load, or shutdown. Temporary `AppCulled`, immediate-dispatch, and accumulator-property flag changes restore exact bytes on success or partial-write rejection. |
 | Visual rig | `plugin/fnvxr_nvse_plugin.cpp::installRetailRigHook` | `PlayerAnimationApplyCallSiteAddress` has no full-product manifest key | Visual-only tracked-prop assist can be requested; full product is false. | Save/apply/render/restore node transforms; invalidate nodes/calibration on equip, root/animation, mode, load, cell, tracking, and recenter changes. |
 | Weapon/projectile observation | `installProjectileNodeConsumeHook` and rig diagnostics | No firing seam has an authorized exact key | Read-only observation only. | No gameplay mutation is permitted; discard transient diagnostics on invalid lineage. |
 | Input | xNVSE `processMainGameLoop` controller consumer | Current runtime/compatibility/mapping evidence | Selected future product owner; authorization remains false. | Release all held actions on transition or producer staleness, then require a fresh press. |

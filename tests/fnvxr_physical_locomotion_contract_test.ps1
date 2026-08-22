@@ -87,20 +87,45 @@ foreach ($required in @(
 foreach ($required in @(
         'FNVXR_XINPUT_NATIVE_LOCOMOTION = "1"',
         'FNVXR_XINPUT_MASK_PLUGIN_OWNED_TRIGGERS = "1"',
-        'FNVXR_CPU_STEREO_MAX_SOURCE_POSE_AGE_MS = "250"')) {
+        'FNVXR_CPU_STEREO_MAX_SOURCE_POSE_AGE_MS = "250"',
+        'FNVXR_PLUGIN_MOVEMENT_DEADZONE = "6000"',
+        'FNVXR_PHYSICAL_LEFT_MENU_PIPBOY_ENABLE = "1"',
+        'FNVXR_DIRECT_UI_CLICK = "1"',
+        'FNVXR_LIVE_PIPBOY_FOCUS_FRAMES = "12"',
+        'FNVXR_WEAPON_ORBIT_GRIP_THRESHOLD = "0.55"',
+        'FNVXR_WEAPON_ORBIT_DEADZONE = "0.35"')) {
     Require-Text -Text $productCommon -Required $required -Reason "physical launcher input split"
+}
+
+foreach ($required in @(
+        'bool physicalLeftMenuPipBoyEnabled()',
+        'physicalPipBoyMenuPressed',
+        '"externalXInput:LeftMenu"',
+        'openEnginePipBoyInventory',
+        'closeEnginePipBoy')) {
+    Require-Text -Text $plugin -Required $required -Reason "single-button physical Pip-Boy route"
 }
 
 foreach ($required in @(
         'drivePhysicalGameplayPrimaryAttack',
         'HighProcessForceFireWeaponOffset',
         'finalConsumer=HighProcess::forceFireWeapon',
-        'controllerOwnedRightHand',
-        'solverResultUsable || controllerOwnedRightHand',
+        'controllerOwnedHand',
+        'if (!solverResultUsable)',
+        'if (!upperAligned || !forearmAligned)',
         'applyHeadRelativeLocomotion',
         'applyControllerSnapTurn',
         'desiredHandLocalPosition')) {
     Require-Text -Text $plugin -Required $required -Reason "physical tracked weapon and trigger consumer"
+}
+
+foreach ($forbiddenRigShortcut in @(
+        'if (controllerOwnedHand)`r`n    {`r`n        // A tracked VR wrist owns',
+        'if (!solverResultUsable && !controllerOwnedHand)',
+        'if ((!upperAligned || !forearmAligned) && !controllerOwnedHand)')) {
+    if ($plugin.Contains($forbiddenRigShortcut.Replace('`r`n', "`r`n"))) {
+        throw "Controller-owned hands bypassed the retail arm-chain solve: $forbiddenRigShortcut"
+    }
 }
 
 $legacyStart = $plugin.IndexOf('void updateControllerAxes(')

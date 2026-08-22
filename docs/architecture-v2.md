@@ -23,10 +23,20 @@ There are exactly two user-visible content modes:
 
 1. `WorldStereo`: all non-blocking gameplay, exploration, combat, and world
    interaction use true binocular 3D, independent 6DoF head motion, a tracked
-   retail weapon, and no persistent gameplay HUD.
-2. `UiQuad`: startup, pause, inventory, barter, terminals, dialogue, VATS,
-   loading, Pip-Boy, and other blocking retail UI use a stable mono quad. The
-   controller ray drives the ordinary retail mouse pointer and click path.
+   retail weapon, persistent live wrist Pip-Boy, and no persistent gameplay
+   HUD. Pointing at the device enlarges/focuses it; opening its screen changes
+   only retail input focus, not presentation mode.
+2. `UiQuad`: startup, pause, containers, barter, terminals, dialogue, VATS,
+   loading, conflicting/unknown menus, and every other blocking retail UI use
+   a stable mono quad floating in front of the player. The controller ray
+   drives the ordinary retail pointer and click path.
+
+Neither mode requires the Fallout desktop window to be foreground or active.
+The host publishes controller intent through shared state, the retail proxies
+consume it through background-capable DirectInput/XInput paths, and a native
+production fuse blocks all OS window activation, cursor, `SendInput`, and
+posted-window input fallbacks. OpenXR session focus is runtime/headset state and
+must never be interpreted as Windows desktop focus authority.
 
 Mono gameplay is never a successful fallback. When UI closes, the last valid
 quad remains visible until one fresh, complete, pose-matched stereo transaction
@@ -140,9 +150,16 @@ projectile or hit ray, and impact result must share one calibrated transform
 chain. Retail retains ammunition, recoil, spread, animation, projectile, and
 damage authority. A host-only debug hand or ray does not satisfy this gate.
 
-Retail HUD pixels are excluded from `WorldStereo`. Blocking retail UI switches
-the whole presentation to `UiQuad`; no synthetic gameplay HUD is composited on
-top of the world.
+Retail HUD pixels are excluded from `WorldStereo`. The live Pip-Boy is always a
+tracked wrist category; focusing its screen never creates a presentation state
+or front-facing quad. The current compatibility implementation retains the
+stock weapon root but replaces the collector's invalid skinned hand/arm/Pip-Boy
+categories in the final OpenXR eye pass. Its screen samples an auxiliary retail
+Present-time crop while the last verified binocular world pair remains the
+background. Missing camera, tracking, validated local hand geometry, screen
+surface, or complete eye resources produces a visible reject. Every unrelated
+blocking menu switches the whole presentation to the front-floating `UiQuad`.
+No synthetic gameplay HUD is composited on top of the world.
 
 ## Release Gates
 
@@ -157,6 +174,9 @@ evidence is insufficient:
 - GPU-native per-eye color through D3D9Ex/D3D11/OpenXR with validated
   render-local per-eye depth/stencil; OpenXR depth submission is not a v1 gate;
 - authoritative weapon, muzzle, projectile/hit, recoil, and reload alignment;
+- final submitted-eye semantic proof that both hands, arm geometry, weapon, and
+  Pip-Boy contribute stable, non-deformed pixels; node/queue/transform
+  telemetry alone is insufficient;
 - UI entry/exit coverage with stable pointer input and no gameplay HUD;
 - signed translation X/Y/Z and yaw/pitch/roll evidence tied to the exact
   rendered/submitted transaction;
