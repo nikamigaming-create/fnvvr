@@ -13,8 +13,8 @@ until the capability's phase gate and the final aggregate release gate pass.
 |---|---|---|---|---|---|---|
 | `CameraStereoVisual` | Partial | Yes | Yes | No | No | CPU-v8 engine-center visual trial proves simulator motion only; physical body/head behavior is unproven. |
 | `ControllerInput` | Partial | Yes | Partial | No | No | The xNVSE main-game-loop consumer exists, but the release semantic map and physical action matrix are incomplete. |
-| `UiInteraction` | Partial | Yes | Partial | No | No | Other menus retain the front quad; headless final-eye evidence proves native Pip-Boy open/close and a stable live wrist screen, while physical pointer/dial/equip acceptance remains open. |
-| `VisualRig` | Partial | Yes | Partial | No | No | Stock weapon-only collection plus host-spatial, locally derived retail hand meshes removes the missing/stretched collector categories in retained simulator pixels. Materials and physical hand/weapon alignment remain open. |
+| `UiInteraction` | Partial | Yes | Yes | No | No | Other menus retain the front quad; headless final-eye evidence proves grip-gated native Pip-Boy open, handled Items-zone ray input, changed retail pixels, close, and resume. Physical pointer/dial/equip acceptance remains open. |
+| `VisualRig` | Partial | Yes | Yes | No | No | Stock weapon-only collection plus host-spatial retail hands/Pip-Boy passes both-eye category continuity, wrist contact, world-background, screen-content, and red-flash gates. The weapon wrist socket and hand orientation are measured from retail; physical ergonomics and weapon-family coverage remain open. |
 | `CombatAim` | No | Partial | No | No | No | Only read-only weapon/projectile observations exist; no retail firing seam is authorized. |
 | `GpuPresentation` | Partial | Yes | No | No | No | Color ABI v5 contracts and components exist; a live supported producer/consumer recovery proof does not. |
 | `FullProduct` | No | No | No | No | No | Only a complete aggregate of the six narrow capabilities plus release qualification can claim this state. |

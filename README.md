@@ -94,14 +94,15 @@ fallbacks remain disabled.
 
 This is not full product acceptance. The CPU-v8 image transfer is intentionally
 bounded and too expensive for the production transport. The retained simulator
-evidence proves a controller-driven movement/combat loop and authentic
-first-person hand, Pip-Boy, and weapon roots. The live Pip-Boy focus/scale,
-physical control-zone, and weapon-orbit contracts are unit-tested. Headless run
-`20260822-082426-198-a396ca04a155` now proves native engine open/close plus a
-continuously submitted live inventory screen at the tracked wrist in both eyes;
-physical pointer/equip interaction, GPU-native color transport with render-local
-depth validation, authoritative muzzle alignment, equipped-item model swaps,
-and physical-headset acceptance remain open gates. The plugin remains inert
+evidence proves a controller-driven movement/combat loop and locally derived
+first-person hands/Pip-Boy around the authenticated stock weapon. The bounded
+wrist interaction proves grip-gated focus, native engine open, a handled
+physical Items-zone ray hit, changed retail UI pixels, native close, and resumed
+gameplay without desktop focus or injected OS input. Final-eye analysis requires
+both hands, wrist/device contact, a populated world background, no red flash,
+and real Pip-Boy pixels on the first visible screen frame. Physical ergonomics,
+GPU-native color transport with render-local depth validation, equipped-item
+model swaps, and headset acceptance remain open gates. The plugin remains inert
 outside explicit profiles.
 
 August 22 final-pixel review found that the current controller-rig trial could
@@ -113,10 +114,13 @@ Recorded SBS output must pass the fixture-specific pixel-quality gate as well.
 The current replacement keeps only the authenticated stock weapon root in the
 engine-center collector. The failed arm/hand/Pip-Boy categories are composed in
 the final OpenXR eye pass from tracked poses. The host loads locally derived
-left/right retail hand geometry from the user's installed BSA, validates its
-binary mesh schema, and falls back to an FNVXR-owned procedural glove if those
-local assets are absent. The Pip-Boy housing is host-owned and its screen uses
-the fresh retail Present-time crop; no Bethesda asset is committed or staged.
+left/right retail hand geometry from the user's installed BSA, including the
+retail `1hpaim` finger pose. xNVSE measures the live stock weapon-to-wrist
+socket and hand-to-weapon orientation, publishes the latter as an OpenXR
+grip-local quaternion, and the host applies both relationships without moving
+the stock muzzle off the aim pose. The Pip-Boy housing is host-owned and its
+screen remains hidden until the exact retail crop passes pixel-content
+readiness; no Bethesda asset is committed or staged.
 
 Windows desktop foreground ownership is not part of the product contract. The
 supported launcher pins a native fail-closed fuse that rejects window
@@ -126,6 +130,12 @@ OpenXR/shared memory and background-capable DirectInput/XInput bridges. OpenXR
 session `FOCUSED` is a headset-runtime state; it does not authorize focusing the
 Fallout desktop window. The headless supervisor also contains no `ShowWindow`
 polling or post-launch window-isolation loop.
+
+Automated retail headset/simulator fixtures require a workspace-owned sandbox.
+The preparation script copies mutable runtime files, hard-links only the
+whitelisted official Data set, and writes local Steam AppID `22380` so Steam
+cannot redirect a test into the installed Library copy. The launcher validates
+that manifest and refuses to stage or launch the real install for this path.
 
 The process-local headless OpenXR Simulator supplies deterministic
 HMD/controller poses and final-eye capture without changing the machine-wide

@@ -78,6 +78,184 @@ try {
         -not (@($bad.failures.metric) -contains "brown_component_ratio")) {
         throw "The rejected visual report lacks its stretched-arm evidence."
     }
+
+    # Final-eye alpha is presentation-inert under the product's required
+    # OPAQUE OpenXR blend mode. The host writes exact per-category tags there
+    # so this gate proves visible pixel contribution instead of trusting node
+    # discovery or transform residuals.
+    Add-Type -AssemblyName System.Drawing
+    function New-SpatialPairDirectory {
+        param(
+            [Parameter(Mandatory = $true)][string]$Directory,
+            [int]$MissingRightHandFrame = 0,
+            [switch]$VoidBackground,
+            [switch]$DetachedPipBoy
+        )
+        New-Item -ItemType Directory -Path $Directory -Force | Out-Null
+        for ($frame = 1; $frame -le 6; ++$frame) {
+            foreach ($eye in @("left", "right")) {
+                $bitmap = [System.Drawing.Bitmap]::new(
+                    240,
+                    140,
+                    [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+                $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+                try {
+                    $graphics.CompositingMode =
+                        [System.Drawing.Drawing2D.CompositingMode]::SourceCopy
+                    $graphics.Clear([System.Drawing.Color]::FromArgb(
+                        255, 0, 0, 0))
+                    if (-not $VoidBackground) {
+                        for ($tile = 0; $tile -lt 12; ++$tile) {
+                            $shade = if (($tile % 2) -eq 0) { 24 } else { 104 }
+                            $worldBrush = [System.Drawing.SolidBrush]::new(
+                                [System.Drawing.Color]::FromArgb(
+                                    255, $shade, ($shade + 8), ($shade + 16)))
+                            try {
+                                $graphics.FillRectangle(
+                                    $worldBrush, $tile * 20, 0, 20, 140)
+                            } finally {
+                                $worldBrush.Dispose()
+                            }
+                        }
+                    }
+                    $leftBrush = [System.Drawing.SolidBrush]::new(
+                        [System.Drawing.Color]::FromArgb(51, 150, 105, 82))
+                    $rightBrush = [System.Drawing.SolidBrush]::new(
+                        [System.Drawing.Color]::FromArgb(102, 150, 105, 82))
+                    $housingBrush = [System.Drawing.SolidBrush]::new(
+                        [System.Drawing.Color]::FromArgb(153, 72, 82, 58))
+                    $screenBrush = [System.Drawing.SolidBrush]::new(
+                        [System.Drawing.Color]::FromArgb(204, 25, 55, 30))
+                    try {
+                        $graphics.FillRectangle($leftBrush, 42, 86, 28, 44)
+                        if ($frame -ne $MissingRightHandFrame) {
+                            $graphics.FillRectangle(
+                                $rightBrush, 174, 84, 30, 46)
+                        }
+                        $housingX = if ($DetachedPipBoy) { 112 } else { 26 }
+                        $graphics.FillRectangle(
+                            $housingBrush, $housingX, 76, 74, 25)
+                        if ($frame -ge 2 -and $frame -le 5) {
+                            $graphics.FillRectangle(
+                                $screenBrush, ($housingX + 12), 80, 48, 15)
+                        }
+                    } finally {
+                        $leftBrush.Dispose()
+                        $rightBrush.Dispose()
+                        $housingBrush.Dispose()
+                        $screenBrush.Dispose()
+                    }
+                    $path = Join-Path $Directory (
+                        "pair_{0:D6}_{1}.png" -f $frame, $eye)
+                    $bitmap.Save(
+                        $path,
+                        [System.Drawing.Imaging.ImageFormat]::Png)
+                } finally {
+                    $graphics.Dispose()
+                    $bitmap.Dispose()
+                }
+            }
+        }
+    }
+
+    $spatialGoodDirectory = Join-Path $testRoot "spatial-good"
+    New-SpatialPairDirectory -Directory $spatialGoodDirectory
+    $spatialGoodReportPath = Join-Path $testRoot "spatial-good.json"
+    & $python $analyzer `
+        --pair-directory $spatialGoodDirectory `
+        --spatial-overlay `
+        --require-pipboy-screen `
+        --require-world-background `
+        --max-red-ratio 0.0005 `
+        --max-red-jump 0.0001 `
+        --report $spatialGoodReportPath | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        $failedSpatialGood = Get-Content `
+            -LiteralPath $spatialGoodReportPath `
+            -Raw | ConvertFrom-Json
+        throw (
+            "The stable tagged hands/Pip-Boy sequence failed its pixel gate: " +
+            (@($failedSpatialGood.failures.metric) -join ", "))
+    }
+    $spatialGood = Get-Content `
+        -LiteralPath $spatialGoodReportPath `
+        -Raw | ConvertFrom-Json
+    if (-not [bool]$spatialGood.accepted -or
+        @($spatialGood.failures).Count -ne 0 -or
+        $null -eq $spatialGood.spatial_overlay) {
+        throw "The stable tagged sequence lacks a clean spatial-overlay proof."
+    }
+
+    $spatialVoidDirectory = Join-Path $testRoot "spatial-void"
+    New-SpatialPairDirectory `
+        -Directory $spatialVoidDirectory `
+        -VoidBackground
+    $spatialVoidReportPath = Join-Path $testRoot "spatial-void.json"
+    & $python $analyzer `
+        --pair-directory $spatialVoidDirectory `
+        --spatial-overlay `
+        --require-pipboy-screen `
+        --require-world-background `
+        --max-red-ratio 0.0005 `
+        --max-red-jump 0.0001 `
+        --report $spatialVoidReportPath | Out-Null
+    if ($LASTEXITCODE -ne 2) {
+        throw "A black final-eye background was not rejected."
+    }
+    $spatialVoid = Get-Content `
+        -LiteralPath $spatialVoidReportPath `
+        -Raw | ConvertFrom-Json
+    if ([bool]$spatialVoid.accepted -or
+        -not (@($spatialVoid.failures.metric) -contains
+            "world_background_nonblack_fraction")) {
+        throw "The rejected void sequence lacks final-eye background evidence."
+    }
+
+    $spatialDetachedDirectory = Join-Path $testRoot "spatial-detached"
+    New-SpatialPairDirectory `
+        -Directory $spatialDetachedDirectory `
+        -DetachedPipBoy
+    $spatialDetachedReportPath = Join-Path $testRoot "spatial-detached.json"
+    & $python $analyzer `
+        --pair-directory $spatialDetachedDirectory `
+        --spatial-overlay `
+        --max-red-ratio 0.0005 `
+        --max-red-jump 0.0001 `
+        --report $spatialDetachedReportPath | Out-Null
+    if ($LASTEXITCODE -ne 2) {
+        throw "A visibly detached Pip-Boy housing was not rejected."
+    }
+    $spatialDetached = Get-Content `
+        -LiteralPath $spatialDetachedReportPath `
+        -Raw | ConvertFrom-Json
+    if ([bool]$spatialDetached.accepted -or
+        -not (@($spatialDetached.failures.metric) -contains
+            "pipboy_wrist_socket_bbox_gap_pixels")) {
+        throw "The rejected detached Pip-Boy lacks wrist-socket evidence."
+    }
+
+    $spatialMissingDirectory = Join-Path $testRoot "spatial-missing"
+    New-SpatialPairDirectory `
+        -Directory $spatialMissingDirectory `
+        -MissingRightHandFrame 4
+    $spatialMissingReportPath = Join-Path $testRoot "spatial-missing.json"
+    & $python $analyzer `
+        --pair-directory $spatialMissingDirectory `
+        --spatial-overlay `
+        --max-red-ratio 0.0005 `
+        --max-red-jump 0.0001 `
+        --report $spatialMissingReportPath | Out-Null
+    if ($LASTEXITCODE -ne 2) {
+        throw "A one-frame missing right hand was not rejected."
+    }
+    $spatialMissing = Get-Content `
+        -LiteralPath $spatialMissingReportPath `
+        -Raw | ConvertFrom-Json
+    if ([bool]$spatialMissing.accepted -or
+        -not (@($spatialMissing.failures.metric) -contains
+            "right_hand_minimum_ratio")) {
+        throw "The missing-hand report lacks final-pixel disappearance evidence."
+    }
 } finally {
     $checked = [System.IO.Path]::GetFullPath($testRoot)
     if ($checked.StartsWith(

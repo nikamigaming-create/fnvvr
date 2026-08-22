@@ -151,19 +151,23 @@ the arm geometry, and showed unstable Pip-Boy color. The structural rig and
 renderer telemetry passed because it measured discovered nodes, queued leaves,
 and transform residuals rather than semantic pixel contribution. The launcher
 now records the root mask and rejects the known bad morphology from the final
-SBS pixels. Visual-rig acceptance remains false until both eyes pass that gate.
+SBS pixels. The bounded simulator visual-rig slice now passes that gate;
+physical and aggregate production acceptance remain false.
 
-The follow-up attested run `20260822-082426-198-a396ca04a155` replaced the
-failed categories instead of mutating them again. Root mask `1` retained only
-the stock weapon; upper-body, left-hand, right-hand, and stock Pip-Boy collector
-roots were disabled. The host loaded 3,936-vertex left and right hand meshes
-derived locally from the user's installed retail BSA, rendered the live retail
-inventory crop inside a tracked wrist housing, and retained 89 binocular final
-eye pairs. Native InterfaceManager actions opened Pip-Boy at game frame 111,
-closed it at 352, and returned to gameplay at 353. The manifest records the
-derived-mesh hashes and a live wrist final-eye proof at host frame 2395. This is
-headless simulator proof, not physical-headset or full-product acceptance;
-material fidelity and physical hand/weapon alignment remain calibration gates.
+The follow-up replacement owns the failed categories instead of mutating them
+again. Root mask `1` retains only the stock weapon; upper-body, left-hand,
+right-hand, and stock Pip-Boy collector roots stay disabled. The host loads
+locally derived retail hands, cuff, housing, and exact curved screen geometry.
+xNVSE measures the equipped weapon's stock wrist socket and hand orientation,
+publishes a grip-local quaternion, and verifies socket residual before the host
+draws the retail `1hpaim` finger pose. The bounded menu proof records grip-gated
+focus, native InterfaceManager open, a handled physical Items-zone ray hit,
+changed CPU retail UI pixels, native B close, and resumed gameplay. Final-eye
+analysis requires both hands in every eye, zero wrist/housing gap, a populated
+world background throughout the paused menu, no red flash, and authored
+Pip-Boy pixels from the first visible screen frame. This remains headless
+simulator proof, not physical-headset or full-product acceptance; physical
+ergonomics and weapon-family coverage remain open.
 
 ### Head tracking
 
@@ -317,8 +321,9 @@ executable checks, pointer validation, logging, and fail-closed rejection.
    D3D9Ex to D3D11/OpenXR, adapter identity, completion/release sequencing,
    transaction IDs, and validated render-local per-eye depth/stencil. OpenXR
    depth-layer submission is outside the v1 release gate.
-5. Prove the authoritative retail weapon, muzzle, projectile/hit, recoil, and
-   reload chain against the right-controller aim pose.
+5. Repeat the authoritative retail weapon/muzzle socket proof on physical
+   controllers, then prove projectile/hit, recoil, reload, and weapon-family
+   swaps against the same right-controller aim lineage.
 6. Pass full retail/headset acceptance and performance. Invalid gameplay
    stereo remains a visible reject, never a successful mono fallback.
 

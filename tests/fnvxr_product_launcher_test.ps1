@@ -46,6 +46,8 @@ $launcherPath = Join-Path $SourceRoot "scripts\start-fnvxr-product.ps1"
 $fixtureLauncherPath = Join-Path $SourceRoot "scripts\start-fnvxr-retail-fixture.ps1"
 $buildPath = Join-Path $SourceRoot "scripts\build-fnvxr-product.ps1"
 $commonPath = Join-Path $SourceRoot "scripts\fnvxr-product-common.ps1"
+$retailSandboxPath = Join-Path $SourceRoot "scripts\prepare-fnvxr-retail-sandbox.ps1"
+$retailPropsPath = Join-Path $SourceRoot "scripts\prepare-fnvxr-retail-props.ps1"
 $hostSourcePath = Join-Path $SourceRoot "host\fnvxr_openxr_pose_host.cpp"
 $pluginSourcePath = Join-Path $SourceRoot "plugin\fnvxr_nvse_plugin.cpp"
 $d3d9SourcePath = Join-Path $SourceRoot "renderhook\fnvxr_d3d9_proxy.cpp"
@@ -53,9 +55,36 @@ $launcher = Get-Content -LiteralPath $launcherPath -Raw
 $fixtureLauncher = Get-Content -LiteralPath $fixtureLauncherPath -Raw
 $builder = Get-Content -LiteralPath $buildPath -Raw
 $common = Get-Content -LiteralPath $commonPath -Raw
+$retailSandbox = Get-Content -LiteralPath $retailSandboxPath -Raw
+$retailProps = Get-Content -LiteralPath $retailPropsPath -Raw
 $hostSource = Get-Content -LiteralPath $hostSourcePath -Raw
 $pluginSource = Get-Content -LiteralPath $pluginSourcePath -Raw
 $d3d9Source = Get-Content -LiteralPath $d3d9SourcePath -Raw
+
+foreach ($sandboxContract in @(
+    'fnvxr-retail-sandbox/v1',
+    'steam_appid.txt',
+    '22380',
+    'steamLibraryRedirectForbidden',
+    'New-Item -ItemType HardLink',
+    'sourceRootsMutated = $false',
+    'processOrUiControl = $false')) {
+    if (-not ($retailSandbox.Contains($sandboxContract) -or
+            $common.Contains($sandboxContract) -or
+            $launcher.Contains($sandboxContract))) {
+        throw "Retail sandbox isolation contract is missing: $sandboxContract"
+    }
+}
+if (-not $launcher.Contains(
+        'Automated retail headset/simulator fixture runs require an isolated')) {
+    throw "Automated retail headset runs can still stage or launch the installed Library root."
+}
+if (-not $retailProps.Contains('1hpaim.kf') -or
+    -not $retailProps.Contains('rightHandPose = "1hpaim@0"') -or
+    -not $launcher.Contains('"1hpaim@0"') -or
+    $retailProps.Contains('1hphandgrip1.kf')) {
+    throw "Retail right-hand preparation no longer bakes the authored pistol aim finger pose."
+}
 
 foreach ($hostGate in @(
         @('void sendHostMouseClick(', 'bool sendAbsoluteCursorMove(', 'host mouse click'),
