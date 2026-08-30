@@ -1,6 +1,7 @@
 #pragma once
 
 #include "fnvxr_gpu_color_consumer.h"
+#include "fnvxr_runtime_evidence_history.h"
 #include "../protocol/fnvxr_product_contract.h"
 
 #include <array>
@@ -37,16 +38,6 @@ struct SourcePoseLineage
     bool distinctBinocularViews = false;
 };
 
-struct RuntimeEvidence
-{
-    std::uint64_t sample = 0u;
-    std::uint32_t phase = shared::RuntimePhaseUnknown;
-    std::uint32_t menuBits = 0u;
-    std::uint32_t showroomActive = 0u;
-    bool cameraActive = false;
-    bool fresh = false;
-};
-
 // Evidence that only the retail producer can establish.  A v5 color
 // publication proves synchronized GPU ownership and identity; it does not by
 // itself prove the private depth/cull/resource transaction or the tracked
@@ -66,170 +57,6 @@ struct ProducerWorldEvidence
     bool authoritativeTrackedRetailWeapon = false;
     bool authoritativeMuzzleAlignment = false;
     bool gameplayHudExcluded = false;
-};
-
-constexpr bool sameRuntimePresentationState(
-    const RuntimeEvidence& left,
-    const RuntimeEvidence& right) noexcept
-{
-    return left.phase == right.phase
-        && left.menuBits == right.menuBits
-        && left.showroomActive == right.showroomActive
-        && left.cameraActive == right.cameraActive;
-}
-
-// GPU work naturally arrives after the runtime mapping has advanced. Admit a
-// historical source sample only while the latest fresh sample describes the
-// identical presentation state. A menu/camera/phase transition therefore
-// invalidates an in-flight gameplay image instead of relabeling it as current.
-constexpr bool stableRuntimeLineage(
-    const RuntimeEvidence& source,
-    const RuntimeEvidence& current) noexcept
-{
-    return source.fresh
-        && current.fresh
-        && source.sample != 0u
-        && current.sample != 0u
-        && source.sample <= current.sample
-        && sameRuntimePresentationState(source, current);
-}
-
-template <std::size_t Capacity = 64u>
-class RuntimeEvidenceHistory final
-{
-    static_assert(Capacity > 0u);
-
-public:
-    void reset() noexcept
-    {
-        mEntries = {};
-        mCursor = 0u;
-    }
-
-    void record(const RuntimeEvidence& evidence) noexcept
-    {
-        if (!evidence.fresh || evidence.sample == 0u)
-            return;
-        for (Entry& entry : mEntries)
-        {
-            if (!entry.occupied || entry.evidence.sample != evidence.sample)
-                continue;
-            if (entry.conflicted)
-                return;
-            if (sameRuntimePresentationState(entry.evidence, evidence))
-                return;
-
-            // One sample identity cannot represent two runtime states. Retain
-            // a tombstone so a later repeat cannot resurrect either value.
-            entry.evidence.fresh = false;
-            entry.conflicted = true;
-            return;
-        }
-
-        Entry& entry = mEntries[mCursor];
-        entry.evidence = evidence;
-        entry.occupied = true;
-        entry.conflicted = false;
-        mCursor = (mCursor + 1u) % mEntries.size();
-    }
-
-    bool findStableSource(
-        std::uint64_t sourceSample,
-        const RuntimeEvidence& current,
-        RuntimeEvidence& found,
-        bool* bracketedOut = nullptr) const noexcept
-    {
-        found = {};
-        if (bracketedOut != nullptr)
-            *bracketedOut = false;
-        if (sourceSample == 0u)
-            return false;
-
-        // Prefer an exact observation and preserve conflict tombstones. An
-        // ambiguous exact identity must never fall through to interpolation.
-        for (const Entry& entry : mEntries)
-        {
-            if (!entry.occupied
-                || entry.evidence.sample != sourceSample)
-                continue;
-            if (entry.conflicted)
-                return false;
-            if (!stableRuntimeLineage(entry.evidence, current))
-                return false;
-            found = entry.evidence;
-            return true;
-        }
-
-        // The retail plugin can advance its runtime sample multiple times
-        // between two OpenXR host frames. Bridge only a tightly bounded missing
-        // identity that lies after a recorded sample and before the current
-        // sample. Every observation in that interval must agree, so a menu,
-        // showroom, camera, or phase transition still invalidates the image.
-        constexpr std::uint64_t MaxBracketSampleSpan = 32u;
-        if (!current.fresh
-            || current.sample == 0u
-            || sourceSample >= current.sample)
-        {
-            return false;
-        }
-
-        const Entry* lower = nullptr;
-        for (const Entry& entry : mEntries)
-        {
-            if (!entry.occupied
-                || entry.evidence.sample >= sourceSample
-                || (lower != nullptr
-                    && entry.evidence.sample
-                        <= lower->evidence.sample))
-            {
-                continue;
-            }
-            lower = &entry;
-        }
-        if (lower == nullptr
-            || lower->conflicted
-            || !stableRuntimeLineage(lower->evidence, current)
-            || current.sample - lower->evidence.sample
-                > MaxBracketSampleSpan)
-        {
-            return false;
-        }
-
-        for (const Entry& entry : mEntries)
-        {
-            if (!entry.occupied
-                || entry.evidence.sample < lower->evidence.sample
-                || entry.evidence.sample > current.sample)
-            {
-                continue;
-            }
-            if (entry.conflicted
-                || !entry.evidence.fresh
-                || !sameRuntimePresentationState(
-                    entry.evidence,
-                    current))
-            {
-                return false;
-            }
-        }
-
-        found = current;
-        found.sample = sourceSample;
-        if (bracketedOut != nullptr)
-            *bracketedOut = true;
-        return true;
-    }
-
-private:
-    struct Entry
-    {
-        RuntimeEvidence evidence {};
-        bool occupied = false;
-        bool conflicted = false;
-    };
-
-    std::array<Entry, Capacity> mEntries {};
-    std::size_t mCursor = 0u;
 };
 
 // Final product binding is a pure projection of PresentationController's

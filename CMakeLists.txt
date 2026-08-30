@@ -31,6 +31,78 @@ target_include_directories(fnvxr_protocol INTERFACE
     ${CMAKE_CURRENT_SOURCE_DIR}/protocol
 )
 
+# Platform-neutral product policy. OpenXR, D3D, Win32, and environment parsing
+# belong in adapters; this target owns validated configuration, frame identity,
+# and presentation decisions only.
+add_library(fnvxr_kernel STATIC
+    kernel/config_validation.cpp
+    kernel/product_kernel.cpp
+    kernel/presentation/coordinator.cpp)
+target_include_directories(fnvxr_kernel PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR})
+if(MSVC)
+    target_compile_options(fnvxr_kernel PRIVATE /W4 /WX)
+endif()
+
+function(fnvxr_add_kernel_test target source)
+    add_executable(${target} ${source})
+    target_link_libraries(${target} PRIVATE fnvxr_kernel)
+    if(MSVC)
+        target_compile_options(${target} PRIVATE /W4 /WX)
+    endif()
+    add_test(NAME ${target} COMMAND ${target})
+endfunction()
+
+fnvxr_add_kernel_test(
+    fnvxr_runtime_config_test
+    tests/fnvxr_runtime_config_test.cpp)
+fnvxr_add_kernel_test(
+    fnvxr_presentation_coordinator_kernel_test
+    tests/fnvxr_presentation_coordinator_kernel_test.cpp)
+fnvxr_add_kernel_test(
+    fnvxr_product_kernel_test
+    tests/fnvxr_product_kernel_test.cpp)
+fnvxr_add_kernel_test(
+    fnvxr_exact_frame_joiner_test
+    tests/fnvxr_exact_frame_joiner_test.cpp)
+fnvxr_add_kernel_test(
+    fnvxr_presentation_evidence_gate_test
+    tests/fnvxr_presentation_evidence_gate_test.cpp)
+
+if(WIN32)
+    add_executable(fnvxr_runtime_config_loader_test
+        tests/fnvxr_runtime_config_loader_test.cpp
+        host/fnvxr_runtime_config_loader.cpp
+        host/fnvxr_runtime_config_source.cpp)
+    target_link_libraries(fnvxr_runtime_config_loader_test PRIVATE fnvxr_kernel)
+    if(MSVC)
+        target_compile_options(fnvxr_runtime_config_loader_test PRIVATE /W4 /WX)
+    endif()
+    add_test(
+        NAME fnvxr_runtime_config_loader_test
+        COMMAND fnvxr_runtime_config_loader_test)
+
+    add_executable(fnvxr_product_kernel_adapter_test
+        tests/fnvxr_product_kernel_adapter_test.cpp
+        host/fnvxr_product_kernel_adapter.cpp)
+    target_link_libraries(fnvxr_product_kernel_adapter_test PRIVATE fnvxr_kernel)
+    if(MSVC)
+        target_compile_options(fnvxr_product_kernel_adapter_test PRIVATE /W4 /WX)
+    endif()
+    add_test(
+        NAME fnvxr_product_kernel_adapter_test
+        COMMAND fnvxr_product_kernel_adapter_test)
+
+    add_executable(fnvxr_tracking_lifetime_test
+        tests/fnvxr_tracking_lifetime_test.cpp)
+    if(MSVC)
+        target_compile_options(fnvxr_tracking_lifetime_test PRIVATE /W4 /WX)
+    endif()
+    add_test(
+        NAME fnvxr_tracking_lifetime_test
+        COMMAND fnvxr_tracking_lifetime_test)
+endif()
+
 add_executable(fnvxr_openxr_live_authority_test
     tests/fnvxr_openxr_live_authority_test.cpp)
 target_include_directories(fnvxr_openxr_live_authority_test PRIVATE
@@ -206,6 +278,21 @@ file(GLOB FNVXR_OPENXR_INCLUDE_DIR
     "${CMAKE_CURRENT_SOURCE_DIR}/deps/sources/OpenXR-SDK-release-1.1.*/*/include"
 )
 
+if(FNVXR_OPENXR_INCLUDE_DIR)
+    add_executable(fnvxr_source_pose_history_test
+        tests/fnvxr_source_pose_history_test.cpp)
+    target_include_directories(fnvxr_source_pose_history_test PRIVATE
+        ${FNVXR_OPENXR_INCLUDE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/renderhook)
+    target_link_libraries(fnvxr_source_pose_history_test PRIVATE fnvxr_kernel)
+    if(MSVC)
+        target_compile_options(fnvxr_source_pose_history_test PRIVATE /W4 /WX)
+    endif()
+    add_test(
+        NAME fnvxr_source_pose_history_test
+        COMMAND fnvxr_source_pose_history_test)
+endif()
+
 if(FNVXR_OPENXR_INCLUDE_DIR AND CMAKE_SIZEOF_VOID_P EQUAL 8)
     add_executable(fnvxr_openxr_probe host/fnvxr_openxr_probe.cpp)
     target_include_directories(fnvxr_openxr_probe PRIVATE ${FNVXR_OPENXR_INCLUDE_DIR})
@@ -220,7 +307,11 @@ if(FNVXR_OPENXR_INCLUDE_DIR AND CMAKE_SIZEOF_VOID_P EQUAL 8)
             -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/assert_openxr_probe_fuse.cmake
     )
 
-    add_executable(fnvxr_openxr_pose_host host/fnvxr_openxr_pose_host.cpp)
+    add_executable(fnvxr_openxr_pose_host
+        host/fnvxr_openxr_pose_host.cpp
+        host/fnvxr_product_kernel_adapter.cpp
+        host/fnvxr_runtime_config_loader.cpp
+        host/fnvxr_runtime_config_source.cpp)
     target_include_directories(fnvxr_openxr_pose_host PRIVATE
         ${FNVXR_OPENXR_INCLUDE_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}/protocol
@@ -228,6 +319,7 @@ if(FNVXR_OPENXR_INCLUDE_DIR AND CMAKE_SIZEOF_VOID_P EQUAL 8)
         ${CMAKE_CURRENT_SOURCE_DIR}/runtime
     )
     target_link_libraries(fnvxr_openxr_pose_host PRIVATE
+        fnvxr_kernel
         fnvxr_gpu_color_consumer
         d3d11
         d3dcompiler
