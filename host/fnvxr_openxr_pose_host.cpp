@@ -17,6 +17,10 @@
 #include "fnvxr_shared_state.h"
 #include "fnvxr_stereo_visual_trial.h"
 #include "fnvxr_stereo_math.h"
+#include "fnvxr_source_pose_history.h"
+#include "fnvxr_runtime_config_loader.h"
+#include "fnvxr_product_kernel_adapter.h"
+#include "fnvxr_tracking_lifetime.h"
 
 #include <windows.h>
 #include <bcrypt.h>
@@ -303,6 +307,8 @@ struct Renderer
     ComPtr<ID3D11ShaderResourceView> retailLeftCuffTextureView;
     ComPtr<ID3D11Buffer> retailLeftForearmVertexBuffer;
     UINT retailLeftForearmVertexCount = 0;
+    ComPtr<ID3D11Buffer> retailRightForearmVertexBuffer;
+    UINT retailRightForearmVertexCount = 0;
     ComPtr<ID3D11ShaderResourceView> retailLeftForearmTextureView;
     ComPtr<ID3D11Buffer> retailPipBoyVertexBuffer;
     UINT retailPipBoyVertexCount = 0;
@@ -528,128 +534,6 @@ struct HeadsetMirrorCapture
             schedule,
             { enabled, frame, everyFrames, maximumPairs });
     }
-};
-
-struct SourceViewPublication
-{
-    bool valid = false;
-    std::uint64_t poseSequence = 0u;
-    XrTime predictedDisplayTime = 0;
-    std::uint64_t hostProducerEpoch = 0u;
-    std::uint32_t referenceSpaceGeneration = 0u;
-    std::array<XrView, 2> views {
-        XrView { XR_TYPE_VIEW },
-        XrView { XR_TYPE_VIEW },
-    };
-};
-
-class SourceViewHistory final
-{
-public:
-    void reset() noexcept
-    {
-        mEntries = {};
-        mCursor = 0u;
-    }
-
-    void record(
-        std::uint64_t poseSequence,
-        XrTime predictedDisplayTime,
-        std::uint64_t hostProducerEpoch,
-        std::uint32_t referenceSpaceGeneration,
-        const XrView* views) noexcept
-    {
-        if (poseSequence == 0u
-            || predictedDisplayTime == 0
-            || hostProducerEpoch == 0u
-            || referenceSpaceGeneration == 0u
-            || !views
-            || !viewUsable(views[0])
-            || !viewUsable(views[1])
-            || !eyesDistinct(views[0], views[1]))
-        {
-            return;
-        }
-        SourceViewPublication& entry = mEntries[mCursor];
-        entry.valid = true;
-        entry.poseSequence = poseSequence;
-        entry.predictedDisplayTime = predictedDisplayTime;
-        entry.hostProducerEpoch = hostProducerEpoch;
-        entry.referenceSpaceGeneration = referenceSpaceGeneration;
-        entry.views[0] = views[0];
-        entry.views[1] = views[1];
-        mCursor = (mCursor + 1u) % mEntries.size();
-    }
-
-    bool find(
-        const fnvxr::host::gpu_color::ConsumerFrame& frame,
-        std::uint64_t currentHostProducerEpoch,
-        std::uint32_t currentReferenceSpaceGeneration,
-        SourceViewPublication& found) const noexcept
-    {
-        found = {};
-        for (const SourceViewPublication& entry : mEntries)
-        {
-            const fnvxr::host::gpu_color::SourcePoseLineage lineage {
-                entry.poseSequence,
-                entry.predictedDisplayTime,
-                entry.hostProducerEpoch,
-                entry.referenceSpaceGeneration,
-                entry.valid,
-                entry.valid,
-            };
-            if (entry.valid
-                && fnvxr::host::gpu_color::exactSourcePoseLineage(
-                    frame,
-                    lineage,
-                    currentHostProducerEpoch,
-                    currentReferenceSpaceGeneration))
-            {
-                found = entry;
-                return true;
-            }
-        }
-        return false;
-    }
-
-private:
-    static bool viewUsable(const XrView& view) noexcept
-    {
-        const float quaternionLengthSquared =
-            view.pose.orientation.x * view.pose.orientation.x
-            + view.pose.orientation.y * view.pose.orientation.y
-            + view.pose.orientation.z * view.pose.orientation.z
-            + view.pose.orientation.w * view.pose.orientation.w;
-        const float fov[4] {
-            view.fov.angleLeft,
-            view.fov.angleRight,
-            view.fov.angleUp,
-            view.fov.angleDown,
-        };
-        return std::isfinite(quaternionLengthSquared)
-            && quaternionLengthSquared >= 0.25f
-            && quaternionLengthSquared <= 4.0f
-            && std::isfinite(view.pose.position.x)
-            && std::isfinite(view.pose.position.y)
-            && std::isfinite(view.pose.position.z)
-            && fnvxr::stereo::openXrFovAnglesUsable(fov);
-    }
-
-    static bool eyesDistinct(
-        const XrView& left,
-        const XrView& right) noexcept
-    {
-        const float x = right.pose.position.x - left.pose.position.x;
-        const float y = right.pose.position.y - left.pose.position.y;
-        const float z = right.pose.position.z - left.pose.position.z;
-        const float distanceSquared = x * x + y * y + z * z;
-        return std::isfinite(distanceSquared)
-            && distanceSquared >= 0.03f * 0.03f
-            && distanceSquared <= 0.12f * 0.12f;
-    }
-
-    std::array<SourceViewPublication, 128> mEntries {};
-    std::size_t mCursor = 0u;
 };
 
 struct UiTextureCandidate
@@ -5502,7 +5386,11 @@ XrPosef poseAlongSegment(XMVECTOR start, XMVECTOR end, XMVECTOR preferredUp)
     return poseFromBasis((start + end) * 0.5f, xAxis, yAxis, zAxis);
 }
 
-SolvedArm solveArm(const XrPosef& hmdPose, const XrPosef& wristPose, bool left)
+SolvedArm solveArm(
+    const XrPosef& hmdPose,
+    const XrPosef& wristPose,
+    bool left,
+    const fnvxr::kernel::BodyRigConfig& config)
 {
     const XMVECTOR worldUp = XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
     const XMVECTOR hmdOrientation = quat(hmdPose.orientation);
@@ -5510,11 +5398,11 @@ SolvedArm solveArm(const XrPosef& hmdPose, const XrPosef& wristPose, bool left)
     hmdForward = safeNormalize3(XMVectorSetY(hmdForward, 0.0f), XMVectorSet(0.0f, 0.0f, -1.0f, 0.0f));
     const XMVECTOR hmdRight = safeNormalize3(XMVector3Cross(hmdForward, worldUp), XMVectorSet(1.0f, 0.0f, 0.0f, 0.0f));
 
-    const float shoulderWidth = envFloat("FNVXR_BODY_SHOULDER_WIDTH", 0.38f);
+    const float shoulderWidth = config.shoulderWidthMeters;
     const float shoulderDrop = envFloat("FNVXR_BODY_SHOULDER_DROP", 0.24f);
     const float shoulderBack = envFloat("FNVXR_BODY_SHOULDER_BACK", 0.08f);
-    const float upperLength = envFloat("FNVXR_ARM_UPPER_LENGTH", 0.31f);
-    const float lowerLength = envFloat("FNVXR_ARM_LOWER_LENGTH", 0.27f);
+    const float upperLength = config.upperArmLengthMeters;
+    const float lowerLength = config.forearmLengthMeters;
 
     const XMVECTOR hmdPosition = vec3(hmdPose.position);
     const XMVECTOR shoulderCenter = hmdPosition - worldUp * shoulderDrop - hmdForward * shoulderBack;
@@ -5552,11 +5440,15 @@ SolvedArm solveArm(const XrPosef& hmdPose, const XrPosef& wristPose, bool left)
     return arm;
 }
 
-BodyRig solveBodyRig(const XrPosef& hmdPose, const XrPosef& leftPose, const XrPosef& rightPose)
+BodyRig solveBodyRig(
+    const XrPosef& hmdPose,
+    const XrPosef& leftPose,
+    const XrPosef& rightPose,
+    const fnvxr::kernel::BodyRigConfig& config)
 {
     BodyRig rig {};
-    rig.left = solveArm(hmdPose, leftPose, true);
-    rig.right = solveArm(hmdPose, rightPose, false);
+    rig.left = solveArm(hmdPose, leftPose, true, config);
+    rig.right = solveArm(hmdPose, rightPose, false, config);
     return rig;
 }
 
@@ -5613,6 +5505,7 @@ GamePlane gamePlaneFromHmd(const XrPosef& hmdPose)
 GamePlane livePipBoyInteractionPlane(
     const SolvedArm& leftArm,
     float scale,
+    const fnvxr::kernel::WristUiConfig& config,
     const XMFLOAT3* measuredGripLocalPosition,
     const XrQuaternionf* measuredGripLocalRotation)
 {
@@ -5620,13 +5513,9 @@ GamePlane livePipBoyInteractionPlane(
     // pipboyscreen:0 measures 5.872956 x 4.471702 retail game units.
     // Preserve that physical aspect and the 70-units-per-meter scale used by
     // the locally derived housing instead of stretching it to a guessed 1.6.
-    constexpr float WristPipBoyDisplayWidthMeters = 5.872956f / 70.0f;
-    constexpr float WristPipBoyDisplayAspect = 5.872956f / 4.471702f;
-    plane.width = envFloat(
-            "FNVXR_PIPBOY_WRIST_UI_WIDTH",
-            WristPipBoyDisplayWidthMeters)
-        * std::clamp(scale, 1.0f, 1.5f);
-    plane.height = plane.width / WristPipBoyDisplayAspect;
+    const float clampedScale = std::clamp(scale, 1.0f, 1.5f);
+    plane.width = config.widthMeters * clampedScale;
+    plane.height = config.heightMeters * clampedScale;
 
     const XMVECTOR wristOrientation = quat(leftArm.wrist.orientation);
     // This plane follows the tracked wrist for both the authored retail
@@ -5876,14 +5765,21 @@ void drawRetailTexturedModel(
     bindSolidPipeline(context, renderer);
 }
 
-void drawRetailLeftForearm(
+void drawRetailForearm(
     ID3D11DeviceContext* context,
     Renderer& renderer,
     const XMMATRIX& viewProjection,
-    const SolvedArm& arm)
+    const SolvedArm& arm,
+    bool left)
 {
-    if (!renderer.retailLeftForearmVertexBuffer
-        || renderer.retailLeftForearmVertexCount == 0u
+    ID3D11Buffer* const vertexBuffer = left
+        ? renderer.retailLeftForearmVertexBuffer.Get()
+        : renderer.retailRightForearmVertexBuffer.Get();
+    const UINT vertexCount = left
+        ? renderer.retailLeftForearmVertexCount
+        : renderer.retailRightForearmVertexCount;
+    if (!vertexBuffer
+        || vertexCount == 0u
         || !renderer.retailLeftForearmTextureView)
     {
         return;
@@ -5900,10 +5796,11 @@ void drawRetailLeftForearm(
         modelFromPose(
             arm.forearm,
             { 1.0f, 1.0f, longitudinalScale }),
-        renderer.retailLeftForearmVertexBuffer.Get(),
-        renderer.retailLeftForearmVertexCount,
+        vertexBuffer,
+        vertexCount,
         renderer.retailLeftForearmTextureView.Get(),
-        { 1.0f, 1.0f, 1.0f, SpatialAlphaLeftHand });
+        { 1.0f, 1.0f, 1.0f,
+          left ? SpatialAlphaLeftHand : SpatialAlphaRightHand });
 }
 
 void drawHandPrimitive(
@@ -7048,6 +6945,34 @@ void drawMenuPointer(
         { 1.0f, 0.95f, 0.05f, 1.0f });
 }
 
+void drawPipBoyPointer(
+    ID3D11DeviceContext* context,
+    Renderer& renderer,
+    const XMMATRIX& viewProjection,
+    const MenuPointer& pointer,
+    const GamePlane& plane)
+{
+    if (!pointer.active || !envEnabled("FNVXR_SHOW_PIPBOY_POINTER", true))
+        return;
+    const float size = std::clamp(
+        envFloat("FNVXR_PIPBOY_POINTER_SIZE", 0.007f),
+        0.003f,
+        0.015f);
+    drawLocalCube(
+        context,
+        renderer,
+        viewProjection,
+        plane.pose,
+        {
+            pointer.x * plane.width - plane.width * 0.5f,
+            plane.height * 0.5f - pointer.y * plane.height,
+            0.012f,
+        },
+        { 0.0f, 0.0f, 0.0f },
+        { size, size, 0.003f },
+        { 1.0f, 0.82f, 0.05f, 1.0f });
+}
+
 void drawWeaponOrbitWheel(
     ID3D11DeviceContext* context,
     Renderer& renderer,
@@ -7528,9 +7453,12 @@ bool renderEye(
     const XrPosef& rightPose,
     const XrPosef& leftAimPose,
     const XrPosef& rightAimPose,
+    bool spatialSourcePoseMatched,
+    const fnvxr::kernel::PresentationConfig& presentationConfig,
     const XrQuaternionf* rightHandGripLocalRotation,
     const BodyRig& bodyRig,
     const MenuPointer& menuPointer,
+    const MenuPointer& livePipBoyPointer,
     const WeaponOrbitWheel& weaponOrbitWheel,
     const GamePlane& gamePlane,
     const GamePlane& livePipBoyPlane,
@@ -7594,7 +7522,11 @@ bool renderEye(
         return outputProven && released;
     }
 
-    const XMMATRIX viewProjection = viewFromPose(view.pose) * projectionFromFov(view.fov, 0.05f, 50.0f);
+    const XMMATRIX viewProjection = viewFromPose(view.pose)
+        * projectionFromFov(
+            view.fov,
+            presentationConfig.nearClipMeters,
+            presentationConfig.farClipMeters);
     ID3D11ShaderResourceView* uiTextureView = productionUiTextureView
         ? productionUiTextureView
         : renderer.gameTextureView.Get();
@@ -7669,11 +7601,14 @@ bool renderEye(
         drawMenuPointer(context.Get(), renderer, viewProjection, menuPointer, gamePlane);
         context->OMSetDepthStencilState(renderer.depthState.Get(), 0);
     }
-    drawWeaponOrbitWheel(
-        context.Get(),
-        renderer,
-        viewProjection,
-        weaponOrbitWheel);
+    if (spatialSourcePoseMatched)
+    {
+        drawWeaponOrbitWheel(
+            context.Get(),
+            renderer,
+            viewProjection,
+            weaponOrbitWheel);
+    }
     const bool spatialHandsOverlay =
         envEnabled("FNVXR_SPATIAL_HANDS_OVERLAY", false);
     const bool drawLegacyWorldProps = !productionWorldTextureView
@@ -7681,14 +7616,17 @@ bool renderEye(
         && envEnabled("FNVXR_SHOW_WORLD_PROPS", false)
         && (!drawFullscreen
             || envEnabled("FNVXR_OVERLAY_PROPS_ON_FULLSCREEN", false));
-    const bool drawWorldProps = drawLegacyWorldProps
-        || (spatialHandsOverlay && productionWorldTextureView);
+    const bool drawWorldProps = spatialSourcePoseMatched
+        && (drawLegacyWorldProps
+            || (spatialHandsOverlay && productionWorldTextureView));
     if (drawWorldProps && envEnabled("FNVXR_SHOW_BODY_RIG", true))
     {
         // Keep the wrist device physically connected to an authored retail
         // arm even when the debug full-arm primitives are disabled.
-        drawRetailLeftForearm(
-            context.Get(), renderer, viewProjection, bodyRig.left);
+        drawRetailForearm(
+            context.Get(), renderer, viewProjection, bodyRig.left, true);
+        drawRetailForearm(
+            context.Get(), renderer, viewProjection, bodyRig.right, false);
         if (envEnabled("FNVXR_SHOW_FULL_ARMS", false))
         {
             drawSolvedArm(
@@ -7750,6 +7688,13 @@ bool renderEye(
             pipBoyScreenTextureView);
         context->OMSetDepthStencilState(renderer.depthState.Get(), 0);
     }
+    if (drawWorldProps)
+        drawPipBoyPointer(
+            context.Get(),
+            renderer,
+            viewProjection,
+            livePipBoyPointer,
+            livePipBoyPlane);
 
     const bool outputProven = captureSwapchainRenderProof(
         device,
@@ -9315,7 +9260,14 @@ float4 PSHudOverlay(VSOutput input) : SV_TARGET
             "FHM2",
             2u,
             renderer.retailLeftForearmVertexBuffer,
-            renderer.retailLeftForearmVertexCount))
+            renderer.retailLeftForearmVertexCount)
+        || !loadRetailTexturedMesh(
+            device,
+            "FNVXR_RETAIL_RIGHT_FOREARM_MESH_PATH",
+            "FHM2",
+            2u,
+            renderer.retailRightForearmVertexBuffer,
+            renderer.retailRightForearmVertexCount))
     {
         return false;
     }
@@ -9930,8 +9882,7 @@ void drainOpenXrEvents(
     bool& shouldReadInput,
     bool& exitRequested,
     bool& lossPending,
-    bool& referenceSpaceChangePending,
-    XrTime& referenceSpaceChangeTime)
+    fnvxr::host::TrackingLifetime& trackingLifetime)
 {
     XrEventDataBuffer event { XR_TYPE_EVENT_DATA_BUFFER };
     while (xr.pollEvent(instance, &event) == XR_SUCCESS)
@@ -9990,10 +9941,8 @@ void drainOpenXrEvents(
             const auto* changed = reinterpret_cast<const XrEventDataReferenceSpaceChangePending*>(&event);
             const bool affectsPublishedBase = changed->referenceSpaceType == XR_REFERENCE_SPACE_TYPE_LOCAL;
             if (affectsPublishedBase)
-            {
-                referenceSpaceChangePending = true;
-                referenceSpaceChangeTime = changed->changeTime;
-            }
+                trackingLifetime.scheduleReferenceSpaceChange(
+                    static_cast<fnvxr::host::TrackingTime>(changed->changeTime));
             std::cout << "referenceSpaceChangePending affectsPublishedBase="
                       << static_cast<int>(affectsPublishedBase)
                       << " type=" << static_cast<int>(changed->referenceSpaceType)
@@ -10144,6 +10093,25 @@ int main(int argc, char** argv)
 {
     std::cout.setf(std::ios::unitbuf);
     std::cerr.setf(std::ios::unitbuf);
+    const fnvxr::host::ProcessEnvironmentConfigSource configSource;
+    const fnvxr::host::RuntimeConfigLoadResult loadedRuntimeConfig =
+        fnvxr::host::loadRuntimeConfig(configSource);
+    if (!loadedRuntimeConfig || !loadedRuntimeConfig.config)
+    {
+        std::cerr << "Invalid FNVXR runtime configuration variable="
+                  << (loadedRuntimeConfig.variable
+                          ? loadedRuntimeConfig.variable : "<cross-field>")
+                  << " textError="
+                  << fnvxr::host::runtimeConfigTextErrorName(
+                      loadedRuntimeConfig.textError)
+                  << " validationError="
+                  << fnvxr::kernel::configErrorName(
+                      loadedRuntimeConfig.validationError)
+                  << "\n";
+        return 29;
+    }
+    const fnvxr::kernel::ValidatedRuntimeConfig& runtimeConfig =
+        *loadedRuntimeConfig.config;
     enableDpiAwareness();
     ComApartment comApartment(COINIT_MULTITHREADED);
     if (FAILED(comApartment.result) && comApartment.result != RPC_E_CHANGED_MODE)
@@ -10384,15 +10352,23 @@ int main(int argc, char** argv)
             xr,
             session,
             swapchainFormat,
-            static_cast<int32_t>(viewConfigs[0].recommendedImageRectWidth),
-            static_cast<int32_t>(viewConfigs[0].recommendedImageRectHeight),
+            static_cast<int32_t>(std::lround(
+                static_cast<float>(viewConfigs[0].recommendedImageRectWidth)
+                * runtimeConfig.get().presentation.renderScale)),
+            static_cast<int32_t>(std::lround(
+                static_cast<float>(viewConfigs[0].recommendedImageRectHeight)
+                * runtimeConfig.get().presentation.renderScale)),
             leftEye)
         || !createQuadSwapchain(
             xr,
             session,
             swapchainFormat,
-            static_cast<int32_t>(viewConfigs[1].recommendedImageRectWidth),
-            static_cast<int32_t>(viewConfigs[1].recommendedImageRectHeight),
+            static_cast<int32_t>(std::lround(
+                static_cast<float>(viewConfigs[1].recommendedImageRectWidth)
+                * runtimeConfig.get().presentation.renderScale)),
+            static_cast<int32_t>(std::lround(
+                static_cast<float>(viewConfigs[1].recommendedImageRectHeight)
+                * runtimeConfig.get().presentation.renderScale)),
             rightEye))
     {
         return 11;
@@ -10668,9 +10644,7 @@ int main(int argc, char** argv)
     bool previousShouldReadInput = false;
     bool exitRequested = false;
     bool lossPending = false;
-    std::uint32_t referenceSpaceGeneration = 1;
-    bool referenceSpaceChangePending = false;
-    XrTime referenceSpaceChangeTime = 0;
+    fnvxr::host::TrackingLifetime trackingLifetime;
     ULONGLONG nextProgressHeartbeatMilliseconds = 0;
     fnvxr::host::gpu_color::ConsumeDisposition previousGpuColorDisposition =
         fnvxr::host::gpu_color::ConsumeDisposition::Rejected;
@@ -10682,9 +10656,9 @@ int main(int argc, char** argv)
     std::uint64_t lastPhase1TraceCpuTransaction = 0u;
     std::uint64_t activeGpuColorProducerEpoch = 0u;
     std::uint32_t activeGpuColorProducerProcessId = 0u;
-    fnvxr::product::PresentationController presentationController;
+    fnvxr::host::ProductKernelAdapter presentationController(runtimeConfig);
     fnvxr::product::PresentationDecision productDecision {};
-    SourceViewHistory sourceViewHistory;
+    fnvxr::host::SourcePoseHistory sourceViewHistory;
     fnvxr::host::gpu_color::RuntimeEvidenceHistory<>
         runtimeEvidenceHistory;
 
@@ -10710,8 +10684,7 @@ int main(int argc, char** argv)
             shouldReadInput,
             exitRequested,
             lossPending,
-            referenceSpaceChangePending,
-            referenceSpaceChangeTime);
+            trackingLifetime);
         const bool sessionSyncLost = previousShouldSyncFrames && !shouldSyncFrames;
         const bool sessionSyncRegained = !previousShouldSyncFrames && shouldSyncFrames;
         if (sessionSyncLost)
@@ -10724,17 +10697,14 @@ int main(int argc, char** argv)
         }
         if (sessionSyncRegained)
         {
-            ++referenceSpaceGeneration;
-            if (referenceSpaceGeneration == 0)
-                referenceSpaceGeneration = 1;
-            referenceSpaceChangePending = false;
-            referenceSpaceChangeTime = 0;
+            const auto generationChange = trackingLifetime.sessionRegained();
             presentationController.reset();
             sourceViewHistory.reset();
             runtimeEvidenceHistory.reset();
             clearRetainedUiTexture(renderer);
             std::cout << "sessionTrackingGenerationChanged generation="
-                      << referenceSpaceGeneration << " reason=session-rebegun\n";
+                      << generationChange.generation
+                      << " reason=session-rebegun\n";
         }
         previousShouldSyncFrames = shouldSyncFrames;
         const bool inputFocusLost = previousShouldReadInput && !shouldReadInput;
@@ -10790,18 +10760,15 @@ int main(int argc, char** argv)
         // discontinuity. Change generations on the first pose sample at or
         // after changeTime so camera and controller consumers invalidate the
         // exact frame whose LOCAL-space coordinates changed.
-        if (referenceSpaceChangePending
-            && (referenceSpaceChangeTime <= 0
-                || frameState.predictedDisplayTime >= referenceSpaceChangeTime))
+        const auto generationChange = trackingLifetime.advance(
+            static_cast<fnvxr::host::TrackingTime>(
+                frameState.predictedDisplayTime));
+        if (generationChange.activated)
         {
-            ++referenceSpaceGeneration;
-            if (referenceSpaceGeneration == 0)
-                referenceSpaceGeneration = 1;
-            std::cout << "referenceSpaceChangeActivated generation=" << referenceSpaceGeneration
-                      << " changeTime=" << referenceSpaceChangeTime
+            std::cout << "referenceSpaceChangeActivated generation="
+                      << generationChange.generation
+                      << " changeTime=" << generationChange.scheduledTime
                       << " displayTime=" << frameState.predictedDisplayTime << "\n";
-            referenceSpaceChangePending = false;
-            referenceSpaceChangeTime = 0;
             presentationController.reset();
             sourceViewHistory.reset();
             runtimeEvidenceHistory.reset();
@@ -11126,7 +11093,15 @@ int main(int argc, char** argv)
         HeadspaceLook headspaceLook {};
         HeadspaceLook handspaceLook {};
         HeadspaceLook gyroAimLook {};
-        const BodyRig bodyRig = solveBodyRig(hmdPose, leftPose, rightPose);
+        // The retail rig consumes these exact unsmoothed poses below. Using
+        // independently smoothed poses for host-rendered hands introduces a
+        // controller-motion seam even before the engine-frame delay is
+        // considered.
+        const BodyRig bodyRig = solveBodyRig(
+            rawHmdPose,
+            rawLeftPose,
+            rawRightPose,
+            runtimeConfig.get().bodyRig);
 
         const bool recenterChord =
             (rightThumbstick.value && rightGrip.value > 0.50f)
@@ -11387,14 +11362,24 @@ int main(int argc, char** argv)
             livePipBoyInteractionPlane(
                 bodyRig.left,
                 1.0f,
+                runtimeConfig.get().wristUi,
                 sharedBridge.leftPipBoyScreenGripLocalPoseValid
                     ? &sharedBridge.leftPipBoyScreenGripLocalPosition
                     : nullptr,
                 sharedBridge.leftPipBoyScreenGripLocalPoseValid
                     ? &sharedBridge.leftPipBoyScreenGripLocalRotation
                     : nullptr);
+        GamePlane livePipBoyFocusPlane = livePipBoyBasePlane;
+        livePipBoyFocusPlane.width *= std::clamp(
+            envFloat("FNVXR_LIVE_PIPBOY_FOCUS_HIT_SCALE_X", 1.0f),
+            1.0f,
+            4.0f);
+        livePipBoyFocusPlane.height *= std::clamp(
+            envFloat("FNVXR_LIVE_PIPBOY_FOCUS_HIT_SCALE_Y", 1.0f),
+            1.0f,
+            4.0f);
         const MenuPointer livePipBoyBasePointer = rightAimTracked
-            ? menuPointerFromAimPose(rightAimPose, livePipBoyBasePlane)
+            ? menuPointerFromAimPose(rightAimPose, livePipBoyFocusPlane)
             : MenuPointer {};
         const bool livePipBoyActivationGripHeld = rightGrip.active
             && rightGrip.value >= envFloat(
@@ -11417,6 +11402,7 @@ int main(int argc, char** argv)
         const GamePlane livePipBoyPlane = livePipBoyInteractionPlane(
             bodyRig.left,
             livePipBoyFocus.scale,
+            runtimeConfig.get().wristUi,
             sharedBridge.leftPipBoyScreenGripLocalPoseValid
                 ? &sharedBridge.leftPipBoyScreenGripLocalPosition
                 : nullptr,
@@ -11549,12 +11535,9 @@ int main(int argc, char** argv)
         int64_t sourcePoseAgeNanoseconds = 0;
         bool sourcePoseAgeValid = false;
         const int64_t maximumSourcePoseAgeNanoseconds =
-            static_cast<int64_t>(std::min(
-                25,
-                std::max(1, envInt(
-                    "FNVXR_STEREO_MAX_SOURCE_POSE_AGE_MS",
-                    25))))
-            * 1000000LL;
+            static_cast<int64_t>(std::llround(
+                runtimeConfig.get().performance.maximumPoseAgeMilliseconds
+                * 1000000.0F));
         const int64_t sourcePoseFutureToleranceNanoseconds =
             static_cast<int64_t>(std::max(
                 0,
@@ -11851,11 +11834,11 @@ int main(int argc, char** argv)
         bool cpuEngineRuntimeLineageFound = false;
         bool cpuEngineRuntimeLineageBracketed = false;
         std::uint64_t cpuEngineSourceRuntimeSample = 0u;
-        SourceViewPublication productSourceView {};
+        fnvxr::host::SourceViewPublication productSourceView {};
         const bool productSourceViewFound = sourceViewHistory.find(
             gpuColorFrame.frame,
             sharedBridge.producerEpoch,
-            referenceSpaceGeneration,
+            trackingLifetime.generation(),
             productSourceView);
         if (gpuColorFrame.frame.renderedDisplayTime != 0)
         {
@@ -11946,8 +11929,31 @@ int main(int argc, char** argv)
                 sourcePoseAgeValid);
         if (hostUiResourceReady)
             presentationInput.ui = hostUiProof;
+        const bool routedTransportReady = controllerRouted.content
+            != fnvxr::host::gpu_color::RoutedContent::SafetyBlank;
+        const bool capturedUiTransportReady = hostUiResourceReady
+            && presentationInput.ui.completeForUiQuad();
+        const fnvxr::host::PresentationTransportProof presentationTransport {
+            routedTransportReady
+                ? controllerRouted.frame.producerEpoch
+                : capturedUiTransportReady
+                    ? sharedBridge.producerEpoch : 0u,
+            routedTransportReady
+                ? controllerRouted.frame.transactionId
+                : capturedUiTransportReady
+                    ? presentationInput.ui.sourceFrame : 0u,
+            routedTransportReady || capturedUiTransportReady,
+            routedTransportReady || capturedUiTransportReady,
+            routedTransportReady || capturedUiTransportReady,
+            routedTransportReady || capturedUiTransportReady,
+            routedTransportReady || capturedUiTransportReady,
+        };
         productDecision = productionGpuColorV5
-            ? presentationController.advance(presentationInput)
+            ? presentationController.advance(
+                presentationInput,
+                presentationTransport,
+                productSourceViewFound && sourcePoseAgeValid,
+                livePipBoyScreenFocused && renderer.retainedUiTextureView)
             : fnvxr::product::PresentationDecision {};
         if (productDecision.mode
                 == fnvxr::product::PresentationMode::UiQuad
@@ -12000,7 +12006,7 @@ int main(int argc, char** argv)
                 productSourceView.hostProducerEpoch,
                 sharedBridge.producerEpoch,
                 productSourceView.referenceSpaceGeneration,
-                referenceSpaceGeneration,
+                trackingLifetime.generation(),
                 productSourceViewFound,
                 productSourceViewFound,
             },
@@ -12420,6 +12426,8 @@ int main(int argc, char** argv)
         bool submittedStereoFullscreen = false;
         bool presentedGameTexture = false;
         bool uiQuadVisible = false;
+        bool spatialPropsSourcePoseMatched = false;
+        std::uint64_t spatialPropsPoseSequence = 0u;
         EyeRenderProof leftRenderProof {};
         EyeRenderProof rightRenderProof {};
 
@@ -12455,7 +12463,7 @@ int main(int argc, char** argv)
             weaponOut,
             runtimeMenuBits,
             poseTrackingFlags,
-            referenceSpaceGeneration,
+            trackingLifetime.generation(),
             recenterRequestId,
             rawLeftAimPose,
             rawRightAimPose,
@@ -12540,8 +12548,14 @@ int main(int argc, char** argv)
                 publishedPoseSequence,
                 frameState.predictedDisplayTime,
                 sharedBridge.producerEpoch,
-                referenceSpaceGeneration,
-                views.data());
+                trackingLifetime.generation(),
+                views.data(),
+                rawHmdPose,
+                rawLeftPose,
+                rawRightPose,
+                rawLeftAimPose,
+                rawRightAimPose,
+                poseTrackingFlags);
         }
         if (frameIndex <= 5
             || frameIndex % 300 == 0
@@ -12730,7 +12744,7 @@ int main(int argc, char** argv)
                 && renderer.stereoStableFrameCount
                     >= stereoStableHandoffFrames
                 && renderer.stereoReferenceSpaceGeneration
-                    == referenceSpaceGeneration
+                    == trackingLifetime.generation()
                 && renderer.stereoProducerEpoch
                     == sharedBridge.producerEpoch
                 && cpuWorldPresentation.present;
@@ -12746,7 +12760,8 @@ int main(int argc, char** argv)
                 && renderer.hasStereoGameFrame
                 && renderer.stereoGameFrameSeparated
                 && renderer.stereoStableFrameCount >= stereoStableHandoffFrames
-                && renderer.stereoReferenceSpaceGeneration == referenceSpaceGeneration
+                && renderer.stereoReferenceSpaceGeneration
+                    == trackingLifetime.generation()
                 && renderer.stereoProducerEpoch == sharedBridge.producerEpoch
                 && legacySourcePoseAgeValid;
             const bool stereoFullscreenActive =
@@ -12989,6 +13004,58 @@ int main(int argc, char** argv)
                           << " missingStereoFrames=" << missingStereoFrames
                           << "\n";
             }
+            XrPosef spatialHmdPose = rawHmdPose;
+            XrPosef spatialLeftPose = rawLeftPose;
+            XrPosef spatialRightPose = rawRightPose;
+            XrPosef spatialLeftAimPose = rawLeftAimPose;
+            XrPosef spatialRightAimPose = rawRightAimPose;
+            fnvxr::host::SourceViewPublication spatialSourcePose {};
+            bool spatialSourceFound = false;
+            if (presentedBinocularWorld && productSourceViewFound)
+            {
+                spatialSourcePose = productSourceView;
+                spatialSourceFound = true;
+            }
+            else if ((cpuEngineStereoActive
+                    || legacyStereoFullscreenActive)
+                && renderer.stereoGamePoseSequence > 0)
+            {
+                spatialSourceFound = sourceViewHistory.findPoseSequence(
+                    static_cast<std::uint64_t>(
+                        renderer.stereoGamePoseSequence),
+                    static_cast<XrTime>(
+                        renderer.stereoGameRenderedDisplayTime),
+                    sharedBridge.producerEpoch,
+                    trackingLifetime.generation(),
+                    spatialSourcePose);
+            }
+            if (spatialSourceFound)
+            {
+                spatialHmdPose = spatialSourcePose.hmdPose;
+                spatialLeftPose = spatialSourcePose.leftGripPose;
+                spatialRightPose = spatialSourcePose.rightGripPose;
+                spatialLeftAimPose = spatialSourcePose.leftAimPose;
+                spatialRightAimPose = spatialSourcePose.rightAimPose;
+                spatialPropsSourcePoseMatched = true;
+                spatialPropsPoseSequence = spatialSourcePose.poseSequence;
+            }
+            const BodyRig spatialBodyRig = solveBodyRig(
+                spatialHmdPose,
+                spatialLeftPose,
+                spatialRightPose,
+                runtimeConfig.get().bodyRig);
+            const GamePlane spatialLivePipBoyPlane =
+                livePipBoyInteractionPlane(
+                    spatialBodyRig.left,
+                    livePipBoyFocus.scale,
+                    runtimeConfig.get().wristUi,
+                    sharedBridge.leftPipBoyScreenGripLocalPoseValid
+                        ? &sharedBridge.leftPipBoyScreenGripLocalPosition
+                        : nullptr,
+                    sharedBridge.leftPipBoyScreenGripLocalPoseValid
+                        ? &sharedBridge.leftPipBoyScreenGripLocalRotation
+                        : nullptr);
+
             bool leftRendered = false;
             bool rightRendered = false;
             uiQuadVisible = (productionUiQuadActive
@@ -13041,7 +13108,7 @@ int main(int argc, char** argv)
                 const WeaponOrbitWheel weaponWheel {
                     weaponOrbitActive,
                     weaponOrbitSlot,
-                    rightAimPose,
+                    spatialRightAimPose,
                 };
                 leftRendered = renderEye(
                     xr,
@@ -13050,16 +13117,19 @@ int main(int argc, char** argv)
                     leftEye,
                     0,
                     submitViews[0],
-                    leftPose,
-                    rightPose,
-                    leftAimPose,
-                    rightAimPose,
+                    spatialLeftPose,
+                    spatialRightPose,
+                    spatialLeftAimPose,
+                    spatialRightAimPose,
+                    spatialPropsSourcePoseMatched,
+                    runtimeConfig.get().presentation,
                     rightHandGripLocalRotation,
-                    bodyRig,
+                    spatialBodyRig,
                     menuPointer,
+                    livePipBoyPointer,
                     weaponWheel,
                     gamePlane,
-                    livePipBoyPlane,
+                    spatialLivePipBoyPlane,
                     pipBoySpatialScreenVisible,
                     renderer.retainedUiTextureView.Get(),
                     pauseSceneAnchor,
@@ -13080,16 +13150,19 @@ int main(int argc, char** argv)
                     rightEye,
                     1,
                     submitViews[1],
-                    leftPose,
-                    rightPose,
-                    leftAimPose,
-                    rightAimPose,
+                    spatialLeftPose,
+                    spatialRightPose,
+                    spatialLeftAimPose,
+                    spatialRightAimPose,
+                    spatialPropsSourcePoseMatched,
+                    runtimeConfig.get().presentation,
                     rightHandGripLocalRotation,
-                    bodyRig,
+                    spatialBodyRig,
                     menuPointer,
+                    livePipBoyPointer,
                     weaponWheel,
                     gamePlane,
-                    livePipBoyPlane,
+                    spatialLivePipBoyPlane,
                     pipBoySpatialScreenVisible,
                     renderer.retainedUiTextureView.Get(),
                     pauseSceneAnchor,
@@ -13399,6 +13472,10 @@ int main(int argc, char** argv)
                 << (envEnabled("FNVXR_SPATIAL_HANDS_OVERLAY", false)
                         ? "true"
                         : "false")
+                << ",\"spatialPropsSourcePoseMatched\":"
+                << (spatialPropsSourcePoseMatched ? "true" : "false")
+                << ",\"spatialPropsPoseSequence\":"
+                << spatialPropsPoseSequence
                 << ",\"rightHandGripCalibrationValid\":"
                 << (sharedBridge.rightHandGripLocalRotationValid
                         ? "true" : "false")

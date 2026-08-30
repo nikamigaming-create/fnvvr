@@ -1577,9 +1577,9 @@ function Set-FnvxrStereoWorldRuntimeEnvironment {
     $env:FNVXR_PLAYER_STATE_READ_GRACE_FRAMES = "4"
     $env:FNVXR_STEREO_TRANSIENT_READ_GRACE_POLLS = "4"
     $env:FNVXR_STEREO_MAX_SAME_SEQUENCE_MS = "250"
-    # Translation cannot be exactly reprojected without a depth layer. Reject
-    # source pixels older than roughly two 90 Hz display periods.
-    $env:FNVXR_STEREO_MAX_SOURCE_POSE_AGE_MS = "25"
+    # Translation cannot be exactly reprojected without a depth layer. Keep
+    # source pixels inside the validated sub-frame 90 Hz product budget.
+    $env:FNVXR_STEREO_MAX_SOURCE_POSE_AGE_MS = "10"
     $env:FNVXR_STEREO_SOURCE_POSE_FUTURE_TOLERANCE_MS = "5"
     $env:FNVXR_STEREO_STALE_FRAME_LIMIT = "2"
     # The host distinguishes an ordinary faster-consumer poll from a producer
