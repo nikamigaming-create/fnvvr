@@ -15,6 +15,12 @@ public:
     [[nodiscard]] static std::optional<ProductKernel> create(
         const RuntimeConfig& config,
         presentation::CoordinatorPolicy presentationPolicy = {});
+    // Consumes already-validated configuration without reopening the raw
+    // validation boundary. Passing an lvalue makes the one ownership copy
+    // explicit; passing an rvalue transfers ownership without a copy.
+    [[nodiscard]] static ProductKernel fromValidated(
+        ValidatedRuntimeConfig config,
+        presentation::CoordinatorPolicy presentationPolicy = {});
 
     [[nodiscard]] const ValidatedRuntimeConfig& config() const noexcept;
     [[nodiscard]] presentation::PresentationDecision present(
@@ -23,7 +29,7 @@ public:
 
 private:
     ProductKernel(
-        const ValidatedRuntimeConfig& config,
+        ValidatedRuntimeConfig config,
         presentation::CoordinatorPolicy presentationPolicy);
 
     ValidatedRuntimeConfig config_;

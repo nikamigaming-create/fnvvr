@@ -27,6 +27,8 @@ struct BodyRigConfig
 {
     float standingHeightMeters = 1.75F;
     float shoulderWidthMeters = 0.38F;
+    float shoulderDropMeters = 0.24F;
+    float shoulderBackMeters = 0.08F;
     float upperArmLengthMeters = 0.31F;
     float forearmLengthMeters = 0.27F;
     float handLengthMeters = 0.18F;

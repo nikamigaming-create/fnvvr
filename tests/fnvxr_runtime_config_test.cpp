@@ -63,6 +63,11 @@ int main()
         return fail("menu geometry must satisfy its cross-field visibility invariant");
 
     invalid = {};
+    invalid.bodyRig.shoulderDropMeters = 0.0F;
+    if (validateRuntimeConfig(invalid).error != ConfigError::InvalidBodyDimensions)
+        return fail("shoulder anchors must be bounded configuration, not per-frame environment reads");
+
+    invalid = {};
     invalid.bodyRig.standingHeightMeters = 1.2F;
     invalid.bodyRig.upperArmLengthMeters = 0.5F;
     invalid.bodyRig.forearmLengthMeters = 0.5F;

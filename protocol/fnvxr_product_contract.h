@@ -125,6 +125,14 @@ struct PresentationDecision
     bool pointerEnabled = false;
     bool gameplayVrAccepted = false;
     bool transitionHold = false;
+    // Kernel-owned spatial authorization. Host rendering may narrow these
+    // gates for missing resources, but must never independently broaden them.
+    bool spatialRigMayRender = false;
+    bool wristScreenMayRender = false;
+    // Exact identity of the pixels selected by the product kernel.
+    std::uint64_t presentedSourceEpoch = 0;
+    std::uint64_t presentedSourceFrame = 0;
+    std::uint64_t presentedSourceTransaction = 0;
     // Nonzero only when UiQuad is visible. A transition hold must carry the
     // exact source frame that was displayed during confirmed retail UI.
     std::uint64_t presentedUiSourceFrame = 0;

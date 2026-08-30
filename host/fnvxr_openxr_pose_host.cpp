@@ -21,6 +21,10 @@
 #include "fnvxr_runtime_config_loader.h"
 #include "fnvxr_product_kernel_adapter.h"
 #include "fnvxr_tracking_lifetime.h"
+#include "fnvxr_eye_readback_policy.h"
+#include "fnvxr_openxr_spatial_adapter.h"
+#include "../kernel/performance/cadence_tracker.h"
+#include "../kernel/wrist/activation.h"
 
 #include <windows.h>
 #include <bcrypt.h>
@@ -196,20 +200,8 @@ struct HandspaceLookTracker
     float y = 0.5f;
 };
 
-struct SolvedArm
-{
-    XrPosef shoulder {};
-    XrPosef elbow {};
-    XrPosef wrist {};
-    XrPosef forearm {};
-    float forearmLength = 0.0f;
-};
-
-struct BodyRig
-{
-    SolvedArm left {};
-    SolvedArm right {};
-};
+using SolvedArm = fnvxr::host::spatial::SolvedArm;
+using BodyRig = fnvxr::host::spatial::BodyRig;
 
 struct GamePlane
 {
@@ -5386,72 +5378,6 @@ XrPosef poseAlongSegment(XMVECTOR start, XMVECTOR end, XMVECTOR preferredUp)
     return poseFromBasis((start + end) * 0.5f, xAxis, yAxis, zAxis);
 }
 
-SolvedArm solveArm(
-    const XrPosef& hmdPose,
-    const XrPosef& wristPose,
-    bool left,
-    const fnvxr::kernel::BodyRigConfig& config)
-{
-    const XMVECTOR worldUp = XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
-    const XMVECTOR hmdOrientation = quat(hmdPose.orientation);
-    XMVECTOR hmdForward = XMVector3Rotate(XMVectorSet(0.0f, 0.0f, -1.0f, 0.0f), hmdOrientation);
-    hmdForward = safeNormalize3(XMVectorSetY(hmdForward, 0.0f), XMVectorSet(0.0f, 0.0f, -1.0f, 0.0f));
-    const XMVECTOR hmdRight = safeNormalize3(XMVector3Cross(hmdForward, worldUp), XMVectorSet(1.0f, 0.0f, 0.0f, 0.0f));
-
-    const float shoulderWidth = config.shoulderWidthMeters;
-    const float shoulderDrop = envFloat("FNVXR_BODY_SHOULDER_DROP", 0.24f);
-    const float shoulderBack = envFloat("FNVXR_BODY_SHOULDER_BACK", 0.08f);
-    const float upperLength = config.upperArmLengthMeters;
-    const float lowerLength = config.forearmLengthMeters;
-
-    const XMVECTOR hmdPosition = vec3(hmdPose.position);
-    const XMVECTOR shoulderCenter = hmdPosition - worldUp * shoulderDrop - hmdForward * shoulderBack;
-    const XMVECTOR side = left ? -hmdRight : hmdRight;
-    const XMVECTOR shoulder = shoulderCenter + side * (shoulderWidth * 0.5f);
-    const XMVECTOR wrist = vec3(wristPose.position);
-    const XMVECTOR shoulderToWrist = wrist - shoulder;
-    float distance = XMVectorGetX(XMVector3Length(shoulderToWrist));
-    const float maxReach = upperLength + lowerLength - 0.002f;
-    const float minReach = std::fabs(upperLength - lowerLength) + 0.002f;
-    const XMVECTOR dir = safeNormalize3(shoulderToWrist, hmdForward);
-    distance = std::max(minReach, std::min(distance, maxReach));
-
-    const float along = (upperLength * upperLength - lowerLength * lowerLength + distance * distance) / (2.0f * distance);
-    const float bend = std::sqrt(std::max(0.0f, upperLength * upperLength - along * along));
-    XMVECTOR elbowHint = -worldUp * envFloat("FNVXR_ARM_ELBOW_DOWN", 1.0f)
-        + side * envFloat("FNVXR_ARM_ELBOW_OUT", 0.35f)
-        - hmdForward * envFloat("FNVXR_ARM_ELBOW_BACK", 0.20f);
-    elbowHint -= dir * XMVectorGetX(XMVector3Dot(elbowHint, dir));
-    elbowHint = safeNormalize3(elbowHint, -worldUp);
-    const XMVECTOR elbow = shoulder + dir * along + elbowHint * bend;
-
-    const XMVECTOR wristOrientation = quat(wristPose.orientation);
-    XMVECTOR handUp = XMVector3Rotate(XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f), wristOrientation);
-    handUp = safeNormalize3(handUp, worldUp);
-
-    SolvedArm arm {};
-    arm.shoulder.position = xrVector(shoulder);
-    arm.shoulder.orientation = xrQuaternion(hmdOrientation);
-    arm.elbow.position = xrVector(elbow);
-    arm.elbow.orientation = xrQuaternion(hmdOrientation);
-    arm.wrist = wristPose;
-    arm.forearm = poseAlongSegment(elbow, wrist, handUp);
-    arm.forearmLength = XMVectorGetX(XMVector3Length(wrist - elbow));
-    return arm;
-}
-
-BodyRig solveBodyRig(
-    const XrPosef& hmdPose,
-    const XrPosef& leftPose,
-    const XrPosef& rightPose,
-    const fnvxr::kernel::BodyRigConfig& config)
-{
-    BodyRig rig {};
-    rig.left = solveArm(hmdPose, leftPose, true, config);
-    rig.right = solveArm(hmdPose, rightPose, false, config);
-    return rig;
-}
-
 GamePlane gamePlaneFromHmd(const XrPosef& hmdPose)
 {
     GamePlane plane {};
@@ -5502,61 +5428,40 @@ GamePlane gamePlaneFromHmd(const XrPosef& hmdPose)
     return plane;
 }
 
-GamePlane livePipBoyInteractionPlane(
-    const SolvedArm& leftArm,
+std::optional<GamePlane> livePipBoyInteractionPlane(
+    const XrPosef& leftGrip,
+    bool leftGripTracked,
     float scale,
     const fnvxr::kernel::WristUiConfig& config,
     const XMFLOAT3* measuredGripLocalPosition,
     const XrQuaternionf* measuredGripLocalRotation)
 {
-    GamePlane plane {};
-    // pipboyscreen:0 measures 5.872956 x 4.471702 retail game units.
-    // Preserve that physical aspect and the 70-units-per-meter scale used by
-    // the locally derived housing instead of stretching it to a guessed 1.6.
-    const float clampedScale = std::clamp(scale, 1.0f, 1.5f);
-    plane.width = config.widthMeters * clampedScale;
-    plane.height = config.heightMeters * clampedScale;
-
-    const XMVECTOR wristOrientation = quat(leftArm.wrist.orientation);
-    // This plane follows the tracked wrist for both the authored retail
-    // screen crop and its ray/fingertip physical controls.
-    const XMVECTOR localOrientation = measuredGripLocalRotation
-        ? quat(*measuredGripLocalRotation)
-        : XMQuaternionRotationRollPitchYaw(
-            degreesToRadians(envFloat(
-                "FNVXR_PIPBOY_WRIST_UI_ROT_X", 0.0f)),
-            degreesToRadians(envFloat(
-                "FNVXR_PIPBOY_WRIST_UI_ROT_Y", 0.0f)),
-            degreesToRadians(envFloat(
-                "FNVXR_PIPBOY_WRIST_UI_ROT_Z", 0.0f)));
-    const XMVECTOR orientation = XMQuaternionNormalize(
-        XMQuaternionMultiply(localOrientation, wristOrientation));
-    XMFLOAT4 orientationValue {};
-    XMStoreFloat4(&orientationValue, orientation);
-    plane.pose.orientation = {
-        orientationValue.x,
-        orientationValue.y,
-        orientationValue.z,
-        orientationValue.w,
-    };
-
-    const XMFLOAT3 localOffset = measuredGripLocalPosition
-        ? *measuredGripLocalPosition
-        : XMFLOAT3 {
-            envFloat("FNVXR_PIPBOY_WRIST_UI_OFFSET_X", -0.11f),
-            envFloat("FNVXR_PIPBOY_WRIST_UI_OFFSET_Y", 0.075f),
-            envFloat("FNVXR_PIPBOY_WRIST_UI_OFFSET_Z", -0.035f),
+    XrPosef calibration {};
+    const bool calibrated = measuredGripLocalPosition != nullptr
+        && measuredGripLocalRotation != nullptr;
+    if (calibrated)
+    {
+        calibration.position = {
+            measuredGripLocalPosition->x,
+            measuredGripLocalPosition->y,
+            measuredGripLocalPosition->z,
         };
-    const XMVECTOR worldOffset = XMVector3Rotate(
-        XMLoadFloat3(&localOffset),
-        wristOrientation);
-    XMFLOAT3 offsetValue {};
-    XMStoreFloat3(&offsetValue, worldOffset);
-    plane.pose.position = {
-        leftArm.wrist.position.x + offsetValue.x,
-        leftArm.wrist.position.y + offsetValue.y,
-        leftArm.wrist.position.z + offsetValue.z,
-    };
+        calibration.orientation = *measuredGripLocalRotation;
+    }
+    const std::optional<fnvxr::host::spatial::WristPlane> surface =
+        fnvxr::host::spatial::placeWristPlane(
+            config,
+            leftGrip,
+            leftGripTracked,
+            std::clamp(scale, 1.0F, 1.5F),
+            calibrated ? &calibration : nullptr);
+    if (!surface)
+        return std::nullopt;
+
+    GamePlane plane {};
+    plane.pose = surface->pose;
+    plane.width = surface->widthMeters;
+    plane.height = surface->heightMeters;
     return plane;
 }
 
@@ -6489,340 +6394,6 @@ bool uploadCpuEngineUiTexture(
     return true;
 }
 
-bool uploadProductUiWindowTexture(
-    ID3D11Device* device,
-    Renderer& renderer,
-    const std::vector<std::uint32_t>& pixels,
-    std::uint32_t width,
-    std::uint32_t height,
-    float aspect,
-    const fnvxr::product::UiFrameProof& proof) noexcept
-{
-    if (!device
-        || width == 0u
-        || height == 0u
-        || width > (std::numeric_limits<UINT>::max)() / 4u
-        || pixels.size() != static_cast<std::size_t>(width) * height
-        || !std::isfinite(aspect)
-        || aspect <= 0.0f
-        || !proof.completeForUiQuad())
-    {
-        return false;
-    }
-
-    bool reusable = renderer.retainedUiHostWindowCaptured
-        && renderer.retainedUiTexture
-        && renderer.retainedUiTextureView;
-    if (reusable)
-    {
-        D3D11_TEXTURE2D_DESC existing {};
-        renderer.retainedUiTexture->GetDesc(&existing);
-        reusable = existing.Width == width
-            && existing.Height == height
-            && existing.MipLevels == 1u
-            && existing.ArraySize == 1u
-            && existing.Format == DXGI_FORMAT_B8G8R8A8_TYPELESS
-            && existing.SampleDesc.Count == 1u
-            && existing.Usage == D3D11_USAGE_DEFAULT
-            && (existing.BindFlags & D3D11_BIND_SHADER_RESOURCE) != 0u;
-    }
-
-    if (reusable)
-    {
-        ComPtr<ID3D11DeviceContext> context;
-        device->GetImmediateContext(&context);
-        if (!context)
-            return false;
-        context->UpdateSubresource(
-            renderer.retainedUiTexture.Get(),
-            0u,
-            nullptr,
-            pixels.data(),
-            width * 4u,
-            0u);
-    }
-    else
-    {
-        D3D11_TEXTURE2D_DESC description {};
-        description.Width = width;
-        description.Height = height;
-        description.MipLevels = 1u;
-        description.ArraySize = 1u;
-        description.Format = DXGI_FORMAT_B8G8R8A8_TYPELESS;
-        description.SampleDesc.Count = 1u;
-        description.Usage = D3D11_USAGE_DEFAULT;
-        description.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        D3D11_SUBRESOURCE_DATA initial {};
-        initial.pSysMem = pixels.data();
-        initial.SysMemPitch = width * 4u;
-
-        ComPtr<ID3D11Texture2D> texture;
-        if (FAILED(device->CreateTexture2D(
-                &description,
-                &initial,
-                &texture))
-            || !texture)
-        {
-            return false;
-        }
-        D3D11_SHADER_RESOURCE_VIEW_DESC viewDescription {};
-        viewDescription.Format = DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
-        viewDescription.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-        viewDescription.Texture2D.MipLevels = 1u;
-        ComPtr<ID3D11ShaderResourceView> view;
-        if (FAILED(device->CreateShaderResourceView(
-                texture.Get(),
-                &viewDescription,
-                &view))
-            || !view)
-        {
-            return false;
-        }
-        renderer.retainedUiTexture = std::move(texture);
-        renderer.retainedUiTextureView = std::move(view);
-    }
-
-    renderer.retainedUiSourceFrame = proof.sourceFrame;
-    renderer.retainedUiRuntimeStateSample = proof.runtimeStateSample;
-    renderer.retainedUiTextureAspect = aspect;
-    renderer.retainedUiHostWindowCaptured = true;
-    renderer.retainedUiLivePipBoySurface = false;
-    renderer.retainedCpuUiTransactionId = 0u;
-    renderer.retainedCpuUiEpoch = 0u;
-    renderer.retainedCpuUiProducerProcessId = 0u;
-    renderer.retainedCpuUiCapturedRuntime = {};
-    return true;
-}
-
-const char* uiCaptureRetailStateName(fnvxr::product::RetailState state) noexcept
-{
-    using State = fnvxr::product::RetailState;
-    switch (state)
-    {
-        case State::Unknown: return "unknown";
-        case State::InteractiveUi: return "interactive_ui";
-        case State::Loading: return "loading";
-        case State::Gameplay: return "gameplay";
-    }
-    return "invalid";
-}
-
-void logProductUiWindowCapture(
-    std::uint64_t sourceFrame,
-    const fnvxr::host::ui_capture::RuntimeSample& before,
-    const fnvxr::host::ui_capture::RuntimeSample& after,
-    const fnvxr::host::ui_capture::WindowCapture& capture,
-    const char* failure,
-    bool uploadAttempted,
-    bool uploadSucceeded,
-    long long copyMicroseconds) noexcept
-{
-    static std::uint64_t attempts = 0u;
-    static const char* previousOutcome = nullptr;
-    ++attempts;
-    const char* outcome = failure ? failure : "unknown";
-    const bool accepted = std::strcmp(outcome, "none") == 0 && uploadSucceeded;
-    const bool sameOutcome = previousOutcome
-        && std::strcmp(outcome, previousOutcome) == 0;
-    if (attempts > 10u
-        && attempts % 120u != 0u
-        && sameOutcome)
-    {
-        return;
-    }
-    previousOutcome = outcome;
-    std::cout << "productUiCapture attempt=" << attempts
-              << " accepted=" << static_cast<int>(accepted)
-              << " failure=" << outcome
-              << " sourceFrame=" << sourceFrame
-              << " beforeSample=" << before.sample
-              << " afterSample=" << after.sample
-              << " beforeFresh=" << static_cast<int>(before.fresh)
-              << " afterFresh=" << static_cast<int>(after.fresh)
-              << " beforeClass="
-              << uiCaptureRetailStateName(fnvxr::host::ui_capture::classify(before))
-              << " afterClass="
-              << uiCaptureRetailStateName(fnvxr::host::ui_capture::classify(after))
-              << " beforePhase=" << before.phase
-              << " afterPhase=" << after.phase
-              << " beforeBits=0x" << std::hex << before.menuBits
-              << " afterBits=0x" << after.menuBits << std::dec
-              << " beforeShowroom=" << before.showroomActive
-              << " afterShowroom=" << after.showroomActive
-              << " beforeCamera=" << static_cast<int>(before.cameraActive)
-              << " afterCamera=" << static_cast<int>(after.cameraActive)
-              << " copied=" << static_cast<int>(capture.complete)
-              << " visible=" << static_cast<int>(capture.visibleContent)
-              << " owned=" << static_cast<int>(capture.retailWindowOwned)
-              << " uploadAttempted=" << static_cast<int>(uploadAttempted)
-              << " uploadSucceeded=" << static_cast<int>(uploadSucceeded)
-              << " dimensions=" << capture.width << "x" << capture.height
-              << " pixels=" << capture.pixelCount
-              << " copyUs=" << copyMicroseconds
-              << "\n";
-    std::cout.flush();
-}
-
-bool prepareProductUiWindowFallback(
-    ID3D11Device* device,
-    Renderer& renderer,
-    std::uint64_t sourceFrame,
-    const fnvxr::host::ui_capture::RuntimeSample& before,
-    fnvxr::product::UiFrameProof& proof,
-    fnvxr::host::ui_capture::RuntimeSample& validatedRuntime) noexcept
-{
-    namespace ui_capture = fnvxr::host::ui_capture;
-    proof = {};
-    validatedRuntime = {};
-    if (!device)
-    {
-        logProductUiWindowCapture(
-            sourceFrame,
-            before,
-            {},
-            {},
-            "device_unavailable",
-            false,
-            false,
-            -1);
-        return false;
-    }
-    if (!ui_capture::confirmedUi(before))
-    {
-        const ui_capture::Decision rejected = ui_capture::assess(before, {}, {});
-        logProductUiWindowCapture(
-            sourceFrame,
-            before,
-            {},
-            {},
-            ui_capture::failureName(rejected.failure),
-            false,
-            false,
-            -1);
-        return false;
-    }
-
-    // A previously sandwiched capture remains valid while its exact post-copy
-    // sample is current. A newer sample is recaptured once in this OpenXR
-    // frame and admitted only if the bracketing observations prove identical
-    // confirmed UI state; it is never relabeled across gameplay or unknown.
-    if (renderer.retainedUiHostWindowCaptured
-        && renderer.retainedUiTexture
-        && renderer.retainedUiTextureView
-        && renderer.retainedUiSourceFrame != 0u
-        && renderer.retainedUiRuntimeStateSample == before.sample)
-    {
-        proof = {
-            renderer.retainedUiSourceFrame,
-            before.sample,
-            true,
-            true,
-            true,
-        };
-        validatedRuntime = before;
-        return proof.completeForUiQuad();
-    }
-
-    if (renderer.gameTextureWidth <= 0 || renderer.gameTextureHeight <= 0)
-    {
-        logProductUiWindowCapture(
-            sourceFrame,
-            before,
-            {},
-            {},
-            "capture_dimensions_invalid",
-            false,
-            false,
-            -1);
-        return false;
-    }
-    static std::vector<std::uint32_t> pixels;
-    float aspect = static_cast<float>(renderer.gameTextureWidth)
-        / static_cast<float>(renderer.gameTextureHeight);
-    const auto copyStarted = std::chrono::steady_clock::now();
-    const bool copied = captureFalloutWindowBgra(
-        renderer.gameTextureWidth,
-        renderer.gameTextureHeight,
-        pixels,
-        aspect);
-    const long long copyMicroseconds =
-        std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::steady_clock::now() - copyStarted).count();
-
-    bool afterUiActive = true;
-    bool afterGameplayActive = false;
-    bool afterCameraActive = false;
-    std::uint32_t afterMenuBits = 0u;
-    std::uint32_t afterPhase = fnvxr::shared::RuntimePhaseUnknown;
-    std::uint32_t afterShowroomActive = 0u;
-    std::uint64_t afterRuntimeSample = 0u;
-    const bool afterFresh = readSharedRuntimeUiActive(
-        renderer,
-        afterUiActive,
-        afterGameplayActive,
-        afterCameraActive,
-        afterMenuBits,
-        afterPhase,
-        afterShowroomActive,
-        afterRuntimeSample);
-    const ui_capture::RuntimeSample after {
-        afterRuntimeSample,
-        afterPhase,
-        afterMenuBits,
-        afterShowroomActive,
-        afterCameraActive,
-        afterFresh,
-    };
-    const ui_capture::WindowCapture capture {
-        sourceFrame,
-        static_cast<std::uint32_t>(renderer.gameTextureWidth),
-        static_cast<std::uint32_t>(renderer.gameTextureHeight),
-        pixels.size(),
-        copied,
-        copied && !isMostlyBlackFrame(pixels),
-        copied,
-    };
-    const ui_capture::Decision decision =
-        ui_capture::assess(before, capture, after);
-    if (!decision.accepted())
-    {
-        logProductUiWindowCapture(
-            sourceFrame,
-            before,
-            after,
-            capture,
-            ui_capture::failureName(decision.failure),
-            false,
-            false,
-            copyMicroseconds);
-        return false;
-    }
-    const bool uploaded = uploadProductUiWindowTexture(
-            device,
-            renderer,
-            pixels,
-            capture.width,
-            capture.height,
-            aspect,
-            decision.proof);
-    logProductUiWindowCapture(
-        sourceFrame,
-        before,
-        after,
-        capture,
-        uploaded ? ui_capture::failureName(decision.failure) : "upload_failed",
-        true,
-        uploaded,
-        copyMicroseconds);
-    if (!uploaded)
-    {
-        return false;
-    }
-    proof = decision.proof;
-    validatedRuntime = after;
-    return true;
-}
-
 MenuPointer menuPointerFromAimPose(const XrPosef& aimPose, const GamePlane& gamePlane)
 {
     const XMVECTOR origin = XMVectorSet(aimPose.position.x, aimPose.position.y, aimPose.position.z, 0.0f);
@@ -7340,7 +6911,7 @@ bool captureSwapchainRenderProof(
     std::uint32_t eyeIndex = 0u)
 {
     proof = {};
-    if (!device || !texture || !envEnabled("FNVXR_RENDER_OUTPUT_PROOF", true))
+    if (!device || !texture)
         return false;
 
     D3D11_TEXTURE2D_DESC desc {};
@@ -7453,7 +7024,10 @@ bool renderEye(
     const XrPosef& rightPose,
     const XrPosef& leftAimPose,
     const XrPosef& rightAimPose,
+    bool leftAimTracked,
+    bool rightAimTracked,
     bool spatialSourcePoseMatched,
+    bool wristSourcePoseMatched,
     const fnvxr::kernel::PresentationConfig& presentationConfig,
     const XrQuaternionf* rightHandGripLocalRotation,
     const BodyRig& bodyRig,
@@ -7601,7 +7175,7 @@ bool renderEye(
         drawMenuPointer(context.Get(), renderer, viewProjection, menuPointer, gamePlane);
         context->OMSetDepthStencilState(renderer.depthState.Get(), 0);
     }
-    if (spatialSourcePoseMatched)
+    if (spatialSourcePoseMatched && rightAimTracked)
     {
         drawWeaponOrbitWheel(
             context.Get(),
@@ -7609,8 +7183,6 @@ bool renderEye(
             viewProjection,
             weaponOrbitWheel);
     }
-    const bool spatialHandsOverlay =
-        envEnabled("FNVXR_SPATIAL_HANDS_OVERLAY", false);
     const bool drawLegacyWorldProps = !productionWorldTextureView
         && !productionUiTextureView
         && envEnabled("FNVXR_SHOW_WORLD_PROPS", false)
@@ -7618,7 +7190,9 @@ bool renderEye(
             || envEnabled("FNVXR_OVERLAY_PROPS_ON_FULLSCREEN", false));
     const bool drawWorldProps = spatialSourcePoseMatched
         && (drawLegacyWorldProps
-            || (spatialHandsOverlay && productionWorldTextureView));
+            || productionWorldTextureView);
+    const bool drawWristDevice = wristSourcePoseMatched
+        && (drawLegacyWorldProps || productionWorldTextureView);
     if (drawWorldProps && envEnabled("FNVXR_SHOW_BODY_RIG", true))
     {
         // Keep the wrist device physically connected to an authored retail
@@ -7662,18 +7236,20 @@ bool renderEye(
             context.Get(), renderer, viewProjection,
             rightPose, false, rightHandGripLocalRotation);
     }
-    if (drawWorldProps && envEnabled("FNVXR_SHOW_PIPBOY_RIG", true))
+    if (drawWristDevice && envEnabled("FNVXR_SHOW_PIPBOY_RIG", true))
         drawPipboyRig(
             context.Get(),
             renderer,
             viewProjection,
             bodyRig.left,
             livePipBoyPlane);
-    if (drawWorldProps && envEnabled("FNVXR_SHOW_LEFT_AIM_RAY", false))
+    if (drawWorldProps && leftAimTracked
+        && envEnabled("FNVXR_SHOW_LEFT_AIM_RAY", false))
         drawAimRay(context.Get(), renderer, viewProjection, leftAimPose);
-    if (drawWorldProps && envEnabled("FNVXR_SHOW_RIGHT_AIM_RAY", true))
+    if (drawWorldProps && rightAimTracked
+        && envEnabled("FNVXR_SHOW_RIGHT_AIM_RAY", true))
         drawAimRay(context.Get(), renderer, viewProjection, rightAimPose);
-    if (drawWorldProps && pipBoyScreenVisible)
+    if (drawWristDevice && pipBoyScreenVisible)
     {
         // The texture is the fresh retail eye source for this exact frame.
         // Its authored screen crop is spatialized on the tracked wrist after
@@ -7688,7 +7264,7 @@ bool renderEye(
             pipBoyScreenTextureView);
         context->OMSetDepthStencilState(renderer.depthState.Get(), 0);
     }
-    if (drawWorldProps)
+    if (drawWristDevice && rightAimTracked)
         drawPipBoyPointer(
             context.Get(),
             renderer,
@@ -7696,13 +7272,17 @@ bool renderEye(
             livePipBoyPointer,
             livePipBoyPlane);
 
-    const bool outputProven = captureSwapchainRenderProof(
-        device,
-        swapchain.images[imageIndex].texture,
-        renderProof,
-        headsetMirrorCapture,
-        hostFrame,
-        static_cast<std::uint32_t>(eyeIndex));
+    const bool diagnosticReadbackRequested = fnvxr::host::eyeReadbackRequired(
+        headsetMirrorCapture != nullptr,
+        envEnabled("FNVXR_VERIFY_EYE_PIXELS", false));
+    const bool outputProven = !diagnosticReadbackRequested
+        || captureSwapchainRenderProof(
+            device,
+            swapchain.images[imageIndex].texture,
+            renderProof,
+            headsetMirrorCapture,
+            hostFrame,
+            static_cast<std::uint32_t>(eyeIndex));
     const bool released = releaseSwapchainImage(xr, swapchain);
     if (!outputProven)
         swapchain.fatalWaitFailure = true;
@@ -10087,6 +9667,15 @@ struct ComApartment
     }
 };
 
+fnvxr::kernel::performance::MonotonicNanoseconds monotonicNow() noexcept
+{
+    return {
+        static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count()),
+    };
+}
+
 }
 
 int main(int argc, char** argv)
@@ -10208,9 +9797,9 @@ int main(int argc, char** argv)
     }
 
     XrInstanceCreateInfo instanceInfo { XR_TYPE_INSTANCE_CREATE_INFO };
-    strcpy_s(instanceInfo.applicationInfo.applicationName, "FNVXR Pose Host");
+    strcpy_s(instanceInfo.applicationInfo.applicationName, "FNVXR Product Host");
     instanceInfo.applicationInfo.applicationVersion = 1;
-    strcpy_s(instanceInfo.applicationInfo.engineName, "fnvxr-bridge-experiment");
+    strcpy_s(instanceInfo.applicationInfo.engineName, "FNVXR");
     instanceInfo.applicationInfo.engineVersion = 1;
     instanceInfo.applicationInfo.apiVersion = XR_CURRENT_API_VERSION;
     instanceInfo.enabledExtensionCount = static_cast<uint32_t>(enabledExtensions.size());
@@ -10607,6 +10196,10 @@ int main(int argc, char** argv)
     bool hasLastActiveMenuPointer = false;
     std::uint32_t livePipBoyHoverFrames = 0u;
     fnvxr::engine::live_pipboy::FocusDecision livePipBoyFocus {};
+    fnvxr::kernel::wrist::WristActivation wristActivation;
+    fnvxr::kernel::wrist::ActivationDecision wristActivationDecision {};
+    std::optional<GamePlane> submittedWristPlane;
+    MenuPointer submittedWristPointer {};
     HeadspaceLookTracker headspaceLookTracker {};
     HandspaceLookTracker handspaceLookTracker {};
     HeadspaceLookTracker gyroAimLookTracker {};
@@ -10661,6 +10254,28 @@ int main(int argc, char** argv)
     fnvxr::host::SourcePoseHistory sourceViewHistory;
     fnvxr::host::gpu_color::RuntimeEvidenceHistory<>
         runtimeEvidenceHistory;
+    const auto resetWristInteraction = [&]() noexcept
+    {
+        wristActivation.reset();
+        wristActivationDecision = {};
+        submittedWristPlane.reset();
+        submittedWristPointer = {};
+    };
+    fnvxr::kernel::performance::CadenceTracker cadenceTracker(runtimeConfig);
+    std::uint64_t cadenceEpoch = 1u;
+    if (!cadenceTracker.resetEpoch(cadenceEpoch))
+    {
+        std::cerr << "cadence tracker failed to establish its initial epoch\n";
+        return 30;
+    }
+    const auto resetCadenceEpoch = [&]()
+    {
+        ++cadenceEpoch;
+        if (cadenceEpoch == 0u)
+            ++cadenceEpoch;
+        if (!cadenceTracker.resetEpoch(cadenceEpoch))
+            std::cerr << "cadence tracker rejected epoch=" << cadenceEpoch << "\n";
+    };
 
     for (uint64_t frameIndex = 1; frameIndex <= targetFrames; ++frameIndex)
     {
@@ -10693,6 +10308,8 @@ int main(int argc, char** argv)
             presentationController.reset();
             sourceViewHistory.reset();
             runtimeEvidenceHistory.reset();
+            resetWristInteraction();
+            resetCadenceEpoch();
             clearRetainedUiTexture(renderer);
         }
         if (sessionSyncRegained)
@@ -10701,6 +10318,8 @@ int main(int argc, char** argv)
             presentationController.reset();
             sourceViewHistory.reset();
             runtimeEvidenceHistory.reset();
+            resetWristInteraction();
+            resetCadenceEpoch();
             clearRetainedUiTexture(renderer);
             std::cout << "sessionTrackingGenerationChanged generation="
                       << generationChange.generation
@@ -10718,6 +10337,7 @@ int main(int argc, char** argv)
             previousHostRightTriggerDown = false;
             previousHostButtonADown = false;
             previousHostButtonXDown = false;
+            resetWristInteraction();
             std::cout << "inputFocusTransition frame=" << frameIndex
                       << " shouldReadInput=" << static_cast<int>(shouldReadInput)
                       << " lost=" << static_cast<int>(inputFocusLost)
@@ -10772,6 +10392,8 @@ int main(int argc, char** argv)
             presentationController.reset();
             sourceViewHistory.reset();
             runtimeEvidenceHistory.reset();
+            resetWristInteraction();
+            resetCadenceEpoch();
             clearRetainedUiTexture(renderer);
         }
 
@@ -10796,6 +10418,7 @@ int main(int argc, char** argv)
             std::cerr << "xrBeginFrame failed: " << resultName(result) << "\n";
             break;
         }
+        const auto cadenceBeginTimestamp = monotonicNow();
         const bool runtimeShouldRender = frameState.shouldRender == XR_TRUE;
         static uint64_t notRequestedFrameCount = 0;
         const bool renderWhenNotRequested = envEnabled("FNVXR_RENDER_WHEN_SHOULD_RENDER_FALSE", false);
@@ -10809,7 +10432,7 @@ int main(int argc, char** argv)
                           << "\n" << std::flush;
             }
         }
-        const bool shouldRender = runtimeShouldRender || renderWhenNotRequested;
+        bool shouldRender = runtimeShouldRender || renderWhenNotRequested;
 
         // The GPU ABI-v5 consumer is exclusive with the ordinary-D3D9 CPU
         // transport. In CPU mode, do not even consume an unrelated v5 record:
@@ -10825,17 +10448,24 @@ int main(int argc, char** argv)
                     gpuColorConsumer.eyeView(0u) != nullptr,
                     gpuColorConsumer.eyeView(1u) != nullptr)
                 : fnvxr::host::gpu_color::RoutedFrame {};
-        if (gpuColorFrame.frame.producerEpoch != 0u
+        const bool gpuColorProducerChanged =
+            activeGpuColorProducerEpoch != 0u
+            && gpuColorFrame.frame.producerEpoch != 0u
             && (gpuColorFrame.frame.producerEpoch
                     != activeGpuColorProducerEpoch
                 || gpuColorFrame.frame.producerProcessId
-                    != activeGpuColorProducerProcessId))
+                    != activeGpuColorProducerProcessId);
+        if (gpuColorFrame.frame.producerEpoch != 0u
+            && (gpuColorProducerChanged
+                || activeGpuColorProducerEpoch == 0u))
         {
             activeGpuColorProducerEpoch =
                 gpuColorFrame.frame.producerEpoch;
             activeGpuColorProducerProcessId =
                 gpuColorFrame.frame.producerProcessId;
             presentationController.reset();
+            if (gpuColorProducerChanged)
+                resetCadenceEpoch();
             clearRetainedUiTexture(renderer);
         }
         const bool gpuColorStateChanged =
@@ -10869,6 +10499,18 @@ int main(int argc, char** argv)
         previousGpuColorContent = gpuColorFrame.content;
         previousGpuColorTransaction = gpuColorFrame.frame.transactionId;
 
+        const fnvxr::kernel::performance::HostFrameId cadenceFrame {
+            cadenceEpoch, frameIndex };
+        const auto cadenceBeginOutcome = cadenceTracker.beginFrame(
+            cadenceFrame, cadenceBeginTimestamp);
+        if (cadenceBeginOutcome
+            != fnvxr::kernel::performance::CadenceEventOutcome::accepted)
+        {
+            std::cerr << "cadence begin rejected frame=" << frameIndex
+                      << " outcome="
+                      << static_cast<unsigned>(cadenceBeginOutcome) << "\n";
+        }
+
         if (shouldReadInput)
         {
             XrActiveActionSet activeActionSet { actionSet, XR_NULL_PATH };
@@ -10879,7 +10521,11 @@ int main(int argc, char** argv)
             if (syncResult == XR_SESSION_LOSS_PENDING)
             {
                 lossPending = true;
-                break;
+                shouldReadInput = false;
+                shouldSyncFrames = false;
+                shouldRender = false;
+                invalidateHostSharedBridgeTracking(
+                    sharedBridge, "xrSyncActions-session-loss-pending");
             }
             if (syncResult == XR_ERROR_SESSION_NOT_RUNNING)
             {
@@ -11093,16 +10739,6 @@ int main(int argc, char** argv)
         HeadspaceLook headspaceLook {};
         HeadspaceLook handspaceLook {};
         HeadspaceLook gyroAimLook {};
-        // The retail rig consumes these exact unsmoothed poses below. Using
-        // independently smoothed poses for host-rendered hands introduces a
-        // controller-motion seam even before the engine-frame delay is
-        // considered.
-        const BodyRig bodyRig = solveBodyRig(
-            rawHmdPose,
-            rawLeftPose,
-            rawRightPose,
-            runtimeConfig.get().bodyRig);
-
         const bool recenterChord =
             (rightThumbstick.value && rightGrip.value > 0.50f)
             || (leftThumbstick.value && leftGrip.value > 0.50f);
@@ -11358,18 +10994,14 @@ int main(int argc, char** argv)
                 runtimeMenuBits,
                 runtimeShowroomActive,
                 runtimeCameraActive);
-        const GamePlane livePipBoyBasePlane =
-            livePipBoyInteractionPlane(
-                bodyRig.left,
-                1.0f,
-                runtimeConfig.get().wristUi,
-                sharedBridge.leftPipBoyScreenGripLocalPoseValid
-                    ? &sharedBridge.leftPipBoyScreenGripLocalPosition
-                    : nullptr,
-                sharedBridge.leftPipBoyScreenGripLocalPoseValid
-                    ? &sharedBridge.leftPipBoyScreenGripLocalRotation
-                    : nullptr);
-        GamePlane livePipBoyFocusPlane = livePipBoyBasePlane;
+        // Interaction consumes the exact pose generation accepted by the
+        // previous successful submission. The candidate for this frame is
+        // computed beside final-eye composition and committed only after
+        // xrEndFrame succeeds.
+        const std::optional<GamePlane> livePipBoyBasePlane =
+            submittedWristPlane;
+        GamePlane livePipBoyFocusPlane =
+            livePipBoyBasePlane.value_or(GamePlane {});
         livePipBoyFocusPlane.width *= std::clamp(
             envFloat("FNVXR_LIVE_PIPBOY_FOCUS_HIT_SCALE_X", 1.0f),
             1.0f,
@@ -11378,20 +11010,20 @@ int main(int argc, char** argv)
             envFloat("FNVXR_LIVE_PIPBOY_FOCUS_HIT_SCALE_Y", 1.0f),
             1.0f,
             4.0f);
-        const MenuPointer livePipBoyBasePointer = rightAimTracked
-            ? menuPointerFromAimPose(rightAimPose, livePipBoyFocusPlane)
-            : MenuPointer {};
+        const MenuPointer livePipBoyBasePointer = submittedWristPointer;
         const bool livePipBoyActivationGripHeld = rightGrip.active
             && rightGrip.value >= envFloat(
                 "FNVXR_LIVE_PIPBOY_GRIP_THRESHOLD",
                 0.55f);
-        if (livePipBoyBasePointer.active
+        if (wristActivationDecision.active
+            && livePipBoyBasePointer.active
             && livePipBoyActivationGripHeld)
             ++livePipBoyHoverFrames;
         else
             livePipBoyHoverFrames = 0u;
         livePipBoyFocus = fnvxr::engine::live_pipboy::assessFocus({
-            livePipBoyBasePointer.active,
+            wristActivationDecision.active
+                && livePipBoyBasePointer.active,
             livePipBoyActivationGripHeld,
             pipBoyMenuMode,
             livePipBoyHoverFrames,
@@ -11399,16 +11031,17 @@ int main(int argc, char** argv)
                 1,
                 envInt("FNVXR_LIVE_PIPBOY_FOCUS_FRAMES", 12))),
         });
-        const GamePlane livePipBoyPlane = livePipBoyInteractionPlane(
-            bodyRig.left,
-            livePipBoyFocus.scale,
-            runtimeConfig.get().wristUi,
-            sharedBridge.leftPipBoyScreenGripLocalPoseValid
-                ? &sharedBridge.leftPipBoyScreenGripLocalPosition
-                : nullptr,
-            sharedBridge.leftPipBoyScreenGripLocalPoseValid
-                ? &sharedBridge.leftPipBoyScreenGripLocalRotation
-                : nullptr);
+        std::optional<GamePlane> livePipBoyPlaneResult = livePipBoyBasePlane;
+        if (livePipBoyPlaneResult)
+        {
+            const float scale = std::clamp(livePipBoyFocus.scale, 1.0F, 1.5F);
+            livePipBoyPlaneResult->width =
+                runtimeConfig.get().wristUi.widthMeters * scale;
+            livePipBoyPlaneResult->height =
+                runtimeConfig.get().wristUi.heightMeters * scale;
+        }
+        const GamePlane livePipBoyPlane =
+            livePipBoyPlaneResult.value_or(livePipBoyFocusPlane);
         const bool dialoguePlaneSize =
             haveRuntimeUiState
             && (runtimeMenuBits & fnvxr::shared::RuntimeDialogMenuBit) != 0
@@ -11442,7 +11075,7 @@ int main(int argc, char** argv)
             gamePlane.pose.position.y += deltaFloat.y;
             gamePlane.pose.position.z += deltaFloat.z;
         }
-        if (pipBoyMenuMode)
+        if (pipBoyMenuMode && livePipBoyPlaneResult)
             gamePlane = livePipBoyPlane;
         if (gameplayPlaneSize != previousLoggedGameplayPlaneSize
             || pipBoyMenuMode != previousLoggedPipBoyMenuMode
@@ -11877,19 +11510,6 @@ int main(int argc, char** argv)
             runtimeCameraActive,
             haveRuntimeUiState,
         };
-        fnvxr::host::ui_capture::RuntimeSample hostUiValidatedRuntime {};
-        fnvxr::product::UiFrameProof hostUiProof {};
-        bool hostUiResourceReady = false;
-        if (productionGpuColorV5 && !incomingUiResourceReady)
-        {
-            hostUiResourceReady = prepareProductUiWindowFallback(
-                device.Get(),
-                renderer,
-                frame.frame,
-                hostUiRuntimeBefore,
-                hostUiProof,
-                hostUiValidatedRuntime);
-        }
         fnvxr::host::gpu_color::RoutedFrame controllerRouted =
             gpuColorFrame;
         if (controllerRouted.content
@@ -11899,7 +11519,7 @@ int main(int argc, char** argv)
             controllerRouted = {};
         }
         const fnvxr::host::ui_capture::RuntimeSample& controllerRuntimeSample =
-            hostUiResourceReady ? hostUiValidatedRuntime : hostUiRuntimeBefore;
+            hostUiRuntimeBefore;
         const fnvxr::host::gpu_color::RuntimeEvidence runtimeEvidence {
             controllerRuntimeSample.sample,
             controllerRuntimeSample.phase,
@@ -11927,33 +11547,50 @@ int main(int argc, char** argv)
                 controllerRouted,
                 productSourceViewFound,
                 sourcePoseAgeValid);
-        if (hostUiResourceReady)
-            presentationInput.ui = hostUiProof;
         const bool routedTransportReady = controllerRouted.content
             != fnvxr::host::gpu_color::RoutedContent::SafetyBlank;
-        const bool capturedUiTransportReady = hostUiResourceReady
-            && presentationInput.ui.completeForUiQuad();
         const fnvxr::host::PresentationTransportProof presentationTransport {
             routedTransportReady
-                ? controllerRouted.frame.producerEpoch
-                : capturedUiTransportReady
-                    ? sharedBridge.producerEpoch : 0u,
+                ? controllerRouted.frame.producerEpoch : 0u,
             routedTransportReady
-                ? controllerRouted.frame.transactionId
-                : capturedUiTransportReady
-                    ? presentationInput.ui.sourceFrame : 0u,
-            routedTransportReady || capturedUiTransportReady,
-            routedTransportReady || capturedUiTransportReady,
-            routedTransportReady || capturedUiTransportReady,
-            routedTransportReady || capturedUiTransportReady,
-            routedTransportReady || capturedUiTransportReady,
+                ? controllerRouted.frame.transactionId : 0u,
+            routedTransportReady,
+            routedTransportReady,
+            routedTransportReady,
+            routedTransportReady,
+            routedTransportReady,
         };
+        const std::uint32_t exactRigFlags = productSourceView.trackingFlags;
+        const bool exactTrackedRigReady = productSourceViewFound
+            && sourcePoseAgeValid
+            && (exactRigFlags & fnvxr::shared::VrPoseTrackingHmd) != 0u
+            && (exactRigFlags
+                & fnvxr::shared::VrPoseTrackingLeftGripActive) != 0u
+            && (exactRigFlags
+                & fnvxr::shared::VrPoseTrackingLeftGripCurrent) != 0u
+            && (exactRigFlags
+                & fnvxr::shared::VrPoseTrackingRightGripActive) != 0u
+            && (exactRigFlags
+                & fnvxr::shared::VrPoseTrackingRightGripCurrent) != 0u;
+        const bool exactWristPoseReady = productSourceViewFound
+            && sourcePoseAgeValid
+            && (exactRigFlags & fnvxr::shared::VrPoseTrackingHmd) != 0u
+            && (exactRigFlags
+                & fnvxr::shared::VrPoseTrackingLeftGripActive) != 0u
+            && (exactRigFlags
+                & fnvxr::shared::VrPoseTrackingLeftGripCurrent) != 0u
+            && (exactRigFlags
+                & fnvxr::shared::VrPoseTrackingRightAimActive) != 0u
+            && (exactRigFlags
+                & fnvxr::shared::VrPoseTrackingRightAimCurrent) != 0u;
         productDecision = productionGpuColorV5
             ? presentationController.advance(
                 presentationInput,
                 presentationTransport,
-                productSourceViewFound && sourcePoseAgeValid,
-                livePipBoyScreenFocused && renderer.retainedUiTextureView)
+                exactTrackedRigReady,
+                exactWristPoseReady
+                    && livePipBoyScreenFocused
+                    && renderer.retainedUiTextureView)
             : fnvxr::product::PresentationDecision {};
         if (productDecision.mode
                 == fnvxr::product::PresentationMode::UiQuad
@@ -11991,9 +11628,8 @@ int main(int argc, char** argv)
                 == fnvxr::host::gpu_color::RoutedContent::BinocularWorld
             && productComposition.bindLeftEyeView
             && productComposition.bindRightEyeView;
-        const bool pipBoySpatialScreenVisible =
-            envEnabled("FNVXR_SPATIAL_HANDS_OVERLAY", false)
-            && pipBoyMenuMode
+        const bool pipBoySpatialContentReady =
+            pipBoyMenuMode
             && renderer.retainedUiLivePipBoySurface
             && renderer.retainedUiTextureView;
         using StereoVisualTrial =
@@ -12217,9 +11853,7 @@ int main(int argc, char** argv)
             envEqualsIgnoreCase("FNVXR_MENU_POINTER_HAND", "head")
             || envEqualsIgnoreCase("FNVXR_MENU_POINTER_SOURCE", "head");
         const bool pointerHeadFallback = envEnabled("FNVXR_MENU_POINTER_HEAD_FALLBACK", false);
-        const MenuPointer livePipBoyPointer = rightAimTracked
-            ? menuPointerFromAimPose(rightAimPose, livePipBoyPlane)
-            : MenuPointer {};
+        const MenuPointer livePipBoyPointer = livePipBoyBasePointer;
         const MenuPointer leftMenuPointer = leftAimTracked
             ? menuPointerFromAimPose(leftAimPose, gamePlane)
             : MenuPointer {};
@@ -12423,13 +12057,23 @@ int main(int argc, char** argv)
             { XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW }
         };
         bool submitProjectionLayer = false;
+        fnvxr::kernel::presentation::SourceKey cadenceSource {};
         bool submittedStereoFullscreen = false;
         bool presentedGameTexture = false;
         bool uiQuadVisible = false;
         bool spatialPropsSourcePoseMatched = false;
+        bool wristSourcePoseMatched = false;
+        bool pipBoySpatialScreenVisible = false;
         std::uint64_t spatialPropsPoseSequence = 0u;
         EyeRenderProof leftRenderProof {};
         EyeRenderProof rightRenderProof {};
+        fnvxr::kernel::wrist::WristActivation candidateWristActivation =
+            wristActivation;
+        fnvxr::kernel::wrist::ActivationDecision
+            candidateWristActivationDecision {};
+        std::optional<GamePlane> candidateWristPlane;
+        MenuPointer candidateWristPointer {};
+        bool candidateWristEvaluated = false;
 
         XrViewLocateInfo viewLocateInfo { XR_TYPE_VIEW_LOCATE_INFO };
         viewLocateInfo.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
@@ -13009,6 +12653,11 @@ int main(int argc, char** argv)
             XrPosef spatialRightPose = rawRightPose;
             XrPosef spatialLeftAimPose = rawLeftAimPose;
             XrPosef spatialRightAimPose = rawRightAimPose;
+            bool spatialHmdTracked = hmdTracked;
+            bool spatialLeftTracked = leftHandTracked;
+            bool spatialRightTracked = rightHandTracked;
+            bool spatialLeftAimTracked = false;
+            bool spatialRightAimTracked = false;
             fnvxr::host::SourceViewPublication spatialSourcePose {};
             bool spatialSourceFound = false;
             if (presentedBinocularWorld && productSourceViewFound)
@@ -13036,17 +12685,49 @@ int main(int argc, char** argv)
                 spatialRightPose = spatialSourcePose.rightGripPose;
                 spatialLeftAimPose = spatialSourcePose.leftAimPose;
                 spatialRightAimPose = spatialSourcePose.rightAimPose;
-                spatialPropsSourcePoseMatched = true;
+                spatialHmdTracked =
+                    (spatialSourcePose.trackingFlags
+                        & fnvxr::shared::VrPoseTrackingHmd) != 0u;
+                spatialLeftTracked =
+                    (spatialSourcePose.trackingFlags
+                        & fnvxr::shared::VrPoseTrackingLeftGripActive) != 0u
+                    && (spatialSourcePose.trackingFlags
+                        & fnvxr::shared::VrPoseTrackingLeftGripCurrent) != 0u;
+                spatialRightTracked =
+                    (spatialSourcePose.trackingFlags
+                        & fnvxr::shared::VrPoseTrackingRightGripActive) != 0u
+                    && (spatialSourcePose.trackingFlags
+                        & fnvxr::shared::VrPoseTrackingRightGripCurrent) != 0u;
+                spatialLeftAimTracked =
+                    (spatialSourcePose.trackingFlags
+                        & fnvxr::shared::VrPoseTrackingLeftAimActive) != 0u
+                    && (spatialSourcePose.trackingFlags
+                        & fnvxr::shared::VrPoseTrackingLeftAimCurrent) != 0u;
+                spatialRightAimTracked =
+                    (spatialSourcePose.trackingFlags
+                        & fnvxr::shared::VrPoseTrackingRightAimActive) != 0u
+                    && (spatialSourcePose.trackingFlags
+                        & fnvxr::shared::VrPoseTrackingRightAimCurrent) != 0u;
                 spatialPropsPoseSequence = spatialSourcePose.poseSequence;
             }
-            const BodyRig spatialBodyRig = solveBodyRig(
+            const BodyRig spatialBodyRig =
+                fnvxr::host::spatial::solveBodyRig(
                 spatialHmdPose,
+                spatialHmdTracked,
                 spatialLeftPose,
+                spatialLeftTracked,
                 spatialRightPose,
+                spatialRightTracked,
                 runtimeConfig.get().bodyRig);
-            const GamePlane spatialLivePipBoyPlane =
+            spatialPropsSourcePoseMatched =
+                spatialSourceFound
+                && spatialBodyRig.valid
+                && (!productionGpuColorV5
+                    || productDecision.spatialRigMayRender);
+            candidateWristPlane =
                 livePipBoyInteractionPlane(
-                    spatialBodyRig.left,
+                    spatialLeftPose,
+                    spatialSourceFound && spatialLeftTracked,
                     livePipBoyFocus.scale,
                     runtimeConfig.get().wristUi,
                     sharedBridge.leftPipBoyScreenGripLocalPoseValid
@@ -13055,6 +12736,39 @@ int main(int argc, char** argv)
                     sharedBridge.leftPipBoyScreenGripLocalPoseValid
                         ? &sharedBridge.leftPipBoyScreenGripLocalRotation
                         : nullptr);
+            wristSourcePoseMatched = spatialSourceFound
+                && spatialLeftTracked
+                && candidateWristPlane.has_value();
+            const GamePlane activationPlane =
+                candidateWristPlane.value_or(GamePlane {});
+            candidateWristActivationDecision =
+                candidateWristActivation.advance(
+                    runtimeConfig.get().wristUi,
+                    fnvxr::kernel::wrist::PoseSnapshot(
+                        fnvxr::host::spatial::toKernelPose(spatialHmdPose),
+                        spatialSourceFound && spatialHmdTracked),
+                    fnvxr::kernel::wrist::PoseSnapshot(
+                        fnvxr::host::spatial::toKernelPose(spatialRightAimPose),
+                        spatialSourceFound && spatialRightAimTracked),
+                    fnvxr::kernel::wrist::PoseSnapshot(
+                        fnvxr::host::spatial::toKernelPose(
+                            activationPlane.pose),
+                        candidateWristPlane.has_value()));
+            candidateWristEvaluated = true;
+            if (candidateWristActivationDecision.active
+                && candidateWristPlane
+                && spatialRightAimTracked)
+            {
+                candidateWristPointer = menuPointerFromAimPose(
+                    spatialRightAimPose, *candidateWristPlane);
+            }
+            pipBoySpatialScreenVisible = pipBoySpatialContentReady
+                && wristSourcePoseMatched
+                && candidateWristActivationDecision.active
+                && (!productionGpuColorV5
+                    || productDecision.wristScreenMayRender);
+            const GamePlane spatialLivePipBoyPlane =
+                candidateWristPlane.value_or(GamePlane {});
 
             bool leftRendered = false;
             bool rightRendered = false;
@@ -13071,10 +12785,14 @@ int main(int argc, char** argv)
             const bool headsetMirrorCaptureEligible =
                 presentedBinocularWorld
                 || cpuEngineStereoActive;
+            const fnvxr::host::headset_mirror::ScheduleDecision
+                headsetMirrorDecision =
+                    headsetMirrorCapture.enabled
+                        && headsetMirrorCaptureEligible
+                    ? headsetMirrorCapture.request(frameIndex)
+                    : fnvxr::host::headset_mirror::ScheduleDecision {};
             HeadsetMirrorCapture* const activeHeadsetMirrorCapture =
-                headsetMirrorCapture.enabled && headsetMirrorCaptureEligible
-                ? &headsetMirrorCapture
-                : nullptr;
+                headsetMirrorDecision.capture ? &headsetMirrorCapture : nullptr;
             const bool legacyDiagnosticVisible = legacyImageDiagnostics
                 && (displayGamePlane
                     || legacyStereoFullscreenActive
@@ -13121,12 +12839,15 @@ int main(int argc, char** argv)
                     spatialRightPose,
                     spatialLeftAimPose,
                     spatialRightAimPose,
+                    spatialLeftAimTracked,
+                    spatialRightAimTracked,
                     spatialPropsSourcePoseMatched,
+                    wristSourcePoseMatched,
                     runtimeConfig.get().presentation,
                     rightHandGripLocalRotation,
                     spatialBodyRig,
                     menuPointer,
-                    livePipBoyPointer,
+                    candidateWristPointer,
                     weaponWheel,
                     gamePlane,
                     spatialLivePipBoyPlane,
@@ -13143,6 +12864,20 @@ int main(int argc, char** argv)
                     leftRenderProof,
                     activeHeadsetMirrorCapture,
                     frameIndex);
+                if (leftRendered)
+                {
+                    const auto outcome = cadenceTracker.recordEyeRendered(
+                        cadenceFrame,
+                        fnvxr::kernel::performance::Eye::left,
+                        monotonicNow());
+                    if (outcome
+                        != fnvxr::kernel::performance::CadenceEventOutcome::accepted)
+                    {
+                        std::cerr << "cadence left render rejected frame="
+                                  << frameIndex << " outcome="
+                                  << static_cast<unsigned>(outcome) << "\n";
+                    }
+                }
                 rightRendered = renderEye(
                     xr,
                     device.Get(),
@@ -13154,12 +12889,15 @@ int main(int argc, char** argv)
                     spatialRightPose,
                     spatialLeftAimPose,
                     spatialRightAimPose,
+                    spatialLeftAimTracked,
+                    spatialRightAimTracked,
                     spatialPropsSourcePoseMatched,
+                    wristSourcePoseMatched,
                     runtimeConfig.get().presentation,
                     rightHandGripLocalRotation,
                     spatialBodyRig,
                     menuPointer,
-                    livePipBoyPointer,
+                    candidateWristPointer,
                     weaponWheel,
                     gamePlane,
                     spatialLivePipBoyPlane,
@@ -13176,13 +12914,51 @@ int main(int argc, char** argv)
                     rightRenderProof,
                     activeHeadsetMirrorCapture,
                     frameIndex);
+                if (rightRendered)
+                {
+                    const auto outcome = cadenceTracker.recordEyeRendered(
+                        cadenceFrame,
+                        fnvxr::kernel::performance::Eye::right,
+                        monotonicNow());
+                    if (outcome
+                        != fnvxr::kernel::performance::CadenceEventOutcome::accepted)
+                    {
+                        std::cerr << "cadence right render rejected frame="
+                                  << frameIndex << " outcome="
+                                  << static_cast<unsigned>(outcome) << "\n";
+                    }
+                }
             }
 
             submitProjectionLayer = leftRendered && rightRendered;
+            if (cpuEngineStereoActive)
+            {
+                cadenceSource = {
+                    renderer.stereoProducerEpoch,
+                    renderer.stereoGameSourceFrame,
+                    renderer.stereoGameTransactionId,
+                };
+            }
+            else if (cpuEngineUiQuadActive)
+            {
+                cadenceSource = {
+                    renderer.stereoProducerEpoch,
+                    renderer.retainedUiSourceFrame,
+                    renderer.retainedCpuUiTransactionId,
+                };
+            }
+            else if (productionGpuColorV5)
+            {
+                cadenceSource = {
+                    productDecision.presentedSourceEpoch,
+                    productDecision.presentedSourceFrame,
+                    productDecision.presentedSourceTransaction,
+                };
+            }
             presentedGameTexture = submitProjectionLayer
-                && leftRenderProof.valid
-                && rightRenderProof.valid
-                && (uiQuadVisible
+                && (presentedBinocularWorld
+                    || cpuEngineStereoActive
+                    || uiQuadVisible
                     || (legacyImageDiagnostics
                         && renderer.hasGameTextureFrame
                         && renderer.gameTextureSourceHash != 0
@@ -13245,6 +13021,57 @@ int main(int argc, char** argv)
             endInfo.layers = nullptr;
         }
         const XrResult endResult = xr.endFrame(session, &endInfo);
+        if (endResult == XR_SUCCESS && candidateWristEvaluated)
+        {
+            wristActivation = candidateWristActivation;
+            wristActivationDecision = candidateWristActivationDecision;
+            submittedWristPlane = candidateWristPlane;
+            submittedWristPointer = candidateWristPointer;
+        }
+        if (endResult == XR_SUCCESS && submitProjectionLayer)
+        {
+            const auto leftSubmit = cadenceTracker.recordEyeSubmitted(
+                cadenceFrame,
+                fnvxr::kernel::performance::Eye::left,
+                cadenceSource,
+                monotonicNow());
+            const auto rightSubmit = cadenceTracker.recordEyeSubmitted(
+                cadenceFrame,
+                fnvxr::kernel::performance::Eye::right,
+                cadenceSource,
+                monotonicNow());
+            if (leftSubmit
+                    != fnvxr::kernel::performance::CadenceEventOutcome::accepted
+                || rightSubmit
+                    != fnvxr::kernel::performance::CadenceEventOutcome::accepted)
+            {
+                std::cerr << "cadence submission rejected frame=" << frameIndex
+                          << " left=" << static_cast<unsigned>(leftSubmit)
+                          << " right=" << static_cast<unsigned>(rightSubmit)
+                          << "\n";
+            }
+        }
+        const auto cadenceFinalizeOutcome = endResult == XR_SUCCESS
+            ? cadenceTracker.endFrame(cadenceFrame, monotonicNow())
+            : cadenceTracker.abortFrame(cadenceFrame, monotonicNow());
+        if (cadenceFinalizeOutcome
+            != fnvxr::kernel::performance::CadenceEventOutcome::accepted)
+        {
+            std::cerr << "cadence finalize rejected frame=" << frameIndex
+                      << " outcome="
+                      << static_cast<unsigned>(cadenceFinalizeOutcome) << "\n";
+        }
+        const fnvxr::kernel::performance::CadenceSnapshot cadence =
+            cadenceTracker.snapshot();
+        const double cadenceObservedFps = cadence.observedSpanNanoseconds > 0u
+            ? static_cast<double>(cadence.framesEnded) * 1.0e9
+                / static_cast<double>(cadence.observedSpanNanoseconds)
+            : 0.0;
+        const double cadenceAverageFrameWorkMilliseconds =
+            cadence.framesEnded > 0u
+            ? static_cast<double>(cadence.totalFrameWorkNanoseconds)
+                / static_cast<double>(cadence.framesEnded) / 1.0e6
+            : 0.0;
         const std::uint64_t cpuEngineTransaction =
             fnvxr::shared::sequencedValueBits(
                 renderer.stereoGameRenderPairSequence);
@@ -13304,6 +13131,29 @@ int main(int argc, char** argv)
                 << std::chrono::duration_cast<std::chrono::milliseconds>(
                        std::chrono::system_clock::now().time_since_epoch()).count()
                 << ",\"predictedDisplayTime\":" << frameState.predictedDisplayTime
+                << ",\"cadenceEpoch\":" << cadence.epoch
+                << ",\"cadenceFrameBudgetNanoseconds\":"
+                << cadence.frameBudgetNanoseconds
+                << ",\"cadenceFramesBegun\":" << cadence.framesBegun
+                << ",\"cadenceFramesEnded\":" << cadence.framesEnded
+                << ",\"cadenceFramesAborted\":" << cadence.framesAborted
+                << ",\"cadenceObservedFps\":" << cadenceObservedFps
+                << ",\"cadenceAverageFrameWorkMilliseconds\":"
+                << cadenceAverageFrameWorkMilliseconds
+                << ",\"cadenceMaximumFrameWorkNanoseconds\":"
+                << cadence.maximumFrameWorkNanoseconds
+                << ",\"cadenceBudgetOverruns\":" << cadence.budgetOverruns
+                << ",\"cadenceFreshTransactions\":"
+                << cadence.freshTransactions
+                << ",\"cadenceRepeatedTransactions\":"
+                << cadence.repeatedTransactions
+                << ",\"cadenceStaleTransactions\":"
+                << cadence.staleTransactions
+                << ",\"cadenceLeftDrops\":" << cadence.leftDrops
+                << ",\"cadenceRightDrops\":" << cadence.rightDrops
+                << ",\"cadencePairDrops\":" << cadence.pairDrops
+                << ",\"cadenceEventRejections\":"
+                << cadence.eventRejections
                 << ",\"productMode\":"
                 << static_cast<std::uint32_t>(productDecision.mode)
                 << ",\"productReason\":"
@@ -13467,9 +13317,18 @@ int main(int argc, char** argv)
                 << (livePipBoyFocus.hovered ? "true" : "false")
                 << ",\"livePipBoyActivationGrip\":"
                 << (livePipBoyActivationGripHeld ? "true" : "false")
+                << ",\"wristActivationActive\":"
+                << (wristActivationDecision.active ? "true" : "false")
+                << ",\"wristActivationReason\":"
+                << static_cast<unsigned>(wristActivationDecision.reason)
+                << ",\"wristHeadDistanceMeters\":"
+                << wristActivationDecision.headDistanceMeters
+                << ",\"wristAimAngleDegrees\":"
+                << wristActivationDecision.aimAngleDegrees
                 << ",\"livePipBoyScale\":" << livePipBoyFocus.scale
-                << ",\"spatialHandsOverlay\":"
-                << (envEnabled("FNVXR_SPATIAL_HANDS_OVERLAY", false)
+                << ",\"spatialRigAuthorized\":"
+                << ((!productionGpuColorV5
+                        || productDecision.spatialRigMayRender)
                         ? "true"
                         : "false")
                 << ",\"spatialPropsSourcePoseMatched\":"
@@ -13508,6 +13367,12 @@ int main(int argc, char** argv)
             invalidateHostSharedBridgeTracking(sharedBridge, "xrEndFrame-session-loss-pending");
             break;
         }
+        if (lossPending)
+        {
+            invalidateHostSharedBridgeTracking(
+                sharedBridge, "xrSyncActions-session-loss-pending-finalized");
+            break;
+        }
         if (endResult == XR_ERROR_SESSION_NOT_RUNNING)
         {
             shouldSyncFrames = false;
@@ -13536,6 +13401,41 @@ int main(int argc, char** argv)
             break;
         }
     }
+
+    const fnvxr::kernel::performance::CadenceSnapshot finalCadence =
+        cadenceTracker.snapshot();
+    const double finalObservedFps = finalCadence.observedSpanNanoseconds > 0u
+        ? static_cast<double>(finalCadence.framesEnded) * 1.0e9
+            / static_cast<double>(finalCadence.observedSpanNanoseconds)
+        : 0.0;
+    const double finalAverageFrameWorkMilliseconds =
+        finalCadence.framesEnded > 0u
+        ? static_cast<double>(finalCadence.totalFrameWorkNanoseconds)
+            / static_cast<double>(finalCadence.framesEnded) / 1.0e6
+        : 0.0;
+    std::cout
+        << "{\"event\":\"fnvxrCadenceSummary\",\"epoch\":"
+        << finalCadence.epoch
+        << ",\"frameBudgetNanoseconds\":"
+        << finalCadence.frameBudgetNanoseconds
+        << ",\"framesBegun\":" << finalCadence.framesBegun
+        << ",\"framesEnded\":" << finalCadence.framesEnded
+        << ",\"framesAborted\":" << finalCadence.framesAborted
+        << ",\"observedFps\":" << finalObservedFps
+        << ",\"averageFrameWorkMilliseconds\":"
+        << finalAverageFrameWorkMilliseconds
+        << ",\"maximumFrameWorkNanoseconds\":"
+        << finalCadence.maximumFrameWorkNanoseconds
+        << ",\"budgetOverruns\":" << finalCadence.budgetOverruns
+        << ",\"freshTransactions\":" << finalCadence.freshTransactions
+        << ",\"repeatedTransactions\":" << finalCadence.repeatedTransactions
+        << ",\"staleTransactions\":" << finalCadence.staleTransactions
+        << ",\"leftDrops\":" << finalCadence.leftDrops
+        << ",\"rightDrops\":" << finalCadence.rightDrops
+        << ",\"pairDrops\":" << finalCadence.pairDrops
+        << ",\"eventRejections\":" << finalCadence.eventRejections
+        << ",\"counterSaturations\":" << finalCadence.counterSaturations
+        << "}\n";
 
     closeHostSharedBridge(sharedBridge);
     closeSharedD3D9VideoFrame(renderer);

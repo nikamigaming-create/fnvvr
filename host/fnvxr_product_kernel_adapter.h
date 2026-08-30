@@ -4,8 +4,6 @@
 #include "../protocol/fnvxr_product_contract.h"
 
 #include <cstdint>
-#include <optional>
-
 namespace fnvxr::host
 {
 struct PresentationTransportProof final
@@ -45,6 +43,6 @@ private:
         const kernel::presentation::PresentationDecision& decision,
         const product::PresentationInput& input) noexcept;
 
-    std::optional<kernel::ProductKernel> kernel_;
+    kernel::ProductKernel kernel_;
 };
 }

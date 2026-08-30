@@ -23,6 +23,17 @@ int main()
     if (fnvxr::kernel::ProductKernel::create(config))
         return fail("invalid configuration crossed the kernel boundary");
 
+    fnvxr::kernel::RuntimeConfig separatelyOwnedRaw {};
+    const auto validated = fnvxr::kernel::validateRuntimeConfig(
+        separatelyOwnedRaw);
+    if (!validated || !validated.config)
+        return fail("validated construction fixture did not validate");
+    auto validatedKernel = fnvxr::kernel::ProductKernel::fromValidated(
+        *validated.config);
+    separatelyOwnedRaw.performance.targetRefreshHz = 72;
+    if (validatedKernel.config().get().performance.targetRefreshHz != 90)
+        return fail("kernel did not own its validated configuration value");
+
     using namespace fnvxr::kernel::presentation;
     PresentationInput input {};
     input.runtime = { 3, RuntimePhase::Running, UiClassification::None, true };

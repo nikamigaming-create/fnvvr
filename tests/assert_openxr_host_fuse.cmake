@@ -65,36 +65,46 @@ if(NOT retired_cpu_mutex_at EQUAL -1)
         "Host still leases the retired v7 stereo reader mutex")
 endif()
 
-foreach(required_ui_capture_text IN ITEMS
-        "#include \"fnvxr_host_ui_capture_gate.h\""
-        "prepareProductUiWindowFallback("
-        "ui_capture::confirmedUi(before)"
-        "const bool copied = captureFalloutWindowBgra("
-        "ui_capture::assess(before, capture, after)"
-        "hostUiValidatedRuntime"
-        "hostUiResourceReady ? hostUiValidatedRuntime : hostUiRuntimeBefore"
-        "productUiCapture attempt="
-        "presentationInput.ui = hostUiProof")
-    string(FIND "${host_source}" "${required_ui_capture_text}" ui_capture_at)
-    if(ui_capture_at EQUAL -1)
+foreach(required_product_kernel_text IN ITEMS
+        "#include \"fnvxr_eye_readback_policy.h\""
+        "#include \"fnvxr_openxr_spatial_adapter.h\""
+        "const fnvxr::host::PresentationTransportProof presentationTransport"
+        "exactWristPoseReady"
+        "productDecision.spatialRigMayRender"
+        "productDecision.wristScreenMayRender"
+        "candidateWristActivation.advance("
+        "endResult == XR_SUCCESS && candidateWristEvaluated"
+        "cadenceTracker.abortFrame("
+        "FNVXR_VERIFY_EYE_PIXELS")
+    string(FIND "${host_source}" "${required_product_kernel_text}" product_kernel_at)
+    if(product_kernel_at EQUAL -1)
         message(FATAL_ERROR
-            "Host lost its strict UI-only window-capture path: ${required_ui_capture_text}")
+            "Host lost a production kernel boundary: ${required_product_kernel_text}")
     endif()
 endforeach()
 
-string(FIND "${host_source}"
-    "ui_capture::confirmedUi(before)" ui_precheck_at)
-string(FIND "${host_source}"
-    "const bool copied = captureFalloutWindowBgra(" ui_window_copy_at)
-string(FIND "${host_source}"
-    "ui_capture::assess(before, capture, after)" ui_sandwich_at)
-if(ui_precheck_at EQUAL -1
-    OR ui_window_copy_at EQUAL -1
-    OR ui_sandwich_at EQUAL -1
-    OR NOT ui_precheck_at LESS ui_window_copy_at
-    OR NOT ui_window_copy_at LESS ui_sandwich_at)
+foreach(retired_product_path IN ITEMS
+        "prepareProductUiWindowFallback("
+        "hostUiValidatedRuntime"
+        "FNVXR_RENDER_OUTPUT_PROOF"
+        "renderProof.valid = true;")
+    string(FIND "${host_source}" "${retired_product_path}" retired_product_at)
+    if(NOT retired_product_at EQUAL -1)
+        message(FATAL_ERROR
+            "Host still contains a retired proof-fabricating product path: ${retired_product_path}")
+    endif()
+endforeach()
+
+string(FIND "${host_source}" "candidateWristActivation.advance(" wrist_candidate_at)
+string(FIND "${host_source}" "const XrResult endResult = xr.endFrame" end_frame_at)
+string(FIND "${host_source}" "endResult == XR_SUCCESS && candidateWristEvaluated" wrist_commit_at)
+if(wrist_candidate_at EQUAL -1
+    OR end_frame_at EQUAL -1
+    OR wrist_commit_at EQUAL -1
+    OR NOT wrist_candidate_at LESS end_frame_at
+    OR NOT end_frame_at LESS wrist_commit_at)
     message(FATAL_ERROR
-        "Product UI capture must precheck UI, copy the retail window, then validate the second runtime sample")
+        "Exact-source wrist state must be computed before xrEndFrame and committed only after success")
 endif()
 
 foreach(retired_fuse IN ITEMS

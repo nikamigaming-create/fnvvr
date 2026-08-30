@@ -6,8 +6,8 @@ namespace kp = kernel::presentation;
 
 ProductKernelAdapter::ProductKernelAdapter(
     const kernel::ValidatedRuntimeConfig& config)
-    : kernel_(kernel::ProductKernel::create(
-          config.get(), { product::MaxUiToStereoHoldFrames, true }))
+    : kernel_(kernel::ProductKernel::fromValidated(
+          config, { product::MaxUiToStereoHoldFrames, true }))
 {
 }
 
@@ -17,18 +17,15 @@ product::PresentationDecision ProductKernelAdapter::advance(
     bool trackedRigReady,
     bool wristContentReady)
 {
-    if (!kernel_)
-        return {};
     return translate(
-        kernel_->present(translate(
+        kernel_.present(translate(
             input, transport, trackedRigReady, wristContentReady)),
         input);
 }
 
 void ProductKernelAdapter::reset() noexcept
 {
-    if (kernel_)
-        kernel_->resetPresentation();
+    kernel_.resetPresentation();
 }
 
 kp::PresentationInput ProductKernelAdapter::translate(
@@ -118,6 +115,12 @@ product::PresentationDecision ProductKernelAdapter::translate(
         translated.mode = product::PresentationMode::WorldStereo;
         translated.reason = product::DecisionReason::StereoWorldReady;
         translated.gameplayVrAccepted = true;
+        translated.spatialRigMayRender = decision.spatialRigMayRender;
+        translated.wristScreenMayRender = decision.wristScreenMayRender;
+        translated.presentedSourceEpoch = decision.selectedSource.epoch;
+        translated.presentedSourceFrame = decision.selectedSource.frame;
+        translated.presentedSourceTransaction =
+            decision.selectedSource.transaction;
         return translated;
     }
     if (decision.mode == kp::PresentationMode::UiQuad)
@@ -130,6 +133,10 @@ product::PresentationDecision ProductKernelAdapter::translate(
                 : product::DecisionReason::RetailUi;
         translated.transitionHold = decision.transitionHold;
         translated.presentedUiSourceFrame = decision.selectedSource.frame;
+        translated.presentedSourceEpoch = decision.selectedSource.epoch;
+        translated.presentedSourceFrame = decision.selectedSource.frame;
+        translated.presentedSourceTransaction =
+            decision.selectedSource.transaction;
         translated.pointerEnabled = decision.pointerMayRender
             && shared::runtimeUiInputAllowed(input.menuBits);
         return translated;

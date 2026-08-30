@@ -67,6 +67,8 @@ int main()
         { "FNVXR_TARGET_REFRESH_HZ", "120" },
         { "FNVXR_STEREO_MAX_SOURCE_POSE_AGE_MS", "8.0" },
         { "FNVXR_BODY_SHOULDER_WIDTH", "0.46" },
+        { "FNVXR_BODY_SHOULDER_DROP", "0.26" },
+        { "FNVXR_BODY_SHOULDER_BACK", "0.10" },
         { "FNVXR_PIPBOY_WRIST_UI_WIDTH", "0.12" },
     });
     const host::RuntimeConfigLoadResult loadedOverrides =
@@ -76,6 +78,8 @@ int main()
     const kernel::RuntimeConfig& config = loadedOverrides.config->get();
     if (config.performance.targetRefreshHz != 120
         || config.bodyRig.shoulderWidthMeters != 0.46F
+        || config.bodyRig.shoulderDropMeters != 0.26F
+        || config.bodyRig.shoulderBackMeters != 0.10F
         || config.wristUi.widthMeters != 0.12F)
         return fail("the host boundary must map overrides to typed fields");
 

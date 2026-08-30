@@ -443,7 +443,7 @@ Require-Text -Path $hostCode -Text 'gameTexture staleExpired=1' -Reason "Host mu
 Require-Text -Path $hostCode -Text 'gameTexture staleSafetyPattern=1' -Reason "Expired live pixels must become an unmistakable safety image rather than a frozen window capture"
 Require-Text -Path $hostCode -Text 'gameTexture rejectedMostlyBlack=1' -Reason "A captured black frame must not be accepted as a valid fallback image"
 Require-Text -Path $hostCode -Text 'captureSwapchainRenderProof' -Reason "Acceptance must hash nonblack/nonuniform post-draw swapchain pixels before release"
-Require-Text -Path $commonScript -Text 'FNVXR_RENDER_OUTPUT_PROOF = "1"' -Reason "Live evidence runs must enable post-draw eye-output readback"
+Require-Text -Path $commonScript -Text 'FNVXR_VERIFY_EYE_PIXELS = "1"' -Reason "Live evidence runs must enable post-draw eye-output readback"
 Require-Text -Path $commonScript -Text 'FNVXR_INPUT_EVENT_MAX_HOLD_MS = "500"' -Reason "Lost queued input-up events must expire while producer heartbeats preserve legitimate holds"
 Require-Text -Path $commonScript -Text 'FNVXR_GAME_PLANE_AUTO_CENTER_FRAMES = "0"' -Reason "Fallback quad must latch once instead of following the headset"
 Require-Text -Path $commonScript -Text 'FNVXR_GAME_PLANE_LOCK_TO_HEAD = "0"' -Reason "Fallback quad must be world anchored by default"

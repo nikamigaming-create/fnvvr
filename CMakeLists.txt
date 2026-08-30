@@ -36,8 +36,13 @@ target_include_directories(fnvxr_protocol INTERFACE
 # and presentation decisions only.
 add_library(fnvxr_kernel STATIC
     kernel/config_validation.cpp
+    kernel/performance/cadence_tracker.cpp
     kernel/product_kernel.cpp
-    kernel/presentation/coordinator.cpp)
+    kernel/presentation/coordinator.cpp
+    kernel/rig/first_person_rig.cpp
+    kernel/wrist/activation.cpp
+    kernel/wrist/geometry.cpp
+    kernel/wrist/placement.cpp)
 target_include_directories(fnvxr_kernel PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR})
 if(MSVC)
@@ -68,6 +73,15 @@ fnvxr_add_kernel_test(
 fnvxr_add_kernel_test(
     fnvxr_presentation_evidence_gate_test
     tests/fnvxr_presentation_evidence_gate_test.cpp)
+fnvxr_add_kernel_test(
+    fnvxr_first_person_rig_test
+    tests/fnvxr_first_person_rig_test.cpp)
+fnvxr_add_kernel_test(
+    fnvxr_wrist_ui_kernel_test
+    tests/fnvxr_wrist_ui_kernel_test.cpp)
+fnvxr_add_kernel_test(
+    fnvxr_cadence_tracker_test
+    tests/fnvxr_cadence_tracker_test.cpp)
 
 if(WIN32)
     add_executable(fnvxr_runtime_config_loader_test
@@ -101,6 +115,15 @@ if(WIN32)
     add_test(
         NAME fnvxr_tracking_lifetime_test
         COMMAND fnvxr_tracking_lifetime_test)
+
+    add_executable(fnvxr_eye_readback_policy_test
+        tests/fnvxr_eye_readback_policy_test.cpp)
+    if(MSVC)
+        target_compile_options(fnvxr_eye_readback_policy_test PRIVATE /W4 /WX)
+    endif()
+    add_test(
+        NAME fnvxr_eye_readback_policy_test
+        COMMAND fnvxr_eye_readback_policy_test)
 endif()
 
 add_executable(fnvxr_openxr_live_authority_test
@@ -291,6 +314,19 @@ if(FNVXR_OPENXR_INCLUDE_DIR)
     add_test(
         NAME fnvxr_source_pose_history_test
         COMMAND fnvxr_source_pose_history_test)
+
+    add_executable(fnvxr_openxr_spatial_adapter_test
+        tests/fnvxr_openxr_spatial_adapter_test.cpp
+        host/fnvxr_openxr_spatial_adapter.cpp)
+    target_include_directories(fnvxr_openxr_spatial_adapter_test PRIVATE
+        ${FNVXR_OPENXR_INCLUDE_DIR})
+    target_link_libraries(fnvxr_openxr_spatial_adapter_test PRIVATE fnvxr_kernel)
+    if(MSVC)
+        target_compile_options(fnvxr_openxr_spatial_adapter_test PRIVATE /W4 /WX)
+    endif()
+    add_test(
+        NAME fnvxr_openxr_spatial_adapter_test
+        COMMAND fnvxr_openxr_spatial_adapter_test)
 endif()
 
 if(FNVXR_OPENXR_INCLUDE_DIR AND CMAKE_SIZEOF_VOID_P EQUAL 8)
@@ -309,6 +345,7 @@ if(FNVXR_OPENXR_INCLUDE_DIR AND CMAKE_SIZEOF_VOID_P EQUAL 8)
 
     add_executable(fnvxr_openxr_pose_host
         host/fnvxr_openxr_pose_host.cpp
+        host/fnvxr_openxr_spatial_adapter.cpp
         host/fnvxr_product_kernel_adapter.cpp
         host/fnvxr_runtime_config_loader.cpp
         host/fnvxr_runtime_config_source.cpp)

@@ -97,6 +97,8 @@ ConfigValidationResult validateRuntimeConfig(const RuntimeConfig& candidate) noe
     const BodyRigConfig& body = candidate.bodyRig;
     if (!finiteInRange(body.standingHeightMeters, 1.2F, 2.3F) ||
         !finiteInRange(body.shoulderWidthMeters, 0.25F, 0.7F) ||
+        !finiteInRange(body.shoulderDropMeters, 0.1F, 0.5F) ||
+        !finiteInRange(body.shoulderBackMeters, 0.0F, 0.3F) ||
         !finiteInRange(body.upperArmLengthMeters, 0.15F, 0.5F) ||
         !finiteInRange(body.forearmLengthMeters, 0.15F, 0.5F) ||
         !finiteInRange(body.handLengthMeters, 0.1F, 0.3F))

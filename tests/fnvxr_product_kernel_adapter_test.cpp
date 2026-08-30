@@ -52,7 +52,10 @@ int main()
     const auto uiDecision = adapter.advance(ui(10), transport(10), false, false);
     if (uiDecision.mode != fnvxr::product::PresentationMode::UiQuad
         || !uiDecision.pointerEnabled
-        || uiDecision.presentedUiSourceFrame != 10)
+        || uiDecision.presentedUiSourceFrame != 10
+        || uiDecision.presentedSourceEpoch != 7
+        || uiDecision.presentedSourceFrame != 10
+        || uiDecision.presentedSourceTransaction != 10)
     {
         return fail("confirmed retail UI did not cross the kernel adapter");
     }
@@ -64,12 +67,28 @@ int main()
     }
     const auto worldDecision = adapter.advance(world(11), transport(11), true, false);
     if (worldDecision.mode != fnvxr::product::PresentationMode::WorldStereo
-        || !worldDecision.gameplayVrAccepted)
+        || !worldDecision.gameplayVrAccepted
+        || !worldDecision.spatialRigMayRender
+        || worldDecision.wristScreenMayRender
+        || worldDecision.presentedSourceEpoch != 7
+        || worldDecision.presentedSourceFrame != 11
+        || worldDecision.presentedSourceTransaction != 11)
     {
         return fail("complete newer world did not cross the kernel adapter");
     }
     const auto replay = adapter.advance(world(11), transport(11), true, false);
     if (replay.mode != fnvxr::product::PresentationMode::SafetyBlank)
         return fail("replayed world identity crossed the kernel adapter");
+
+    adapter.reset();
+    auto pipBoy = world(12);
+    pipBoy.runtimePhase = fnvxr::shared::RuntimePhaseMenu;
+    pipBoy.menuBits = fnvxr::shared::RuntimePipBoyMenuBit;
+    const auto pipBoyDecision = adapter.advance(
+        pipBoy, transport(12), true, true);
+    if (pipBoyDecision.mode != fnvxr::product::PresentationMode::WorldStereo
+        || !pipBoyDecision.spatialRigMayRender
+        || !pipBoyDecision.wristScreenMayRender)
+        return fail("kernel wrist authorization was lost at the host adapter boundary");
     return EXIT_SUCCESS;
 }

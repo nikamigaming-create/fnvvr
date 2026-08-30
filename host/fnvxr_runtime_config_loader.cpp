@@ -177,6 +177,8 @@ RuntimeConfigLoadResult loadRuntimeConfig(
 
     FNVXR_READ(readFloat, "FNVXR_BODY_STANDING_HEIGHT", candidate.bodyRig.standingHeightMeters);
     FNVXR_READ(readFloat, "FNVXR_BODY_SHOULDER_WIDTH", candidate.bodyRig.shoulderWidthMeters);
+    FNVXR_READ(readFloat, "FNVXR_BODY_SHOULDER_DROP", candidate.bodyRig.shoulderDropMeters);
+    FNVXR_READ(readFloat, "FNVXR_BODY_SHOULDER_BACK", candidate.bodyRig.shoulderBackMeters);
     FNVXR_READ(readFloat, "FNVXR_ARM_UPPER_LENGTH", candidate.bodyRig.upperArmLengthMeters);
     FNVXR_READ(readFloat, "FNVXR_ARM_LOWER_LENGTH", candidate.bodyRig.forearmLengthMeters);
     FNVXR_READ(readFloat, "FNVXR_HAND_LENGTH", candidate.bodyRig.handLengthMeters);
