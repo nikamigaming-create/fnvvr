@@ -88,13 +88,14 @@ ReadError readSize(
     return {};
 }
 
-ReadError readFloat(
+ReadError readOptionalFloat(
     const RuntimeConfigSource& source,
     const char* variable,
-    float& destination)
+    float& destination,
+    bool& present)
 {
     std::string text;
-    bool present = false;
+    present = false;
     if (const ReadError failure = readText(
             source, variable, text, present))
         return failure;
@@ -109,6 +110,15 @@ ReadError readFloat(
         return { RuntimeConfigTextError::InvalidFloat, variable };
     destination = parsed;
     return {};
+}
+
+ReadError readFloat(
+    const RuntimeConfigSource& source,
+    const char* variable,
+    float& destination)
+{
+    bool present = false;
+    return readOptionalFloat(source, variable, destination, present);
 }
 
 ReadError readBoolean(
@@ -159,21 +169,43 @@ RuntimeConfigLoadResult loadRuntimeConfig(
     kernel::RuntimeConfig candidate {};
     ReadError failure {};
 
-#define FNVXR_READ(reader, variable, destination) \
-    failure = reader(source, variable, destination); \
+#define FNVXR_READ(reader, variable, ...) \
+    failure = reader(source, variable, __VA_ARGS__); \
     if (failure) return textFailure(failure)
 
     FNVXR_READ(readUnsigned, "FNVXR_TARGET_REFRESH_HZ", candidate.performance.targetRefreshHz);
     FNVXR_READ(readUnsigned, "FNVXR_MAX_FRAMES_IN_FLIGHT", candidate.performance.maximumFramesInFlight);
     FNVXR_READ(readSize, "FNVXR_POSE_HISTORY_CAPACITY", candidate.performance.poseHistoryCapacity);
     FNVXR_READ(readFloat, "FNVXR_STEREO_MAX_SOURCE_POSE_AGE_MS", candidate.performance.maximumPoseAgeMilliseconds);
-    FNVXR_READ(readBoolean, "FNVXR_REQUIRE_GPU_EYE_TRANSPORT", candidate.performance.requireGpuEyeTransport);
+    FNVXR_READ(readFloat, "FNVXR_CPU_STEREO_MAX_SOURCE_POSE_AGE_MS", candidate.performance.maximumCpuPoseAgeMilliseconds);
+    bool engineCenterStereo = false;
+    FNVXR_READ(readBoolean, "FNVXR_ENABLE_ENGINE_CENTER_STEREO", engineCenterStereo);
+    candidate.performance.eyeTransport = engineCenterStereo
+        ? kernel::EyeTransport::CpuEngineCenter
+        : kernel::EyeTransport::GpuColorV5;
 
     FNVXR_READ(readFloat, "FNVXR_RENDER_SCALE", candidate.presentation.renderScale);
     FNVXR_READ(readFloat, "FNVXR_NEAR_CLIP_METERS", candidate.presentation.nearClipMeters);
     FNVXR_READ(readFloat, "FNVXR_FAR_CLIP_METERS", candidate.presentation.farClipMeters);
-    FNVXR_READ(readFloat, "FNVXR_MENU_WIDTH_METERS", candidate.presentation.menuWidthMeters);
-    FNVXR_READ(readFloat, "FNVXR_MENU_DISTANCE_METERS", candidate.presentation.menuDistanceMeters);
+    // Preserve the established launcher surface while moving ownership into
+    // the typed snapshot. Explicit typed names take precedence over legacy
+    // aliases, including when an ignored legacy alias contains malformed text.
+    bool menuWidthPresent = false;
+    FNVXR_READ(readOptionalFloat, "FNVXR_MENU_WIDTH_METERS", candidate.presentation.menuWidthMeters, menuWidthPresent);
+    if (!menuWidthPresent)
+        FNVXR_READ(readFloat, "FNVXR_GAME_PLANE_WIDTH", candidate.presentation.menuWidthMeters);
+    bool menuHeightPresent = false;
+    FNVXR_READ(readOptionalFloat, "FNVXR_MENU_HEIGHT_METERS", candidate.presentation.menuHeightMeters, menuHeightPresent);
+    if (!menuHeightPresent)
+        FNVXR_READ(readFloat, "FNVXR_GAME_PLANE_HEIGHT", candidate.presentation.menuHeightMeters);
+    bool menuDistancePresent = false;
+    FNVXR_READ(readOptionalFloat, "FNVXR_MENU_DISTANCE_METERS", candidate.presentation.menuDistanceMeters, menuDistancePresent);
+    float legacyGamePlaneOffsetZ = -candidate.presentation.menuDistanceMeters;
+    if (!menuDistancePresent)
+    {
+        FNVXR_READ(readFloat, "FNVXR_GAME_PLANE_OFFSET_Z", legacyGamePlaneOffsetZ);
+        candidate.presentation.menuDistanceMeters = -legacyGamePlaneOffsetZ;
+    }
 
     FNVXR_READ(readFloat, "FNVXR_BODY_STANDING_HEIGHT", candidate.bodyRig.standingHeightMeters);
     FNVXR_READ(readFloat, "FNVXR_BODY_SHOULDER_WIDTH", candidate.bodyRig.shoulderWidthMeters);
@@ -188,6 +220,7 @@ RuntimeConfigLoadResult loadRuntimeConfig(
     FNVXR_READ(readFloat, "FNVXR_WRIST_UI_ACTIVATION_DISTANCE", candidate.wristUi.activationDistanceMeters);
     FNVXR_READ(readFloat, "FNVXR_WRIST_UI_DEACTIVATION_DISTANCE", candidate.wristUi.deactivationDistanceMeters);
     FNVXR_READ(readFloat, "FNVXR_WRIST_UI_ACTIVATION_ANGLE", candidate.wristUi.activationAngleDegrees);
+    FNVXR_READ(readUnsigned, "FNVXR_PIPBOY_UI_MAX_CONTENT_AGE_MS", candidate.wristUi.maximumContentAgeMilliseconds);
 
 #undef FNVXR_READ
 

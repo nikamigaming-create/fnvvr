@@ -82,6 +82,9 @@ fnvxr_add_kernel_test(
 fnvxr_add_kernel_test(
     fnvxr_cadence_tracker_test
     tests/fnvxr_cadence_tracker_test.cpp)
+fnvxr_add_kernel_test(
+    fnvxr_spatial_calibration_history_test
+    tests/fnvxr_spatial_calibration_history_test.cpp)
 
 if(WIN32)
     add_executable(fnvxr_runtime_config_loader_test

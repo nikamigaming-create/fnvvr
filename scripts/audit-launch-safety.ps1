@@ -453,7 +453,7 @@ Require-Text -Path $commonScript -Text 'FNVXR_GAME_PLANE_HEIGHT = "2.15"' -Reaso
 Require-Text -Path $commonScript -Text 'FNVXR_GAME_PLANE_OFFSET_Z = "-3.35"' -Reason "Bigger fallback quad must be anchored farther away instead of crowding the headset"
 Require-Text -Path $commonScript -Text 'FNVXR_GAME_PLANE_CURVE_ENABLE = "1"' -Reason "Fallback screen must use the slight curved/concave mesh"
 Require-Text -Path $commonScript -Text 'FNVXR_GAME_PLANE_REMOVE_PITCH = "1"' -Reason "Flat-surface recenter must remain level instead of following a downward headset pitch"
-Require-Text -Path $hostCode -Text '!stereoWorldRuntimeEnabled()' -Reason "The flat-surface grip recenter chord must not mutate a hidden fallback surface during native stereo gameplay"
+Require-Text -Path $hostCode -Text '(recenterEdge && !stereoWorldEnabled)' -Reason "The flat-surface grip recenter chord must not mutate a hidden fallback surface during native stereo gameplay"
 Require-Text -Path $commonScript -Text 'FNVXR_GAME_PLANE_CURVE_DEPTH_X = "0.22"' -Reason "Fallback screen horizontal concavity must be explicit"
 Require-Text -Path $commonScript -Text 'FNVXR_GAME_PLANE_CURVE_DEPTH_Y = "0.08"' -Reason "Fallback screen vertical concavity must be explicit"
 Require-Text -Path $commonScript -Text 'FNVXR_GAME_PLANE_CURVE_CORNER_DEPTH = "0.03"' -Reason "Fallback screen corner bulge must be explicit"
@@ -944,7 +944,7 @@ if ($hostStartIndex -lt 0 -or $retailStartIndex -lt 0 -or $hostStartIndex -gt $r
 }
 
 Require-Text -Path $hostCode -Text 'openxr-sidecar' -Reason "Host must understand OpenXR sidecar profile"
-Require-Text -Path $hostCode -Text 'stereoWorldRuntimeEnabled()' -Reason "Host must use runtime stereo intent instead of a launch flag"
+Require-Text -Path $hostCode -Text 'const bool stereoWorldEnabled = stereoWorldRuntimeEnabled(' -Reason "Host must resolve typed transport selection into one startup stereo intent"
 Require-Text -Path $hostCode -Text 'envInt("FNVXR_SESSION_READY_TIMEOUT_SECONDS", 45)' -Reason "A runtime that never leaves READY must have a finite default fail-stop deadline"
 Require-Text -Path $hostCode -Text 'fnvxrHostProgress' -Reason "The out-of-process watchdog must have a flushed host heartbeat to distinguish progress from a hung runtime call"
 Require-Text -Path $hostCode -Text 'waitForD3D11GpuIdle' -Reason "OpenXR swapchains must not be destroyed until submitted D3D11 work is proven complete"

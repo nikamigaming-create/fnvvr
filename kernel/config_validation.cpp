@@ -79,8 +79,12 @@ ConfigValidationResult validateRuntimeConfig(const RuntimeConfig& candidate) noe
     const float frameBudget = 1000.0F / static_cast<float>(performance.targetRefreshHz);
     if (!finiteInRange(performance.maximumPoseAgeMilliseconds, 0.1F, frameBudget))
         return { ConfigError::InvalidPoseAge, candidate };
-    if (!performance.requireGpuEyeTransport)
-        return { ConfigError::GpuEyeTransportRequired, candidate };
+    if (!finiteInRange(
+            performance.maximumCpuPoseAgeMilliseconds, 1.0F, 250.0F))
+        return { ConfigError::InvalidCpuPoseAge, candidate };
+    if (performance.eyeTransport != EyeTransport::GpuColorV5
+        && performance.eyeTransport != EyeTransport::CpuEngineCenter)
+        return { ConfigError::InvalidEyeTransport, candidate };
 
     const PresentationConfig& presentation = candidate.presentation;
     if (!finiteInRange(presentation.renderScale, 0.5F, 2.0F))
@@ -89,9 +93,11 @@ ConfigValidationResult validateRuntimeConfig(const RuntimeConfig& candidate) noe
         !finiteInRange(presentation.farClipMeters, 10.0F, 10000.0F) ||
         presentation.nearClipMeters >= presentation.farClipMeters)
         return { ConfigError::InvalidClipPlanes, candidate };
-    if (!finiteInRange(presentation.menuWidthMeters, 0.25F, 2.0F) ||
-        !finiteInRange(presentation.menuDistanceMeters, 0.3F, 3.0F) ||
-        presentation.menuWidthMeters >= 2.0F * presentation.menuDistanceMeters)
+    if (!finiteInRange(presentation.menuWidthMeters, 0.25F, 4.0F) ||
+        !finiteInRange(presentation.menuHeightMeters, 0.2F, 3.0F) ||
+        !finiteInRange(presentation.menuDistanceMeters, 0.3F, 5.0F) ||
+        presentation.menuWidthMeters >= 2.0F * presentation.menuDistanceMeters ||
+        presentation.menuHeightMeters >= 2.0F * presentation.menuDistanceMeters)
         return { ConfigError::InvalidMenuSurface, candidate };
 
     const BodyRigConfig& body = candidate.bodyRig;
@@ -114,6 +120,9 @@ ConfigValidationResult validateRuntimeConfig(const RuntimeConfig& candidate) noe
         return { ConfigError::InvalidWristSurface, candidate };
     if (!finiteInRange(wrist.activationAngleDegrees, 5.0F, 80.0F))
         return { ConfigError::InvalidWristActivationAngle, candidate };
+    if (wrist.maximumContentAgeMilliseconds < 50u
+        || wrist.maximumContentAgeMilliseconds > 2000u)
+        return { ConfigError::InvalidWristContentAge, candidate };
     if (!finiteInRange(wrist.activationDistanceMeters, 0.1F, 0.8F) ||
         !finiteInRange(wrist.deactivationDistanceMeters, 0.15F, 1.0F) ||
         wrist.deactivationDistanceMeters - wrist.activationDistanceMeters < 0.05F)
@@ -131,7 +140,8 @@ const char* configErrorName(ConfigError error) noexcept
     case ConfigError::InvalidFramesInFlight: return "invalid-frames-in-flight";
     case ConfigError::InvalidPoseHistoryCapacity: return "invalid-pose-history-capacity";
     case ConfigError::InvalidPoseAge: return "invalid-pose-age";
-    case ConfigError::GpuEyeTransportRequired: return "gpu-eye-transport-required";
+    case ConfigError::InvalidCpuPoseAge: return "invalid-cpu-pose-age";
+    case ConfigError::InvalidEyeTransport: return "invalid-eye-transport";
     case ConfigError::InvalidRenderScale: return "invalid-render-scale";
     case ConfigError::InvalidClipPlanes: return "invalid-clip-planes";
     case ConfigError::InvalidMenuSurface: return "invalid-menu-surface";
@@ -139,6 +149,7 @@ const char* configErrorName(ConfigError error) noexcept
     case ConfigError::InvalidArmReach: return "invalid-arm-reach";
     case ConfigError::InvalidWristSurface: return "invalid-wrist-surface";
     case ConfigError::InvalidWristActivationAngle: return "invalid-wrist-activation-angle";
+    case ConfigError::InvalidWristContentAge: return "invalid-wrist-content-age";
     case ConfigError::InvalidWristHysteresis: return "invalid-wrist-hysteresis";
     }
     return "unknown";

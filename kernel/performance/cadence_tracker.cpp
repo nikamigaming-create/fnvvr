@@ -107,18 +107,26 @@ CadenceEventOutcome CadenceTracker::endFrame(
     if (ready != CadenceEventOutcome::accepted)
         return ready;
 
-    const std::uint64_t frameWork = elapsed(active_.begin, timestamp).value;
-    if (frameWork > frameBudgetNanoseconds_)
-        count(budgetOverruns_);
-    add(totalFrameWorkNanoseconds_, frameWork);
-    if (frameWork > maximumFrameWorkNanoseconds_)
-        maximumFrameWorkNanoseconds_ = frameWork;
-    lastFrameEnd_ = timestamp;
+    accountFrameWork(timestamp, true);
     accountDrops();
     accountTransaction();
-    lastTimestamp_ = timestamp;
-    active_ = {};
+    finishFrame(timestamp);
     count(framesEnded_);
+    return CadenceEventOutcome::accepted;
+}
+
+CadenceEventOutcome CadenceTracker::endFrameNotRequested(
+    HostFrameId id,
+    MonotonicNanoseconds timestamp) noexcept
+{
+    const CadenceEventOutcome ready = validateActiveEvent(id, timestamp);
+    if (ready != CadenceEventOutcome::accepted)
+        return ready;
+
+    accountFrameWork(timestamp, false);
+    finishFrame(timestamp);
+    count(framesEnded_);
+    count(framesNotRequested_);
     return CadenceEventOutcome::accepted;
 }
 
@@ -143,14 +151,20 @@ CadenceSnapshot CadenceTracker::snapshot() const noexcept
     result.frameBudgetNanoseconds = frameBudgetNanoseconds_;
     result.framesBegun = framesBegun_.value();
     result.framesEnded = framesEnded_.value();
+    result.framesNotRequested = framesNotRequested_.value();
     result.framesAborted = framesAborted_.value();
     result.budgetOverruns = budgetOverruns_.value();
+    result.requestedBudgetOverruns = requestedBudgetOverruns_.value();
     result.firstFrameBeginNanoseconds = firstFrameBegin_.value;
     result.lastFrameEndNanoseconds = lastFrameEnd_.value;
     result.observedSpanNanoseconds = lastFrameEnd_.value >= firstFrameBegin_.value
         ? lastFrameEnd_.value - firstFrameBegin_.value : 0u;
     result.totalFrameWorkNanoseconds = totalFrameWorkNanoseconds_;
     result.maximumFrameWorkNanoseconds = maximumFrameWorkNanoseconds_;
+    result.totalRequestedFrameWorkNanoseconds =
+        totalRequestedFrameWorkNanoseconds_;
+    result.maximumRequestedFrameWorkNanoseconds =
+        maximumRequestedFrameWorkNanoseconds_;
     result.leftRenders = leftRenders_.value();
     result.rightRenders = rightRenders_.value();
     result.leftSubmissions = leftSubmissions_.value();
@@ -225,6 +239,35 @@ void CadenceTracker::accountTransaction() noexcept
     }
 }
 
+void CadenceTracker::accountFrameWork(
+    MonotonicNanoseconds timestamp,
+    bool renderRequested) noexcept
+{
+    const std::uint64_t frameWork = elapsed(active_.begin, timestamp).value;
+    if (frameWork > frameBudgetNanoseconds_)
+    {
+        count(budgetOverruns_);
+        if (renderRequested)
+            count(requestedBudgetOverruns_);
+    }
+    add(totalFrameWorkNanoseconds_, frameWork);
+    if (frameWork > maximumFrameWorkNanoseconds_)
+        maximumFrameWorkNanoseconds_ = frameWork;
+    if (renderRequested)
+    {
+        add(totalRequestedFrameWorkNanoseconds_, frameWork);
+        if (frameWork > maximumRequestedFrameWorkNanoseconds_)
+            maximumRequestedFrameWorkNanoseconds_ = frameWork;
+    }
+    lastFrameEnd_ = timestamp;
+}
+
+void CadenceTracker::finishFrame(MonotonicNanoseconds timestamp) noexcept
+{
+    lastTimestamp_ = timestamp;
+    active_ = {};
+}
+
 CadenceEventOutcome CadenceTracker::reject(
     CadenceEventOutcome outcome) noexcept
 {
@@ -257,10 +300,14 @@ void CadenceTracker::clearEpochTelemetry() noexcept
     lastFrameEnd_ = {};
     totalFrameWorkNanoseconds_ = 0;
     maximumFrameWorkNanoseconds_ = 0;
+    totalRequestedFrameWorkNanoseconds_ = 0;
+    maximumRequestedFrameWorkNanoseconds_ = 0;
     framesBegun_.reset();
     framesEnded_.reset();
+    framesNotRequested_.reset();
     framesAborted_.reset();
     budgetOverruns_.reset();
+    requestedBudgetOverruns_.reset();
     leftRenders_.reset();
     rightRenders_.reset();
     leftSubmissions_.reset();

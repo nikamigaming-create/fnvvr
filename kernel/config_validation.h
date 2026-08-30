@@ -13,7 +13,8 @@ enum class ConfigError
     InvalidFramesInFlight,
     InvalidPoseHistoryCapacity,
     InvalidPoseAge,
-    GpuEyeTransportRequired,
+    InvalidCpuPoseAge,
+    InvalidEyeTransport,
     InvalidRenderScale,
     InvalidClipPlanes,
     InvalidMenuSurface,
@@ -21,6 +22,7 @@ enum class ConfigError
     InvalidArmReach,
     InvalidWristSurface,
     InvalidWristActivationAngle,
+    InvalidWristContentAge,
     InvalidWristHysteresis,
 };
 

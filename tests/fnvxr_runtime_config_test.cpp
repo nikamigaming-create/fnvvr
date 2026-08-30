@@ -28,8 +28,9 @@ int main()
     if (!defaults)
         return fail("production defaults must validate");
     if (!defaults.config
-        || !defaults.config->get().performance.requireGpuEyeTransport)
-        return fail("production defaults must require GPU eye transport");
+        || defaults.config->get().performance.eyeTransport
+            != EyeTransport::GpuColorV5)
+        return fail("production defaults must select the GPU-v5 eye transport");
     if (!close(defaults.config->frameBudgetMilliseconds(), 1000.0F / 90.0F))
         return fail("validated config must normalize refresh rate to a frame budget once");
     if (!close(defaults.config->wristHysteresisMeters(), 0.10F))
@@ -57,10 +58,22 @@ int main()
         return fail("pose age must fit inside the selected frame budget");
 
     invalid = {};
+    invalid.performance.maximumCpuPoseAgeMilliseconds = 251.0F;
+    if (validateRuntimeConfig(invalid).error != ConfigError::InvalidCpuPoseAge)
+        return fail("CPU transport pose age must retain its bounded compatibility policy");
+
+    invalid = {};
     invalid.presentation.menuWidthMeters = 1.0F;
     invalid.presentation.menuDistanceMeters = 0.4F;
     if (validateRuntimeConfig(invalid).error != ConfigError::InvalidMenuSurface)
         return fail("menu geometry must satisfy its cross-field visibility invariant");
+
+    invalid = {};
+    invalid.presentation.menuWidthMeters = 0.5F;
+    invalid.presentation.menuHeightMeters = 1.0F;
+    invalid.presentation.menuDistanceMeters = 0.4F;
+    if (validateRuntimeConfig(invalid).error != ConfigError::InvalidMenuSurface)
+        return fail("vertical menu geometry must satisfy the visibility invariant");
 
     invalid = {};
     invalid.bodyRig.shoulderDropMeters = 0.0F;
@@ -76,16 +89,22 @@ int main()
         return fail("body dimensions must satisfy their cross-field reach invariant");
 
     invalid = {};
+    invalid.wristUi.maximumContentAgeMilliseconds = 49u;
+    if (validateRuntimeConfig(invalid).error !=
+        ConfigError::InvalidWristContentAge)
+        return fail("wrist content freshness must have a finite policy bound");
+
+    invalid = {};
     invalid.wristUi.activationDistanceMeters = 0.42F;
     invalid.wristUi.deactivationDistanceMeters = 0.45F;
     if (validateRuntimeConfig(invalid).error != ConfigError::InvalidWristHysteresis)
         return fail("wrist activation must retain a stable hysteresis band");
 
     invalid = {};
-    invalid.performance.requireGpuEyeTransport = false;
+    invalid.performance.eyeTransport = static_cast<EyeTransport>(255);
     if (validateRuntimeConfig(invalid).error !=
-        ConfigError::GpuEyeTransportRequired)
-        return fail("the kernel must expose only the GPU production path");
+        ConfigError::InvalidEyeTransport)
+        return fail("unknown eye transports must fail validation");
     if (std::strcmp(configErrorName(ConfigError::InvalidPoseAge),
             "invalid-pose-age") != 0)
         return fail("configuration failures must expose stable diagnostic names");

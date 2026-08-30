@@ -66,10 +66,16 @@ int main()
     FakeSource overrides({
         { "FNVXR_TARGET_REFRESH_HZ", "120" },
         { "FNVXR_STEREO_MAX_SOURCE_POSE_AGE_MS", "8.0" },
+        { "FNVXR_CPU_STEREO_MAX_SOURCE_POSE_AGE_MS", "250" },
+        { "FNVXR_ENABLE_ENGINE_CENTER_STEREO", "1" },
+        { "FNVXR_GAME_PLANE_WIDTH", "3.15" },
+        { "FNVXR_GAME_PLANE_HEIGHT", "2.15" },
+        { "FNVXR_GAME_PLANE_OFFSET_Z", "-3.35" },
         { "FNVXR_BODY_SHOULDER_WIDTH", "0.46" },
         { "FNVXR_BODY_SHOULDER_DROP", "0.26" },
         { "FNVXR_BODY_SHOULDER_BACK", "0.10" },
         { "FNVXR_PIPBOY_WRIST_UI_WIDTH", "0.12" },
+        { "FNVXR_PIPBOY_UI_MAX_CONTENT_AGE_MS", "180" },
     });
     const host::RuntimeConfigLoadResult loadedOverrides =
         host::loadRuntimeConfig(overrides);
@@ -77,11 +83,34 @@ int main()
         return fail("valid typed overrides must load");
     const kernel::RuntimeConfig& config = loadedOverrides.config->get();
     if (config.performance.targetRefreshHz != 120
+        || config.performance.maximumCpuPoseAgeMilliseconds != 250.0F
+        || config.performance.eyeTransport
+            != kernel::EyeTransport::CpuEngineCenter
+        || config.presentation.menuWidthMeters != 3.15F
+        || config.presentation.menuHeightMeters != 2.15F
+        || config.presentation.menuDistanceMeters != 3.35F
         || config.bodyRig.shoulderWidthMeters != 0.46F
         || config.bodyRig.shoulderDropMeters != 0.26F
         || config.bodyRig.shoulderBackMeters != 0.10F
-        || config.wristUi.widthMeters != 0.12F)
+        || config.wristUi.widthMeters != 0.12F
+        || config.wristUi.maximumContentAgeMilliseconds != 180u)
         return fail("the host boundary must map overrides to typed fields");
+
+    FakeSource typedMenuPrecedence({
+        { "FNVXR_MENU_WIDTH_METERS", "1.50" },
+        { "FNVXR_MENU_HEIGHT_METERS", "0.80" },
+        { "FNVXR_MENU_DISTANCE_METERS", "1.60" },
+        { "FNVXR_GAME_PLANE_WIDTH", "malformed-legacy" },
+        { "FNVXR_GAME_PLANE_HEIGHT", "malformed-legacy" },
+        { "FNVXR_GAME_PLANE_OFFSET_Z", "malformed-legacy" },
+    });
+    const host::RuntimeConfigLoadResult typedMenu =
+        host::loadRuntimeConfig(typedMenuPrecedence);
+    if (!typedMenu || !typedMenu.config
+        || typedMenu.config->get().presentation.menuWidthMeters != 1.50F
+        || typedMenu.config->get().presentation.menuHeightMeters != 0.80F
+        || typedMenu.config->get().presentation.menuDistanceMeters != 1.60F)
+        return fail("typed menu names must override legacy aliases atomically");
 
     FakeSource malformed({ { "FNVXR_TARGET_REFRESH_HZ", "90hz" } });
     const host::RuntimeConfigLoadResult malformedResult =
@@ -100,7 +129,7 @@ int main()
             host::RuntimeConfigTextError::EmptyValue), "empty-value") != 0)
         return fail("text failures must expose stable diagnostic names");
 
-    FakeSource invalidBoolean({ { "FNVXR_REQUIRE_GPU_EYE_TRANSPORT", "yes" } });
+    FakeSource invalidBoolean({ { "FNVXR_ENABLE_ENGINE_CENTER_STEREO", "yes" } });
     if (host::loadRuntimeConfig(invalidBoolean).textError !=
         host::RuntimeConfigTextError::InvalidBoolean)
         return fail("booleans must use an explicit stable text format");

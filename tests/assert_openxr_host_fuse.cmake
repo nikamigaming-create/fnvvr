@@ -72,8 +72,15 @@ foreach(required_product_kernel_text IN ITEMS
         "exactWristPoseReady"
         "productDecision.spatialRigMayRender"
         "productDecision.wristScreenMayRender"
+        "runtimeConfig.get().performance.eyeTransport"
+        "FNVXR_ENABLE_UNPROVEN_GPU_STEREO_VISUAL_TRIAL_DIAGNOSTIC"
+        "auxiliaryPipBoyUiRequested"
+        "pipBoySourceRuntimeEligible"
+        "rightHandGripCalibrationHistory.find("
+        "leftPipBoyScreenCalibrationHistory.find("
         "candidateWristActivation.advance("
-        "endResult == XR_SUCCESS && candidateWristEvaluated"
+        "&& pipBoySpatialScreenVisible)"
+        "runtimeDidNotRequestRender"
         "cadenceTracker.abortFrame("
         "FNVXR_VERIFY_EYE_PIXELS")
     string(FIND "${host_source}" "${required_product_kernel_text}" product_kernel_at)
@@ -86,6 +93,7 @@ endforeach()
 foreach(retired_product_path IN ITEMS
         "prepareProductUiWindowFallback("
         "hostUiValidatedRuntime"
+        "envEnabled(\"FNVXR_ENABLE_ENGINE_CENTER_STEREO\""
         "FNVXR_RENDER_OUTPUT_PROOF"
         "renderProof.valid = true;")
     string(FIND "${host_source}" "${retired_product_path}" retired_product_at)
@@ -97,7 +105,7 @@ endforeach()
 
 string(FIND "${host_source}" "candidateWristActivation.advance(" wrist_candidate_at)
 string(FIND "${host_source}" "const XrResult endResult = xr.endFrame" end_frame_at)
-string(FIND "${host_source}" "endResult == XR_SUCCESS && candidateWristEvaluated" wrist_commit_at)
+string(FIND "${host_source}" "&& pipBoySpatialScreenVisible)" wrist_commit_at)
 if(wrist_candidate_at EQUAL -1
     OR end_frame_at EQUAL -1
     OR wrist_commit_at EQUAL -1

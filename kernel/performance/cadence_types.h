@@ -38,13 +38,17 @@ struct CadenceSnapshot final
     std::uint64_t frameBudgetNanoseconds = 0;
     std::uint64_t framesBegun = 0;
     std::uint64_t framesEnded = 0;
+    std::uint64_t framesNotRequested = 0;
     std::uint64_t framesAborted = 0;
     std::uint64_t budgetOverruns = 0;
+    std::uint64_t requestedBudgetOverruns = 0;
     std::uint64_t firstFrameBeginNanoseconds = 0;
     std::uint64_t lastFrameEndNanoseconds = 0;
     std::uint64_t observedSpanNanoseconds = 0;
     std::uint64_t totalFrameWorkNanoseconds = 0;
     std::uint64_t maximumFrameWorkNanoseconds = 0;
+    std::uint64_t totalRequestedFrameWorkNanoseconds = 0;
+    std::uint64_t maximumRequestedFrameWorkNanoseconds = 0;
     std::uint64_t leftRenders = 0;
     std::uint64_t rightRenders = 0;
     std::uint64_t leftSubmissions = 0;

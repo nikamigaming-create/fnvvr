@@ -29,6 +29,9 @@ public:
     [[nodiscard]] CadenceEventOutcome endFrame(
         HostFrameId id,
         MonotonicNanoseconds timestamp) noexcept;
+    [[nodiscard]] CadenceEventOutcome endFrameNotRequested(
+        HostFrameId id,
+        MonotonicNanoseconds timestamp) noexcept;
     [[nodiscard]] CadenceEventOutcome abortFrame(
         HostFrameId id,
         MonotonicNanoseconds timestamp) noexcept;
@@ -54,6 +57,10 @@ private:
         MonotonicNanoseconds timestamp) noexcept;
     void accountDrops() noexcept;
     void accountTransaction() noexcept;
+    void accountFrameWork(
+        MonotonicNanoseconds timestamp,
+        bool renderRequested) noexcept;
+    void finishFrame(MonotonicNanoseconds timestamp) noexcept;
     [[nodiscard]] CadenceEventOutcome reject(
         CadenceEventOutcome outcome) noexcept;
     void count(SaturatingCounter& counter) noexcept;
@@ -69,13 +76,17 @@ private:
     MonotonicNanoseconds lastFrameEnd_ {};
     std::uint64_t totalFrameWorkNanoseconds_ = 0;
     std::uint64_t maximumFrameWorkNanoseconds_ = 0;
+    std::uint64_t totalRequestedFrameWorkNanoseconds_ = 0;
+    std::uint64_t maximumRequestedFrameWorkNanoseconds_ = 0;
     bool hasTimestamp_ = false;
     bool hasFreshTransaction_ = false;
     presentation::SourceKey lastFreshTransaction_ {};
     SaturatingCounter framesBegun_;
     SaturatingCounter framesEnded_;
+    SaturatingCounter framesNotRequested_;
     SaturatingCounter framesAborted_;
     SaturatingCounter budgetOverruns_;
+    SaturatingCounter requestedBudgetOverruns_;
     SaturatingCounter leftRenders_;
     SaturatingCounter rightRenders_;
     SaturatingCounter leftSubmissions_;

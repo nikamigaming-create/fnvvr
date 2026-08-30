@@ -97,12 +97,16 @@ int main()
 
     const auto beforeReset = tracker.snapshot();
     if (beforeReset.framesBegun != 8 || beforeReset.framesEnded != 7 ||
+        beforeReset.framesNotRequested != 0 ||
         beforeReset.framesAborted != 1 || beforeReset.budgetOverruns != 1 ||
+        beforeReset.requestedBudgetOverruns != 1 ||
         beforeReset.firstFrameBeginNanoseconds != 100 ||
         beforeReset.lastFrameEndNanoseconds != 90'000'003 ||
         beforeReset.observedSpanNanoseconds != 90'000'003 - 100 ||
         beforeReset.totalFrameWorkNanoseconds != 4 * budget + 8 ||
         beforeReset.maximumFrameWorkNanoseconds != budget + 1 ||
+        beforeReset.totalRequestedFrameWorkNanoseconds != 4 * budget + 8 ||
+        beforeReset.maximumRequestedFrameWorkNanoseconds != budget + 1 ||
         beforeReset.leftRenders != 4 || beforeReset.rightRenders != 4 ||
         beforeReset.leftSubmissions != 7 || beforeReset.rightSubmissions != 6 ||
         beforeReset.freshTransactions != 2 || beforeReset.repeatedTransactions != 1 ||
@@ -118,10 +122,15 @@ int main()
         return fail("new cadence epoch was rejected");
     const auto reset = tracker.snapshot();
     if (reset.epoch != 8 || reset.framesBegun != 0 || reset.framesEnded != 0 ||
+        reset.framesNotRequested != 0 ||
         reset.framesAborted != 0 || reset.budgetOverruns != 0 ||
+        reset.requestedBudgetOverruns != 0 ||
         reset.firstFrameBeginNanoseconds != 0 || reset.lastFrameEndNanoseconds != 0 ||
         reset.observedSpanNanoseconds != 0 || reset.totalFrameWorkNanoseconds != 0 ||
-        reset.maximumFrameWorkNanoseconds != 0 || reset.leftRenders != 0 ||
+        reset.maximumFrameWorkNanoseconds != 0 ||
+        reset.totalRequestedFrameWorkNanoseconds != 0 ||
+        reset.maximumRequestedFrameWorkNanoseconds != 0 ||
+        reset.leftRenders != 0 ||
         reset.rightRenders != 0 || reset.leftSubmissions != 0 ||
         reset.rightSubmissions != 0 || reset.freshTransactions != 0 ||
         reset.repeatedTransactions != 0 || reset.staleTransactions != 0 ||
@@ -132,22 +141,32 @@ int main()
         return fail("epoch reset leaked prior telemetry or transaction state");
 
     if (tracker.beginFrame({ 7, 9 }, { 110'000'000 }) !=
-            CadenceEventOutcome::invalid_epoch ||
-        !completePair(tracker, { 8, 1 }, transaction(1), 120'000'000,
-            120'000'000 + budget))
+        CadenceEventOutcome::invalid_epoch)
         return fail("new epoch did not isolate state and permit sequence reuse");
-    if (tracker.beginFrame({ 8, 2 }, { 110'000'000 }) !=
+    const HostFrameId notRequested { 8, 1 };
+    if (tracker.beginFrame(notRequested, { 120'000'000 }) !=
+            CadenceEventOutcome::accepted ||
+        tracker.endFrameNotRequested(notRequested, { 120'000'000 + budget + 1 }) !=
+            CadenceEventOutcome::accepted)
+        return fail("runtime-not-requested frame did not finalize successfully");
+    if (!completePair(tracker, { 8, 2 }, transaction(1), 140'000'000,
+            140'000'000 + budget))
+        return fail("normal frame after runtime-not-requested frame failed");
+    if (tracker.beginFrame({ 8, 3 }, { 130'000'000 }) !=
         CadenceEventOutcome::timestamp_regression)
         return fail("monotonic timestamp regression across frames was accepted");
 
     const auto snapshot = tracker.snapshot();
-    if (snapshot.framesBegun != 1 || snapshot.framesEnded != 1 ||
-        snapshot.framesAborted != 0 || snapshot.budgetOverruns != 0 ||
+    if (snapshot.framesBegun != 2 || snapshot.framesEnded != 2 ||
+        snapshot.framesNotRequested != 1 || snapshot.framesAborted != 0 ||
+        snapshot.budgetOverruns != 1 || snapshot.requestedBudgetOverruns != 0 ||
         snapshot.firstFrameBeginNanoseconds != 120'000'000 ||
-        snapshot.lastFrameEndNanoseconds != 120'000'000 + budget ||
-        snapshot.observedSpanNanoseconds != budget ||
-        snapshot.totalFrameWorkNanoseconds != budget ||
-        snapshot.maximumFrameWorkNanoseconds != budget ||
+        snapshot.lastFrameEndNanoseconds != 140'000'000 + budget ||
+        snapshot.observedSpanNanoseconds != 20'000'000 + budget ||
+        snapshot.totalFrameWorkNanoseconds != 2 * budget + 1 ||
+        snapshot.maximumFrameWorkNanoseconds != budget + 1 ||
+        snapshot.totalRequestedFrameWorkNanoseconds != budget ||
+        snapshot.maximumRequestedFrameWorkNanoseconds != budget ||
         snapshot.leftRenders != 1 || snapshot.rightRenders != 1 ||
         snapshot.leftSubmissions != 1 || snapshot.rightSubmissions != 1 ||
         snapshot.freshTransactions != 1 || snapshot.repeatedTransactions != 0 ||
