@@ -18,6 +18,10 @@ struct ScreenPixelEvidence
     float nonBlackFraction {};
     float blueDominantFraction {};
     float meanLuma {};
+    float minimumLuma {};
+    float maximumLuma {};
+    float lumaVariance {};
+    std::uint32_t populatedLumaBins {};
 };
 
 // Retail's live screen occupies this region of its own UI source. The host
@@ -80,5 +84,31 @@ constexpr bool screenPixelsReady(
         && evidence.nonBlackFraction >= minimumNonBlackFraction
         && evidence.blueDominantFraction <= maximumBlueDominantFraction
         && evidence.meanLuma <= maximumMeanLuma;
+}
+
+// Shipping wrist pixels must contain authored structure, not merely a
+// uniformly colored non-black surface. Environment tuning may tighten these
+// bounds but cannot weaken the invariant floors/ceilings.
+constexpr bool screenContentReady(
+    const ScreenPixelEvidence& evidence,
+    float minimumNonBlackFraction = 0.30f,
+    float maximumBlueDominantFraction = 0.20f,
+    float maximumMeanLuma = 60.0f) noexcept
+{
+    const float safeMinimumNonBlack = minimumNonBlackFraction > 0.30f
+        ? minimumNonBlackFraction : 0.30f;
+    const float safeMaximumBlue = maximumBlueDominantFraction < 0.20f
+        ? maximumBlueDominantFraction : 0.20f;
+    const float safeMaximumMean = maximumMeanLuma < 75.0f
+        ? maximumMeanLuma : 75.0f;
+    return screenPixelsReady(
+            evidence,
+            safeMinimumNonBlack,
+            safeMaximumBlue,
+            safeMaximumMean)
+        && evidence.maximumLuma >= evidence.minimumLuma
+        && evidence.maximumLuma - evidence.minimumLuma >= 8.0f
+        && evidence.lumaVariance >= 4.0f
+        && evidence.populatedLumaBins >= 3u;
 }
 }

@@ -24,8 +24,11 @@
 #include "fnvxr_eye_readback_policy.h"
 #include "fnvxr_openxr_spatial_adapter.h"
 #include "../kernel/performance/cadence_tracker.h"
+#include "../kernel/performance/cadence_metrics.h"
 #include "../kernel/spatial_calibration_history.h"
+#include "../kernel/transport/presentation_authority.h"
 #include "../kernel/wrist/activation.h"
+#include "../kernel/wrist/content_readiness.h"
 
 #include <windows.h>
 #include <bcrypt.h>
@@ -372,6 +375,10 @@ struct Renderer
     std::uint32_t gameTextureSourceHash = 0;
     std::uint64_t retainedUiSourceFrame = 0u;
     std::uint64_t retainedUiRuntimeStateSample = 0u;
+    std::uint64_t uiResourceGenerationCounter = 0u;
+    std::uint64_t retainedUiResourceGeneration = 0u;
+    std::uint32_t retainedUiProducerProcessId = 0u;
+    std::uint64_t retainedUiRendererProducerEpoch = 0u;
     float retainedUiTextureAspect = 16.0f / 9.0f;
     bool retainedUiHostWindowCaptured = false;
     bool retainedUiLivePipBoySurface = false;
@@ -436,6 +443,8 @@ struct Renderer
     std::uint32_t stereoRightHash = 0;
 };
 
+void clearRetainedUiResource(Renderer& renderer) noexcept;
+
 constexpr DWORD SharedVideoMagic = fnvxr::shared::D3D9FrameSharedMagic;
 constexpr DWORD SharedStereoMagic = fnvxr::shared::D3D9StereoFrameSharedMagic;
 constexpr UINT SharedVideoMaxWidth = fnvxr::shared::D3D9SharedFrameMaxWidth;
@@ -465,6 +474,8 @@ struct CpuMonoUiFrame
     int width = 0;
     int height = 0;
     float aspect = 16.0f / 9.0f;
+    std::uint32_t producerProcessId = 0u;
+    std::uint64_t rendererProducerEpoch = 0u;
     fnvxr::host::cpu_engine_presentation::FrameIdentity identity {};
 };
 
@@ -2550,7 +2561,11 @@ fnvxr::pipboy::ScreenPixelEvidence analyzePipBoyScreenPixels(
         envInt("FNVXR_LIVE_PIPBOY_PIXEL_SAMPLE_STRIDE", 3));
     std::uint32_t nonBlack = 0u;
     std::uint32_t blueDominant = 0u;
-    double luma = 0.0;
+    double lumaSum = 0.0;
+    double lumaSquaredSum = 0.0;
+    float minimumLuma = 255.0f;
+    float maximumLuma = 0.0f;
+    std::uint32_t populatedLumaBinMask = 0u;
     for (int y = top; y < bottom; y += stride)
     {
         const size_t row = static_cast<size_t>(y)
@@ -2570,7 +2585,17 @@ fnvxr::pipboy::ScreenPixelEvidence analyzePipBoyScreenPixels(
             {
                 ++blueDominant;
             }
-            luma += blue * 0.114 + green * 0.587 + red * 0.299;
+            const float sampleLuma =
+                blue * 0.114f + green * 0.587f + red * 0.299f;
+            lumaSum += sampleLuma;
+            lumaSquaredSum += static_cast<double>(sampleLuma)
+                * static_cast<double>(sampleLuma);
+            minimumLuma = (std::min)(minimumLuma, sampleLuma);
+            maximumLuma = (std::max)(maximumLuma, sampleLuma);
+            const std::uint32_t lumaBin = (std::min)(
+                7u,
+                static_cast<std::uint32_t>(sampleLuma / 32.0f));
+            populatedLumaBinMask |= 1u << lumaBin;
             ++evidence.sampleCount;
         }
     }
@@ -2580,8 +2605,18 @@ fnvxr::pipboy::ScreenPixelEvidence analyzePipBoyScreenPixels(
         evidence.nonBlackFraction = static_cast<float>(nonBlack) / denominator;
         evidence.blueDominantFraction =
             static_cast<float>(blueDominant) / denominator;
-        evidence.meanLuma = static_cast<float>(
-            luma / static_cast<double>(evidence.sampleCount));
+        const double mean = lumaSum
+            / static_cast<double>(evidence.sampleCount);
+        const double variance = (std::max)(
+            0.0,
+            lumaSquaredSum / static_cast<double>(evidence.sampleCount)
+                - mean * mean);
+        evidence.meanLuma = static_cast<float>(mean);
+        evidence.minimumLuma = minimumLuma;
+        evidence.maximumLuma = maximumLuma;
+        evidence.lumaVariance = static_cast<float>(variance);
+        evidence.populatedLumaBins = static_cast<std::uint32_t>(
+            countSetBits16(populatedLumaBinMask));
     }
     return evidence;
 }
@@ -2686,6 +2721,7 @@ bool readSharedD3D9StereoFrame(
     if (renderer.stereoProducerProcessId != 0
         && renderer.stereoProducerProcessId != sourceProcessId)
     {
+        clearRetainedUiResource(renderer);
         renderer.lastSharedStereoSequence = 0;
         renderer.lastSharedStereoPublicationGeneration = 0;
         renderer.stereoGameFrameSequence = 0;
@@ -2977,6 +3013,7 @@ bool readSharedD3D9MonoUiFrame(
     if (renderer.stereoProducerProcessId != 0u
         && renderer.stereoProducerProcessId != sourceProcessId)
     {
+        clearRetainedUiResource(renderer);
         renderer.lastSharedStereoSequence = 0;
         renderer.lastSharedStereoPublicationGeneration = 0;
         renderer.lastSharedStereoUiSequence = 0;
@@ -2996,6 +3033,12 @@ bool readSharedD3D9MonoUiFrame(
     MemoryBarrier();
     const LONG publishedSlot = header->publishedSlot;
     const std::uint64_t sourceRendererEpoch = header->rendererProducerEpoch;
+    if (renderer.lastSharedStereoUiRendererEpoch != 0u
+        && renderer.lastSharedStereoUiRendererEpoch
+            != sourceRendererEpoch)
+    {
+        clearRetainedUiResource(renderer);
+    }
     if (publishedSlot < 0
         || publishedSlot >= static_cast<LONG>(fnvxr::shared::D3D9StereoFrameSlotCount)
         || (sequenceBefore == renderer.lastSharedStereoUiSequence
@@ -3107,6 +3150,8 @@ bool readSharedD3D9MonoUiFrame(
     output.height = sourceHeight;
     output.aspect = static_cast<float>(sourceWidth)
         / static_cast<float>(sourceHeight);
+    output.producerProcessId = sourceProcessId;
+    output.rendererProducerEpoch = sourceRendererEpoch;
     output.identity.pixelsComplete = monoPixels
         && !isMostlyBlackFrame(output.pixels);
     renderer.lastSharedStereoUiSequence = sequenceBefore;
@@ -3258,6 +3303,12 @@ bool readSharedStereoState(
     const auto now = std::chrono::steady_clock::now();
     if (stateAdvanced)
     {
+        if (renderer.lastSharedStereoStateRendererEpoch != 0u
+            && renderer.lastSharedStereoStateRendererEpoch
+                != sourceRendererEpoch)
+        {
+            clearRetainedUiResource(renderer);
+        }
         if (sourceRendererEpoch == renderer.lastSharedStereoStateRendererEpoch
             && renderer.lastSharedStereoStateGeneration != 0
             && !fnvxr::shared::nonzeroSharedGenerationAdvanced(
@@ -3292,6 +3343,7 @@ bool readSharedStereoState(
     if (renderer.stereoProducerProcessId != 0
         && renderer.stereoProducerProcessId != sourceProcessId)
     {
+        clearRetainedUiResource(renderer);
         renderer.hasStereoGameFrame = false;
         renderer.stereoGameFrameSequence = 0;
         renderer.stereoGamePublicationGeneration = 0u;
@@ -6284,6 +6336,15 @@ bool prepareUiTextureCandidate(
     return true;
 }
 
+void advanceRetainedUiResourceGeneration(Renderer& renderer) noexcept
+{
+    ++renderer.uiResourceGenerationCounter;
+    if (renderer.uiResourceGenerationCounter == 0u)
+        ++renderer.uiResourceGenerationCounter;
+    renderer.retainedUiResourceGeneration =
+        renderer.uiResourceGenerationCounter;
+}
+
 void commitUiTextureCandidate(
     Renderer& renderer,
     UiTextureCandidate& candidate) noexcept
@@ -6301,6 +6362,9 @@ void commitUiTextureCandidate(
     renderer.retainedCpuUiEpoch = 0u;
     renderer.retainedCpuUiProducerProcessId = 0u;
     renderer.retainedCpuUiCapturedRuntime = {};
+    renderer.retainedUiProducerProcessId = 0u;
+    renderer.retainedUiRendererProducerEpoch = 0u;
+    advanceRetainedUiResourceGeneration(renderer);
     candidate = {};
 }
 
@@ -6310,6 +6374,9 @@ void clearRetainedUiResource(Renderer& renderer) noexcept
     renderer.retainedUiTextureView.Reset();
     renderer.retainedUiSourceFrame = 0u;
     renderer.retainedUiRuntimeStateSample = 0u;
+    renderer.retainedUiResourceGeneration = 0u;
+    renderer.retainedUiProducerProcessId = 0u;
+    renderer.retainedUiRendererProducerEpoch = 0u;
     renderer.retainedUiTextureAspect = 16.0f / 9.0f;
     renderer.retainedUiHostWindowCaptured = false;
     renderer.retainedUiLivePipBoySurface = false;
@@ -6343,6 +6410,8 @@ bool uploadCpuEngineUiTexture(
     if (!device
         || !cpu_presentation::flatUiBoundaryValid(frame.identity)
         || !frame.identity.pixelsComplete
+        || frame.producerProcessId == 0u
+        || frame.rendererProducerEpoch == 0u
         || frame.width <= 0
         || frame.height <= 0
         || frame.width > static_cast<int>((std::numeric_limits<UINT>::max)() / 4u)
@@ -6433,6 +6502,10 @@ bool uploadCpuEngineUiTexture(
     renderer.retainedUiTextureAspect = frame.aspect;
     renderer.retainedUiHostWindowCaptured = false;
     renderer.retainedUiAcceptedAt = std::chrono::steady_clock::now();
+    renderer.retainedUiProducerProcessId = frame.producerProcessId;
+    renderer.retainedUiRendererProducerEpoch =
+        frame.rendererProducerEpoch;
+    advanceRetainedUiResourceGeneration(renderer);
     return true;
 }
 
@@ -10296,6 +10369,7 @@ int main(int argc, char** argv)
         fnvxr::host::gpu_color::RoutedContent::SafetyBlank;
     std::uint64_t previousGpuColorTransaction = 0u;
     std::uint64_t lastPhase1TraceCpuTransaction = 0u;
+    std::uint64_t presentedExactFrameJoins = 0u;
     std::uint64_t activeGpuColorProducerEpoch = 0u;
     std::uint32_t activeGpuColorProducerProcessId = 0u;
     fnvxr::host::ProductKernelAdapter presentationController(runtimeConfig);
@@ -11291,8 +11365,29 @@ int main(int argc, char** argv)
                 || controlMode
                 || (vrMode && envEnabled("FNVXR_SHOW_GAME_PLANE_IN_GAME", false)))
             && envEnabled("FNVXR_SHOW_GAME_PLANE_IN_GAME", true);
+        fnvxr::product::PresentationInput runtimeAuthorityInput {};
+        runtimeAuthorityInput.runtimeStateSample = runtimeStateSample;
+        runtimeAuthorityInput.runtimePhase = runtimePhase;
+        runtimeAuthorityInput.menuBits = runtimeMenuBits;
+        runtimeAuthorityInput.showroomActive = runtimeShowroomActive;
+        runtimeAuthorityInput.runtimeFresh = haveRuntimeUiState;
+        runtimeAuthorityInput.cameraActive = runtimeCameraActive;
+        const fnvxr::kernel::transport::AuthorityDecision
+            presentationAuthority =
+                fnvxr::kernel::transport::resolvePresentationAuthority(
+                    runtimeConfig,
+                    fnvxr::host::ProductKernelAdapter::runtimeSnapshot(
+                        runtimeAuthorityInput));
+        const bool gpuPresentationAuthority =
+            presentationAuthority.authority
+                == fnvxr::kernel::transport::PresentationAuthority::
+                    GpuProductKernel;
+        const bool cpuPresentationAuthority =
+            presentationAuthority.authority
+                == fnvxr::kernel::transport::PresentationAuthority::
+                    CpuEngineCenter;
         const bool allowCpuEngineStereo =
-            productionCpuEngineStereo
+            cpuPresentationAuthority
             && vrMode
             && stereoWorldIntent
             && (!gameUiMode || livePipBoyScreenFocused)
@@ -11439,7 +11534,7 @@ int main(int argc, char** argv)
                 {
                     pipBoyScreenPixelEvidence = analyzePipBoyScreenPixels(
                         incomingCpuUi);
-                    pipBoyScreenPixelsReady = fnvxr::pipboy::screenPixelsReady(
+                    pipBoyScreenPixelsReady = fnvxr::pipboy::screenContentReady(
                         pipBoyScreenPixelEvidence,
                         envFloat(
                             "FNVXR_LIVE_PIPBOY_MIN_NONBLACK_FRACTION",
@@ -11552,7 +11647,7 @@ int main(int argc, char** argv)
                 && renderer.retainedCpuUiProducerProcessId
                     == renderer.stereoProducerProcessId,
         };
-        const bool cpuEngineUiQuadActive = productionCpuEngineStereo
+        const bool cpuEngineUiQuadActive = cpuPresentationAuthority
             && renderer.cpuPresentationMode
                 == cpu_presentation::RuntimeMode::Ui
             && cpu_presentation::retainedFlatUiFrameEligible(
@@ -11684,39 +11779,82 @@ int main(int argc, char** argv)
                 & fnvxr::shared::VrPoseTrackingRightAimActive) != 0u
             && (exactRigFlags
                 & fnvxr::shared::VrPoseTrackingRightAimCurrent) != 0u;
-        const bool retainedPipBoyContentFresh =
-            renderer.retainedUiAcceptedAt.time_since_epoch().count() != 0
-            && std::chrono::steady_clock::now()
-                - renderer.retainedUiAcceptedAt
-                <= std::chrono::milliseconds(
-                    runtimeConfig.get().wristUi
-                        .maximumContentAgeMilliseconds);
         fnvxr::host::gpu_color::RuntimeEvidence
             retainedPipBoyRuntimeEvidence {};
         bool retainedPipBoyRuntimeLineageBracketed = false;
         const bool retainedPipBoyRuntimeLineage =
-            renderer.retainedUiLivePipBoySurface
-            && runtimeEvidenceHistory.findStableSource(
+            runtimeEvidenceHistory.findStableSource(
                 renderer.retainedUiRuntimeStateSample,
                 runtimeEvidence,
                 retainedPipBoyRuntimeEvidence,
-                &retainedPipBoyRuntimeLineageBracketed)
-            && retainedPipBoyRuntimeEvidence.sample
-                == renderer.retainedUiRuntimeStateSample
-            && (retainedPipBoyRuntimeEvidence.menuBits
-                & fnvxr::shared::RuntimePipBoyMenuBit) != 0u
-            && fnvxr::engine::live_pipboy::worldPresentationContinues(
-                retainedPipBoyRuntimeEvidence.phase,
-                retainedPipBoyRuntimeEvidence.menuBits,
-                retainedPipBoyRuntimeEvidence.showroomActive,
-                retainedPipBoyRuntimeEvidence.cameraActive);
+                &retainedPipBoyRuntimeLineageBracketed);
+        const auto contentReadinessNow = std::chrono::steady_clock::now();
+        const bool retainedAcceptanceRecorded =
+            renderer.retainedUiAcceptedAt.time_since_epoch().count() != 0;
+        const auto monotonicMilliseconds = [](const auto& time) noexcept
+        {
+            const auto count = std::chrono::duration_cast<
+                std::chrono::milliseconds>(
+                    time.time_since_epoch()).count();
+            return count > 0
+                ? static_cast<std::uint64_t>(count) : 0u;
+        };
+        const fnvxr::kernel::wrist::ContentReadinessDecision
+            pipBoyContentReadiness =
+                fnvxr::kernel::wrist::assessContentReadiness({
+                    pipBoyMenuMode,
+                    livePipBoyScreenFocused,
+                    {
+                        renderer.retainedUiResourceGeneration,
+                        renderer.retainedUiRuntimeStateSample,
+                        monotonicMilliseconds(
+                            renderer.retainedUiAcceptedAt),
+                        renderer.retainedUiProducerProcessId,
+                        renderer.retainedUiRendererProducerEpoch,
+                        renderer.retainedUiTextureView != nullptr,
+                        renderer.retainedUiLivePipBoySurface,
+                        retainedAcceptanceRecorded,
+                    },
+                    {
+                        {
+                            retainedPipBoyRuntimeEvidence.sample,
+                            retainedPipBoyRuntimeEvidence.fresh,
+                            (retainedPipBoyRuntimeEvidence.menuBits
+                                & fnvxr::shared::RuntimePipBoyMenuBit)
+                                != 0u,
+                            fnvxr::engine::live_pipboy::
+                                worldPresentationContinues(
+                                    retainedPipBoyRuntimeEvidence.phase,
+                                    retainedPipBoyRuntimeEvidence.menuBits,
+                                    retainedPipBoyRuntimeEvidence
+                                        .showroomActive,
+                                    retainedPipBoyRuntimeEvidence
+                                        .cameraActive),
+                        },
+                        {
+                            runtimeEvidence.sample,
+                            runtimeEvidence.fresh,
+                            (runtimeEvidence.menuBits
+                                & fnvxr::shared::RuntimePipBoyMenuBit)
+                                != 0u,
+                            fnvxr::engine::live_pipboy::
+                                worldPresentationContinues(
+                                    runtimeEvidence.phase,
+                                    runtimeEvidence.menuBits,
+                                    runtimeEvidence.showroomActive,
+                                    runtimeEvidence.cameraActive),
+                        },
+                        retainedPipBoyRuntimeLineage,
+                    },
+                    renderer.stereoProducerProcessId,
+                    renderer.lastSharedStereoStateRendererEpoch,
+                    monotonicMilliseconds(contentReadinessNow),
+                    runtimeConfig.get().wristUi
+                        .maximumContentAgeMilliseconds,
+                });
         const bool pipBoySpatialContentReady =
-            pipBoyMenuMode
-            && renderer.retainedUiLivePipBoySurface
-            && renderer.retainedUiTextureView
-            && retainedPipBoyContentFresh
-            && retainedPipBoyRuntimeLineage;
-        productDecision = productionGpuColorV5
+            pipBoyContentReadiness.ready;
+        productDecision = gpuPresentationAuthority
             ? presentationController.advance(
                 presentationInput,
                 presentationTransport,
@@ -11725,6 +11863,16 @@ int main(int argc, char** argv)
                     && livePipBoyScreenFocused
                     && pipBoySpatialContentReady)
             : fnvxr::product::PresentationDecision {};
+        if (!gpuPresentationAuthority)
+            presentationController.reset();
+        const bool spatialRigPolicyAuthorized =
+            cpuPresentationAuthority
+            || (gpuPresentationAuthority
+                && productDecision.spatialRigMayRender);
+        const bool wristScreenPolicyAuthorized =
+            cpuPresentationAuthority
+            || (gpuPresentationAuthority
+                && productDecision.wristScreenMayRender);
         if (productDecision.mode
                 == fnvxr::product::PresentationMode::UiQuad
             && uiCandidate.view
@@ -11746,7 +11894,7 @@ int main(int argc, char** argv)
             && gpuColorConsumer.eyeView(0u)
             && gpuColorConsumer.eyeView(1u);
         const fnvxr::host::gpu_color::ProductCompositionBindings
-            productComposition = productionGpuColorV5
+            productComposition = gpuPresentationAuthority
                 ? fnvxr::host::gpu_color::selectProductComposition(
                     productDecision,
                     worldResourcesReady,
@@ -11796,7 +11944,7 @@ int main(int argc, char** argv)
             gpuColorConsumer.eyeView(1u),
         };
         const fnvxr::host::stereo_visual_trial::Decision
-            stereoVisualTrialDecision = productionGpuColorV5
+            stereoVisualTrialDecision = gpuPresentationAuthority
                 ? fnvxr::host::stereo_visual_trial::decide(
                     stereoVisualTrialInput)
                 : fnvxr::host::stereo_visual_trial::Decision {};
@@ -11836,11 +11984,11 @@ int main(int argc, char** argv)
             && envEnabled("FNVXR_STEREO_FALLBACK_MONO_FULLSCREEN", false)
             && allowStereoWorld2dFallback;
         const bool cpuMenuModeActive =
-            productionCpuEngineStereo
+            cpuPresentationAuthority
             && renderer.cpuPresentationMode
                 == cpu_presentation::RuntimeMode::Ui;
         const bool cpuGameplayModeActive =
-            productionCpuEngineStereo
+            cpuPresentationAuthority
             && renderer.cpuPresentationMode
                 == cpu_presentation::RuntimeMode::Gameplay;
         const bool controllerConsumerAcknowledged =
@@ -11878,7 +12026,7 @@ int main(int argc, char** argv)
             && controllerMode
                 == fnvxr::shared::RuntimeControllerMode::Ui
             && (showGamePlane || livePipBoyScreenFocused)
-            && (productionCpuEngineStereo
+            && (cpuPresentationAuthority
                 ? ((cpuMenuModeActive && cpuEngineUiQuadActive)
                     || (livePipBoyScreenFocused && cpuGameplayModeActive))
                 : legacyImageDiagnostics
@@ -11895,7 +12043,7 @@ int main(int argc, char** argv)
             && controllerMutationAuthorized
             && controllerMode
                 == fnvxr::shared::RuntimeControllerMode::Gameplay
-            && (productionCpuEngineStereo
+            && (cpuPresentationAuthority
                 ? cpuGameplayModeActive
                 : (haveRuntimeUiState
                     ? (!runtimeUiActive || runtimeGameplayActive)
@@ -12196,6 +12344,7 @@ int main(int argc, char** argv)
         bool wristSourcePoseMatched = false;
         bool pipBoySpatialScreenVisible = false;
         std::uint64_t spatialPropsPoseSequence = 0u;
+        bool exactPoseJoinSelected = false;
         EyeRenderProof leftRenderProof {};
         EyeRenderProof rightRenderProof {};
         fnvxr::kernel::wrist::WristActivation candidateWristActivation =
@@ -12814,6 +12963,8 @@ int main(int argc, char** argv)
             }
             if (spatialSourceFound)
             {
+                exactPoseJoinSelected = presentedBinocularWorld
+                    || cpuEngineStereoActive;
                 spatialHmdPose = spatialSourcePose.hmdPose;
                 spatialLeftPose = spatialSourcePose.leftGripPose;
                 spatialRightPose = spatialSourcePose.rightGripPose;
@@ -12876,8 +13027,7 @@ int main(int argc, char** argv)
             spatialPropsSourcePoseMatched =
                 spatialSourceFound
                 && spatialBodyRig.valid
-                && (!productionGpuColorV5
-                    || productDecision.spatialRigMayRender);
+                && spatialRigPolicyAuthorized;
             candidateWristPlane =
                 livePipBoyInteractionPlane(
                     spatialLeftPose,
@@ -12893,8 +13043,7 @@ int main(int argc, char** argv)
             wristSourcePoseMatched = spatialSourceFound
                 && spatialLeftTracked
                 && candidateWristPlane.has_value()
-                && (!productionGpuColorV5
-                    || productDecision.spatialRigMayRender);
+                && spatialRigPolicyAuthorized;
             const GamePlane activationPlane =
                 candidateWristPlane.value_or(GamePlane {});
             candidateWristActivationDecision =
@@ -12921,8 +13070,7 @@ int main(int argc, char** argv)
             pipBoySpatialScreenVisible = pipBoySpatialContentReady
                 && wristSourcePoseMatched
                 && candidateWristActivationDecision.active
-                && (!productionGpuColorV5
-                    || productDecision.wristScreenMayRender);
+                && wristScreenPolicyAuthorized;
             const GamePlane spatialLivePipBoyPlane =
                 candidateWristPlane.value_or(GamePlane {});
 
@@ -13103,7 +13251,7 @@ int main(int argc, char** argv)
                     renderer.retainedCpuUiTransactionId,
                 };
             }
-            else if (productionGpuColorV5)
+            else if (gpuPresentationAuthority)
             {
                 cadenceSource = {
                     productDecision.presentedSourceEpoch,
@@ -13177,6 +13325,16 @@ int main(int argc, char** argv)
             endInfo.layers = nullptr;
         }
         const XrResult endResult = xr.endFrame(session, &endInfo);
+        const bool presentedExactFrameJoin =
+            endResult == XR_SUCCESS
+            && submitProjectionLayer
+            && exactPoseJoinSelected;
+        if (presentedExactFrameJoin
+            && presentedExactFrameJoins
+                != (std::numeric_limits<std::uint64_t>::max)())
+        {
+            ++presentedExactFrameJoins;
+        }
         if (endResult == XR_SUCCESS
             && submitProjectionLayer
             && candidateWristEvaluated
@@ -13214,8 +13372,7 @@ int main(int argc, char** argv)
                           << "\n";
             }
         }
-        const bool runtimeDidNotRequestRender =
-            !runtimeShouldRender && !renderWhenNotRequested;
+        const bool runtimeDidNotRequestRender = !runtimeShouldRender;
         const auto cadenceFinalizeOutcome = endResult != XR_SUCCESS
             ? cadenceTracker.abortFrame(cadenceFrame, monotonicNow())
             : runtimeDidNotRequestRender
@@ -13231,36 +13388,9 @@ int main(int argc, char** argv)
         }
         const fnvxr::kernel::performance::CadenceSnapshot cadence =
             cadenceTracker.snapshot();
-        const double cadenceObservedFps = cadence.observedSpanNanoseconds > 0u
-            ? static_cast<double>(cadence.framesEnded) * 1.0e9
-                / static_cast<double>(cadence.observedSpanNanoseconds)
-            : 0.0;
-        const double cadenceAverageFrameWorkMilliseconds =
-            cadence.framesEnded > 0u
-            ? static_cast<double>(cadence.totalFrameWorkNanoseconds)
-                / static_cast<double>(cadence.framesEnded) / 1.0e6
-            : 0.0;
-        const std::uint64_t cadenceRequestedFrames =
-            cadence.framesEnded >= cadence.framesNotRequested
-                ? cadence.framesEnded - cadence.framesNotRequested
-                : 0u;
-        const double cadenceRequestedFrameFps =
-            cadence.observedSpanNanoseconds > 0u
-            ? static_cast<double>(cadenceRequestedFrames) * 1.0e9
-                / static_cast<double>(cadence.observedSpanNanoseconds)
-            : 0.0;
-        const double cadenceAverageRequestedFrameWorkMilliseconds =
-            cadenceRequestedFrames > 0u
-            ? static_cast<double>(
-                cadence.totalRequestedFrameWorkNanoseconds)
-                / static_cast<double>(cadenceRequestedFrames) / 1.0e6
-            : 0.0;
-        const double cadenceSubmittedPairFps =
-            cadence.observedSpanNanoseconds > 0u
-            ? static_cast<double>(std::min(
-                cadence.leftSubmissions, cadence.rightSubmissions)) * 1.0e9
-                / static_cast<double>(cadence.observedSpanNanoseconds)
-            : 0.0;
+        const fnvxr::kernel::performance::CadencePerformanceMetrics
+            cadenceMetrics =
+                fnvxr::kernel::performance::deriveCadencePerformance(cadence);
         const std::uint64_t cpuEngineTransaction =
             fnvxr::shared::sequencedValueBits(
                 renderer.stereoGameRenderPairSequence);
@@ -13314,6 +13444,8 @@ int main(int argc, char** argv)
             || !submitProjectionLayer
             || endResult != XR_SUCCESS)
         {
+            const fnvxr::kernel::FrameJoinTelemetry frameJoinTelemetry =
+                sourceViewHistory.telemetry();
             std::cout
                 << "{\"event\":\"fnvxrOpenXrSubmit\",\"frame\":" << frameIndex
                 << ",\"hostWallClockUnixMilliseconds\":"
@@ -13328,24 +13460,28 @@ int main(int argc, char** argv)
                 << ",\"cadenceFramesNotRequested\":"
                 << cadence.framesNotRequested
                 << ",\"cadenceRequestedFrames\":"
-                << cadenceRequestedFrames
+                << cadenceMetrics.requested.frames
                 << ",\"cadenceFramesAborted\":" << cadence.framesAborted
-                << ",\"cadenceObservedFps\":" << cadenceObservedFps
+                << ",\"cadenceObservedFps\":"
+                << cadenceMetrics.host.framesPerSecond
                 << ",\"cadenceRequestedFrameFps\":"
-                << cadenceRequestedFrameFps
+                << cadenceMetrics.requested.framesPerSecond
+                << ",\"cadenceSubmittedPairs\":"
+                << cadenceMetrics.submittedPairs.pairs
                 << ",\"cadenceSubmittedPairFps\":"
-                << cadenceSubmittedPairFps
+                << cadenceMetrics.submittedPairs.pairsPerSecond
                 << ",\"cadenceAverageFrameWorkMilliseconds\":"
-                << cadenceAverageFrameWorkMilliseconds
+                << cadenceMetrics.host.averageWorkMilliseconds
                 << ",\"cadenceAverageRequestedFrameWorkMilliseconds\":"
-                << cadenceAverageRequestedFrameWorkMilliseconds
+                << cadenceMetrics.requested.averageWorkMilliseconds
                 << ",\"cadenceMaximumFrameWorkNanoseconds\":"
-                << cadence.maximumFrameWorkNanoseconds
+                << cadenceMetrics.host.maximumWorkNanoseconds
                 << ",\"cadenceMaximumRequestedFrameWorkNanoseconds\":"
-                << cadence.maximumRequestedFrameWorkNanoseconds
-                << ",\"cadenceBudgetOverruns\":" << cadence.budgetOverruns
+                << cadenceMetrics.requested.maximumWorkNanoseconds
+                << ",\"cadenceBudgetOverruns\":"
+                << cadenceMetrics.host.budgetOverruns
                 << ",\"cadenceRequestedBudgetOverruns\":"
-                << cadence.requestedBudgetOverruns
+                << cadenceMetrics.requested.budgetOverruns
                 << ",\"cadenceFreshTransactions\":"
                 << cadence.freshTransactions
                 << ",\"cadenceRepeatedTransactions\":"
@@ -13357,6 +13493,22 @@ int main(int argc, char** argv)
                 << ",\"cadencePairDrops\":" << cadence.pairDrops
                 << ",\"cadenceEventRejections\":"
                 << cadence.eventRejections
+                << ",\"poseHistoryOccupancy\":"
+                << frameJoinTelemetry.currentOccupancy
+                << ",\"poseHistoryMaximumOccupancy\":"
+                << frameJoinTelemetry.maximumOccupancy
+                << ",\"poseHistoryExactLookups\":"
+                << frameJoinTelemetry.exact
+                << ",\"presentedExactFrameJoin\":"
+                << (presentedExactFrameJoin ? "true" : "false")
+                << ",\"presentedExactFrameJoins\":"
+                << presentedExactFrameJoins
+                << ",\"poseHistoryMissingJoins\":"
+                << frameJoinTelemetry.missingPose
+                << ",\"poseHistoryOverwrittenJoins\":"
+                << frameJoinTelemetry.overwrittenPose
+                << ",\"poseHistoryTimeMismatches\":"
+                << frameJoinTelemetry.timeMismatch
                 << ",\"productMode\":"
                 << static_cast<std::uint32_t>(productDecision.mode)
                 << ",\"productReason\":"
@@ -13392,6 +13544,12 @@ int main(int argc, char** argv)
                 << fnvxr::shared::runtimeControllerModeName(
                     controllerMode)
                 << "\""
+                << ",\"presentationAuthority\":"
+                << static_cast<unsigned>(presentationAuthority.authority)
+                << ",\"runtimePresentation\":"
+                << static_cast<unsigned>(presentationAuthority.presentation)
+                << ",\"presentationAuthorityFailure\":"
+                << static_cast<unsigned>(presentationAuthority.failure)
                 << ",\"physicalHeadsetPlayRequested\":"
                 << (physicalHeadsetPlayRequested() ? "true" : "false")
                 << ",\"trackedWeaponAuthorized\":false"
@@ -13445,6 +13603,14 @@ int main(int argc, char** argv)
                 << pipBoyScreenPixelEvidence.blueDominantFraction
                 << ",\"pipBoyScreenMeanLuma\":"
                 << pipBoyScreenPixelEvidence.meanLuma
+                << ",\"pipBoyScreenMinimumLuma\":"
+                << pipBoyScreenPixelEvidence.minimumLuma
+                << ",\"pipBoyScreenMaximumLuma\":"
+                << pipBoyScreenPixelEvidence.maximumLuma
+                << ",\"pipBoyScreenLumaVariance\":"
+                << pipBoyScreenPixelEvidence.lumaVariance
+                << ",\"pipBoyScreenPopulatedLumaBins\":"
+                << pipBoyScreenPixelEvidence.populatedLumaBins
                 << ",\"cpuUiRetainedEpoch\":"
                 << renderer.retainedCpuUiEpoch
                 << ",\"cpuUiRetainedTransaction\":"
@@ -13530,8 +13696,7 @@ int main(int argc, char** argv)
                 << wristActivationDecision.aimAngleDegrees
                 << ",\"livePipBoyScale\":" << livePipBoyFocus.scale
                 << ",\"spatialRigAuthorized\":"
-                << ((!productionGpuColorV5
-                        || productDecision.spatialRigMayRender)
+                << (spatialRigPolicyAuthorized
                         ? "true"
                         : "false")
                 << ",\"spatialPropsSourcePoseMatched\":"
@@ -13557,8 +13722,14 @@ int main(int argc, char** argv)
                         && (presentedBinocularWorld || cpuEngineStereoActive))
                         ? "true"
                         : "false")
-                << ",\"pipBoyContentFresh\":"
-                << (retainedPipBoyContentFresh ? "true" : "false")
+                << ",\"pipBoyContentReady\":"
+                << (pipBoyContentReadiness.ready ? "true" : "false")
+                << ",\"pipBoyContentReason\":"
+                << static_cast<unsigned>(pipBoyContentReadiness.reason)
+                << ",\"pipBoyContentAgeMilliseconds\":"
+                << pipBoyContentReadiness.ageMilliseconds
+                << ",\"pipBoyContentResourceGeneration\":"
+                << renderer.retainedUiResourceGeneration
                 << ",\"pipBoyContentRuntimeLineage\":"
                 << (retainedPipBoyRuntimeLineage ? "true" : "false")
                 << ",\"pipBoyContentRuntimeLineageBracketed\":"
@@ -13619,37 +13790,12 @@ int main(int argc, char** argv)
 
     const fnvxr::kernel::performance::CadenceSnapshot finalCadence =
         cadenceTracker.snapshot();
-    const double finalObservedFps = finalCadence.observedSpanNanoseconds > 0u
-        ? static_cast<double>(finalCadence.framesEnded) * 1.0e9
-            / static_cast<double>(finalCadence.observedSpanNanoseconds)
-        : 0.0;
-    const double finalAverageFrameWorkMilliseconds =
-        finalCadence.framesEnded > 0u
-        ? static_cast<double>(finalCadence.totalFrameWorkNanoseconds)
-            / static_cast<double>(finalCadence.framesEnded) / 1.0e6
-        : 0.0;
-    const std::uint64_t finalRequestedFrames =
-        finalCadence.framesEnded >= finalCadence.framesNotRequested
-            ? finalCadence.framesEnded - finalCadence.framesNotRequested
-            : 0u;
-    const double finalRequestedFrameFps =
-        finalCadence.observedSpanNanoseconds > 0u
-        ? static_cast<double>(finalRequestedFrames) * 1.0e9
-            / static_cast<double>(finalCadence.observedSpanNanoseconds)
-        : 0.0;
-    const double finalSubmittedPairFps =
-        finalCadence.observedSpanNanoseconds > 0u
-        ? static_cast<double>(std::min(
-            finalCadence.leftSubmissions,
-            finalCadence.rightSubmissions)) * 1.0e9
-            / static_cast<double>(finalCadence.observedSpanNanoseconds)
-        : 0.0;
-    const double finalAverageRequestedFrameWorkMilliseconds =
-        finalRequestedFrames > 0u
-        ? static_cast<double>(
-            finalCadence.totalRequestedFrameWorkNanoseconds)
-            / static_cast<double>(finalRequestedFrames) / 1.0e6
-        : 0.0;
+    const fnvxr::kernel::performance::CadencePerformanceMetrics
+        finalCadenceMetrics =
+            fnvxr::kernel::performance::deriveCadencePerformance(
+                finalCadence);
+    const fnvxr::kernel::FrameJoinTelemetry finalFrameJoin =
+        sourceViewHistory.telemetry();
     std::cout
         << "{\"event\":\"fnvxrCadenceSummary\",\"epoch\":"
         << finalCadence.epoch
@@ -13659,22 +13805,29 @@ int main(int argc, char** argv)
         << ",\"framesEnded\":" << finalCadence.framesEnded
         << ",\"framesNotRequested\":"
         << finalCadence.framesNotRequested
-        << ",\"requestedFrames\":" << finalRequestedFrames
+        << ",\"requestedFrames\":"
+        << finalCadenceMetrics.requested.frames
         << ",\"framesAborted\":" << finalCadence.framesAborted
-        << ",\"observedFps\":" << finalObservedFps
-        << ",\"requestedFrameFps\":" << finalRequestedFrameFps
-        << ",\"submittedPairFps\":" << finalSubmittedPairFps
+        << ",\"observedFps\":"
+        << finalCadenceMetrics.host.framesPerSecond
+        << ",\"requestedFrameFps\":"
+        << finalCadenceMetrics.requested.framesPerSecond
+        << ",\"submittedPairs\":"
+        << finalCadenceMetrics.submittedPairs.pairs
+        << ",\"submittedPairFps\":"
+        << finalCadenceMetrics.submittedPairs.pairsPerSecond
         << ",\"averageFrameWorkMilliseconds\":"
-        << finalAverageFrameWorkMilliseconds
+        << finalCadenceMetrics.host.averageWorkMilliseconds
         << ",\"averageRequestedFrameWorkMilliseconds\":"
-        << finalAverageRequestedFrameWorkMilliseconds
+        << finalCadenceMetrics.requested.averageWorkMilliseconds
         << ",\"maximumFrameWorkNanoseconds\":"
-        << finalCadence.maximumFrameWorkNanoseconds
+        << finalCadenceMetrics.host.maximumWorkNanoseconds
         << ",\"maximumRequestedFrameWorkNanoseconds\":"
-        << finalCadence.maximumRequestedFrameWorkNanoseconds
-        << ",\"budgetOverruns\":" << finalCadence.budgetOverruns
+        << finalCadenceMetrics.requested.maximumWorkNanoseconds
+        << ",\"budgetOverruns\":"
+        << finalCadenceMetrics.host.budgetOverruns
         << ",\"requestedBudgetOverruns\":"
-        << finalCadence.requestedBudgetOverruns
+        << finalCadenceMetrics.requested.budgetOverruns
         << ",\"freshTransactions\":" << finalCadence.freshTransactions
         << ",\"repeatedTransactions\":" << finalCadence.repeatedTransactions
         << ",\"staleTransactions\":" << finalCadence.staleTransactions
@@ -13683,6 +13836,25 @@ int main(int argc, char** argv)
         << ",\"pairDrops\":" << finalCadence.pairDrops
         << ",\"eventRejections\":" << finalCadence.eventRejections
         << ",\"counterSaturations\":" << finalCadence.counterSaturations
+        << "}\n";
+    std::cout
+        << "{\"event\":\"fnvxrFrameJoinSummary\",\"poseStores\":"
+        << finalFrameJoin.poseStores
+        << ",\"poseStoreRejections\":"
+        << finalFrameJoin.poseStoreRejections
+        << ",\"slotOverwrites\":" << finalFrameJoin.slotOverwrites
+        << ",\"currentOccupancy\":" << finalFrameJoin.currentOccupancy
+        << ",\"maximumOccupancy\":" << finalFrameJoin.maximumOccupancy
+        << ",\"lookups\":" << finalFrameJoin.joins
+        << ",\"exactLookups\":" << finalFrameJoin.exact
+        << ",\"presentedExactFrameJoins\":"
+        << presentedExactFrameJoins
+        << ",\"missingPose\":" << finalFrameJoin.missingPose
+        << ",\"overwrittenPose\":" << finalFrameJoin.overwrittenPose
+        << ",\"stalePoseEpoch\":" << finalFrameJoin.stalePoseEpoch
+        << ",\"staleReferenceSpace\":"
+        << finalFrameJoin.staleReferenceSpace
+        << ",\"timeMismatch\":" << finalFrameJoin.timeMismatch
         << "}\n";
 
     closeHostSharedBridge(sharedBridge);

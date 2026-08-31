@@ -111,6 +111,7 @@ int main()
     const auto telemetry = joiner.telemetry();
     if (telemetry.poseStores != 5 || telemetry.poseStoreRejections != 3 ||
         telemetry.slotOverwrites != 1 || telemetry.resets != 3 ||
+        telemetry.currentOccupancy != 1 || telemetry.maximumOccupancy != 2 ||
         telemetry.resetRejections != 2 || telemetry.joins != 8 ||
         telemetry.exact != 1 || telemetry.invalidImageKey != 1 ||
         telemetry.stalePoseEpoch != 1 || telemetry.staleReferenceSpace != 2 ||

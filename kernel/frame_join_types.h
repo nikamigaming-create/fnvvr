@@ -38,6 +38,8 @@ struct FrameJoinTelemetry final
     std::uint64_t poseStores = 0;
     std::uint64_t poseStoreRejections = 0;
     std::uint64_t slotOverwrites = 0;
+    std::uint64_t currentOccupancy = 0;
+    std::uint64_t maximumOccupancy = 0;
     std::uint64_t resets = 0;
     std::uint64_t resetRejections = 0;
     std::uint64_t joins = 0;

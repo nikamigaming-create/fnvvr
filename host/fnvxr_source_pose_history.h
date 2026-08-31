@@ -143,6 +143,11 @@ public:
         return true;
     }
 
+    [[nodiscard]] kernel::FrameJoinTelemetry telemetry() const noexcept
+    {
+        return history_.telemetry();
+    }
+
 private:
     using History = kernel::ExactFrameJoiner<128>;
 

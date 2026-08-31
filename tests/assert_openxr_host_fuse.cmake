@@ -82,6 +82,15 @@ foreach(required_product_kernel_text IN ITEMS
         "&& pipBoySpatialScreenVisible)"
         "runtimeDidNotRequestRender"
         "cadenceTracker.abortFrame("
+        "deriveCadencePerformance("
+        "resolvePresentationAuthority("
+        "assessContentReadiness("
+        "screenContentReady("
+        "fnvxrFrameJoinSummary"
+        "retainedUiResourceGeneration"
+        "retainedUiRendererProducerEpoch"
+        "const bool runtimeDidNotRequestRender = !runtimeShouldRender;"
+        "presentedExactFrameJoin"
         "FNVXR_VERIFY_EYE_PIXELS")
     string(FIND "${host_source}" "${required_product_kernel_text}" product_kernel_at)
     if(product_kernel_at EQUAL -1)
@@ -100,6 +109,19 @@ foreach(retired_product_path IN ITEMS
     if(NOT retired_product_at EQUAL -1)
         message(FATAL_ERROR
             "Host still contains a retired proof-fabricating product path: ${retired_product_path}")
+    endif()
+endforeach()
+
+foreach(retired_inline_policy IN ITEMS
+        "finalObservedFps"
+        "finalRequestedFrames"
+        "retainedPipBoyContentFresh"
+        "poseHistoryExactJoins"
+        "(!productionGpuColorV5")
+    string(FIND "${host_source}" "${retired_inline_policy}" retired_inline_at)
+    if(NOT retired_inline_at EQUAL -1)
+        message(FATAL_ERROR
+            "Host revived duplicated product policy: ${retired_inline_policy}")
     endif()
 endforeach()
 

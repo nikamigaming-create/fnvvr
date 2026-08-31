@@ -62,6 +62,12 @@ public:
         auto& slot = slots_[indexFor(identity.poseSequence)];
         if (slot.sample.has_value())
             ++telemetry_.slotOverwrites;
+        else
+        {
+            ++telemetry_.currentOccupancy;
+            if (telemetry_.currentOccupancy > telemetry_.maximumOccupancy)
+                telemetry_.maximumOccupancy = telemetry_.currentOccupancy;
+        }
         slot.sample.emplace(identity, pose);
         latestIdentity_ = identity;
         keySpaceExhausted_ =
@@ -121,6 +127,7 @@ private:
     {
         for (auto& slot : slots_)
             slot.sample.reset();
+        telemetry_.currentOccupancy = 0;
         latestIdentity_ = {};
         keySpaceExhausted_ = false;
     }

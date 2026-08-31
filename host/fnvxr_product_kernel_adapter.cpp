@@ -28,6 +28,25 @@ void ProductKernelAdapter::reset() noexcept
     kernel_.resetPresentation();
 }
 
+kp::RuntimeSnapshot ProductKernelAdapter::runtimeSnapshot(
+    const product::PresentationInput& input) noexcept
+{
+    kp::RuntimeSnapshot runtime {};
+    const product::RetailState retailState = product::classifyRetailState(input);
+    runtime.sample = input.runtimeStateSample;
+    runtime.fresh = input.runtimeFresh;
+    runtime.phase = retailState == product::RetailState::Unknown
+        ? kp::RuntimePhase::Unknown
+        : retailState == product::RetailState::Loading
+            ? kp::RuntimePhase::Loading : kp::RuntimePhase::Running;
+    if (retailState == product::RetailState::InteractiveUi)
+        runtime.ui = kp::UiClassification::Blocking;
+    else if (retailState == product::RetailState::Gameplay
+        && (input.menuBits & shared::RuntimePipBoyMenuBit) != 0)
+        runtime.ui = kp::UiClassification::PipBoySpatial;
+    return runtime;
+}
+
 kp::PresentationInput ProductKernelAdapter::translate(
     const product::PresentationInput& input,
     const PresentationTransportProof& transport,
@@ -35,18 +54,7 @@ kp::PresentationInput ProductKernelAdapter::translate(
     bool wristContentReady) noexcept
 {
     kp::PresentationInput translated {};
-    const product::RetailState retailState = product::classifyRetailState(input);
-    translated.runtime.sample = input.runtimeStateSample;
-    translated.runtime.fresh = input.runtimeFresh;
-    translated.runtime.phase = retailState == product::RetailState::Unknown
-        ? kp::RuntimePhase::Unknown
-        : retailState == product::RetailState::Loading
-            ? kp::RuntimePhase::Loading : kp::RuntimePhase::Running;
-    if (retailState == product::RetailState::InteractiveUi)
-        translated.runtime.ui = kp::UiClassification::Blocking;
-    else if (retailState == product::RetailState::Gameplay
-        && (input.menuBits & shared::RuntimePipBoyMenuBit) != 0)
-        translated.runtime.ui = kp::UiClassification::PipBoySpatial;
+    translated.runtime = runtimeSnapshot(input);
 
     const kp::SourceKey worldSource {
         transport.producerEpoch,

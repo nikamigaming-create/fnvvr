@@ -49,6 +49,31 @@ int main()
         return fail("test config did not validate");
     fnvxr::host::ProductKernelAdapter adapter(*validated.config);
 
+    const auto worldRuntime =
+        fnvxr::host::ProductKernelAdapter::runtimeSnapshot(world(1));
+    if (worldRuntime.sample != 5
+        || worldRuntime.phase
+            != fnvxr::kernel::presentation::RuntimePhase::Running
+        || worldRuntime.ui
+            != fnvxr::kernel::presentation::UiClassification::None
+        || !worldRuntime.fresh)
+    {
+        return fail("runtime authority and ProductKernel input mapping diverged");
+    }
+    auto pipBoyRuntimeInput = world(2);
+    pipBoyRuntimeInput.runtimePhase = fnvxr::shared::RuntimePhaseMenu;
+    pipBoyRuntimeInput.menuBits = fnvxr::shared::RuntimePipBoyMenuBit;
+    const auto pipBoyRuntime =
+        fnvxr::host::ProductKernelAdapter::runtimeSnapshot(
+            pipBoyRuntimeInput);
+    if (pipBoyRuntime.phase
+            != fnvxr::kernel::presentation::RuntimePhase::Running
+        || pipBoyRuntime.ui
+            != fnvxr::kernel::presentation::UiClassification::PipBoySpatial)
+    {
+        return fail("spatial Pip-Boy runtime mapping diverged");
+    }
+
     const auto uiDecision = adapter.advance(ui(10), transport(10), false, false);
     if (uiDecision.mode != fnvxr::product::PresentationMode::UiQuad
         || !uiDecision.pointerEnabled

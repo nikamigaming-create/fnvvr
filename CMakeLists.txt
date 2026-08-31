@@ -36,11 +36,14 @@ target_include_directories(fnvxr_protocol INTERFACE
 # and presentation decisions only.
 add_library(fnvxr_kernel STATIC
     kernel/config_validation.cpp
+    kernel/performance/cadence_metrics.cpp
     kernel/performance/cadence_tracker.cpp
     kernel/product_kernel.cpp
     kernel/presentation/coordinator.cpp
     kernel/rig/first_person_rig.cpp
+    kernel/transport/presentation_authority.cpp
     kernel/wrist/activation.cpp
+    kernel/wrist/content_readiness.cpp
     kernel/wrist/geometry.cpp
     kernel/wrist/placement.cpp)
 target_include_directories(fnvxr_kernel PUBLIC
@@ -83,8 +86,20 @@ fnvxr_add_kernel_test(
     fnvxr_cadence_tracker_test
     tests/fnvxr_cadence_tracker_test.cpp)
 fnvxr_add_kernel_test(
+    fnvxr_cadence_metrics_test
+    tests/fnvxr_cadence_metrics_test.cpp)
+fnvxr_add_kernel_test(
     fnvxr_spatial_calibration_history_test
     tests/fnvxr_spatial_calibration_history_test.cpp)
+fnvxr_add_kernel_test(
+    fnvxr_presentation_authority_test
+    tests/fnvxr_presentation_authority_test.cpp)
+fnvxr_add_kernel_test(
+    fnvxr_wrist_content_readiness_test
+    tests/fnvxr_wrist_content_readiness_test.cpp)
+fnvxr_add_kernel_test(
+    fnvxr_pipboy_panel_contract_test
+    tests/fnvxr_pipboy_panel_contract_test.cpp)
 
 if(WIN32)
     add_executable(fnvxr_runtime_config_loader_test

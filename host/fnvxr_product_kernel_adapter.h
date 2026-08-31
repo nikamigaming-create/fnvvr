@@ -26,6 +26,9 @@ public:
     explicit ProductKernelAdapter(
         const kernel::ValidatedRuntimeConfig& config);
 
+    [[nodiscard]] static kernel::presentation::RuntimeSnapshot runtimeSnapshot(
+        const product::PresentationInput& input) noexcept;
+
     [[nodiscard]] product::PresentationDecision advance(
         const product::PresentationInput& input,
         const PresentationTransportProof& transport,
