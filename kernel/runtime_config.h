@@ -16,7 +16,9 @@ struct PerformanceConfig
     std::uint32_t targetRefreshHz = 90;
     std::uint32_t maximumFramesInFlight = 1;
     std::size_t poseHistoryCapacity = 128;
-    float maximumPoseAgeMilliseconds = 10.0F;
+    // A completed game pair normally arrives on a later compositor cycle.
+    // Keep its historical pose and bound retention to three refresh periods.
+    float maximumPoseAgeMilliseconds = 33.0F;
     float maximumCpuPoseAgeMilliseconds = 75.0F;
     EyeTransport eyeTransport = EyeTransport::GpuColorV5;
 };

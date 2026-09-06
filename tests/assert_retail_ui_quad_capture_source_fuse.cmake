@@ -124,37 +124,21 @@ require_text(
     "controllerOperations.claimWorldTransaction = &claimWorldTransaction;"
     "The world controller must claim from the bridge's UI/world transaction domain before rendering")
 require_text(
+    "${proxy_text}"
+    "operations.publicationTransport =\n        fnvxr::d3d9::RetailVrPublicationTransport::GpuSharedTextures;"
+    "The supported retail route must select GPU transport")
+require_text(
+    "${proxy_text}"
+    "operations.produceColorPair = &produceRetailVrColorPair;"
+    "The retail proxy must connect the GPU publisher")
+require_text(
     "${bridge_text}"
-    "publishCpuMonoUiQuad"
-    "The ordinary-D3D9 bridge must publish a verified flat UI record as well as a world pair")
+    "identity.renderFlags = gpu::color_v5::RetailMenuCaptured;"
+    "Menu publication must carry authenticated capture provenance")
 require_text(
     "${bridge_text}"
-    "operations.publishCpuPair\n        && operations.publishCpuMonoUiQuad"
-    "CPU transport setup must require both the world and UI publishers")
-require_text(
-    "${bridge_text}"
-    "mOperations.publishCpuMonoUiQuad("
-    "A confirmed UI Present must route through the CPU mono-quad publisher")
-require_text(
-    "${proxy_text}"
-    "operations.publishCpuMonoUiQuad = &publishRetailVrCpuMonoUiQuad;"
-    "The retail proxy must bind its CPU mono-quad publisher into the bridge")
-require_text(
-    "${proxy_text}"
-    "bool publishRetailVrCpuMonoUiQuad("
-    "The ordinary-D3D9 proxy must implement the CPU mono-quad publication seam")
-require_text(
-    "${proxy_text}"
-    "header->producerMode = fnvxr::shared::StereoProducerMonoUiQuad;"
-    "CPU UI pixels must be labelled as a flat UI producer, never as world stereo")
-require_text(
-    "${proxy_text}"
-    "header->separated = 0;\n    header->worldCandidate = 0;\n    header->uiActive = 1;"
-    "CPU UI records must be exclusively flat, non-world presentation records")
-require_text(
-    "${proxy_text}"
-    "header->transactionId = transactionId;\n    header->sourceFrame = transactionId;\n    header->runtimeStateSample = tracked.runtime.frame;"
-    "CPU UI records must carry the exact shared transition identity and runtime sample")
+    "identity.sourceFrame = transactionId;"
+    "UI and world must share the retail transaction ordering domain")
 
 string(FIND "${bridge_text}" "static bool claimWorldTransaction(" world_claim_start)
 string(FIND "${bridge_text}" "static engine::RetailCenterRuntimeFrameResult renderStereo(" world_claim_end)
@@ -216,8 +200,8 @@ require_text(
     "The narrow Present lease must not authorize whole-vtable replacement")
 require_text(
     "${activation_text}"
-    "static_assert(CompiledRetailVrBridgePolicy.cpuImageTransfer);"
-    "The isolated engine bridge must explicitly authorize its bounded CPU transfer")
+    "static_assert(CompiledRetailVrBridgePolicy.gpuImageTransfer);"
+    "The isolated engine bridge must explicitly authorize its GPU transfer")
 require_text(
     "${proxy_text}"
     "#include \"fnvxr_retail_ui_quad_capture_win32.h\""

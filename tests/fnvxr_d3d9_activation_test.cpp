@@ -56,7 +56,7 @@ int main()
         || !CompiledRetailVrBridgePolicy.retailWorldHookOnly
         || CompiledRetailVrBridgePolicy.replaceD3D9DeviceVtablePointer
         || !CompiledRetailVrBridgePolicy.leaseNativePresentSlot
-        || !CompiledRetailVrBridgePolicy.cpuImageTransfer
+        || !CompiledRetailVrBridgePolicy.gpuImageTransfer
         || CompiledRetailVrBridgePolicy.legacyDrawReplay)
     {
         return fail("retail bridge must preserve ordinary D3D9 and isolate its CPU transport and Present lease");

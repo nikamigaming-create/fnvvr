@@ -49,5 +49,6 @@ private:
     Win32PublisherFailure mFailure = Win32PublisherFailure::NotInitialized;
     bool mOwnsProducerLease = false;
     bool mOwnsProcessClaim = false;
+    std::size_t mLastPublishedChannel = 0;
 };
 }

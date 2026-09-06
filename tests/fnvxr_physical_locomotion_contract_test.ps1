@@ -91,7 +91,9 @@ foreach ($required in @(
         'FNVXR_PLUGIN_MOVEMENT_DEADZONE = "6000"',
         'FNVXR_PHYSICAL_LEFT_MENU_PIPBOY_ENABLE = "1"',
         'FNVXR_DIRECT_UI_CLICK = "1"',
-        'FNVXR_LIVE_PIPBOY_FOCUS_FRAMES = "12"',
+        'FNVXR_LIVE_PIPBOY_FOCUS_FRAMES = "6"',
+        'FNVXR_LIVE_PIPBOY_FOCUS_HIT_SCALE_X = "2.6"',
+        'FNVXR_LIVE_PIPBOY_MAX_MEAN_LUMA = "75"',
         'FNVXR_WEAPON_ORBIT_GRIP_THRESHOLD = "0.55"',
         'FNVXR_WEAPON_ORBIT_DEADZONE = "0.35"')) {
     Require-Text -Text $productCommon -Required $required -Reason "physical launcher input split"

@@ -85,7 +85,7 @@ int main()
     if (config.performance.targetRefreshHz != 120
         || config.performance.maximumCpuPoseAgeMilliseconds != 250.0F
         || config.performance.eyeTransport
-            != kernel::EyeTransport::CpuEngineCenter
+            != kernel::EyeTransport::GpuColorV5
         || config.presentation.menuWidthMeters != 3.15F
         || config.presentation.menuHeightMeters != 2.15F
         || config.presentation.menuDistanceMeters != 3.35F
@@ -130,13 +130,12 @@ int main()
         return fail("text failures must expose stable diagnostic names");
 
     FakeSource invalidBoolean({ { "FNVXR_ENABLE_ENGINE_CENTER_STEREO", "yes" } });
-    if (host::loadRuntimeConfig(invalidBoolean).textError !=
-        host::RuntimeConfigTextError::InvalidBoolean)
-        return fail("booleans must use an explicit stable text format");
+    if (!host::loadRuntimeConfig(invalidBoolean))
+        return fail("retired CPU-transport selector must not affect GPU configuration");
 
     FakeSource invalidConfig({
         { "FNVXR_TARGET_REFRESH_HZ", "120" },
-        { "FNVXR_STEREO_MAX_SOURCE_POSE_AGE_MS", "10" },
+        { "FNVXR_STEREO_MAX_SOURCE_POSE_AGE_MS", "26" },
     });
     const host::RuntimeConfigLoadResult invalidConfigResult =
         host::loadRuntimeConfig(invalidConfig);

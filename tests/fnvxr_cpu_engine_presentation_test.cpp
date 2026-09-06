@@ -88,6 +88,13 @@ int main()
         fnvxr::pipboy::screenPixelsReady({ 100u, 0.82f, 0.0f, 34.0f }),
         "authored dark Pip-Boy pixels did not pass the screen-ready gate");
     require(
+        fnvxr::pipboy::screenPixelsReady(
+            { 58752u, 0.878098f, 0.00783f, 64.4998f },
+            0.30f,
+            0.20f,
+            75.0f),
+        "observed physical-resolution Pip-Boy pixels did not pass the calibrated gate");
+    require(
         !fnvxr::pipboy::screenPixelsReady({ 100u, 0.95f, 0.0f, 88.0f })
             && !fnvxr::pipboy::screenPixelsReady(
                 { 100u, 0.02f, 0.0f, 2.0f })
@@ -214,8 +221,8 @@ int main()
             {}),
         "a current live Pip-Boy world pair was rejected");
 
-    // Source-pose freshness controls advancing proof, not whether the verified
-    // world layer remains visible between exact producer updates.
+    // Reuse between producer updates is bounded by source-pose age. A stopped
+    // producer must not keep an expired simulation visible indefinitely.
     const presentation::WorldPresentationDecision staleWorldDecision =
         presentation::assessBinocularWorldFrame(
             resumedWorld,
@@ -224,8 +231,8 @@ int main()
             uiBoundary,
             false);
     require(
-        staleWorldDecision.present && !staleWorldDecision.advancesFreshProof,
-        "a stale verified world frame caused a presentation dropout");
+        !staleWorldDecision.present && !staleWorldDecision.advancesFreshProof,
+        "an expired verified world frame bypassed the source-pose budget");
     const presentation::WorldPresentationDecision freshWorldDecision =
         presentation::assessBinocularWorldFrame(
             resumedWorld,
@@ -243,11 +250,53 @@ int main()
             missingSourceRuntime,
             gameplayRuntime(99u),
             uiBoundary,
-            false);
+            true);
     require(
         historyMissDecision.present
             && !historyMissDecision.advancesFreshProof,
         "a transient source-runtime history miss blanked retained gameplay");
+    const presentation::WorldPresentationDecision expiredHistoryMissDecision =
+        presentation::assessBinocularWorldFrame(
+            resumedWorld,
+            missingSourceRuntime,
+            gameplayRuntime(99u),
+            uiBoundary,
+            false);
+    require(
+        !expiredHistoryMissDecision.present
+            && !expiredHistoryMissDecision.advancesFreshProof,
+        "missing runtime history allowed an expired world frame to persist");
+    const presentation::WorldPresentationDecision menuTransitionDecision =
+        presentation::assessBinocularWorldFrame(
+            resumedWorld,
+            gameplayRuntime(42u),
+            laterMenu,
+            uiBoundary,
+            true);
+    require(
+        !menuTransitionDecision.present
+            && !menuTransitionDecision.advancesFreshProof,
+        "historical gameplay authorized world presentation over a current menu");
+    const presentation::WorldPresentationDecision runtimeLossDecision =
+        presentation::assessBinocularWorldFrame(
+            resumedWorld,
+            gameplayRuntime(42u),
+            {},
+            uiBoundary,
+            true);
+    require(
+        !runtimeLossDecision.present && !runtimeLossDecision.advancesFreshProof,
+        "historical gameplay authorized world presentation after runtime loss");
+    const presentation::WorldPresentationDecision focusedWristDecision =
+        presentation::assessBinocularWorldFrame(
+            resumedWorld,
+            livePipBoyRuntime,
+            livePipBoyRuntime,
+            {},
+            true);
+    require(
+        focusedWristDecision.present && focusedWristDecision.advancesFreshProof,
+        "a current live wrist screen lost its valid world background");
     require(
         presentation::preserveVerifiedWorldAcrossCellChange(true, true)
             && !presentation::preserveVerifiedWorldAcrossCellChange(false, true)

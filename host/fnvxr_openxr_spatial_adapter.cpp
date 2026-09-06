@@ -107,6 +107,12 @@ XrPosef toOpenXrPose(const kernel::Pose& pose) noexcept
     return result;
 }
 
+XrPosef handAttachmentPose(const XrPosef& grip, const XrVector3f& localOffset) noexcept
+{
+    return toOpenXrPose(kernel::wrist::compose(toKernelPose(grip),
+        { { localOffset.x, localOffset.y, localOffset.z }, Quaternion {} }));
+}
+
 BodyRig solveBodyRig(
     const XrPosef& head,
     bool headTracked,

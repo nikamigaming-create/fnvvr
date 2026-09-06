@@ -57,6 +57,24 @@ int main()
         || rig.left.forearmLength <= 0.0F)
         return fail("adapter did not produce a usable authored-mesh forearm");
 
+    // A 90-degree wrist rotation rotates the attachment offset too. Both
+    // authored hands and the forearm endpoint consume this exact socket.
+    XrPosef grip = pose(0.35F, 1.25F, -0.25F);
+    grip.orientation = { 0.0F, 0.0F, 0.70710678F, 0.70710678F };
+    const XrPosef socket = host::spatial::handAttachmentPose(
+        grip, { -0.040F, 0.026F, 0.0F });
+    if (!close(socket.position.x, 0.324F) || !close(socket.position.y, 1.21F)
+        || !close(socket.position.z, -0.25F))
+        return fail("hand socket did not rotate its local offset with the grip");
+    const auto attached = host::spatial::solveBodyRig(
+        pose(0.0F, 1.7F, 0.0F), true,
+        pose(-0.35F, 1.25F, -0.25F), true, socket, true, config.bodyRig);
+    if (!attached.right.valid
+        || !close(attached.right.wrist.position.x, socket.position.x)
+        || !close(attached.right.wrist.position.y, socket.position.y)
+        || !close(attached.right.wrist.position.z, socket.position.z))
+        return fail("forearm endpoint detached from the rotated hand socket");
+
     XrPosef pitchedHead = pose(0.0F, 1.7F, 0.0F);
     pitchedHead.orientation = { 0.258819F, 0.0F, 0.0F, 0.965926F };
     const host::spatial::BodyRig pitchedRig = host::spatial::solveBodyRig(

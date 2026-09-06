@@ -9,9 +9,9 @@ namespace fnvxr::d3d9::color_transport
 {
 struct ProducerCapabilities
 {
-    bool sourceDeviceIsD3D9Ex = false;
+    bool sourceDeviceHasGpuInterop = false;
     bool d3d11DeviceUsesSourceAdapter = false;
-    bool d3d9TexturesOpenedByD3D11 = false;
+    bool sourceTexturesAccessibleOnGpu = false;
     bool destinationTexturesUseNtHandles = false;
     bool completionUsesSharedD3D11Fence = false;
     bool cpuPixelTransferAbsent = false;
@@ -21,9 +21,9 @@ struct ProducerCapabilities
 constexpr bool capabilitiesComplete(
     const ProducerCapabilities& capabilities) noexcept
 {
-    return capabilities.sourceDeviceIsD3D9Ex
+    return capabilities.sourceDeviceHasGpuInterop
         && capabilities.d3d11DeviceUsesSourceAdapter
-        && capabilities.d3d9TexturesOpenedByD3D11
+        && capabilities.sourceTexturesAccessibleOnGpu
         && capabilities.destinationTexturesUseNtHandles
         && capabilities.completionUsesSharedD3D11Fence
         && capabilities.cpuPixelTransferAbsent
@@ -78,6 +78,7 @@ struct ProducerFrameIdentity
     std::uint64_t poseSequence = 0u;
     std::uint64_t runtimeStateSample = 0u;
     std::int64_t renderedDisplayTime = 0;
+    std::uint32_t renderFlags = 0u;
 };
 
 constexpr bool frameIdentityComplete(
@@ -180,6 +181,15 @@ public:
             && mNextReadySequence != 0u;
     }
 
+    // Admission check before expensive engine rendering. This neither waits
+    // nor consumes the release; produce() revalidates it before GPU writes.
+    bool available() const noexcept
+    {
+        return ready() && (!mAwaitingConsumerRelease
+            || mOperations.consumerReleaseReached(mOperations.context,
+                mConsumerReleaseSequence));
+    }
+
     ProducerPublication produce(
         const ProducerFrameIdentity& identity) noexcept
     {
@@ -240,6 +250,7 @@ public:
         payload.poseSequence = identity.poseSequence;
         payload.runtimeStateSample = identity.runtimeStateSample;
         payload.renderedDisplayTime = identity.renderedDisplayTime;
+        payload.renderFlags = identity.renderFlags;
         payload.leftColor = {
             mResources.leftColorNtHandle,
             mResources.width,

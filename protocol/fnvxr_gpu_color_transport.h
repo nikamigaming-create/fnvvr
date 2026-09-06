@@ -11,14 +11,22 @@
 
 namespace fnvxr::gpu::color_v5
 {
-// ABI v5 is the production stereo-color path. The D3D9 depth surfaces remain
+// ABI v6 carries independent world and UI channels. The D3D9 depth surfaces remain
 // private render resources; a correct left/right engine render does not need
 // fabricated depth textures in the OpenXR process.
 inline constexpr std::uint32_t SharedStereoColorMagic = 0x43585646u; // FVXC
-inline constexpr std::uint32_t SharedStereoColorVersion = 5u;
+inline constexpr std::uint32_t SharedStereoColorVersion = 6u;
 inline constexpr char SharedStereoColorMappingName[] =
-    "Local\\FNVXR_GPU_StereoColor_v5";
+    "Local\\FNVXR_GPU_Frames_v6";
+enum class FrameChannel : std::uint32_t { World = 0, Ui = 1 };
+inline constexpr std::size_t FrameChannelCount = 2;
 inline constexpr std::uint32_t MaximumTextureDimension = 16384u;
+
+// Set by the authenticated retail transaction, never inferred from pixels or
+// texture arrival. These describe capture provenance, not product acceptance.
+inline constexpr std::uint32_t RetailWorldTransactionComplete = 1u << 0;
+inline constexpr std::uint32_t RetailMenuCaptured = 1u << 1;
+inline constexpr std::uint32_t LivePipBoyCaptured = 1u << 2;
 
 enum class PresentationMode : std::uint32_t
 {
@@ -62,7 +70,7 @@ struct alignas(8) SharedStereoColorDescriptor
     std::uint64_t resourceSetId = 0u;
     std::uint64_t producerEpoch = 0u;
     std::uint32_t producerProcessId = 0u;
-    std::uint32_t reserved = 0u;
+    std::uint32_t renderFlags = 0u;
     std::uint64_t adapterLuid = 0u;
     std::uint64_t transactionId = 0u;
     std::uint64_t sourceFrame = 0u;
@@ -90,7 +98,7 @@ struct alignas(8) SharedStereoColorPayload
     std::uint64_t resourceSetId = 0u;
     std::uint64_t producerEpoch = 0u;
     std::uint32_t producerProcessId = 0u;
-    std::uint32_t reserved = 0u;
+    std::uint32_t renderFlags = 0u;
     std::uint64_t adapterLuid = 0u;
     std::uint64_t transactionId = 0u;
     std::uint64_t sourceFrame = 0u;

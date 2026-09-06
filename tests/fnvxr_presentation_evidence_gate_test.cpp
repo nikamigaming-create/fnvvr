@@ -240,10 +240,14 @@ int main()
             "world ordering fixture failed to establish a watermark");
         auto repeated = completeWorld(300);
         const auto repeatDecision = coordinator.advance(repeated);
-        require(repeatDecision.mode == p::PresentationMode::SafetyBlank
-                && repeatDecision.reason
-                    == p::DecisionReason::WorldNotNewerThanAccepted,
-            "repeated accepted world identity was admitted as fresh");
+        require(repeatDecision.mode == p::PresentationMode::WorldStereo,
+            "still-fresh exact world frame must survive faster host cadence");
+        repeated.world.fresh = false;
+        require(coordinator.advance(repeated).mode == p::PresentationMode::SafetyBlank,
+            "expired retained world frame was admitted");
+        auto regressed = completeWorld(299);
+        require(coordinator.advance(regressed).reason == p::DecisionReason::WorldNotNewerThanAccepted,
+            "a regressed world identity was admitted");
 
         auto oldUi = completeUi(299);
         const auto oldUiDecision = coordinator.advance(oldUi);

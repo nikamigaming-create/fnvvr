@@ -68,8 +68,9 @@ $outputs = [ordered]@{
     pipBoy = Join-Path $assetRoot "pipboyarm.fpm"
     pipBoyScreen = Join-Path $assetRoot "pipboyscreen.fps"
     leftForearm = Join-Path $assetRoot "left-forearm.fhm"
+    rightForearm = Join-Path $assetRoot "right-forearm.fhm"
 }
-$manifestPath = Join-Path $assetRoot "retail-props-v3.json"
+$manifestPath = Join-Path $assetRoot "retail-props-v4.json"
 $toolHashes = [ordered]@{
     extractor = Get-Sha256Lower -Path $extractor
     handConverter = Get-Sha256Lower -Path $handConverter
@@ -84,9 +85,9 @@ function Test-PreparedManifest {
     try {
         $cached = Get-Content -LiteralPath $manifestPath -Raw |
             ConvertFrom-Json -ErrorAction Stop
-        if ([string]$cached.schema -cne "fnvxr-retail-props/v3" -or
+        if ([string]$cached.schema -cne "fnvxr-retail-props/v4" -or
             [string]$cached.coordinateBasis -cne "openxr-grip-minus-z" -or
-            [string]$cached.rightHandPose -cne "1hphandgrip1@end") {
+            [string]$cached.rightHandPose -cne "_1stperson/1hphandgrip1@end") {
             return $false
         }
         foreach ($name in $toolHashes.Keys) {
@@ -161,7 +162,7 @@ Invoke-ExactExtraction -Archive $meshArchive `
     -Entry "meshes\characters\_1stperson\skeleton.nif" `
     -Output $raw.skeleton
 Invoke-ExactExtraction -Archive $meshArchive `
-    -Entry "meshes\characters\_male\1hphandgrip1.kf" `
+    -Entry "meshes\characters\_1stperson\1hphandgrip1.kf" `
     -Output $raw.pistolGrip
 Invoke-ExactExtraction -Archive $meshArchive `
     -Entry "meshes\pipboy3000\pipboyarm.nif" `
@@ -209,8 +210,14 @@ if ($LASTEXITCODE -ne 0) { throw "Authored pistol-grip hand conversion failed." 
 if ($LASTEXITCODE -ne 0) { throw "Retail Pip-Boy housing conversion failed." }
 & $python $forearmConverter `
     --input $raw.upperBody `
-    --output $outputs.leftForearm | Out-Null
+    --output $outputs.leftForearm `
+    --side left | Out-Null
 if ($LASTEXITCODE -ne 0) { throw "Retail left-forearm conversion failed." }
+& $python $forearmConverter `
+    --input $raw.upperBody `
+    --output $outputs.rightForearm `
+    --side right | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "Retail right-forearm conversion failed." }
 
 $inputRecords = [ordered]@{}
 foreach ($name in $raw.Keys) {
@@ -231,11 +238,11 @@ foreach ($name in $outputs.Keys) {
     }
 }
 $manifest = [ordered]@{
-    schema = "fnvxr-retail-props/v3"
+    schema = "fnvxr-retail-props/v4"
     generatedAtUtc = [DateTime]::UtcNow.ToString("o")
     provenance = "locally derived from the user's installed Fallout BSAs; never staged into the game or distributed"
     coordinateBasis = "openxr-grip-minus-z"
-    rightHandPose = "1hphandgrip1@end"
+    rightHandPose = "_1stperson/1hphandgrip1@end"
     tools = $toolHashes
     inputs = $inputRecords
     outputs = $outputRecords

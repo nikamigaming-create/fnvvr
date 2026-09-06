@@ -5,6 +5,9 @@ param(
     # verifier targets. Two workers avoid intermittent compiler/linker
     # corruption on this machine while retaining bounded parallelism.
     [ValidateRange(1, 4)][int]$Parallelism = 2,
+    # CMake still rebuilds changed sources/dependencies and every test runs.
+    # Useful for a local edit/test loop; default builds remain clean builds.
+    [switch]$Incremental,
     [switch]$ReuseAttestation
 )
 
@@ -50,14 +53,22 @@ if ($LASTEXITCODE -ne 0) { throw "Product Win32 configure failed with exit code 
 # multi-gigabyte CL processes and turn a clean build into an out-of-memory
 # compiler exit. The default is deliberately conservative and can be raised
 # only through the explicit bounded parameter.
-& cmake --build $win32Build --config $Configuration --clean-first --parallel $Parallelism
+if ($Incremental) {
+    & cmake --build $win32Build --config $Configuration --parallel $Parallelism
+} else {
+    & cmake --build $win32Build --config $Configuration --clean-first --parallel $Parallelism
+}
 if ($LASTEXITCODE -ne 0) { throw "Product Win32 clean build failed with exit code $LASTEXITCODE." }
 & ctest --test-dir $win32Build -C $Configuration --no-tests=error --output-on-failure
 if ($LASTEXITCODE -ne 0) { throw "Product Win32 CTest failed with exit code $LASTEXITCODE." }
 
 & cmake -S $root -B $x64Build -A x64
 if ($LASTEXITCODE -ne 0) { throw "Product x64 configure failed with exit code $LASTEXITCODE." }
-& cmake --build $x64Build --config $Configuration --clean-first --parallel $Parallelism
+if ($Incremental) {
+    & cmake --build $x64Build --config $Configuration --parallel $Parallelism
+} else {
+    & cmake --build $x64Build --config $Configuration --clean-first --parallel $Parallelism
+}
 if ($LASTEXITCODE -ne 0) { throw "Product x64 clean build failed with exit code $LASTEXITCODE." }
 & ctest --test-dir $x64Build -C $Configuration --no-tests=error --output-on-failure
 if ($LASTEXITCODE -ne 0) { throw "Product x64 CTest failed with exit code $LASTEXITCODE." }

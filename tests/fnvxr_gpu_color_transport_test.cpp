@@ -88,8 +88,8 @@ int main()
     require(
         std::strcmp(
             SharedStereoColorMappingName,
-            "Local\\FNVXR_GPU_StereoColor_v5") == 0,
-        "v5 mapping name drifted");
+            "Local\\FNVXR_GPU_Frames_v6") == 0,
+        "v6 mapping name drifted");
 
     SharedStereoColorPayload value = completePayload();
     require(

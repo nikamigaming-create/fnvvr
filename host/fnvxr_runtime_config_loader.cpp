@@ -178,11 +178,9 @@ RuntimeConfigLoadResult loadRuntimeConfig(
     FNVXR_READ(readSize, "FNVXR_POSE_HISTORY_CAPACITY", candidate.performance.poseHistoryCapacity);
     FNVXR_READ(readFloat, "FNVXR_STEREO_MAX_SOURCE_POSE_AGE_MS", candidate.performance.maximumPoseAgeMilliseconds);
     FNVXR_READ(readFloat, "FNVXR_CPU_STEREO_MAX_SOURCE_POSE_AGE_MS", candidate.performance.maximumCpuPoseAgeMilliseconds);
-    bool engineCenterStereo = false;
-    FNVXR_READ(readBoolean, "FNVXR_ENABLE_ENGINE_CENTER_STEREO", engineCenterStereo);
-    candidate.performance.eyeTransport = engineCenterStereo
-        ? kernel::EyeTransport::CpuEngineCenter
-        : kernel::EyeTransport::GpuColorV5;
+    // Engine-center describes how the retail scene is rendered. It must not
+    // select a CPU image transport. All supported VR frames stay on the GPU.
+    candidate.performance.eyeTransport = kernel::EyeTransport::GpuColorV5;
 
     FNVXR_READ(readFloat, "FNVXR_RENDER_SCALE", candidate.presentation.renderScale);
     FNVXR_READ(readFloat, "FNVXR_NEAR_CLIP_METERS", candidate.presentation.nearClipMeters);

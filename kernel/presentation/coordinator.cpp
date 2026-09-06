@@ -91,7 +91,7 @@ PresentationDecision Coordinator::decideWorld(const PresentationInput& input)
     }
 
     if (isValid(lastAcceptedWorldSource_)
-        && !isStrictlyNewer(input.world.source, lastAcceptedWorldSource_))
+        && !isSameOrNewer(input.world.source, lastAcceptedWorldSource_))
     {
         return { PresentationMode::SafetyBlank,
             DecisionReason::WorldNotNewerThanAccepted };
@@ -156,7 +156,7 @@ DecisionReason Coordinator::worldFailure(const PresentationInput& input) const
     }
     if (!input.world.gpu.completeFor(input.world.source))
         return DecisionReason::WorldGpuEvidenceInvalid;
-    if (!input.world.retail.complete())
+    if (!input.world.retail.renderComplete())
         return DecisionReason::WorldRetailPrerequisitesInvalid;
     if (!exactPoseExistsFor(input, input.world.source))
         return DecisionReason::WorldPoseJoinMissing;

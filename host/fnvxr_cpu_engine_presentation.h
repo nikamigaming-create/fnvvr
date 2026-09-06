@@ -197,16 +197,21 @@ constexpr bool retainedBinocularWorldFrameEligible(
         && worldFollowsUiBoundary(frame, lastUiBoundary);
 }
 
-// Keep presentation continuity independent from producer freshness. A stale
-// but semantically valid pair remains safe to reproject and present; only a
-// fresh pair advances evidence that the producer itself is still rendering.
+// Retain a verified pair between producer updates only while its source pose
+// remains within the caller's age/future budget and the current runtime still
+// permits world presentation. Historical source gameplay cannot authorize a
+// layer over a newer blocking menu. A transient source-runtime history miss
+// may retain the pair within that budget, but cannot advance fresh proof.
 constexpr WorldPresentationDecision assessBinocularWorldFrame(
     const FrameIdentity& frame,
     const RuntimeSample& sourceRuntime,
     const RuntimeSample& currentRuntime,
     const UiBoundary& lastUiBoundary,
-    bool sourcePoseFresh) noexcept
+    bool sourcePoseWithinBudget) noexcept
 {
+    if (!sourcePoseWithinBudget || !runtimeGameplayConfirmed(currentRuntime))
+        return {};
+
     const bool freshEligible = binocularWorldFrameEligible(
         frame,
         sourceRuntime,
@@ -216,7 +221,7 @@ constexpr WorldPresentationDecision assessBinocularWorldFrame(
             frame,
             currentRuntime,
             lastUiBoundary);
-    return { present, freshEligible && sourcePoseFresh };
+    return { present, freshEligible };
 }
 
 constexpr bool preserveVerifiedWorldAcrossCellChange(

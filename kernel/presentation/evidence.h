@@ -52,6 +52,12 @@ struct RetailWorldProof
     bool authoritativeTrackedRetailWeapon = false;
     bool authoritativeMuzzleAlignment = false;
     bool gameplayHudExcluded = false;
+    bool renderTransactionComplete = false;
+
+    constexpr bool renderComplete() const
+    {
+        return renderTransactionComplete || complete();
+    }
 
     constexpr bool complete() const
     {

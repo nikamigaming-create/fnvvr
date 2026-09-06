@@ -12,7 +12,7 @@ EXPORTS
     Direct3D9EnableMaximizedWindowedModeShim=_FNVXR_Direct3D9EnableMaximizedWindowedModeShim@4
     Direct3DCreate9=_FNVXR_Direct3DCreate9@4
     Direct3DCreate9Ex=_FNVXR_Direct3DCreate9Ex@8
-    Direct3DCreate9On12=_FNVXR_Direct3DCreate9On12@16
+    Direct3DCreate9On12=_FNVXR_Direct3DCreate9On12@12
     Direct3DCreate9On12Ex=_FNVXR_Direct3DCreate9On12Ex@16
     Direct3DShaderValidatorCreate9=_FNVXR_Direct3DShaderValidatorCreate9@0
     PSGPError=_FNVXR_PSGPError@0

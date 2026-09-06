@@ -59,6 +59,10 @@ struct StereoFrameProof
     bool gameplayHudExcluded = false;
     bool fresh = false;
 
+    // The exact retail render transaction completed. Rendering may proceed
+    // while weapon-family and other product acceptance work remains open.
+    bool retailRenderTransactionComplete = false;
+
     bool completeForWorldStereo() const
     {
         return transactionId != 0
@@ -124,6 +128,7 @@ struct PresentationDecision
     DecisionReason reason = DecisionReason::IncompleteEvidence;
     bool pointerEnabled = false;
     bool gameplayVrAccepted = false;
+    bool stereoPresentationReady = false;
     bool transitionHold = false;
     // Kernel-owned spatial authorization. Host rendering may narrow these
     // gates for missing resources, but must never independently broaden them.

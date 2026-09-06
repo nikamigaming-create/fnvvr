@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bake the installed retail male left forearm into a host-local mesh.
+"""Bake one installed retail male forearm into a host-local mesh.
 
 The output is a private, locally derived artifact. It contains expanded
 position/normal/UV vertices only and must never be committed or redistributed.
@@ -27,6 +27,7 @@ def main() -> int:
     parser.add_argument("--input", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--shape-name", default="Arms:1")
+    parser.add_argument("--side", choices=("left", "right"), required=True)
     parser.add_argument("--units-per-meter", type=float, default=70.0)
     args = parser.parse_args()
 
@@ -57,18 +58,25 @@ def main() -> int:
         raise SystemExit("forearm geometry has no diffuse UV set")
 
     bone_names = [bytes(bone.name) for bone in shape.skin_instance.bones]
+    side_token = b"L" if args.side == "left" else b"R"
     required_names = (
-        b"Bip01 L Hand",
-        b"Bip01 L Forearm",
-        b"Bip01 L ForeTwist",
-        b"Bip01 L UpperArm",
-        b"Bip01 LUpArmTwistBone",
+        b"Bip01 " + side_token + b" Hand",
+        b"Bip01 " + side_token + b" Forearm",
+        b"Bip01 " + side_token + b" ForeTwist",
+        b"Bip01 " + side_token + b" UpperArm",
+        b"Bip01 " + side_token + b"UpArmTwistBone",
     )
     if any(name not in bone_names for name in required_names):
-        raise SystemExit("retail upper body is missing required left-arm bones")
-    left_bone_indices = [bone_names.index(name) for name in required_names]
-    forearm = shape.skin_instance.bones[bone_names.index(b"Bip01 L Forearm")]
-    hand = shape.skin_instance.bones[bone_names.index(b"Bip01 L Hand")]
+        raise SystemExit(
+            f"retail upper body is missing required {args.side}-arm bones"
+        )
+    side_bone_indices = [bone_names.index(name) for name in required_names]
+    forearm = shape.skin_instance.bones[
+        bone_names.index(b"Bip01 " + side_token + b" Forearm")
+    ]
+    hand = shape.skin_instance.bones[
+        bone_names.index(b"Bip01 " + side_token + b" Hand")
+    ]
     skeleton_root = shape.skin_instance.skeleton_root
 
     hand_to_forearm = (
@@ -78,7 +86,7 @@ def main() -> int:
     hand_in_forearm = hand_to_forearm.get_translation()
     forearm_length = float(hand_in_forearm.x)
     if not math.isfinite(forearm_length) or not 8.0 <= forearm_length <= 40.0:
-        raise SystemExit("retail left forearm length is invalid")
+        raise SystemExit(f"retail {args.side} forearm length is invalid")
 
     vertex_weights: list[dict[int, float]] = [
         {} for _ in range(shape.data.num_vertices)
@@ -106,7 +114,7 @@ def main() -> int:
     diffuse_uvs = shape.data.uv_sets[0]
 
     # The retail forearm bone's +X axis runs elbow-to-wrist. Select only the
-    # connected left-arm skin band ending at that wrist, then rotate +X onto
+    # connected side-specific skin band ending at that wrist, then rotate +X onto
     # host segment +Z. drawSolvedArm already supplies the tracked elbow/wrist
     # orientation, so no guessed arm transform remains in the mesh.
     selected_triangles = []
@@ -116,17 +124,17 @@ def main() -> int:
             / 3.0
             for axis in ("x", "y", "z")
         )
-        left_weight = sum(
+        side_weight = sum(
             sum(
                 vertex_weights[int(index)].get(bone_index, 0.0)
-                for bone_index in left_bone_indices
+                for bone_index in side_bone_indices
             )
             for index in triangle
         ) / 3.0
         if (
             -2.0 <= centroid[0] <= forearm_length + 1.0
             and math.hypot(centroid[1], centroid[2]) <= 8.0
-            and left_weight >= 0.5
+            and side_weight >= 0.5
         ):
             selected_triangles.append(triangle)
 
@@ -161,7 +169,7 @@ def main() -> int:
     output.write_bytes(payload)
     print(
         f"{output}\tvertices={len(expanded)}\t"
-        f"forearm_units={forearm_length:.6f}\t"
+        f"side={args.side}\tforearm_units={forearm_length:.6f}\t"
         f"source_sha256={hashlib.sha256(source.read_bytes()).hexdigest()}\t"
         f"output_sha256={hashlib.sha256(payload).hexdigest()}"
     )

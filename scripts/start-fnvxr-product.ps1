@@ -571,11 +571,11 @@ if ($spatialRetailPropsRequested) {
     $retailPropPreparation =
         $preparationOutput | ConvertFrom-Json -ErrorAction Stop
     if ([string]$retailPropPreparation.schema -cne
-            "fnvxr-retail-props/v3" -or
+            "fnvxr-retail-props/v4" -or
         [string]$retailPropPreparation.coordinateBasis -cne
             "openxr-grip-minus-z" -or
         [string]$retailPropPreparation.rightHandPose -cne
-            "1hphandgrip1@end") {
+            "_1stperson/1hphandgrip1@end") {
         throw "Installed retail prop preparation returned an invalid hand/socket contract."
     }
 }
@@ -2038,7 +2038,7 @@ function ConvertTo-FnvxrProductStereoOutputProof {
         return $null
     }
 
-    $transport = if ($cpuProof) { "cpu-engine-v8" } else { "gpu-v5" }
+    $transport = if ($cpuProof) { "cpu-engine-v8" } else { "gpu-v6" }
     $transaction = if ($cpuProof) {
         [uint64]$Frame.cpuEngineTransaction
     } else {
@@ -2111,6 +2111,10 @@ function Get-FnvxrProductControllerAuthorizationProof {
         if ([bool]$frame.physicalHeadsetPlayRequested -and
             [bool]$frame.controllerConsumerAcknowledged -and
             [bool]$frame.controllerMutationAuthorized -and
+            [bool]$frame.spatialPropsSourcePoseMatched -and
+            [uint64]$frame.spatialPropsPoseSequence -ne 0 -and
+            [uint64]$frame.spatialPropsPoseSequence -eq
+                [uint64]$frame.sourcePoseSequence -and
             [string]$frame.controllerMode -in @("ui", "gameplay")) {
             return [ordered]@{
                 frame = [uint64]$frame.frame
@@ -2120,6 +2124,9 @@ function Get-FnvxrProductControllerAuthorizationProof {
                     [uint64]$frame.controllerRuntimeStateSample
                 consumerAcknowledged = $true
                 mutationAuthorized = $true
+                spatialPropsSourcePoseMatched = $true
+                spatialPropsPoseSequence =
+                    [uint64]$frame.spatialPropsPoseSequence
                 observedAtUtc = [DateTime]::UtcNow.ToString("o")
             }
         }
@@ -2142,6 +2149,9 @@ function Get-FnvxrProductPhysicalDisplayOutputProof {
     foreach ($line in $lines) {
         $jsonStart = $line.IndexOf('{"event":"fnvxrRetailEngineCenterCpu')
         if ($jsonStart -lt 0) {
+            $jsonStart = $line.IndexOf('{"event":"fnvxrRetailEngineGpuFrame"')
+        }
+        if ($jsonStart -lt 0) {
             continue
         }
         try {
@@ -2153,7 +2163,11 @@ function Get-FnvxrProductPhysicalDisplayOutputProof {
         # The world eye targets are created from the actual retail backbuffer.
         # A fixed-size menu transport is not proof of the gameplay source
         # resolution, even when it happens to share the same dimensions.
-        if ([string]$frame.event -cne
+        $gpuWorld = [string]$frame.event -ceq "fnvxrRetailEngineGpuFrame" -and
+            [bool]$frame.gpuSubmitted -and [uint32]$frame.mode -eq 1 -and
+            ([uint32]$frame.renderFlags -band 1) -ne 0 -and
+            [uint32]$frame.cpuEyeReadbacks -eq 0
+        if (-not $gpuWorld -and [string]$frame.event -cne
             "fnvxrRetailEngineCenterCpuStereo") {
             continue
         }
@@ -2425,9 +2439,12 @@ function Get-FnvxrProductPipBoyOutputProof {
             [bool]$frame.leftPipBoyScreenCalibrationValid -and
             [bool]$frame.pipBoySpatialScreenVisible -and
             -not [bool]$frame.uiQuadVisible -and
-            [bool]$frame.cpuEngineStereoActive -and
-            [string]$frame.cpuPresentationMode -ceq "gameplay" -and
-            [uint32]$frame.cpuEngineProducerMode -eq 4 -and
+            (([bool]$frame.stereoVisualTrialActive -and
+                [bool]$frame.gpuV5RuntimeLineage -and
+                [bool]$frame.gpuV5ExactSourceView) -or
+             ([bool]$frame.cpuEngineStereoActive -and
+                [string]$frame.cpuPresentationMode -ceq "gameplay" -and
+                [uint32]$frame.cpuEngineProducerMode -eq 4)) -and
             [uint64]$frame.sourceRenderPairSequence -gt 0 -and
             [uint32]$frame.sourcePoseSequence -gt 0 -and
             [bool]$frame.runtimeShouldRender -and
@@ -2455,7 +2472,9 @@ function Get-FnvxrProductPipBoyOutputProof {
                     [uint64]$frame.leftPipBoyScreenCalibrationCommit
                 pipBoySpatialScreenVisible = $true
                 menuBits = [uint32]$frame.runtimeMenuBits
-                transaction = [uint64]$frame.cpuEngineTransaction
+                transaction = if ([bool]$frame.stereoVisualTrialActive) {
+                    [uint64]$frame.gpuV5Transaction
+                } else { [uint64]$frame.cpuEngineTransaction }
                 poseSequence = [uint32]$frame.sourcePoseSequence
                 leftOutputHash = [string]$frame.leftOutputHash
                 rightOutputHash = [string]$frame.rightOutputHash
@@ -3151,13 +3170,17 @@ try {
             } else {
                 $null
             }
-            leftForearm = if (($environment.Keys -ccontains
+            forearms = if (($environment.Keys -ccontains
                         "FNVXR_RETAIL_LEFT_FOREARM_MESH_PATH") -and
+                    ($environment.Keys -ccontains
+                        "FNVXR_RETAIL_RIGHT_FOREARM_MESH_PATH") -and
                     ($environment.Keys -ccontains
                         "FNVXR_RETAIL_LEFT_FOREARM_TEXTURE_PATH")) {
                 [ordered]@{
-                    mesh = Get-FnvxrProductFileIdentity `
+                    leftMesh = Get-FnvxrProductFileIdentity `
                         -Path ([string]$environment.FNVXR_RETAIL_LEFT_FOREARM_MESH_PATH)
+                    rightMesh = Get-FnvxrProductFileIdentity `
+                        -Path ([string]$environment.FNVXR_RETAIL_RIGHT_FOREARM_MESH_PATH)
                     diffuseTexture = Get-FnvxrProductFileIdentity `
                         -Path ([string]$environment.FNVXR_RETAIL_LEFT_FOREARM_TEXTURE_PATH)
                 }
@@ -3401,7 +3424,7 @@ try {
     if (-not (Wait-FnvxrProductLogPattern `
         -Process $fallout `
         -LogPath $retailVrLog `
-        -Pattern "retail VR bridge initialized: exact AccumulateScene callsite hook, ordinary-D3D9 CPU-v8 stereo transport, and deferred Present bootstrap ready" `
+        -Pattern "retail VR bridge initialized: exact AccumulateScene callsite hook, D3D9On12 GPU-v6 world/UI transport, and deferred Present bootstrap ready" `
         -TimeoutSeconds 15)) {
         throw "The exact D3D9 module loaded, but its ordinary-D3D9 retail VR bridge never initialized. See $retailVrLog"
     }
@@ -4061,7 +4084,7 @@ try {
     } else {
         $manifest.state = "ready-and-supervised"
         Write-FnvxrProductJsonAtomic -Value $manifest -Path $manifestPath
-        Write-SupervisorLog "retail runtime, pose, exact modules, and the CPU-v8 engine bridge are live; waiting for proven binocular headset output"
+        Write-SupervisorLog "retail runtime, pose, exact modules, and the GPU-v6 engine bridge are live; waiting for proven binocular headset output"
 
     $deadline = [DateTime]::UtcNow.AddSeconds($MaximumRunSeconds)
     $healthFailures = 0

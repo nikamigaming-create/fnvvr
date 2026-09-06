@@ -36,7 +36,7 @@ bool sameDescriptorPayload(
         && left.resourceSetId == right.resourceSetId
         && left.producerEpoch == right.producerEpoch
         && left.producerProcessId == right.producerProcessId
-        && left.reserved == right.reserved
+        && left.renderFlags == right.renderFlags
         && left.adapterLuid == right.adapterLuid
         && left.transactionId == right.transactionId
         && left.sourceFrame == right.sourceFrame
@@ -73,6 +73,7 @@ ConsumerFrame makeFrame(const Descriptor& value) noexcept
     frame.renderedDisplayTime = value.renderedDisplayTime;
     frame.readySequence = value.gpuReadySequence;
     frame.releaseSequence = value.gpuConsumerReleaseSequence;
+    frame.renderFlags = value.renderFlags;
     return frame;
 }
 
@@ -90,6 +91,7 @@ bool samePublishedFrame(
         && value.poseSequence == frame.poseSequence
         && value.runtimeStateSample == frame.runtimeStateSample
         && value.renderedDisplayTime == frame.renderedDisplayTime
+        && value.renderFlags == frame.renderFlags
         && value.gpuReadySequence == frame.readySequence
         && value.gpuConsumerReleaseSequence == frame.releaseSequence;
 }
@@ -338,7 +340,7 @@ ConsumeResult Consumer::consume(const Descriptor* shared) noexcept
 struct Win32Consumer::Implementation final
 {
     static constexpr wchar_t DefaultMappingName[] =
-        L"Local\\FNVXR_GPU_StereoColor_v5";
+        L"Local\\FNVXR_GPU_Frames_v6";
     static constexpr std::size_t MappingNameCapacity = 128u;
 
     ID3D11Device* device = nullptr;
@@ -347,6 +349,8 @@ struct Win32Consumer::Implementation final
     ID3D11DeviceContext4* context4 = nullptr;
     HANDLE mappingHandle = nullptr;
     const Descriptor* shared = nullptr;
+    const Descriptor* mappingBase = nullptr;
+    gpu::color_v5::FrameChannel channel = gpu::color_v5::FrameChannel::World;
     HANDLE producerProcess = nullptr;
     ID3D11Texture2D* sharedTextures[2] { nullptr, nullptr };
     ID3D11Fence* sharedFence = nullptr;
@@ -382,7 +386,8 @@ struct Win32Consumer::Implementation final
     {
         if (shared)
         {
-            UnmapViewOfFile(shared);
+            UnmapViewOfFile(mappingBase);
+            mappingBase = nullptr;
             shared = nullptr;
         }
         if (mappingHandle)
@@ -442,8 +447,12 @@ struct Win32Consumer::Implementation final
         return true;
     }
 
-    bool initialize(ID3D11Device* source, const wchar_t* name) noexcept
+    bool initialize(ID3D11Device* source, const wchar_t* name,
+        gpu::color_v5::FrameChannel selectedChannel) noexcept
     {
+        if (static_cast<std::size_t>(selectedChannel) >= gpu::color_v5::FrameChannelCount)
+            return reject(Win32ConsumerFailure::InvalidDevice);
+        channel = selectedChannel;
         if (!source || !copyMappingName(name))
             return reject(Win32ConsumerFailure::InvalidDevice);
         source->AddRef();
@@ -495,12 +504,13 @@ struct Win32Consumer::Implementation final
         mappingHandle = OpenFileMappingW(FILE_MAP_READ, FALSE, mappingName);
         if (!mappingHandle)
             return reject(Win32ConsumerFailure::MappingUnavailable);
-        shared = static_cast<const Descriptor*>(MapViewOfFile(
+        mappingBase = static_cast<const Descriptor*>(MapViewOfFile(
             mappingHandle,
             FILE_MAP_READ,
             0u,
             0u,
-            sizeof(Descriptor)));
+            sizeof(Descriptor) * gpu::color_v5::FrameChannelCount));
+        shared = mappingBase ? &mappingBase[static_cast<std::size_t>(channel)] : nullptr;
         if (!shared)
         {
             releaseMapping();
@@ -837,7 +847,8 @@ Win32Consumer::~Win32Consumer() noexcept
 
 bool Win32Consumer::initialize(
     ID3D11Device* device,
-    const wchar_t* mappingName) noexcept
+    const wchar_t* mappingName,
+    gpu::color_v5::FrameChannel channel) noexcept
 {
     reset();
     mImplementation = new (std::nothrow) Implementation;
@@ -846,7 +857,7 @@ bool Win32Consumer::initialize(
         mFailure = Win32ConsumerFailure::InvalidDevice;
         return false;
     }
-    if (!mImplementation->initialize(device, mappingName))
+    if (!mImplementation->initialize(device, mappingName, channel))
     {
         mFailure = mImplementation->failure;
         delete mImplementation;

@@ -38,6 +38,10 @@ struct WristPlane final
 [[nodiscard]] kernel::Pose toKernelPose(const XrPosef& pose) noexcept;
 [[nodiscard]] XrPosef toOpenXrPose(const kernel::Pose& pose) noexcept;
 
+// The mesh and IK endpoint must use this same grip-local wrist socket.
+[[nodiscard]] XrPosef handAttachmentPose(
+    const XrPosef& grip, const XrVector3f& localOffset) noexcept;
+
 [[nodiscard]] BodyRig solveBodyRig(
     const XrPosef& head,
     bool headTracked,

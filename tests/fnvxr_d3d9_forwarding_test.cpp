@@ -2,6 +2,7 @@
 
 #include <windows.h>
 #include <d3d9.h>
+#include <d3d9on12.h>
 
 #include <cstdlib>
 #include <cstring>
@@ -149,6 +150,27 @@ int main(int argc, char** argv)
             directSystemEx->Release();
         if (!resultsMatch || !exInterfacesMatch)
             return fail("fused Direct3DCreate9Ex was not a transparent system forward");
+    }
+
+    // Exercise the actual x86 export with the SDK's three-argument stdcall
+    // type. A wrong @16 decoration or HRESULT/out-pointer ABI corrupts this
+    // call even though ordinary Direct3DCreate9 forwarding still works.
+    const auto proxyOn12 = reinterpret_cast<PFN_Direct3DCreate9On12>(
+        GetProcAddress(proxyD3D9, "Direct3DCreate9On12"));
+    const auto systemOn12 = reinterpret_cast<PFN_Direct3DCreate9On12>(
+        GetProcAddress(systemD3D9, "Direct3DCreate9On12"));
+    if (systemOn12)
+    {
+        if (!proxyOn12) return fail("Direct3DCreate9On12 export missing");
+        D3D9ON12_ARGS args {};
+        args.Enable9On12 = TRUE;
+        auto* throughOn12 = proxyOn12(D3D_SDK_VERSION, &args, 1);
+        auto* directOn12 = systemOn12(D3D_SDK_VERSION, &args, 1);
+        const bool matches = (throughOn12 != nullptr) == (directOn12 != nullptr)
+            && (!throughOn12 || interfaceOwner(throughOn12) == interfaceOwner(directOn12));
+        if (throughOn12) throughOn12->Release();
+        if (directOn12) directOn12->Release();
+        if (!matches) return fail("9on12 factory did not preserve the SDK ABI");
     }
 
     const FileSnapshot logAfter = snapshotFile(logPath);

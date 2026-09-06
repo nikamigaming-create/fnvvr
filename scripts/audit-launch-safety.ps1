@@ -39,8 +39,8 @@ function Require-Text {
         [string]$Reason
     )
 
-    $content = Get-Content -LiteralPath $Path -Raw
-    if (-not $content.Contains($Text)) {
+    $content = (Get-Content -LiteralPath $Path -Raw).Replace("`r`n", "`n")
+    if (-not $content.Contains($Text.Replace("`r`n", "`n"))) {
         throw "Missing required launch safety text in $Path`: $Reason"
     }
 }
@@ -52,8 +52,8 @@ function Forbid-Text {
         [string]$Reason
     )
 
-    $content = Get-Content -LiteralPath $Path -Raw
-    if ($content.Contains($Text)) {
+    $content = (Get-Content -LiteralPath $Path -Raw).Replace("`r`n", "`n")
+    if ($content.Contains($Text.Replace("`r`n", "`n"))) {
         throw "Forbidden launch safety text found in $Path`: $Reason"
     }
 }
@@ -1055,7 +1055,7 @@ Require-Text -Path $d3d9ActivationCode -Text 'static_assert(!CompiledInterpositi
 Require-Text -Path $d3d9ActivationCode -Text 'static_assert(!CompiledRetailVrBridgePolicy.exBackedGameDevice);' -Reason "The exact-retail route must preserve Fallout's ordinary D3D9 device"
 Require-Text -Path $d3d9ActivationCode -Text 'static_assert(CompiledRetailVrBridgePolicy.leaseNativePresentSlot);' -Reason "The exact-retail route must explicitly authorize its isolated deferred-startup/UI Present lease"
 Require-Text -Path $d3d9ActivationCode -Text 'static_assert(!CompiledRetailVrBridgePolicy.replaceD3D9DeviceVtablePointer);' -Reason "The narrow Present lease must never authorize whole-vtable replacement"
-Require-Text -Path $d3d9ActivationCode -Text 'static_assert(CompiledRetailVrBridgePolicy.cpuImageTransfer);' -Reason "The exact-retail route must explicitly authorize its bounded engine-eye readback transport"
+Require-Text -Path $d3d9ActivationCode -Text 'static_assert(CompiledRetailVrBridgePolicy.gpuImageTransfer);' -Reason "The exact-retail route must explicitly authorize its GPU eye transport"
 Require-Text -Path $d3d9ActivationCode -Text 'static_assert(!CompiledInterpositionPolicy.accessSharedMappings);' -Reason "The checked-in D3D9 proxy policy must forbid shared mappings"
 Require-Text -Path $d3d9ActivationCode -Text 'static_assert(!CompiledInterpositionPolicy.captureOrCpuReadback);' -Reason "The checked-in D3D9 proxy policy must forbid capture/readback"
 Require-Text -Path $d3d9ActivationCode -Text 'static_assert(!CompiledInterpositionPolicy.perFrameLogging);' -Reason "The checked-in D3D9 proxy policy must forbid frame logging"

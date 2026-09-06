@@ -54,6 +54,7 @@ struct ConsumerFrame
     std::int64_t renderedDisplayTime = 0;
     std::uint64_t readySequence = 0u;
     std::uint64_t releaseSequence = 0u;
+    std::uint32_t renderFlags = 0u;
 };
 
 struct ConsumeResult
@@ -169,7 +170,8 @@ public:
 
     bool initialize(
         ID3D11Device* device,
-        const wchar_t* mappingName = nullptr) noexcept;
+        const wchar_t* mappingName = nullptr,
+        gpu::color_v5::FrameChannel channel = gpu::color_v5::FrameChannel::World) noexcept;
     void reset() noexcept;
     bool ready() const noexcept;
     ConsumeResult consume() noexcept;

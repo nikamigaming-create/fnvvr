@@ -80,7 +80,8 @@ kp::PresentationInput ProductKernelAdapter::translate(
         input.stereo.independentRotational6Dof,
         input.stereo.authoritativeTrackedRetailWeapon,
         input.stereo.authoritativeMuzzleAlignment,
-        input.stereo.gameplayHudExcluded };
+        input.stereo.gameplayHudExcluded,
+        input.stereo.retailRenderTransactionComplete };
     translated.world.completeStereoPair = input.stereo.colorPairComplete;
     translated.world.distinctEyeViews = input.stereo.distinctBinocularViews;
     translated.world.runtimeLineageVerified =
@@ -122,7 +123,8 @@ product::PresentationDecision ProductKernelAdapter::translate(
     {
         translated.mode = product::PresentationMode::WorldStereo;
         translated.reason = product::DecisionReason::StereoWorldReady;
-        translated.gameplayVrAccepted = true;
+        translated.stereoPresentationReady = true;
+        translated.gameplayVrAccepted = input.stereo.completeForWorldStereo();
         translated.spatialRigMayRender = decision.spatialRigMayRender;
         translated.wristScreenMayRender = decision.wristScreenMayRender;
         translated.presentedSourceEpoch = decision.selectedSource.epoch;

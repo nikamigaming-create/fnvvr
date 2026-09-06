@@ -8,7 +8,7 @@ namespace fnvxr::d3d9::color_transport
 namespace
 {
 constexpr char DefaultProducerMutexName[] =
-    "Local\\FNVXR_GPU_StereoColor_v5_Producer";
+    "Local\\FNVXR_GPU_Frames_v6_Producer";
 volatile LONG ProcessPublisherClaimed = 0;
 }
 
@@ -70,7 +70,7 @@ bool Win32Publisher::initialize(
         nullptr,
         PAGE_READWRITE,
         0u,
-        sizeof(gpu::color_v5::SharedStereoColorDescriptor),
+        sizeof(gpu::color_v5::SharedStereoColorDescriptor) * gpu::color_v5::FrameChannelCount,
         selectedMapping);
     if (!mMapping)
     {
@@ -86,7 +86,7 @@ bool Win32Publisher::initialize(
             FILE_MAP_ALL_ACCESS,
             0u,
             0u,
-            sizeof(gpu::color_v5::SharedStereoColorDescriptor)));
+            sizeof(gpu::color_v5::SharedStereoColorDescriptor) * gpu::color_v5::FrameChannelCount));
     if (!mDescriptor)
     {
         const Win32PublisherFailure failure =
@@ -102,8 +102,9 @@ bool Win32Publisher::initialize(
     std::memset(
         static_cast<void*>(mDescriptor),
         0,
-        sizeof(*mDescriptor));
-    new (mDescriptor) gpu::color_v5::SharedStereoColorDescriptor {};
+        sizeof(*mDescriptor) * gpu::color_v5::FrameChannelCount);
+    for (std::size_t channel = 0; channel != gpu::color_v5::FrameChannelCount; ++channel)
+        new (&mDescriptor[channel]) gpu::color_v5::SharedStereoColorDescriptor {};
     mFailure = Win32PublisherFailure::None;
     return true;
 }
@@ -125,6 +126,7 @@ void Win32Publisher::reset() noexcept
     mDescriptor = nullptr;
     mOwnsProducerLease = false;
     mOwnsProcessClaim = false;
+    mLastPublishedChannel = 0;
     mFailure = Win32PublisherFailure::NotInitialized;
 }
 
@@ -153,12 +155,15 @@ bool Win32Publisher::publish(
         mFailure = Win32PublisherFailure::InvalidPublication;
         return false;
     }
+    const std::size_t channel = publication.payload.presentationMode
+        == gpu::color_v5::PresentationMode::MonoUiQuad ? 1u : 0u;
     const bool published = gpu::color_v5::publish(
-        mDescriptor,
+        &mDescriptor[channel],
         [&publication](gpu::color_v5::SharedStereoColorPayload& payload) {
             payload = publication.payload;
             return true;
         });
+    if (published) mLastPublishedChannel = channel;
     mFailure = published
         ? Win32PublisherFailure::None
         : Win32PublisherFailure::SharedPublicationRejected;
@@ -173,6 +178,6 @@ Win32PublisherFailure Win32Publisher::failure() const noexcept
 const gpu::color_v5::SharedStereoColorDescriptor*
 Win32Publisher::descriptor() const noexcept
 {
-    return mDescriptor;
+    return mDescriptor ? &mDescriptor[mLastPublishedChannel] : nullptr;
 }
 }

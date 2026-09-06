@@ -58,7 +58,7 @@ foreach(required IN ITEMS
         "policy.retailWorldHookOnly"
         "!policy.replaceD3D9DeviceVtablePointer"
         "policy.leaseNativePresentSlot"
-        "policy.cpuImageTransfer"
+        "policy.gpuImageTransfer"
         "!policy.legacyDrawReplay"
         "request.exactProfileMatched"
         "request.engineCenterStereoRequested"
@@ -97,8 +97,8 @@ require_text(
     "The early D3D bootstrap must verify the exact loaded retail PE")
 require_text(
     "${proxy_source}"
-    "IDirect3D9* real = gRealDirect3DCreate9(sdkVersion);"
-    "Retail startup must preserve Fallout's ordinary D3D9 enumerator")
+    "IDirect3D9* real = nullptr;"
+    "Retail startup must retain the ordinary IDirect3D9 API")
 require_text(
     "${proxy_source}"
     "#include \"fnvxr_retail_vr_bridge_win32.h\""
@@ -152,7 +152,7 @@ string(FIND "${create9_body}" "if (!currentExecutableIsFalloutNv())" create9_non
 string(FIND "${create9_body}" "assessGameD3D9Bootstrap(" create9_authority_at)
 string(FIND "${create9_body}" "if (!bootstrap.authorized())" create9_complete_at)
 string(FIND "${create9_body}" "authorizeCurrentRetailRuntimeAtDecisionPoint()" create9_mutation_authority_at)
-string(FIND "${create9_body}" "IDirect3D9* real = gRealDirect3DCreate9(sdkVersion);" create9_ordinary_at)
+string(FIND "${create9_body}" "IDirect3D9* real = nullptr;" create9_ordinary_at)
 string(FIND "${create9_body}" "new (std::nothrow) Direct3D9Proxy" create9_wrap_at)
 if(create9_nonretail_at EQUAL -1
     OR create9_authority_at EQUAL -1
@@ -214,24 +214,16 @@ if(create_device_at GREATER present_bootstrap_at
 endif()
 require_text(
     "${proxy_source}"
-    "header->producerMode =\n        fnvxr::shared::StereoProducerEngineCenter;"
-    "The isolated CPU publisher must identify the exact engine-center producer")
+    "operations.prepareColorProducer = &prepareRetailVrColorProducer;"
+    "The retail bridge must prepare GPU resources")
 require_text(
     "${proxy_source}"
-    "device->GetRenderTargetData(\n        gLeftEyeSurface"
-    "The ordinary-D3D9 bridge must read back the private left eye")
+    "operations.produceColorPair = &produceRetailVrColorPair;"
+    "The retail bridge must select the GPU pair publisher")
 require_text(
     "${proxy_source}"
-    "operations.publishCpuPair = &publishRetailVrCpuPair;"
-    "The retail bridge must select the isolated CPU pair publisher")
-require_text(
-    "${proxy_source}"
-    "fnvxrRetailEngineCenterFrame"
-    "Engine-center acceptance must receive an exact completed-render transaction event")
-require_text(
-    "${proxy_source}"
-    "fnvxrRetailEngineCenterCpuStereo"
-    "Engine-center acceptance must receive a source-pixel event from the CPU pair publisher")
+    "fnvxrRetailEngineGpuFrame"
+    "GPU submission must retain its source transaction identity")
 
 # The verifier treats source order as part of the transaction proof: the CPU
 # pixels are logged by publishCpuPair during the in-scope post-stock-render
@@ -253,21 +245,6 @@ if(adapter_stage_at EQUAL -1
     message(FATAL_ERROR
         "The engine-center transaction must stage before stock render and emit completion only after deferred dispatch returns")
 endif()
-extract_region(
-    cpu_pair_publisher_body
-    "${proxy_source}"
-    "bool publishRetailVrCpuPair("
-    "void publishSharedStereoInvalid(bool uiActive, const char* reason)\n{")
-string(FIND "${cpu_pair_publisher_body}" "fnvxrRetailEngineCenterCpuStereo" cpu_pair_event_at)
-if(cpu_pair_event_at EQUAL -1)
-    message(FATAL_ERROR
-        "The publishCpuPair callback must emit the source-pixel lineage event")
-endif()
-require_text(
-    "${cpu_pair_publisher_body}"
-    [[\"publicationGeneration\":\"%llu\"]]
-    "The engine-center CPU event must carry the exact nonzero 64-bit publication identity")
-
 extract_region(
     create9ex_body
     "${proxy_source}"

@@ -12455,8 +12455,9 @@ void recoverFocusLossPause(UInt64 frame, UInt32 menuBits, RuntimePhase phase)
     // already-completed, owned headset-demo fixture: retail itself creates a
     // StartMenu pause as soon as its hidden process loses foreground after a
     // verified load. This path never repairs focus or sends input; it can
-    // issue one fixed in-engine CloseAllMenus command only after the exact
-    // gameplay-to-StartMenu transition has been observed.
+    // issue one fixed in-engine CloseAllMenus command per observed
+    // gameplay-to-StartMenu transition. A second focus-loss pause must not
+    // strand the owned fixture. Physical play does not use this exception.
     const bool ownedHeadsetFixtureRecovery =
         headsetDemoFixtureProfileSelected()
         && retailFixtureAutomationRequested()
@@ -12497,6 +12498,7 @@ void recoverFocusLossPause(UInt64 frame, UInt32 menuBits, RuntimePhase phase)
     {
         focusLossArmed = true;
         lastCloseAttemptFrame = 0;
+        ownedFixtureCloseAttempts = 0u;
         logTelemetry(
             "focusLossPause armed frame=%llu previousBits=0x%02lx ownedFixture=%d\n",
             static_cast<unsigned long long>(frame),

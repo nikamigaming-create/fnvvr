@@ -160,6 +160,10 @@ int main()
             "producer output is not valid ABI-v5 color metadata");
 
         state.calls.clear();
+        require(!producer.available()
+                && state.calls == std::vector<Call> { Call::Release },
+            "render admission must reject an owned pair without queueing GPU work");
+        state.calls.clear();
         const ProducerPublication busy = producer.produce(frame(0x501u));
         require(!busy.complete
                 && busy.failure == ProducerFailure::ConsumerReleasePending
@@ -167,6 +171,7 @@ int main()
             "an unreleased resource set was overwritten");
 
         state.completedFence = 2u;
+        require(producer.available(), "consumer release did not reopen render admission");
         state.calls.clear();
         const ProducerPublication second = producer.produce(frame(0x601u));
         require(second.complete

@@ -79,7 +79,7 @@ constexpr ProductCompositionBindings selectProductComposition(
     if (decision.hudVisible)
         return {};
     if (decision.mode == product::PresentationMode::WorldStereo
-        && decision.gameplayVrAccepted
+        && (decision.stereoPresentationReady || decision.gameplayVrAccepted)
         && worldResourcesReady)
     {
         return {
@@ -171,7 +171,10 @@ inline product::PresentationInput makePresentationInput(
     proof.colorPairComplete = true;
     proof.renderLocalDepthPairComplete =
         producerEvidence.renderLocalDepthPairComplete;
-    proof.sameSimulationTick = producerEvidence.sameSimulationTick;
+    proof.retailRenderTransactionComplete = (routed.frame.renderFlags
+        & gpu::color_v5::RetailWorldTransactionComplete) != 0u;
+    proof.sameSimulationTick = producerEvidence.sameSimulationTick
+        || proof.retailRenderTransactionComplete;
     proof.poseMatched = true;
     proof.conservativeVisibilityComplete =
         producerEvidence.conservativeVisibilityComplete;

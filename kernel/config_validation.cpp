@@ -77,7 +77,7 @@ ConfigValidationResult validateRuntimeConfig(const RuntimeConfig& candidate) noe
     if (performance.poseHistoryCapacity != 128)
         return { ConfigError::InvalidPoseHistoryCapacity, candidate };
     const float frameBudget = 1000.0F / static_cast<float>(performance.targetRefreshHz);
-    if (!finiteInRange(performance.maximumPoseAgeMilliseconds, 0.1F, frameBudget))
+    if (!finiteInRange(performance.maximumPoseAgeMilliseconds, 0.1F, frameBudget * 3.0F))
         return { ConfigError::InvalidPoseAge, candidate };
     if (!finiteInRange(
             performance.maximumCpuPoseAgeMilliseconds, 1.0F, 250.0F))

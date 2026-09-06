@@ -102,8 +102,24 @@ int main()
         return fail("complete newer world did not cross the kernel adapter");
     }
     const auto replay = adapter.advance(world(11), transport(11), true, false);
-    if (replay.mode != fnvxr::product::PresentationMode::SafetyBlank)
-        return fail("replayed world identity crossed the kernel adapter");
+    if (replay.mode != fnvxr::product::PresentationMode::WorldStereo)
+        return fail("a still-fresh exact source frame blanked between producer frames");
+    auto expired = world(11);
+    expired.stereo.fresh = false;
+    if (adapter.advance(expired, transport(11), true, false).mode
+        != fnvxr::product::PresentationMode::SafetyBlank)
+        return fail("expired retained world remained visible");
+
+    adapter.reset();
+    auto renderable = world(12);
+    renderable.stereo.authoritativeTrackedRetailWeapon = false;
+    renderable.stereo.authoritativeMuzzleAlignment = false;
+    renderable.stereo.retailRenderTransactionComplete = true;
+    const auto partial = adapter.advance(renderable, transport(12), true, false);
+    if (partial.mode != fnvxr::product::PresentationMode::WorldStereo
+        || !partial.stereoPresentationReady || !partial.spatialRigMayRender
+        || partial.gameplayVrAccepted)
+        return fail("render readiness was conflated with full weapon acceptance");
 
     adapter.reset();
     auto pipBoy = world(12);

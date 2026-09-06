@@ -2485,7 +2485,12 @@ function Get-FnvxrProductMinimalEnvironment {
         # transaction. The host-owned tracked categories above replace the
         # unstable arm/hand/Pip-Boy collector roots and spatialize the live
         # retail screen crop directly on the opposite wrist.
-        $environment.FNVXR_LIVE_PIPBOY_FOCUS_FRAMES = "12"
+        $environment.FNVXR_LIVE_PIPBOY_FOCUS_FRAMES = "6"
+        $environment.FNVXR_LIVE_PIPBOY_FOCUS_HIT_SCALE_X = "2.6"
+        $environment.FNVXR_LIVE_PIPBOY_FOCUS_HIT_SCALE_Y = "2.4"
+        $environment.FNVXR_LIVE_PIPBOY_MAX_MEAN_LUMA = "75"
+        $environment.FNVXR_LIVE_PIPBOY_UI_WARMUP_UPLOADS = "2"
+        $environment.FNVXR_SHOW_PIPBOY_POINTER = "1"
         $environment.FNVXR_WEAPON_ORBIT_GRIP_THRESHOLD = "0.55"
         $environment.FNVXR_WEAPON_ORBIT_DEADZONE = "0.35"
         $environment.FNVXR_UI_SHARED_WIDTH = "1280"
@@ -2536,6 +2541,7 @@ function Get-FnvxrProductMinimalEnvironment {
         $environment.FNVXR_SHOW_RIGHT_AIM_RAY = "0"
         $environment.FNVXR_DEBUG_AXES = "0"
         $environment.FNVXR_DEBUG_LEFT_AXES = "0"
+        $environment.FNVXR_STEREO_MAX_SOURCE_POSE_AGE_MS = "33"
         # Physical pipboyscreen:0 width (5.872956 retail units / 70 units per
         # meter). Runtime placement comes from the stock left-hand-to-screen
         # transform published through WeaponFrame v3; offsets below are only
@@ -2568,6 +2574,9 @@ function Get-FnvxrProductMinimalEnvironment {
         $retailLeftForearmMesh = Join-Path `
             $retailHandAssetRoot `
             "left-forearm.fhm"
+        $retailRightForearmMesh = Join-Path `
+            $retailHandAssetRoot `
+            "right-forearm.fhm"
         $retailLeftForearmTexture = Join-Path `
             $retailHandAssetRoot `
             "UpperBodyMale.dds"
@@ -2601,9 +2610,12 @@ function Get-FnvxrProductMinimalEnvironment {
                     [System.IO.Path]::GetFullPath($retailHandTexture)
             }
             if ((Test-Path -LiteralPath $retailLeftForearmMesh -PathType Leaf) -and
+                (Test-Path -LiteralPath $retailRightForearmMesh -PathType Leaf) -and
                 (Test-Path -LiteralPath $retailLeftForearmTexture -PathType Leaf)) {
                 $environment.FNVXR_RETAIL_LEFT_FOREARM_MESH_PATH =
                     [System.IO.Path]::GetFullPath($retailLeftForearmMesh)
+                $environment.FNVXR_RETAIL_RIGHT_FOREARM_MESH_PATH =
+                    [System.IO.Path]::GetFullPath($retailRightForearmMesh)
                 $environment.FNVXR_RETAIL_LEFT_FOREARM_TEXTURE_PATH =
                     [System.IO.Path]::GetFullPath($retailLeftForearmTexture)
             }

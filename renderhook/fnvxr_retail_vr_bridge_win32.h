@@ -983,11 +983,14 @@ public:
         identity.producerEpoch = tracked.pose.producerEpoch;
         identity.producerProcessId = GetCurrentProcessId();
         identity.transactionId = transactionId;
-        identity.sourceFrame = tracked.pose.frame;
+        identity.sourceFrame = transactionId;
         identity.poseSequence =
             shared::sequencedValueBits(tracked.poseSequence);
         identity.runtimeStateSample = tracked.runtime.frame;
         identity.renderedDisplayTime = tracked.pose.predictedDisplayTime;
+        identity.renderFlags = gpu::color_v5::RetailMenuCaptured;
+        if ((tracked.runtime.menuBits & shared::RuntimePipBoyMenuBit) != 0u)
+            identity.renderFlags |= gpu::color_v5::LivePipBoyCaptured;
         return produceAndPublish(identity);
     }
 
@@ -1957,11 +1960,12 @@ private:
         identity.producerEpoch = pending.tracked.pose.producerEpoch;
         identity.producerProcessId = GetCurrentProcessId();
         identity.transactionId = pending.transactionId;
-        identity.sourceFrame = pending.tracked.pose.frame;
+        identity.sourceFrame = pending.transactionId;
         identity.poseSequence = shared::sequencedValueBits(
             pending.tracked.poseSequence);
         identity.runtimeStateSample = pending.tracked.runtime.frame;
         identity.renderedDisplayTime = pending.tracked.pose.predictedDisplayTime;
+        identity.renderFlags = gpu::color_v5::RetailWorldTransactionComplete;
         return produceAndPublish(identity);
     }
 
@@ -2275,13 +2279,15 @@ private:
             mOperations.produceColorPair(
                 mOperations.context,
                 identity);
+        auto& releasePendingSince = mReleasePendingSince[
+            identity.presentationMode == gpu::color_v5::PresentationMode::MonoUiQuad ? 1u : 0u];
         if (publication.failure
                 == color_transport::ProducerFailure::ConsumerReleasePending)
         {
             const ULONGLONG now = GetTickCount64();
-            if (mReleasePendingSince == 0u)
-                mReleasePendingSince = now;
-            if (now - mReleasePendingSince >= 500u)
+            if (releasePendingSince == 0u)
+                releasePendingSince = now;
+            if (now - releasePendingSince >= 500u)
             {
                 ++mResourceSetId;
                 if (mResourceSetId == 0u)
@@ -2289,11 +2295,11 @@ private:
                 static_cast<void>(mOperations.prepareColorProducer(
                     mOperations.context,
                     mResourceSetId));
-                mReleasePendingSince = 0u;
+                mReleasePendingSince[0] = mReleasePendingSince[1] = 0u;
             }
             return false;
         }
-        mReleasePendingSince = 0u;
+        releasePendingSince = 0u;
         return mPublisher.publish(publication);
     }
 
@@ -2311,7 +2317,7 @@ private:
     engine::RetailFirstPersonRelayAddresses mFirstPersonRelays {};
     std::uint64_t mResourceSetId = 0u;
     RetailV5PublicationSequence mPublicationSequence {};
-    ULONGLONG mReleasePendingSince = 0u;
+    ULONGLONG mReleasePendingSince[2] {};
     RetailVrBridgeFrameDiagnostics mFrameDiagnostics {};
     RetailVrBridgeFailure mFailure =
         RetailVrBridgeFailure::UnsupportedArchitecture;

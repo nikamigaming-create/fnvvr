@@ -62,7 +62,7 @@ inline constexpr InterpositionPolicy CompiledInterpositionPolicy =
 // This is separate from the retired replay interposer above. It describes
 // the narrow exact-retail route: Fallout's ordinary D3D9 device, one
 // authorized RenderWorldSceneGraph detour, engine-owned eye rendering, a
-// bounded CPU readback transport, and a single leased Present slot used to
+// GPU shared-texture transport, and a single leased Present slot used to
 // finish deferred startup. It never authorizes the retained draw-hook set.
 struct RetailVrBridgePolicy
 {
@@ -72,7 +72,7 @@ struct RetailVrBridgePolicy
     bool retailWorldHookOnly = true;
     bool replaceD3D9DeviceVtablePointer = false;
     bool leaseNativePresentSlot = false;
-    bool cpuImageTransfer = false;
+    bool gpuImageTransfer = false;
     bool legacyDrawReplay = false;
 };
 
@@ -87,7 +87,7 @@ inline constexpr RetailVrBridgePolicy CompiledRetailVrBridgePolicy {
     false,
 };
 
-// Runtime configuration can request only the bounded CPU visual trial.  It
+// Runtime configuration can request only the GPU visual trial.  It
 // cannot widen the compiled bridge policy or authorize the retained D3D9
 // replay interposer.
 struct RetailVrVisualTrialRequest
@@ -113,7 +113,7 @@ constexpr bool retailVrVisualTrialAuthorized(
         && policy.retailWorldHookOnly
         && !policy.replaceD3D9DeviceVtablePointer
         && policy.leaseNativePresentSlot
-        && policy.cpuImageTransfer
+        && policy.gpuImageTransfer
         && !policy.legacyDrawReplay
         && request.exactProfileMatched
         && request.engineCenterStereoRequested
@@ -155,7 +155,7 @@ constexpr bool retailVrPhysicalPlayAuthorized(
         && policy.retailWorldHookOnly
         && !policy.replaceD3D9DeviceVtablePointer
         && policy.leaseNativePresentSlot
-        && policy.cpuImageTransfer
+        && policy.gpuImageTransfer
         && !policy.legacyDrawReplay
         && request.exactProfileMatched
         && request.physicalHeadsetPlayRequested
@@ -183,6 +183,6 @@ static_assert(!CompiledRetailVrBridgePolicy.exBackedGameDevice);
 static_assert(CompiledRetailVrBridgePolicy.retailWorldHookOnly);
 static_assert(!CompiledRetailVrBridgePolicy.replaceD3D9DeviceVtablePointer);
 static_assert(CompiledRetailVrBridgePolicy.leaseNativePresentSlot);
-static_assert(CompiledRetailVrBridgePolicy.cpuImageTransfer);
+static_assert(CompiledRetailVrBridgePolicy.gpuImageTransfer);
 static_assert(!CompiledRetailVrBridgePolicy.legacyDrawReplay);
 }

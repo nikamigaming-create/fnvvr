@@ -2,7 +2,7 @@
 
 #include <windows.h>
 #include <bcrypt.h>
-#include <d3d9.h>
+#include <d3d9on12.h>
 #include <intrin.h>
 
 #include "../protocol/fnvxr_shared_state.h"
@@ -13,7 +13,7 @@
 #include "../runtime/fnvxr_weapon_frame_contract.h"
 #include "fnvxr_d3d9_activation.h"
 #include "fnvxr_d3d9_eye_targets.h"
-#include "fnvxr_d3d9ex_color_transport_win32.h"
+#include "fnvxr_gpu_eye_transport_win32.h"
 #include "fnvxr_d3d9ex_game_creation.h"
 #include "fnvxr_retail_ui_quad_capture_win32.h"
 #include "fnvxr_retail_vr_bridge_win32.h"
@@ -39,8 +39,8 @@ using Direct3DCreate9Fn = IDirect3D9* (WINAPI*)(UINT);
 using Direct3DCreate9ExFn = HRESULT(WINAPI*)(UINT, IDirect3D9Ex**);
 using Direct3D9EnableMaximizedWindowedModeShimFn = void(WINAPI*)(BOOL);
 using Direct3DShaderValidatorCreate9Fn = void* (WINAPI*)();
-using Direct3DCreate9On12Fn = HRESULT(WINAPI*)(UINT, void*, UINT, IDirect3D9**);
-using Direct3DCreate9On12ExFn = HRESULT(WINAPI*)(UINT, void*, UINT, IDirect3D9Ex**);
+using Direct3DCreate9On12Fn = PFN_Direct3DCreate9On12;
+using Direct3DCreate9On12ExFn = PFN_Direct3DCreate9On12Ex;
 using D3DPERFBeginEventFn = int(WINAPI*)(D3DCOLOR, LPCWSTR);
 using D3DPERFEndEventFn = int(WINAPI*)();
 using D3DPERFGetStatusFn = DWORD(WINAPI*)();
@@ -293,10 +293,10 @@ IDirect3DDevice9* gRetailEngineEyeTargetDevice = nullptr;
 IDirect3DDevice9* gRetailEngineDepthDescriptionDevice = nullptr;
 D3DSURFACE_DESC gRetailEngineDepthDescription {};
 bool gRetailEngineDepthDescriptionValid = false;
-HANDLE gLeftEyeD3D9SharedHandle = nullptr;
-HANDLE gRightEyeD3D9SharedHandle = nullptr;
-fnvxr::d3d9::color_transport::Win32Producer
+fnvxr::d3d9::color_transport::GpuEyeTransport
     gRetailEngineColorProducer {};
+fnvxr::d3d9::color_transport::GpuEyeTransport
+    gRetailUiColorProducer {};
 IDirect3DTexture9* gWideWorldTexture = nullptr;
 IDirect3DSurface9* gWideWorldSurface = nullptr;
 IDirect3DSurface9* gWideWorldDepth = nullptr;
@@ -7264,6 +7264,7 @@ void releaseStereoTargets()
     // them. D3D9 pSharedHandle values are legacy resource tokens, not NT
     // handles, so they are cleared but never passed to CloseHandle.
     gRetailEngineColorProducer.reset();
+    gRetailUiColorProducer.reset();
     gRetailEngineEyeTargetContext.abandonForDeviceLoss();
     gRetailEngineEyeTargetDevice = nullptr;
     releaseSurface(gNativeResolvedReadback[0]);
@@ -7293,8 +7294,6 @@ void releaseStereoTargets()
     releaseSurface(gRightEyeDepth);
     releaseTexture(gLeftEyeTexture);
     releaseTexture(gRightEyeTexture);
-    gLeftEyeD3D9SharedHandle = nullptr;
-    gRightEyeD3D9SharedHandle = nullptr;
     releaseStereoSurfaceTwins();
     gStereoTargetsAliasTwin = false;
     gStereoTargetWidth = 0;
@@ -7794,12 +7793,10 @@ bool retailEngineEyeTargetsMatch(
         || !gRightEyeSurface
         || !gLeftEyeDepth
         || !gRightEyeDepth
-        || !gLeftEyeReadback
-        || !gRightEyeReadback
         || gStereoTargetWidth != color.Width
         || gStereoTargetHeight != color.Height
         || gStereoTargetDepthFormat != depthFormat
-        || !fnvxr::d3d9::retailCpuEyeTargetColorFormatAccepted(
+        || !fnvxr::d3d9::retailSharedEyeTargetColorFormatAccepted(
             static_cast<std::uint32_t>(gStereoTargetFormat)))
     {
         return false;
@@ -7809,14 +7806,10 @@ bool retailEngineEyeTargetsMatch(
     D3DSURFACE_DESC rightColor {};
     D3DSURFACE_DESC leftDepth {};
     D3DSURFACE_DESC rightDepth {};
-    D3DSURFACE_DESC leftReadback {};
-    D3DSURFACE_DESC rightReadback {};
     return SUCCEEDED(gLeftEyeSurface->GetDesc(&leftColor))
         && SUCCEEDED(gRightEyeSurface->GetDesc(&rightColor))
         && SUCCEEDED(gLeftEyeDepth->GetDesc(&leftDepth))
         && SUCCEEDED(gRightEyeDepth->GetDesc(&rightDepth))
-        && SUCCEEDED(gLeftEyeReadback->GetDesc(&leftReadback))
-        && SUCCEEDED(gRightEyeReadback->GetDesc(&rightReadback))
         && leftColor.Width == color.Width
         && leftColor.Height == color.Height
         && leftColor.Format == gStereoTargetFormat
@@ -7830,15 +7823,7 @@ bool retailEngineEyeTargetsMatch(
         && rightDepth.Width == color.Width
         && rightDepth.Height == color.Height
         && rightDepth.Format == depthFormat
-        && depthSurfaceIsProofNonLockable(rightDepth)
-        && leftReadback.Width == color.Width
-        && leftReadback.Height == color.Height
-        && leftReadback.Format == gStereoTargetFormat
-        && leftReadback.Pool == D3DPOOL_SYSTEMMEM
-        && rightReadback.Width == color.Width
-        && rightReadback.Height == color.Height
-        && rightReadback.Format == gStereoTargetFormat
-        && rightReadback.Pool == D3DPOOL_SYSTEMMEM;
+        && depthSurfaceIsProofNonLockable(rightDepth);
 }
 
 // Resource creation for the engine-owned renderer is deliberately independent
@@ -8032,7 +8017,7 @@ bool ensureRetailEngineEyeTargets(IDirect3DDevice9* device) noexcept
     }
 
     for (const std::uint32_t colorCandidateValue :
-        fnvxr::d3d9::RetailCpuEyeTargetColorFormats)
+        std::array<std::uint32_t, 1u> { D3DFMT_A8B8G8R8 })
     {
         const D3DFORMAT colorCandidate =
             static_cast<D3DFORMAT>(colorCandidateValue);
@@ -8089,21 +8074,7 @@ bool ensureRetailEngineEyeTargets(IDirect3DDevice9* device) noexcept
                     gRightEyeTexture,
                     gRightEyeSurface,
                     gRightEyeDepth,
-                    depthCandidate)
-                && SUCCEEDED(device->CreateOffscreenPlainSurface(
-                    colorDescription.Width,
-                    colorDescription.Height,
-                    colorCandidate,
-                    D3DPOOL_SYSTEMMEM,
-                    &gLeftEyeReadback,
-                    nullptr))
-                && SUCCEEDED(device->CreateOffscreenPlainSurface(
-                    colorDescription.Width,
-                    colorDescription.Height,
-                    colorCandidate,
-                    D3DPOOL_SYSTEMMEM,
-                    &gRightEyeReadback,
-                    nullptr)))
+                    depthCandidate))
             {
                 direct3D->Release();
                 gRetailEngineEyeTargetDevice = device;
@@ -8115,7 +8086,7 @@ bool ensureRetailEngineEyeTargets(IDirect3DDevice9* device) noexcept
                 char message[320] {};
                 sprintf_s(
                     message,
-                    "retail eye targets ready: ordinary-D3D9 CPU-v8 size=%ux%u color=%u depth=%u depthSource=%u distinctReadbacks=1",
+                    "retail eye targets ready: D3D9On12 GPU size=%ux%u color=%u depth=%u depthSource=%u cpuReadbacks=0",
                     gStereoTargetWidth,
                     gStereoTargetHeight,
                     static_cast<unsigned>(gStereoTargetFormat),
@@ -8135,7 +8106,7 @@ bool ensureRetailEngineEyeTargets(IDirect3DDevice9* device) noexcept
         char message[384] {};
         sprintf_s(
             message,
-            "retail eye targets rejected: no CPU transport format survived probes count=%ld source=%u lastColor=%u lastDepth=%u colorFormat=0x%08lx depthFormat=0x%08lx depthMatch=0x%08lx",
+            "retail eye targets rejected: GPU eye format failed render/depth probes count=%ld source=%u lastColor=%u lastDepth=%u colorFormat=0x%08lx depthFormat=0x%08lx depthMatch=0x%08lx",
             diagnostic,
             static_cast<unsigned>(depthSource),
             static_cast<unsigned>(lastColorCandidate),
@@ -8188,16 +8159,20 @@ bool ensureRetailEngineEyeTargets(IDirect3DDevice9* device) noexcept
     if (!ensureRetailEngineEyeTargets(device))
         return false;
 
-    const fnvxr::d3d9::color_transport::Win32ProducerSource source {
+    const fnvxr::d3d9::color_transport::GpuEyeSource source {
         device,
         gLeftEyeTexture,
         gRightEyeTexture,
-        reinterpret_cast<std::uintptr_t>(gLeftEyeD3D9SharedHandle),
-        reinterpret_cast<std::uintptr_t>(gRightEyeD3D9SharedHandle),
         resourceSetId,
     };
-    if (!gRetailEngineColorProducer.initialize(source))
+    if (!gRetailEngineColorProducer.initialize(source)
+        || !gRetailUiColorProducer.initialize(source))
     {
+        char message[192] {};
+        sprintf_s(message, "GPU eye transport initialization failed reason=%u hresult=0x%08x",
+            static_cast<unsigned>(gRetailEngineColorProducer.failure()),
+            static_cast<unsigned>(gRetailEngineColorProducer.lastHresult()));
+        logRetailVrLine(message);
         releaseStereoTargets();
         return false;
     }
@@ -8209,7 +8184,25 @@ produceRetailEngineColorPair(
     const fnvxr::d3d9::color_transport::ProducerFrameIdentity& identity)
     noexcept
 {
-    return gRetailEngineColorProducer.produce(identity);
+    const auto publication = identity.presentationMode == fnvxr::gpu::color_v5::PresentationMode::MonoUiQuad
+        ? gRetailUiColorProducer.produce(identity)
+        : gRetailEngineColorProducer.produce(identity);
+    static std::uint64_t completed = 0;
+    if (publication.complete && (++completed <= 5u || completed % 60u == 0u))
+    {
+        const auto& frame = publication.payload;
+        char message[1024] {};
+        sprintf_s(message,
+            "{\"event\":\"fnvxrRetailEngineGpuFrame\",\"version\":6,\"gpuSubmitted\":true,"
+            "\"mode\":%u,\"transaction\":%llu,\"sourceFrame\":%llu,\"poseSequence\":%llu,"
+            "\"runtimeSample\":%llu,\"width\":%u,\"height\":%u,\"resourceSet\":%llu,"
+            "\"readySequence\":%llu,\"renderFlags\":%u,\"cpuEyeReadbacks\":0}",
+            unsigned(frame.presentationMode), frame.transactionId, frame.sourceFrame,
+            frame.poseSequence, frame.runtimeStateSample, frame.leftColor.width,
+            frame.leftColor.height, frame.resourceSetId, frame.gpuReadySequence, frame.renderFlags);
+        logRetailVrLine(message);
+    }
+    return publication;
 }
 
 constexpr std::size_t RetailVrGeometryCapacity = 262144u;
@@ -9045,6 +9038,30 @@ bool prepareRetailVrFrame(
     using namespace fnvxr::engine;
     using namespace fnvxr::engine::abi;
     frame = {};
+    // Do not queue private stereo work while the previous pair still owns
+    // the shared resources. Otherwise an uncapped retail loop can bury the
+    // current pose under GPU work that can never be published.
+    static ULONGLONG releasePendingSince = 0;
+    if (!gRetailEngineColorProducer.available())
+    {
+        const ULONGLONG now = GetTickCount64();
+        if (releasePendingSince == 0) releasePendingSince = now;
+        if (now - releasePendingSince < 500) return false;
+        // One bounded retry reaches the bridge's existing lost-consumer
+        // recovery, which replaces both resource generations.
+        releasePendingSince = now;
+    }
+    else
+    {
+        releasePendingSince = 0;
+    }
+    static std::uint64_t admittedEpoch = 0;
+    static std::uint32_t admittedReferenceSpace = 0;
+    static LONG admittedPoseSequence = 0;
+    if (tracked.pose.producerEpoch == admittedEpoch
+        && tracked.pose.referenceSpaceGeneration == admittedReferenceSpace
+        && tracked.poseSequence == admittedPoseSequence)
+        return false;
     const auto rejectFrame = [&call, transactionId, &frame](
                                  const char* stage,
                                  RetailPointer32 sceneCuller) noexcept {
@@ -9221,6 +9238,9 @@ bool prepareRetailVrFrame(
         logRetailVrLine(message);
     }
     frame.gameUnitsPerMeter = fnvxr::stereo::DefaultGameUnitsPerMeter;
+    admittedEpoch = tracked.pose.producerEpoch;
+    admittedReferenceSpace = tracked.pose.referenceSpaceGeneration;
+    admittedPoseSequence = tracked.poseSequence;
     return true;
 }
 
@@ -9294,7 +9314,7 @@ bool copyRetailUiBackBufferToMonoTargets(
         && left.Height == right.Height
         && left.Format == gStereoTargetFormat
         && right.Format == gStereoTargetFormat
-        && fnvxr::d3d9::retailCpuEyeTargetColorFormatAccepted(
+        && fnvxr::d3d9::retailSharedEyeTargetColorFormatAccepted(
             static_cast<std::uint32_t>(gStereoTargetFormat));
     const bool copied = descriptionsMatch
         && SUCCEEDED(device->StretchRect(
@@ -11396,7 +11416,7 @@ bool retailVrFirstPersonGameplayLeaseReady(void*) noexcept
         return false;
     constexpr std::uint32_t Required =
         fnvxr::shared::PlayerSharedFlagGameplay
-        | fnvxr::shared::PlayerSharedFlagWeaponOut
+        | fnvxr::shared::PlayerSharedFlagCameraValid
         | fnvxr::shared::PlayerSharedFlagPlayerNodeValid;
     const bool gameplayReady = sequence != 0
         && (player.flags & Required) == Required
@@ -12133,11 +12153,10 @@ bool initializeRetailVrBridge(IDirect3DDevice9* device) noexcept
     }
     fnvxr::d3d9::RetailVrBridgeOperations operations {};
     operations.context = &gRetailVrProxyContext;
-    // Fallout's actual game device is ordinary D3D9.  This retained route is
-    // deliberately CPU-readback only; it must not be mistaken for, or
-    // silently win over, the future GPU-shared-texture production transport.
+    // The supported renderer exports complete engine eye pairs on GPU. The
+    // D3D9 API stays intact while 9On12 supplies explicit resource ownership.
     operations.publicationTransport =
-        fnvxr::d3d9::RetailVrPublicationTransport::CpuReadback;
+        fnvxr::d3d9::RetailVrPublicationTransport::GpuSharedTextures;
     operations.eyeTargets = eyeTargets;
     operations.armAccumulationCallRelay = &armRetailVrAccumulateSceneRelay;
     operations.disarmAccumulationCallRelay =
@@ -12167,8 +12186,8 @@ bool initializeRetailVrBridge(IDirect3DDevice9* device) noexcept
     operations.prepareControllerRigForRender =
         &prepareRetailVrControllerRigForRender;
     operations.prepareDistinctCameraFrame = &prepareRetailVrFrame;
-    operations.publishCpuPair = &publishRetailVrCpuPair;
-    operations.publishCpuMonoUiQuad = &publishRetailVrCpuMonoUiQuad;
+    operations.prepareColorProducer = &prepareRetailVrColorProducer;
+    operations.produceColorPair = &produceRetailVrColorPair;
     // Publish this exact bridge before installing the in-body call patches.
     // The bridge arms the stock target into the relay before those writes, so
     // an in-flight E8 always executes the original retail call first.
@@ -12225,7 +12244,7 @@ bool initializeRetailVrBridge(IDirect3DDevice9* device) noexcept
     char initializedMessage[416] {};
     sprintf_s(
         initializedMessage,
-        "retail VR bridge initialized: exact AccumulateScene callsite hook, ordinary-D3D9 CPU-v8 stereo transport, and deferred Present bootstrap ready; exact post-stock-render lifecycle hook ready; accumulationMode=%s initThread=%lu deviceThread=%lu behaviorFlags=0x%08lX exceptionObserver=%d",
+        "retail VR bridge initialized: exact AccumulateScene callsite hook, D3D9On12 GPU-v6 world/UI transport, and deferred Present bootstrap ready; exact post-stock-render lifecycle hook ready; accumulationMode=%s initThread=%lu deviceThread=%lu behaviorFlags=0x%08lX exceptionObserver=%d",
         retailVrAccumulationDiagnosticModeName(
             accumulationDiagnosticMode),
         GetCurrentThreadId(),
@@ -21066,7 +21085,20 @@ extern "C" IDirect3D9* WINAPI FNVXR_Direct3DCreate9(UINT sdkVersion)
         return nullptr;
     }
 
-    IDirect3D9* real = gRealDirect3DCreate9(sdkVersion);
+    IDirect3D9* real = nullptr;
+    if (retailVrVisualTrialRequested())
+    {
+        const auto createOn12 = resolve<PFN_Direct3DCreate9On12>("Direct3DCreate9On12");
+        D3D9ON12_ARGS arguments {};
+        arguments.Enable9On12 = TRUE;
+        real = createOn12 ? createOn12(sdkVersion, &arguments, 1) : nullptr;
+        logRetailVrLine(real ? "retail GPU renderer created: D3D9On12"
+                             : "retail GPU renderer unavailable: D3D9On12 creation failed");
+    }
+    else
+    {
+        real = gRealDirect3DCreate9(sdkVersion);
+    }
     if (!real)
         return nullptr;
 
@@ -21180,23 +21212,20 @@ extern "C" void WINAPI FNVXR_Direct3D9EnableMaximizedWindowedModeShim(BOOL enabl
         fn(enable);
 }
 
-extern "C" HRESULT WINAPI FNVXR_Direct3DCreate9On12(UINT sdkVersion, void* overrideList, UINT overrideCount, IDirect3D9** out)
+extern "C" IDirect3D9* WINAPI FNVXR_Direct3DCreate9On12(
+    UINT sdkVersion, D3D9ON12_ARGS* overrideList, UINT overrideCount)
 {
     if (stereoProofModeArmed())
     {
-        if (out)
-            *out = nullptr;
         logLine("Direct3DCreate9On12 rejected: On12 is not covered by the stereo proof");
-        return D3DERR_NOTAVAILABLE_RESULT;
+        return nullptr;
     }
     if (auto fn = resolve<Direct3DCreate9On12Fn>("Direct3DCreate9On12"))
-        return fn(sdkVersion, overrideList, overrideCount, out);
-    if (out)
-        *out = nullptr;
-    return D3DERR_NOTAVAILABLE_RESULT;
+        return fn(sdkVersion, overrideList, overrideCount);
+    return nullptr;
 }
 
-extern "C" HRESULT WINAPI FNVXR_Direct3DCreate9On12Ex(UINT sdkVersion, void* overrideList, UINT overrideCount, IDirect3D9Ex** out)
+extern "C" HRESULT WINAPI FNVXR_Direct3DCreate9On12Ex(UINT sdkVersion, D3D9ON12_ARGS* overrideList, UINT overrideCount, IDirect3D9Ex** out)
 {
     if (stereoProofModeArmed())
     {

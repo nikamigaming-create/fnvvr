@@ -5,6 +5,30 @@ project(fnvvr LANGUAGES CXX)
 enable_testing()
 
 if(WIN32)
+    add_library(fnvxr_mirror_writer STATIC host/fnvxr_mirror_writer.cpp)
+    target_compile_features(fnvxr_mirror_writer PUBLIC cxx_std_17)
+    target_link_libraries(fnvxr_mirror_writer PRIVATE windowscodecs ole32)
+    add_executable(fnvxr_mirror_writer_test tests/fnvxr_mirror_writer_test.cpp)
+    target_link_libraries(fnvxr_mirror_writer_test PRIVATE fnvxr_mirror_writer windowscodecs ole32)
+    add_test(NAME fnvxr_mirror_writer_test COMMAND fnvxr_mirror_writer_test)
+    add_library(fnvxr_gpu_eye_transport_win32 STATIC renderhook/fnvxr_gpu_eye_transport_win32.cpp)
+    target_include_directories(fnvxr_gpu_eye_transport_win32 PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/renderhook)
+    target_compile_features(fnvxr_gpu_eye_transport_win32 PUBLIC cxx_std_17)
+    add_executable(fnvxr_gpu_interop_probe tools/fnvxr_gpu_interop_probe.cpp)
+    target_link_libraries(fnvxr_gpu_interop_probe PRIVATE fnvxr_gpu_eye_transport_win32 d3d11 d3d12 dxgi)
+    add_executable(fnvxr_gpu_channel_probe tools/fnvxr_gpu_channel_probe.cpp)
+    target_link_libraries(fnvxr_gpu_channel_probe PRIVATE fnvxr_gpu_eye_transport_win32
+        fnvxr_gpu_color_consumer fnvxr_gpu_color_publisher_win32 d3d11 d3d12 dxgi)
+    if(MSVC)
+        target_compile_options(fnvxr_mirror_writer PRIVATE /W4 /WX)
+        target_compile_options(fnvxr_mirror_writer_test PRIVATE /W4 /WX)
+        target_compile_options(fnvxr_gpu_eye_transport_win32 PRIVATE /W4 /WX)
+        target_compile_options(fnvxr_gpu_interop_probe PRIVATE /W4 /WX)
+        target_compile_options(fnvxr_gpu_channel_probe PRIVATE /W4 /WX)
+    endif()
+endif()
+
+if(WIN32)
 add_test(
     NAME fnvxr_launcher_live_fuse
         COMMAND ${CMAKE_COMMAND}
@@ -375,6 +399,7 @@ if(FNVXR_OPENXR_INCLUDE_DIR AND CMAKE_SIZEOF_VOID_P EQUAL 8)
     )
     target_link_libraries(fnvxr_openxr_pose_host PRIVATE
         fnvxr_kernel
+        fnvxr_mirror_writer
         fnvxr_gpu_color_consumer
         d3d11
         d3dcompiler
@@ -426,15 +451,6 @@ if(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 4)
         OUTPUT_NAME "nvse_fnvxr"
     )
 
-    add_library(fnvxr_d3d9ex_color_transport_win32 STATIC
-        renderhook/fnvxr_d3d9ex_color_transport_win32.cpp)
-    target_include_directories(fnvxr_d3d9ex_color_transport_win32 PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/renderhook
-        ${CMAKE_CURRENT_SOURCE_DIR}/protocol)
-    if(MSVC)
-        target_compile_options(fnvxr_d3d9ex_color_transport_win32 PRIVATE /W4 /WX)
-    endif()
-
     add_library(fnvxr_retail_ui_quad_capture_win32 STATIC
         renderhook/fnvxr_retail_ui_quad_capture_win32.cpp)
     target_include_directories(fnvxr_retail_ui_quad_capture_win32 PUBLIC
@@ -452,7 +468,7 @@ if(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 4)
     target_link_libraries(fnvxr_d3d9_proxy PRIVATE
         dxguid
         bcrypt
-        fnvxr_d3d9ex_color_transport_win32
+        fnvxr_gpu_eye_transport_win32
         fnvxr_gpu_color_publisher_win32
         fnvxr_retail_ui_quad_capture_win32
         fnvxr_retail_runtime_authority

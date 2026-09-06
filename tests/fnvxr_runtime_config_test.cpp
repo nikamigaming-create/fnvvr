@@ -53,9 +53,12 @@ int main()
         return fail("unsupported pose history capacity must fail instead of becoming a fake knob");
 
     invalid = {};
-    invalid.performance.maximumPoseAgeMilliseconds = 12.0F;
+    invalid.performance.maximumPoseAgeMilliseconds = 34.0F;
     if (validateRuntimeConfig(invalid).error != ConfigError::InvalidPoseAge)
-        return fail("pose age must fit inside the selected frame budget");
+        return fail("retained source age must fit inside three host cycles");
+    invalid.performance.maximumPoseAgeMilliseconds = 22.0F;
+    if (!validateRuntimeConfig(invalid))
+        return fail("a frame arriving on the next host cycle must remain displayable");
 
     invalid = {};
     invalid.performance.maximumCpuPoseAgeMilliseconds = 251.0F;

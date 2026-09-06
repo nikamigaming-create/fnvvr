@@ -11,6 +11,7 @@
 #include "fnvxr_game_plane_surface.h"
 #include "fnvxr_host_ui_capture_gate.h"
 #include "fnvxr_headset_mirror_capture.h"
+#include "fnvxr_mirror_writer.h"
 #include "fnvxr_openxr_live_authority.h"
 #include "fnvxr_pipboy_panel_contract.h"
 #include "fnvxr_physical_input_authority.h"
@@ -321,6 +322,8 @@ struct Renderer
     ComPtr<ID3D11ShaderResourceView> gameTextureView;
     ComPtr<ID3D11Texture2D> retainedUiTexture;
     ComPtr<ID3D11ShaderResourceView> retainedUiTextureView;
+    ComPtr<ID3D11Texture2D> uiScratchTexture;
+    ComPtr<ID3D11ShaderResourceView> uiScratchTextureView;
     ComPtr<ID3D11Texture2D> worldTexture;
     ComPtr<ID3D11ShaderResourceView> worldTextureView;
     ComPtr<ID3D11ShaderResourceView> pauseSceneTextureView;
@@ -541,6 +544,26 @@ struct HeadsetMirrorCapture
     std::uint32_t everyFrames = 1u;
     std::uint32_t maximumPairs = 0u;
     fnvxr::host::headset_mirror::ScheduleState schedule {};
+    std::unique_ptr<fnvxr::host::mirror::Writer> writer;
+    fnvxr::host::mirror::Pair pendingPair;
+
+    void reportCompleted()
+    {
+        if (!writer) return;
+        for (const auto& completed : writer->takeCompleted())
+            for (std::size_t eye = 0; eye != 2; ++eye)
+                std::cout
+                    << "{\"event\":\"fnvxrHeadsetMirrorCapture\",\"frame\":" << completed.frame
+                    << ",\"ordinal\":" << completed.ordinal
+                    << ",\"eye\":\"" << (eye == 0 ? "left" : "right")
+                    << "\",\"saved\":" << (completed.status[eye] >= 0 ? "true" : "false")
+                    << ",\"width\":" << completed.width << ",\"height\":" << completed.height
+                    << ",\"format\":" << completed.format
+                    << ",\"writeHr\":\"0x" << std::hex
+                    << static_cast<std::uint32_t>(completed.status[eye])
+                    << "\",\"outputHash\":\"0x" << completed.hashes[eye] << std::dec
+                    << "\"}\n";
+    }
 
     fnvxr::host::headset_mirror::ScheduleDecision request(
         std::uint64_t frame) noexcept
@@ -558,6 +581,8 @@ struct UiTextureCandidate
     std::uint64_t sourceFrame = 0u;
     std::uint64_t runtimeStateSample = 0u;
     float aspect = 16.0f / 9.0f;
+    std::uint32_t producerProcessId = 0u;
+    std::uint64_t producerEpoch = 0u;
 };
 
 constexpr LONG SharedPointerWidth = 1280;
@@ -1179,152 +1204,6 @@ HeadsetMirrorPixelLayout headsetMirrorPixelLayout(DXGI_FORMAT format) noexcept
     default:
         return HeadsetMirrorPixelLayout::Unsupported;
     }
-}
-
-HRESULT writeHeadsetMirrorPng(
-    const std::wstring& path,
-    const D3D11_TEXTURE2D_DESC& desc,
-    const D3D11_MAPPED_SUBRESOURCE& mapped)
-{
-    if (path.empty()
-        || !mapped.pData
-        || desc.Width == 0u
-        || desc.Height == 0u
-        || mapped.RowPitch == 0u
-        || mapped.RowPitch < static_cast<size_t>(desc.Width) * 4u
-        || desc.Height > (std::numeric_limits<UINT>::max)() / mapped.RowPitch)
-    {
-        return E_INVALIDARG;
-    }
-
-    // A supervised host can stop while WIC is flushing an eye image.  Encode
-    // to an owned sibling first and publish the final PNG only after every
-    // encoder handle is closed, so a partial image can never masquerade as a
-    // completed stereo pair in the launcher or recording pipeline.
-    const std::wstring temporaryPath = path + L".tmp";
-    static_cast<void>(DeleteFileW(temporaryPath.c_str()));
-
-    const HeadsetMirrorPixelLayout sourceLayout = headsetMirrorPixelLayout(desc.Format);
-    if (sourceLayout == HeadsetMirrorPixelLayout::Unsupported)
-        return WINCODEC_ERR_UNSUPPORTEDPIXELFORMAT;
-
-    constexpr size_t BytesPerPixel = 4u;
-    const size_t tightRowPitch = static_cast<size_t>(desc.Width) * BytesPerPixel;
-    if (tightRowPitch > (std::numeric_limits<UINT>::max)()
-        || desc.Height > (std::numeric_limits<UINT>::max)() / tightRowPitch)
-    {
-        return E_INVALIDARG;
-    }
-
-    BYTE* encodedPixels = static_cast<BYTE*>(mapped.pData);
-    UINT encodedRowPitch = mapped.RowPitch;
-    UINT encodedImageBytes = mapped.RowPitch * desc.Height;
-    std::vector<BYTE> convertedPixels;
-    if (sourceLayout == HeadsetMirrorPixelLayout::Rgba)
-    {
-        try
-        {
-            convertedPixels.resize(tightRowPitch * desc.Height);
-        }
-        catch (...)
-        {
-            return E_OUTOFMEMORY;
-        }
-
-        for (UINT y = 0u; y < desc.Height; ++y)
-        {
-            const BYTE* const source = static_cast<const BYTE*>(mapped.pData)
-                + static_cast<size_t>(y) * mapped.RowPitch;
-            BYTE* const destination = convertedPixels.data()
-                + static_cast<size_t>(y) * tightRowPitch;
-            for (UINT x = 0u; x < desc.Width; ++x)
-            {
-                const size_t offset = static_cast<size_t>(x) * BytesPerPixel;
-                destination[offset + 0u] = source[offset + 2u];
-                destination[offset + 1u] = source[offset + 1u];
-                destination[offset + 2u] = source[offset + 0u];
-                destination[offset + 3u] = source[offset + 3u];
-            }
-        }
-
-        encodedPixels = convertedPixels.data();
-        encodedRowPitch = static_cast<UINT>(tightRowPitch);
-        encodedImageBytes = static_cast<UINT>(convertedPixels.size());
-    }
-
-    ComPtr<IWICImagingFactory> factory;
-    HRESULT result = CoCreateInstance(
-            CLSID_WICImagingFactory,
-            nullptr,
-            CLSCTX_INPROC_SERVER,
-            IID_PPV_ARGS(&factory));
-    if (FAILED(result))
-    {
-        return result;
-    }
-    if (!factory)
-        return E_NOINTERFACE;
-
-    ComPtr<IWICStream> stream;
-    ComPtr<IWICBitmapEncoder> encoder;
-    ComPtr<IWICBitmapFrameEncode> frame;
-    ComPtr<IPropertyBag2> properties;
-    result = factory->CreateStream(&stream);
-    if (SUCCEEDED(result))
-        result = stream->InitializeFromFilename(
-            temporaryPath.c_str(),
-            GENERIC_WRITE);
-    if (SUCCEEDED(result))
-        result = factory->CreateEncoder(GUID_ContainerFormatPng, nullptr, &encoder);
-    if (SUCCEEDED(result))
-        result = encoder->Initialize(stream.Get(), WICBitmapEncoderNoCache);
-    if (SUCCEEDED(result))
-        result = encoder->CreateNewFrame(&frame, &properties);
-    if (SUCCEEDED(result))
-        result = frame->Initialize(properties.Get());
-    if (SUCCEEDED(result))
-        result = frame->SetSize(desc.Width, desc.Height);
-    WICPixelFormatGUID requestedPixelFormat = GUID_WICPixelFormat32bppBGRA;
-    if (SUCCEEDED(result))
-        result = frame->SetPixelFormat(&requestedPixelFormat);
-    if (SUCCEEDED(result)
-        && !IsEqualGUID(requestedPixelFormat, GUID_WICPixelFormat32bppBGRA))
-    {
-        return WINCODEC_ERR_UNSUPPORTEDPIXELFORMAT;
-    }
-    if (SUCCEEDED(result))
-    {
-        result = frame->WritePixels(
-            desc.Height,
-            encodedRowPitch,
-            encodedImageBytes,
-            encodedPixels);
-    }
-    if (SUCCEEDED(result))
-        result = frame->Commit();
-    if (SUCCEEDED(result))
-        result = encoder->Commit();
-    // Close WIC's source handle before the atomic same-volume rename.
-    frame.Reset();
-    properties.Reset();
-    encoder.Reset();
-    stream.Reset();
-    factory.Reset();
-    if (FAILED(result))
-    {
-        static_cast<void>(DeleteFileW(temporaryPath.c_str()));
-        return result;
-    }
-    if (!MoveFileExW(
-            temporaryPath.c_str(),
-            path.c_str(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
-    {
-        const HRESULT moveError = HRESULT_FROM_WIN32(GetLastError());
-        static_cast<void>(DeleteFileW(temporaryPath.c_str()));
-        return moveError;
-    }
-    return S_OK;
 }
 
 std::wstring headsetMirrorFramePath(
@@ -5781,10 +5660,7 @@ void drawRetailForearm(
         return;
     }
     constexpr float AuthoredForearmLengthMeters = 18.12860046f / 70.0f;
-    const float longitudinalScale = std::clamp(
-        arm.forearmLength / AuthoredForearmLengthMeters,
-        0.70f,
-        1.35f);
+    const float longitudinalScale = arm.forearmLength / AuthoredForearmLengthMeters;
     drawRetailTexturedModel(
         context,
         renderer,
@@ -5797,6 +5673,22 @@ void drawRetailForearm(
         renderer.retailLeftForearmTextureView.Get(),
         { 1.0f, 1.0f, 1.0f,
           left ? SpatialAlphaLeftHand : SpatialAlphaRightHand });
+}
+
+float retailHandSetting(bool left, const char* suffix, float fallback)
+{
+    const std::string name = std::string("FNVXR_RETAIL_")
+        + (left ? "LEFT" : "RIGHT") + "_HAND_" + suffix;
+    return envFloat(name.c_str(), fallback);
+}
+
+XrVector3f retailHandLocalOffset(bool left)
+{
+    return {
+        retailHandSetting(left, "OFFSET_X", left ? 0.0f : -0.040f),
+        retailHandSetting(left, "OFFSET_Y", left ? 0.0f : 0.026f),
+        retailHandSetting(left, "OFFSET_Z", 0.0f),
+    };
 }
 
 void drawHandPrimitive(
@@ -5822,20 +5714,12 @@ void drawHandPrimitive(
     if (!selectedHand || selectedVertexCount == 0u)
         return;
 
-    const char* sideToken = left ? "LEFT" : "RIGHT";
     auto sideFloat = [&](const char* suffix, float fallback)
     {
-        std::string name = "FNVXR_RETAIL_";
-        name += sideToken;
-        name += "_HAND_";
-        name += suffix;
-        return envFloat(name.c_str(), fallback);
+        return retailHandSetting(left, suffix, fallback);
     };
-    const XMFLOAT3 localOffset {
-        sideFloat("OFFSET_X", left ? 0.0f : -0.040f),
-        sideFloat("OFFSET_Y", left ? 0.0f : 0.026f),
-        sideFloat("OFFSET_Z", 0.0f),
-    };
+    const XrPosef attachment = fnvxr::host::spatial::handAttachmentPose(
+        wristPose, retailHandLocalOffset(left));
     const XMFLOAT3 localRotation {
         degreesToRadians(sideFloat("ROT_X", 0.0f)),
         degreesToRadians(sideFloat("ROT_Y", 0.0f)),
@@ -5848,8 +5732,8 @@ void drawHandPrimitive(
         ? XMFLOAT3 { retailScale, retailScale, retailScale }
         : XMFLOAT3 { left ? -1.0f : 1.0f, 1.0f, 1.0f };
     const XMMATRIX model = modelFromParentLocalCalibration(
-        wristPose,
-        localOffset,
+        attachment,
+        { 0.0f, 0.0f, 0.0f },
         left ? nullptr : rightHandGripLocalRotation,
         localRotation,
         scale);
@@ -6276,11 +6160,14 @@ bool retainedUiMatches(
     return renderer.retainedUiTexture
         && renderer.retainedUiTextureView
         && renderer.retainedUiSourceFrame == frame.sourceFrame
-        && renderer.retainedUiRuntimeStateSample == frame.runtimeStateSample;
+        && renderer.retainedUiRuntimeStateSample == frame.runtimeStateSample
+        && renderer.retainedUiProducerProcessId == frame.producerProcessId
+        && renderer.retainedUiRendererProducerEpoch == frame.producerEpoch;
 }
 
 bool prepareUiTextureCandidate(
     ID3D11Device* device,
+    Renderer& renderer,
     ID3D11Texture2D* source,
     const fnvxr::host::gpu_color::ConsumerFrame& frame,
     UiTextureCandidate& candidate) noexcept
@@ -6307,7 +6194,20 @@ bool prepareUiTextureCandidate(
     description.BindFlags = D3D11_BIND_SHADER_RESOURCE;
     description.CPUAccessFlags = 0u;
     description.MiscFlags = 0u;
-    if (FAILED(device->CreateTexture2D(
+    candidate.texture = std::move(renderer.uiScratchTexture);
+    candidate.view = std::move(renderer.uiScratchTextureView);
+    if (candidate.texture)
+    {
+        D3D11_TEXTURE2D_DESC existing {};
+        candidate.texture->GetDesc(&existing);
+        if (existing.Width != description.Width || existing.Height != description.Height
+            || existing.Format != description.Format)
+        {
+            candidate.texture.Reset();
+            candidate.view.Reset();
+        }
+    }
+    if (!candidate.texture && (FAILED(device->CreateTexture2D(
             &description,
             nullptr,
             &candidate.texture))
@@ -6316,7 +6216,7 @@ bool prepareUiTextureCandidate(
             candidate.texture.Get(),
             nullptr,
             &candidate.view))
-        || !candidate.view)
+        || !candidate.view))
     {
         candidate = {};
         return false;
@@ -6331,6 +6231,8 @@ bool prepareUiTextureCandidate(
     context->CopyResource(candidate.texture.Get(), source);
     candidate.sourceFrame = frame.sourceFrame;
     candidate.runtimeStateSample = frame.runtimeStateSample;
+    candidate.producerProcessId = frame.producerProcessId;
+    candidate.producerEpoch = frame.producerEpoch;
     candidate.aspect = static_cast<float>(description.Width)
         / static_cast<float>(description.Height);
     return true;
@@ -6349,6 +6251,8 @@ void commitUiTextureCandidate(
     Renderer& renderer,
     UiTextureCandidate& candidate) noexcept
 {
+    renderer.uiScratchTexture = std::move(renderer.retainedUiTexture);
+    renderer.uiScratchTextureView = std::move(renderer.retainedUiTextureView);
     renderer.retainedUiTexture = std::move(candidate.texture);
     renderer.retainedUiTextureView = std::move(candidate.view);
     renderer.retainedUiSourceFrame = candidate.sourceFrame;
@@ -6356,20 +6260,22 @@ void commitUiTextureCandidate(
     renderer.retainedUiTextureAspect = candidate.aspect;
     renderer.retainedUiHostWindowCaptured = false;
     renderer.retainedUiLivePipBoySurface = false;
-    renderer.retainedUiAcceptedAt = {};
+    renderer.retainedUiAcceptedAt = std::chrono::steady_clock::now();
     renderer.livePipBoyUiUploadCount = 0u;
     renderer.retainedCpuUiTransactionId = 0u;
     renderer.retainedCpuUiEpoch = 0u;
     renderer.retainedCpuUiProducerProcessId = 0u;
     renderer.retainedCpuUiCapturedRuntime = {};
-    renderer.retainedUiProducerProcessId = 0u;
-    renderer.retainedUiRendererProducerEpoch = 0u;
+    renderer.retainedUiProducerProcessId = candidate.producerProcessId;
+    renderer.retainedUiRendererProducerEpoch = candidate.producerEpoch;
     advanceRetainedUiResourceGeneration(renderer);
     candidate = {};
 }
 
 void clearRetainedUiResource(Renderer& renderer) noexcept
 {
+    renderer.uiScratchTexture.Reset();
+    renderer.uiScratchTextureView.Reset();
     renderer.retainedUiTexture.Reset();
     renderer.retainedUiTextureView.Reset();
     renderer.retainedUiSourceFrame = 0u;
@@ -7094,34 +7000,49 @@ bool captureSwapchainRenderProof(
     proof.valid = proof.samples >= 64
         && proof.nonBlackSamples >= 16
         && proof.variedSamples >= 16;
-    if (proof.valid && headsetMirrorCapture)
+    if (proof.valid && headsetMirrorCapture && headsetMirrorCapture->writer && eyeIndex < 2u)
     {
-        const fnvxr::host::headset_mirror::ScheduleDecision decision =
-            headsetMirrorCapture->request(hostFrame);
-        if (decision.capture)
+        auto& capture = *headsetMirrorCapture;
+        const auto decision = capture.request(hostFrame);
+        const auto layout = headsetMirrorPixelLayout(desc.Format);
+        if (decision.capture && layout != HeadsetMirrorPixelLayout::Unsupported)
         {
-            const std::wstring outputPath = headsetMirrorFramePath(
-                *headsetMirrorCapture,
-                decision.ordinal,
-                eyeIndex);
-            const HRESULT writeResult = writeHeadsetMirrorPng(
-                outputPath,
-                desc,
-                mapped);
-            const bool saved = SUCCEEDED(writeResult);
-            std::cout
-                << "{\"event\":\"fnvxrHeadsetMirrorCapture\",\"frame\":"
-                << hostFrame
-                << ",\"ordinal\":" << decision.ordinal
-                << ",\"eye\":\"" << (eyeIndex == 0u ? "left" : "right")
-                << "\",\"saved\":" << (saved ? "true" : "false")
-                << ",\"width\":" << desc.Width
-                << ",\"height\":" << desc.Height
-                << ",\"format\":" << static_cast<unsigned int>(desc.Format)
-                << ",\"writeHr\":\"0x" << std::hex
-                << static_cast<std::uint32_t>(writeResult) << std::dec << "\""
-                << ",\"outputHash\":\"0x" << std::hex << proof.hash << std::dec
-                << "\"}\n";
+            if (capture.pendingPair.frame != hostFrame)
+            {
+                capture.pendingPair = {};
+                capture.pendingPair.frame = hostFrame;
+                capture.pendingPair.ordinal = decision.ordinal;
+            }
+            auto& image = capture.pendingPair.eyes[eyeIndex];
+            try
+            {
+                image.path = headsetMirrorFramePath(capture, decision.ordinal, eyeIndex);
+                image.width = desc.Width;
+                image.height = desc.Height;
+                image.rowPitch = desc.Width * 4u;
+                image.format = static_cast<std::uint32_t>(desc.Format);
+                image.rgba = layout == HeadsetMirrorPixelLayout::Rgba;
+                image.pixels.resize(static_cast<std::size_t>(image.rowPitch) * image.height);
+                for (UINT y = 0; y != image.height; ++y)
+                    std::memcpy(image.pixels.data() + static_cast<std::size_t>(y) * image.rowPitch,
+                        static_cast<const BYTE*>(mapped.pData) + static_cast<std::size_t>(y) * mapped.RowPitch,
+                        image.rowPitch);
+                capture.pendingPair.hashes[eyeIndex] = proof.hash;
+                if (!capture.pendingPair.eyes[0].pixels.empty()
+                    && !capture.pendingPair.eyes[1].pixels.empty())
+                {
+                    if (!capture.writer->submit(std::move(capture.pendingPair)))
+                        std::cout << "{\"event\":\"fnvxrHeadsetMirrorDropped\",\"frame\":"
+                            << hostFrame << ",\"ordinal\":" << decision.ordinal
+                            << ",\"reason\":\"encoder-queue-full\"}\n";
+                    capture.pendingPair = {};
+                }
+            }
+            catch (...)
+            {
+                capture.pendingPair = {};
+                std::cerr << "Headset mirror capture allocation failed at frame=" << hostFrame << "\n";
+            }
         }
     }
     context->Unmap(staging.Get(), 0);
@@ -7335,10 +7256,10 @@ bool renderEye(
         }
         drawHandFingers(
             context.Get(), renderer, viewProjection,
-            bodyRig.left.wrist, true, nullptr);
+            leftPose, true, nullptr);
         drawHandFingers(
             context.Get(), renderer, viewProjection,
-            bodyRig.right.wrist, false, rightHandGripLocalRotation);
+            rightPose, false, rightHandGripLocalRotation);
     }
     else if (drawWorldProps)
     {
@@ -9858,6 +9779,7 @@ int main(int argc, char** argv)
             && (captureDirectoryAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0u)
         {
             headsetMirrorCapture.enabled = true;
+            headsetMirrorCapture.writer = std::make_unique<fnvxr::host::mirror::Writer>();
             headsetMirrorCapture.everyFrames = static_cast<std::uint32_t>(
                 std::clamp(envInt("FNVXR_HMD_MIRROR_CAPTURE_EVERY_N_FRAMES", 6), 1, 600));
             headsetMirrorCapture.maximumPairs = static_cast<std::uint32_t>(
@@ -9969,13 +9891,13 @@ int main(int argc, char** argv)
     // back to an unrelated host-window/GPU capture path.
     const bool productionGpuColorV5 = !legacyImageDiagnostics
         && !productionCpuEngineStereo;
-    const bool gpuStereoVisualTrialDiagnostic = envEnabled(
-        "FNVXR_ENABLE_UNPROVEN_GPU_STEREO_VISUAL_TRIAL_DIAGNOSTIC",
-        false);
     const bool stereoWorldEnabled = stereoWorldRuntimeEnabled(
-        productionCpuEngineStereo);
+        productionCpuEngineStereo || productionGpuColorV5);
     fnvxr::host::gpu_color::Win32Consumer gpuColorConsumer;
-    const bool gpuColorConsumerReady = gpuColorConsumer.initialize(device.Get());
+    fnvxr::host::gpu_color::Win32Consumer gpuUiConsumer;
+    const bool gpuColorConsumerReady = gpuColorConsumer.initialize(device.Get())
+        && gpuUiConsumer.initialize(device.Get(), nullptr,
+            fnvxr::gpu::color_v5::FrameChannel::Ui);
     if (productionGpuColorV5 && !gpuColorConsumerReady)
     {
         std::cerr << "ABI-v5 GPU color consumer initialization failed backend="
@@ -9994,7 +9916,7 @@ int main(int argc, char** argv)
         initPauseSceneTexture(device.Get(), renderer);
         loadSceneCacheIntoStereoTextures(device.Get(), renderer);
     }
-    std::cout << "gpuColorTransport version=5 productionDefault=1 productionActive="
+    std::cout << "gpuColorTransport version=6 channels=world,ui productionDefault=1 productionActive="
               << static_cast<int>(productionGpuColorV5)
               << " cpuEngineStereoProduction="
               << static_cast<int>(productionCpuEngineStereo)
@@ -10368,6 +10290,7 @@ int main(int argc, char** argv)
     fnvxr::host::gpu_color::RoutedContent previousGpuColorContent =
         fnvxr::host::gpu_color::RoutedContent::SafetyBlank;
     std::uint64_t previousGpuColorTransaction = 0u;
+    bool previousProjectionSubmitted = false;
     std::uint64_t lastPhase1TraceCpuTransaction = 0u;
     std::uint64_t presentedExactFrameJoins = 0u;
     std::uint64_t activeGpuColorProducerEpoch = 0u;
@@ -10402,6 +10325,7 @@ int main(int argc, char** argv)
 
     for (uint64_t frameIndex = 1; frameIndex <= targetFrames; ++frameIndex)
     {
+        headsetMirrorCapture.reportCompleted();
         const ULONGLONG progressNow = GetTickCount64();
         if (progressNow >= nextProgressHeartbeatMilliseconds)
         {
@@ -10478,6 +10402,7 @@ int main(int argc, char** argv)
 
         XrFrameWaitInfo waitInfo { XR_TYPE_FRAME_WAIT_INFO };
         XrFrameState frameState { XR_TYPE_FRAME_STATE };
+        const auto frameWaitStarted = monotonicNow();
         result = xr.waitFrame(session, &waitInfo, &frameState);
         if (result != XR_SUCCESS)
         {
@@ -10571,21 +10496,28 @@ int main(int argc, char** argv)
                     gpuColorConsumer.eyeView(0u) != nullptr,
                     gpuColorConsumer.eyeView(1u) != nullptr)
                 : fnvxr::host::gpu_color::RoutedFrame {};
+        const auto gpuUiConsume = productionGpuColorV5 && gpuColorConsumerReady
+            ? gpuUiConsumer.consume() : fnvxr::host::gpu_color::ConsumeResult {};
+        const auto gpuUiFrame = fnvxr::host::gpu_color::routeConsumedFrame(
+            gpuUiConsume, gpuUiConsumer.eyeView(0u) != nullptr,
+            gpuUiConsumer.eyeView(1u) != nullptr);
+        const auto& producerIdentity = gpuColorFrame.frame.producerEpoch != 0u
+            ? gpuColorFrame.frame : gpuUiFrame.frame;
         const bool gpuColorProducerChanged =
             activeGpuColorProducerEpoch != 0u
-            && gpuColorFrame.frame.producerEpoch != 0u
-            && (gpuColorFrame.frame.producerEpoch
+            && producerIdentity.producerEpoch != 0u
+            && (producerIdentity.producerEpoch
                     != activeGpuColorProducerEpoch
-                || gpuColorFrame.frame.producerProcessId
+                || producerIdentity.producerProcessId
                     != activeGpuColorProducerProcessId);
-        if (gpuColorFrame.frame.producerEpoch != 0u
+        if (producerIdentity.producerEpoch != 0u
             && (gpuColorProducerChanged
                 || activeGpuColorProducerEpoch == 0u))
         {
             activeGpuColorProducerEpoch =
-                gpuColorFrame.frame.producerEpoch;
+                producerIdentity.producerEpoch;
             activeGpuColorProducerProcessId =
-                gpuColorFrame.frame.producerProcessId;
+                producerIdentity.producerProcessId;
             presentationController.reset();
             if (gpuColorProducerChanged)
                 resetCadenceEpoch();
@@ -10621,6 +10553,7 @@ int main(int argc, char** argv)
         previousGpuColorFailure = gpuColorConsume.failure;
         previousGpuColorContent = gpuColorFrame.content;
         previousGpuColorTransaction = gpuColorFrame.frame.transactionId;
+        const auto gpuConsumeFinished = monotonicNow();
 
         const fnvxr::kernel::performance::HostFrameId cadenceFrame {
             cadenceEpoch, frameIndex };
@@ -11489,7 +11422,7 @@ int main(int argc, char** argv)
         CpuMonoUiFrame incomingCpuUi {};
         const bool auxiliaryPipBoyUiRequested =
             livePipBoyScreenFocused
-            && (productionCpuEngineStereo || productionGpuColorV5);
+            && productionCpuEngineStereo;
         const bool cpuUiRecordRead =
             (productionCpuEngineStereo || auxiliaryPipBoyUiRequested)
             && haveSharedStereoUiState
@@ -11683,19 +11616,44 @@ int main(int argc, char** argv)
 
         UiTextureCandidate uiCandidate {};
         bool incomingUiResourceReady = false;
-        if (gpuColorFrame.content
+        fnvxr::host::gpu_color::RuntimeEvidence gpuUiSourceRuntime {};
+        const bool gpuUiRuntimeLineage = runtimeEvidenceHistory.findStableSource(
+            gpuUiFrame.frame.runtimeStateSample, cpuCurrentRuntimeEvidence,
+            gpuUiSourceRuntime);
+        const bool gpuUiFresh = fnvxr::stereo::sourcePoseAgeWithinBudget(
+            frameState.predictedDisplayTime, gpuUiFrame.frame.renderedDisplayTime,
+            static_cast<XrTime>(runtimeConfig.get().wristUi.maximumContentAgeMilliseconds)
+                * 1000000, sourcePoseFutureToleranceNanoseconds, nullptr);
+        const bool gpuUiSourceEligible = gpuUiRuntimeLineage && gpuUiFresh
+            && gpuUiFrame.frame.producerEpoch == activeGpuColorProducerEpoch
+            && gpuUiFrame.frame.producerProcessId == activeGpuColorProducerProcessId
+            && (gpuUiFrame.frame.renderFlags & fnvxr::gpu::color_v5::RetailMenuCaptured) != 0u;
+        if (gpuUiSourceEligible && gpuUiFrame.content
             == fnvxr::host::gpu_color::RoutedContent::MonoUiQuad)
         {
             incomingUiResourceReady = retainedUiMatches(
                 renderer,
-                gpuColorFrame.frame);
+                gpuUiFrame.frame);
             if (!incomingUiResourceReady)
             {
                 incomingUiResourceReady = prepareUiTextureCandidate(
                     device.Get(),
-                    gpuColorConsumer.eyeTexture(0u),
-                    gpuColorFrame.frame,
-                uiCandidate);
+                    renderer,
+                    gpuUiConsumer.eyeTexture(0u),
+                    gpuUiFrame.frame,
+                    uiCandidate);
+            }
+            if (livePipBoyScreenFocused && uiCandidate.view
+                && (gpuUiFrame.frame.renderFlags & fnvxr::gpu::color_v5::LivePipBoyCaptured) != 0u)
+            {
+                // Screen pixels have their own channel and capture lineage.
+                // World presentation keeps the matching historical rig pose.
+                // Do not classify authored UI by its palette or read full eyes
+                // back to the CPU merely to decide whether a menu may render.
+                const auto consecutiveFrames = renderer.livePipBoyUiUploadCount + 1u;
+                commitUiTextureCandidate(renderer, uiCandidate);
+                renderer.livePipBoyUiUploadCount = consecutiveFrames;
+                renderer.retainedUiLivePipBoySurface = consecutiveFrames >= 2u;
             }
         }
         const fnvxr::host::ui_capture::RuntimeSample hostUiRuntimeBefore {
@@ -11707,7 +11665,9 @@ int main(int argc, char** argv)
             haveRuntimeUiState,
         };
         fnvxr::host::gpu_color::RoutedFrame controllerRouted =
-            gpuColorFrame;
+            fnvxr::product::classifyRetailState(runtimeAuthorityInput)
+                    == fnvxr::product::RetailState::Gameplay
+                ? gpuColorFrame : gpuUiFrame;
         if (controllerRouted.content
                 == fnvxr::host::gpu_color::RoutedContent::MonoUiQuad
             && !incomingUiResourceReady)
@@ -11742,7 +11702,8 @@ int main(int argc, char** argv)
                 controllerRuntimeEvidence,
                 controllerRouted,
                 productSourceViewFound,
-                sourcePoseAgeValid);
+                controllerRouted.content == fnvxr::host::gpu_color::RoutedContent::MonoUiQuad
+                    ? gpuUiFresh : sourcePoseAgeValid);
         const bool routedTransportReady = controllerRouted.content
             != fnvxr::host::gpu_color::RoutedContent::SafetyBlank;
         const fnvxr::host::PresentationTransportProof presentationTransport {
@@ -11846,8 +11807,10 @@ int main(int argc, char** argv)
                         },
                         retainedPipBoyRuntimeLineage,
                     },
-                    renderer.stereoProducerProcessId,
-                    renderer.lastSharedStereoStateRendererEpoch,
+                    productionGpuColorV5 ? activeGpuColorProducerProcessId
+                        : renderer.stereoProducerProcessId,
+                    productionGpuColorV5 ? activeGpuColorProducerEpoch
+                        : renderer.lastSharedStereoStateRendererEpoch,
                     monotonicMilliseconds(contentReadinessNow),
                     runtimeConfig.get().wristUi
                         .maximumContentAgeMilliseconds,
@@ -11948,15 +11911,11 @@ int main(int argc, char** argv)
                 ? fnvxr::host::stereo_visual_trial::decide(
                     stereoVisualTrialInput)
                 : fnvxr::host::stereo_visual_trial::Decision {};
-        // This is deliberately not a ProductPresentationController decision.
-        // It provides an honest, bounded visual proof while controller and
-        // tracked-weapon authority remain closed.
-        const bool stereoVisualTrialActive =
-            gpuStereoVisualTrialDiagnostic
-            && !productionBinocularWorld
-            && stereoVisualTrialDecision.bindsStereoVisuals();
-        const bool presentedBinocularWorld = productionBinocularWorld
-            || stereoVisualTrialActive;
+        // Retain the diagnostic field for existing capture readers. There is
+        // one rendering decision: the kernel. Visual-trial switches no longer
+        // bypass it, and visible stereo does not imply full product acceptance.
+        const bool stereoVisualTrialActive = productionBinocularWorld;
+        const bool presentedBinocularWorld = productionBinocularWorld;
         if ((productionUiQuadActive || cpuEngineUiQuadActive)
             && !pipBoyMenuMode)
         {
@@ -12675,13 +12634,10 @@ int main(int argc, char** argv)
                 && renderer.stereoProducerEpoch
                     == sharedBridge.producerEpoch
                 && cpuWorldPresentation.present;
-            // A verified world texture is a latched presentation resource.
-            // Pose age decides whether the source is fresh enough to count as
-            // a newly advancing proof frame; it must not turn an already
-            // accepted layer off.  OpenXR can reproject the source views while
-            // the D3D9 producer finishes the next exact engine transaction.
-            // Semantic transitions (UI/runtime/producer identity) still clear
-            // or reject the resource through the gates above.
+            // Keep the verified texture available between producer updates,
+            // but submit it only within the CPU source-pose age/future budget.
+            // Retaining the resource must not bypass expiry or a newer menu;
+            // OpenXR reprojection cannot make an expired simulation current.
             const bool legacyStereoFullscreenActive =
                 allowStereoFullscreen
                 && renderer.hasStereoGameFrame
@@ -13019,9 +12975,11 @@ int main(int argc, char** argv)
                 fnvxr::host::spatial::solveBodyRig(
                 spatialHmdPose,
                 spatialHmdTracked,
-                spatialLeftPose,
+                fnvxr::host::spatial::handAttachmentPose(
+                    spatialLeftPose, retailHandLocalOffset(true)),
                 spatialLeftTracked,
-                spatialRightPose,
+                fnvxr::host::spatial::handAttachmentPose(
+                    spatialRightPose, retailHandLocalOffset(false)),
                 spatialRightTracked,
                 runtimeConfig.get().bodyRig);
             spatialPropsSourcePoseMatched =
@@ -13441,7 +13399,7 @@ int main(int argc, char** argv)
             || frameIndex % 60 == 0
             || (headsetMirrorCapture.enabled
                 && headsetMirrorCapture.schedule.activeFrame == frameIndex)
-            || !submitProjectionLayer
+            || submitProjectionLayer != previousProjectionSubmitted
             || endResult != XR_SUCCESS)
         {
             const fnvxr::kernel::FrameJoinTelemetry frameJoinTelemetry =
@@ -13452,6 +13410,8 @@ int main(int argc, char** argv)
                 << std::chrono::duration_cast<std::chrono::milliseconds>(
                        std::chrono::system_clock::now().time_since_epoch()).count()
                 << ",\"predictedDisplayTime\":" << frameState.predictedDisplayTime
+                << ",\"runtimeWaitNanoseconds\":" << (cadenceBeginTimestamp.value - frameWaitStarted.value)
+                << ",\"gpuConsumeNanoseconds\":" << (gpuConsumeFinished.value - cadenceBeginTimestamp.value)
                 << ",\"cadenceEpoch\":" << cadence.epoch
                 << ",\"cadenceFrameBudgetNanoseconds\":"
                 << cadence.frameBudgetNanoseconds
@@ -13626,13 +13586,23 @@ int main(int argc, char** argv)
                 << ",\"sourceStereoSequence\":" << renderer.stereoGameFrameSequence
                 << ",\"sourceStereoPublicationGeneration\":\""
                 << renderer.stereoGamePublicationGeneration << "\""
-                << ",\"sourceRenderPairSequence\":" << renderer.stereoGameRenderPairSequence
-                << ",\"sourcePoseSequence\":" << renderer.stereoGamePoseSequence
-                << ",\"sourceReferenceSpaceGeneration\":" << renderer.stereoReferenceSpaceGeneration
-                << ",\"sourcePoseProducerEpoch\":\"" << renderer.stereoProducerEpoch << "\""
-                << ",\"sourceRendererProducerEpoch\":\"" << renderer.stereoRendererProducerEpoch << "\""
-                << ",\"sourceProducerProcessId\":" << renderer.stereoProducerProcessId
-                << ",\"sourceRenderedDisplayTime\":" << renderer.stereoGameRenderedDisplayTime
+                << ",\"sourceRenderPairSequence\":" << (productionGpuColorV5
+                    ? gpuColorFrame.frame.transactionId : renderer.stereoGameRenderPairSequence)
+                << ",\"sourcePoseSequence\":" << (productionGpuColorV5
+                    ? gpuColorFrame.frame.poseSequence : renderer.stereoGamePoseSequence)
+                << ",\"sourceReferenceSpaceGeneration\":" << (productionGpuColorV5
+                    ? productSourceView.referenceSpaceGeneration : renderer.stereoReferenceSpaceGeneration)
+                << ",\"sourcePoseProducerEpoch\":\"" << (productionGpuColorV5
+                    ? productSourceView.hostProducerEpoch : renderer.stereoProducerEpoch) << "\""
+                << ",\"sourceRendererProducerEpoch\":\"" << (productionGpuColorV5
+                    ? gpuColorFrame.frame.producerEpoch : renderer.stereoRendererProducerEpoch) << "\""
+                << ",\"sourceProducerProcessId\":" << (productionGpuColorV5
+                    ? gpuColorFrame.frame.producerProcessId : renderer.stereoProducerProcessId)
+                << ",\"sourceRenderedDisplayTime\":" << (productionGpuColorV5
+                    ? gpuColorFrame.frame.renderedDisplayTime : renderer.stereoGameRenderedDisplayTime)
+                << ",\"gpuUiTransaction\":" << gpuUiFrame.frame.transactionId
+                << ",\"gpuUiRuntimeLineage\":" << (gpuUiRuntimeLineage ? "true" : "false")
+                << ",\"gpuUiFresh\":" << (gpuUiFresh ? "true" : "false")
                 << ",\"sourcePoseAgeNanoseconds\":"
                 << (productionCpuEngineStereo
                     ? cpuSourcePoseAgeNanoseconds
@@ -13747,6 +13717,7 @@ int main(int argc, char** argv)
                 << "\n";
             std::cout.flush();
         }
+        previousProjectionSubmitted = submitProjectionLayer;
         if (endResult == XR_SESSION_LOSS_PENDING)
         {
             lossPending = true;
@@ -13857,6 +13828,11 @@ int main(int argc, char** argv)
         << ",\"timeMismatch\":" << finalFrameJoin.timeMismatch
         << "}\n";
 
+    if (headsetMirrorCapture.writer)
+    {
+        headsetMirrorCapture.writer->finish();
+        headsetMirrorCapture.reportCompleted();
+    }
     closeHostSharedBridge(sharedBridge);
     closeSharedD3D9VideoFrame(renderer);
     if (!waitForD3D11GpuIdle(device.Get()))
@@ -13866,12 +13842,14 @@ int main(int argc, char** argv)
         // reclaim handles rather than making a provably invalid destroy call.
         std::cerr << "D3D11 GPU idle proof timed out; skipping explicit OpenXR teardown\n";
         gpuColorConsumer.reset();
+        gpuUiConsumer.reset();
         return 22;
     }
     // Release duplicated producer handles, shared resources, private eye
     // textures, fence interfaces, mapping, and the retained D3D11 reference
     // while the OpenXR device is still provably alive and idle.
     gpuColorConsumer.reset();
+    gpuUiConsumer.reset();
     if (sessionBegun && !lossPending)
         xr.endSession(session);
     xr.destroySwapchain(leftEye.handle);

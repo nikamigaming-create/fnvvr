@@ -158,10 +158,16 @@ if (-not $launcher.Contains(
     throw "Automated retail headset runs can still stage or launch the installed Library root."
 }
 if (-not $retailProps.Contains('1hphandgrip1.kf') -or
-    -not $retailProps.Contains('rightHandPose = "1hphandgrip1@end"') -or
-    -not $launcher.Contains('"1hphandgrip1@end"') -or
+    -not $retailProps.Contains('rightHandPose = "_1stperson/1hphandgrip1@end"') -or
+    -not $launcher.Contains('"_1stperson/1hphandgrip1@end"') -or
     $retailProps.Contains('1hpaim.kf')) {
     throw "Retail right-hand preparation no longer bakes the dedicated authored closed pistol-grip finger pose."
+}
+if (-not $retailProps.Contains('fnvxr-retail-props/v4') -or
+    -not $retailProps.Contains('--side right') -or
+    -not $common.Contains('FNVXR_RETAIL_RIGHT_FOREARM_MESH_PATH') -or
+    -not $hostSource.Contains('retailRightForearmVertexBuffer')) {
+    throw "The physical overlay no longer derives and renders both retail forearms."
 }
 if (-not $hostSource.Contains(
         'PoseInteractionLivePipBoyPointerActive') -or
@@ -978,6 +984,9 @@ if ([string]$physicalHeadsetEnvironment.FNVXR_RETAIL_VR_FIRST_PERSON_PRIVATE_CAL
     [string]$physicalHeadsetEnvironment.FNVXR_PHYSICAL_HEADSET_PLAY -cne "1" -or
     [string]$physicalHeadsetEnvironment.FNVXR_RETAIL_CENTER_INTEGRATED_FIRST_PERSON -cne "1" -or
     [string]$physicalHeadsetEnvironment.FNVXR_SPATIAL_HANDS_OVERLAY -cne "1" -or
+    [string]$physicalHeadsetEnvironment.FNVXR_LIVE_PIPBOY_FOCUS_FRAMES -cne "6" -or
+    [string]$physicalHeadsetEnvironment.FNVXR_LIVE_PIPBOY_FOCUS_HIT_SCALE_X -cne "2.6" -or
+    [string]$physicalHeadsetEnvironment.FNVXR_LIVE_PIPBOY_MAX_MEAN_LUMA -cne "75" -or
     [string]$physicalHeadsetEnvironment.FNVXR_SHOW_LEFT_AIM_RAY -cne "0" -or
     [string]$physicalHeadsetEnvironment.FNVXR_SHOW_RIGHT_AIM_RAY -cne "0" -or
     [string]$physicalHeadsetEnvironment.FNVXR_DEBUG_AXES -cne "0") {
@@ -1385,7 +1394,9 @@ foreach ($physicalPlayContract in @(
     'FNVXR_PLUGIN_GAMEPLAY_KEYBOARD_FALLBACK = "1"',
     'FNVXR_PHYSICAL_LEFT_MENU_PIPBOY_ENABLE = "1"',
     'FNVXR_DIRECT_UI_CLICK = "1"',
-    'FNVXR_LIVE_PIPBOY_FOCUS_FRAMES = "12"',
+    'FNVXR_LIVE_PIPBOY_FOCUS_FRAMES = "6"',
+    'FNVXR_LIVE_PIPBOY_FOCUS_HIT_SCALE_X = "2.6"',
+    'FNVXR_LIVE_PIPBOY_MAX_MEAN_LUMA = "75"',
     'FNVXR_UI_INPUT_WIDTH',
     'FNVXR_UI_INPUT_HEIGHT',
     'FNVXR_D3D9_NATIVE_APPLY_HEAD_ROTATION = "1"',
@@ -1396,6 +1407,9 @@ foreach ($physicalPlayContract in @(
     '"fnvxrRetailEngineCenterCpuStereo"',
     'live-source-resolution-proven',
     'Get-FnvxrProductControllerAuthorizationProof',
+    'spatialPropsSourcePoseMatched',
+    'sourceViewHistory.findPoseSequence',
+    'spatialPropsPoseSequence',
     'controllerConsumerAcknowledged',
     'runtimeControllerMode(',
     'controller mode transition',
@@ -1685,7 +1699,7 @@ if ($launcher.Contains('$manifest.accepted = $true')) {
     throw "Visual trial must not represent itself as full product acceptance."
 }
 if (-not $launcher.Contains(
-    'retail VR bridge initialized: exact AccumulateScene callsite hook, ordinary-D3D9 CPU-v8 stereo transport, and deferred Present bootstrap ready')) {
+    'retail VR bridge initialized: exact AccumulateScene callsite hook, D3D9On12 GPU-v6 world/UI transport, and deferred Present bootstrap ready')) {
     throw "Visual trial must prove bridge initialization instead of accepting a merely loaded proxy."
 }
 if (-not $launcher.Contains(

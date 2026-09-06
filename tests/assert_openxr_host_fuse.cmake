@@ -15,7 +15,7 @@ file(READ "${HOST_AUTHORITY}" host_authority)
 
 foreach(required_trial_text IN ITEMS
         "#include \"fnvxr_stereo_visual_trial.h\""
-        "stereoVisualTrialDecision.bindsStereoVisuals()"
+        "const bool stereoVisualTrialActive = productionBinocularWorld;"
         "const bool presentedBinocularWorld = productionBinocularWorld"
         "stereoVisualTrialFullProductAccepted"
         "controllerMutationAuthorized"
@@ -73,7 +73,7 @@ foreach(required_product_kernel_text IN ITEMS
         "productDecision.spatialRigMayRender"
         "productDecision.wristScreenMayRender"
         "runtimeConfig.get().performance.eyeTransport"
-        "FNVXR_ENABLE_UNPROVEN_GPU_STEREO_VISUAL_TRIAL_DIAGNOSTIC"
+        "fnvxr::gpu::color_v5::FrameChannel::Ui"
         "auxiliaryPipBoyUiRequested"
         "pipBoySourceRuntimeEligible"
         "rightHandGripCalibrationHistory.find("
