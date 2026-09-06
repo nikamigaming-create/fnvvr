@@ -1,0 +1,36 @@
+{
+  "schema": "opennv-fo1-tactical-proof/v1",
+  "status": "pass",
+  "evidenceLevel": "private-local-artifact",
+  "sourceReportSha256": "c2dce1acd2ee166d7b3b8266592902fe5ad105c1b1e111d7d47f2aa4dd2c6ebd",
+  "sceneSha256": "fdd490db24623a9e173e540010e335e3e96e8da2074869741febf36084a897d1",
+  "grid": {
+    "width": 200,
+    "height": 200,
+    "flatToFlatReconstructionMeters": 1.0,
+    "layout": "odd-row-offset-pointy"
+  },
+  "topology": {
+    "floorBackedHexes": 30196,
+    "provisionalWalkableHexesAfterDecodedObjectFlags": 29127,
+    "drawnOverlayHexesAfterPresentationFootprintMasks": 27519,
+    "sessionReportedProvisionalWalkableHexes": 27520,
+    "presentationFootprintBlockedHexes": 1608
+  },
+  "encounter": {
+    "sourceMobCount": 20,
+    "proofAttacks": 1,
+    "proofKills": 1,
+    "livingMobsAfterProof": 19,
+    "alertedMobsAfterProof": 0,
+    "localActivationDistanceHexes": 6,
+    "wholeCaveAggroPreventedInProof": true
+  },
+  "limitations": [
+    "Counts are not a complete Fallout walk-mask parity claim.",
+    "Complete OBJECT_MULTIHEX footprint parity is unsupported.",
+    "The one-metre hex scale is a reconstruction convention, not recovered retail metric truth.",
+    "The report was produced from a dirty source tree and is not yet paired with a reproducible source snapshot."
+  ],
+  "sanitization": "Absolute local paths, private character data, and presentation-asset paths removed."
+}
