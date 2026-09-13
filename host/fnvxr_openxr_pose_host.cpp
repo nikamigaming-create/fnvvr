@@ -22,6 +22,8 @@
 #include "fnvxr_runtime_config_loader.h"
 #include "fnvxr_product_kernel_adapter.h"
 #include "fnvxr_tracking_lifetime.h"
+#include "fnvxr_world_continuity.h"
+#include "../protocol/fnvxr_haptic_feedback.h"
 #include "fnvxr_eye_readback_policy.h"
 #include "fnvxr_openxr_spatial_adapter.h"
 #include "../kernel/performance/cadence_tracker.h"
@@ -30,6 +32,7 @@
 #include "../kernel/transport/presentation_authority.h"
 #include "../kernel/wrist/activation.h"
 #include "../kernel/wrist/content_readiness.h"
+#include "../kernel/wrist/placement.h"
 
 #include <windows.h>
 #include <bcrypt.h>
@@ -110,10 +113,13 @@ struct OpenXr
     PFN_xrGetActionStateBoolean getActionStateBoolean = nullptr;
     PFN_xrGetActionStateVector2f getActionStateVector2f = nullptr;
     PFN_xrGetActionStatePose getActionStatePose = nullptr;
+    PFN_xrApplyHapticFeedback applyHapticFeedback = nullptr;
+    PFN_xrStopHapticFeedback stopHapticFeedback = nullptr;
 };
 
 struct XrInputActions
 {
+    XrAction vibration = XR_NULL_HANDLE;
     XrAction handPose = XR_NULL_HANDLE;
     XrAction aimPose = XR_NULL_HANDLE;
     XrAction leftTrigger = XR_NULL_HANDLE;
@@ -259,13 +265,12 @@ struct Constants
     XMFLOAT4 color;
 };
 
-// The compositor uses XR_ENVIRONMENT_BLEND_MODE_OPAQUE, so swapchain alpha is
-// presentation-inert. Preserve category IDs there for final-eye QA: unlike
-// scene-graph telemetry, these values prove the hands/device reached pixels.
+// Hand alpha remains available to legacy capture diagnostics. The Pip-Boy
+// casing and screen are explicitly opaque in every presentation mode.
 constexpr float SpatialAlphaLeftHand = 0.20f;
 constexpr float SpatialAlphaRightHand = 0.40f;
-constexpr float SpatialAlphaPipBoyHousing = 0.60f;
-constexpr float SpatialAlphaPipBoyScreen = 0.80f;
+constexpr float SpatialAlphaPipBoyHousing = 1.0f;
+constexpr float SpatialAlphaPipBoyScreen = 1.0f;
 
 struct Renderer
 {
@@ -289,6 +294,8 @@ struct Renderer
     ComPtr<ID3D11InputLayout> texturedInputLayout;
     ComPtr<ID3D11Buffer> texturedVertexBuffer;
     ComPtr<ID3D11Buffer> pipBoyScreenTexturedVertexBuffer;
+    ComPtr<ID3D11Buffer> pipBoyNativeUiVertexBuffer;
+    std::vector<TexturedVertex> pipBoyNativeUiVertices;
     UINT pipBoyScreenTexturedVertexCount = 0;
     ComPtr<ID3D11Buffer> roundedVertexBuffer;
     UINT roundedVertexCount = 0;
@@ -322,6 +329,11 @@ struct Renderer
     ComPtr<ID3D11ShaderResourceView> gameTextureView;
     ComPtr<ID3D11Texture2D> retainedUiTexture;
     ComPtr<ID3D11ShaderResourceView> retainedUiTextureView;
+    ComPtr<ID3D11Texture2D> wristUiTexture;
+    ComPtr<ID3D11ShaderResourceView> wristUiTextureView;
+    bool wristUiIsolated = false;
+    std::uint64_t wristUiProducerEpoch = 0;
+    std::uint32_t wristUiProducerProcessId = 0;
     ComPtr<ID3D11Texture2D> uiScratchTexture;
     ComPtr<ID3D11ShaderResourceView> uiScratchTextureView;
     ComPtr<ID3D11Texture2D> worldTexture;
@@ -332,6 +344,7 @@ struct Renderer
     std::array<ComPtr<ID3D11ShaderResourceView>, 2> stereoGameTextureViews;
     ComPtr<ID3D11SamplerState> gameSampler;
     ComPtr<ID3D11BlendState> alphaBlendState;
+    ComPtr<ID3D11BlendState> premultipliedUiBlendState;
     ComPtr<ID3D11RasterizerState> rasterizerState;
     ComPtr<ID3D11DepthStencilState> depthState;
     ComPtr<ID3D11DepthStencilState> gamePlaneDepthState;
@@ -385,8 +398,10 @@ struct Renderer
     float retainedUiTextureAspect = 16.0f / 9.0f;
     bool retainedUiHostWindowCaptured = false;
     bool retainedUiLivePipBoySurface = false;
+    bool retainedUiIsolated = false;
     std::chrono::steady_clock::time_point retainedUiAcceptedAt {};
     std::uint32_t livePipBoyUiUploadCount = 0u;
+    XrTime livePipBoyOpenedDisplayTime = 0;
     std::uint64_t retainedCpuUiTransactionId = 0u;
     std::uint64_t retainedCpuUiEpoch = 0u;
     std::uint32_t retainedCpuUiProducerProcessId = 0u;
@@ -486,6 +501,57 @@ struct PipBoyScreenCalibration final
 {
     XMFLOAT3 gripLocalPosition {};
     XrQuaternionf gripLocalRotation { 0.0f, 0.0f, 0.0f, 1.0f };
+    XrVector3f gripLocalScalePivot {};
+    float nativeDeviceScale = 1.0f;
+};
+
+struct SubmittedWorldSnapshot final
+{
+    bool valid = false;
+    std::uint32_t cellFormId = 0;
+    fnvxr::host::gpu_color::RoutedFrame routed {};
+    fnvxr::product::StereoFrameProof proof {};
+    fnvxr::host::SourceViewPublication pose {};
+    XrQuaternionf rightHandCalibration {};
+    PipBoyScreenCalibration leftScreenCalibration {};
+    std::array<ComPtr<ID3D11Texture2D>, 2> textures;
+    std::array<ComPtr<ID3D11ShaderResourceView>, 2> views;
+
+    bool copyEyes(ID3D11Device* device, ID3D11Texture2D* left, ID3D11Texture2D* right)
+    {
+        valid = false;
+        ComPtr<ID3D11DeviceContext> context;
+        device->GetImmediateContext(&context);
+        ID3D11Texture2D* sources[] { left, right };
+        for (std::size_t eye = 0; eye < textures.size(); ++eye)
+        {
+            if (!sources[eye]) return false;
+            D3D11_TEXTURE2D_DESC description {};
+            sources[eye]->GetDesc(&description);
+            D3D11_TEXTURE2D_DESC existing {};
+            if (textures[eye]) textures[eye]->GetDesc(&existing);
+            if (existing.Width != description.Width || existing.Height != description.Height
+                || existing.Format != description.Format)
+            {
+                textures[eye].Reset();
+                views[eye].Reset();
+            }
+            if (!textures[eye])
+            {
+                description.Usage = D3D11_USAGE_DEFAULT;
+                description.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+                description.CPUAccessFlags = 0;
+                description.MiscFlags = 0;
+                if (FAILED(device->CreateTexture2D(&description, nullptr, &textures[eye]))
+                    || FAILED(device->CreateShaderResourceView(textures[eye].Get(), nullptr, &views[eye])))
+                    return false;
+            }
+            // These private copies survive the next consumer pair. The GPU
+            // context orders their copy after rendering and before later use.
+            context->CopyResource(textures[eye].Get(), sources[eye]);
+        }
+        return true;
+    }
 };
 
 struct HostSharedBridge
@@ -540,6 +606,9 @@ struct EyeRenderProof
 struct HeadsetMirrorCapture
 {
     bool enabled = false;
+    const char* eventName = "fnvxrHeadsetMirrorCapture";
+    bool includeEmptyDiagnosticSources = false;
+    bool jpeg = false;
     std::wstring directory;
     std::uint32_t everyFrames = 1u;
     std::uint32_t maximumPairs = 0u;
@@ -553,7 +622,7 @@ struct HeadsetMirrorCapture
         for (const auto& completed : writer->takeCompleted())
             for (std::size_t eye = 0; eye != 2; ++eye)
                 std::cout
-                    << "{\"event\":\"fnvxrHeadsetMirrorCapture\",\"frame\":" << completed.frame
+                    << "{\"event\":\"" << eventName << "\",\"frame\":" << completed.frame
                     << ",\"ordinal\":" << completed.ordinal
                     << ",\"eye\":\"" << (eye == 0 ? "left" : "right")
                     << "\",\"saved\":" << (completed.status[eye] >= 0 ? "true" : "false")
@@ -583,6 +652,7 @@ struct UiTextureCandidate
     float aspect = 16.0f / 9.0f;
     std::uint32_t producerProcessId = 0u;
     std::uint64_t producerEpoch = 0u;
+    bool isolated = false;
 };
 
 constexpr LONG SharedPointerWidth = 1280;
@@ -1216,9 +1286,9 @@ std::wstring headsetMirrorFramePath(
     wchar_t fileName[64] {};
     if (swprintf_s(
             fileName,
-            L"pair_%06u_%s.png",
+            L"pair_%06u_%s.%s",
             ordinal,
-            eyeIndex == 0u ? L"left" : L"right") < 0)
+            eyeIndex == 0u ? L"left" : L"right", capture.jpeg ? L"jpg" : L"png") < 0)
     {
         return {};
     }
@@ -1714,7 +1784,9 @@ bool loadInstanceFunctions(OpenXr& xr, XrInstance instance)
         && loadInstanceFunction(xr, instance, "xrGetActionStateFloat", xr.getActionStateFloat)
         && loadInstanceFunction(xr, instance, "xrGetActionStateBoolean", xr.getActionStateBoolean)
         && loadInstanceFunction(xr, instance, "xrGetActionStateVector2f", xr.getActionStateVector2f)
-        && loadInstanceFunction(xr, instance, "xrGetActionStatePose", xr.getActionStatePose);
+        && loadInstanceFunction(xr, instance, "xrGetActionStatePose", xr.getActionStatePose)
+        && loadInstanceFunction(xr, instance, "xrApplyHapticFeedback", xr.applyHapticFeedback)
+        && loadInstanceFunction(xr, instance, "xrStopHapticFeedback", xr.stopHapticFeedback);
 }
 
 int64_t chooseSwapchainFormat(OpenXr& xr, XrSession session)
@@ -3840,10 +3912,22 @@ bool updateSharedSpatialPropCalibration(HostSharedBridge& bridge)
             const float w = candidate.leftPipBoyScreenGripLocalRot[3];
             const float rotationLength = std::sqrt(
                 x * x + y * y + z * z + w * w);
+            const XrVector3f scalePivot {
+                candidate.leftPipBoyScalePivotGripLocalPos[0],
+                candidate.leftPipBoyScalePivotGripLocalPos[1],
+                candidate.leftPipBoyScalePivotGripLocalPos[2],
+            };
             if (!std::isfinite(positionLength)
                 || positionLength < 0.02f || positionLength > 0.40f
                 || !std::isfinite(rotationLength)
-                || rotationLength < 0.5f || rotationLength > 1.5f)
+                || rotationLength < 0.5f || rotationLength > 1.5f
+                || !std::isfinite(scalePivot.x) || !std::isfinite(scalePivot.y)
+                || !std::isfinite(scalePivot.z)
+                || !std::isfinite(candidate.leftPipBoyDeviceScale)
+                || candidate.leftPipBoyDeviceScale < 0.25f
+                || candidate.leftPipBoyDeviceScale > 6.0f
+                || scalePivot.x * scalePivot.x + scalePivot.y * scalePivot.y
+                    + scalePivot.z * scalePivot.z > 0.16f)
             {
                 return false;
             }
@@ -3862,6 +3946,8 @@ bool updateSharedSpatialPropCalibration(HostSharedBridge& bridge)
             const PipBoyScreenCalibration calibration {
                 bridge.leftPipBoyScreenGripLocalPosition,
                 bridge.leftPipBoyScreenGripLocalRotation,
+                scalePivot,
+                candidate.leftPipBoyDeviceScale,
             };
             if (!bridge.leftPipBoyScreenCalibrationHistory.record(
                     identity, calibration))
@@ -3881,7 +3967,10 @@ bool updateSharedSpatialPropCalibration(HostSharedBridge& bridge)
                     << " pos=(" << px << "," << py << "," << pz << ")"
                     << " quat=(" << x / rotationLength << ","
                     << y / rotationLength << "," << z / rotationLength
-                    << "," << w / rotationLength << ")\n";
+                    << "," << w / rotationLength << ")"
+                    << " pivot=(" << scalePivot.x << "," << scalePivot.y
+                    << "," << scalePivot.z << ") scale="
+                    << candidate.leftPipBoyDeviceScale << "\n";
             }
         }
         return updated;
@@ -5348,7 +5437,8 @@ XrPosef poseAlongSegment(XMVECTOR start, XMVECTOR end, XMVECTOR preferredUp)
 
 GamePlane gamePlaneFromHmd(
     const XrPosef& hmdPose,
-    const fnvxr::kernel::PresentationConfig& config)
+    const fnvxr::kernel::PresentationConfig& config,
+    bool retainHeadPitch = false)
 {
     GamePlane plane {};
     plane.width = config.menuWidthMeters;
@@ -5362,7 +5452,8 @@ GamePlane gamePlaneFromHmd(
         XMVECTOR hmdForward =
             XMVector3Normalize(XMVector3Rotate(XMVectorSet(0.0f, 0.0f, -1.0f, 0.0f), planeOrientation));
         const XMVECTOR worldUp = XMVectorSet(0.0f, 1.0f, 0.0f, 0.0f);
-        if (envFloat("FNVXR_GAME_PLANE_REMOVE_PITCH", 1.0f) != 0.0f)
+        if (!retainHeadPitch
+            && envFloat("FNVXR_GAME_PLANE_REMOVE_PITCH", 1.0f) != 0.0f)
         {
             // A fallback/menu surface is not the native 3D camera.  Recenter
             // it at eye height using headset yaw only so looking down while
@@ -5398,17 +5489,29 @@ GamePlane gamePlaneFromHmd(
     return plane;
 }
 
+float pipBoyDeviceScale(float focusScale)
+{
+    return std::clamp(envFloat("FNVXR_PIPBOY_SCALE", 1.0f), 0.25f, 4.0f)
+        * std::clamp(focusScale, 1.0f, 1.5f);
+}
+
 std::optional<GamePlane> livePipBoyInteractionPlane(
     const XrPosef& leftGrip,
     bool leftGripTracked,
     float scale,
     const fnvxr::kernel::WristUiConfig& config,
     const XMFLOAT3* measuredGripLocalPosition,
-    const XrQuaternionf* measuredGripLocalRotation)
+    const XrQuaternionf* measuredGripLocalRotation,
+    const XrVector3f* measuredGripLocalScalePivot)
 {
     XrPosef calibration {};
     const bool calibrated = measuredGripLocalPosition != nullptr
-        && measuredGripLocalRotation != nullptr;
+        && measuredGripLocalRotation != nullptr
+        && measuredGripLocalScalePivot != nullptr;
+    // Native arm pixels contain an actual animated forearm mount. The generic
+    // kernel wrist pose is not a substitute for that missing source identity.
+    if (!calibrated)
+        return std::nullopt;
     if (calibrated)
     {
         calibration.position = {
@@ -5423,8 +5526,9 @@ std::optional<GamePlane> livePipBoyInteractionPlane(
             config,
             leftGrip,
             leftGripTracked,
-            std::clamp(scale, 1.0F, 1.5F),
-            calibrated ? &calibration : nullptr);
+            scale,
+            calibrated ? &calibration : nullptr,
+            measuredGripLocalScalePivot);
     if (!surface)
         return std::nullopt;
 
@@ -5880,6 +5984,14 @@ void drawTexturedVertexBuffer(
     context->PSSetShaderResources(0, 1, &emptyView);
 }
 
+XMMATRIX pipBoyModelFromPlane(const GamePlane& plane)
+{
+    // Both source meshes share one screen-local basis. Enlargement is applied
+    // once in placement and therefore includes the casing, curved display and
+    // the pointer hit area, with no independent screen or housing multiplier.
+    return modelFromPose(plane.pose, { plane.width, plane.height, plane.width });
+}
+
 void drawPipBoyScreen(
     ID3D11DeviceContext* context,
     Renderer& renderer,
@@ -5887,21 +5999,21 @@ void drawPipBoyScreen(
     const GamePlane& screenPlane,
     ID3D11ShaderResourceView* sourceTextureView)
 {
-    if (!sourceTextureView || !renderer.pipBoyScreenTexturedVertexBuffer)
+    if (!renderer.pipBoyScreenTexturedVertexBuffer)
         return;
 
     drawTexturedVertexBuffer(
         context,
         renderer,
         viewProjection,
-        modelFromPose(
-            screenPlane.pose,
-            { screenPlane.width, screenPlane.height, 1.0f }),
-        { 1.0f, 1.0f, 1.0f, SpatialAlphaPipBoyScreen },
-        sourceTextureView,
-        renderer.pipBoyScreenTexturedVertexBuffer.Get(),
+        pipBoyModelFromPlane(screenPlane),
+        sourceTextureView ? XMFLOAT4 { 1.0f, 1.0f, 1.0f, SpatialAlphaPipBoyScreen }
+            : XMFLOAT4 { 0.012f, 0.020f, 0.014f, 1.0f },
+        sourceTextureView ? sourceTextureView : renderer.retailPipBoyTextureView.Get(),
+        renderer.wristUiIsolated ? renderer.pipBoyNativeUiVertexBuffer.Get()
+            : renderer.pipBoyScreenTexturedVertexBuffer.Get(),
         renderer.pipBoyScreenTexturedVertexCount,
-        renderer.forcedAlphaPixelShader.Get());
+        sourceTextureView ? renderer.forcedAlphaPixelShader.Get() : renderer.pixelShader.Get());
 }
 
 void drawGamePlane(
@@ -6022,6 +6134,17 @@ void drawGamePlane(
         return;
     }
 
+    if (renderer.retainedUiIsolated
+        && gameTextureView == renderer.retainedUiTextureView.Get())
+    {
+        drawTexturedVertexBuffer(
+            context, renderer, viewProjection,
+            modelFromPose(gamePlane.pose, { gamePlane.width, gamePlane.height, 1.0f }),
+            { 1.0f, 1.0f, 1.0f, 1.0f }, gameTextureView,
+            renderer.texturedVertexBuffer.Get(), 6u, nullptr,
+            renderer.premultipliedUiBlendState.Get());
+        return;
+    }
     drawTexturedPlane(
         context,
         renderer,
@@ -6233,6 +6356,8 @@ bool prepareUiTextureCandidate(
     candidate.runtimeStateSample = frame.runtimeStateSample;
     candidate.producerProcessId = frame.producerProcessId;
     candidate.producerEpoch = frame.producerEpoch;
+    candidate.isolated =
+        (frame.renderFlags & fnvxr::gpu::color_v5::IsolatedMenuCaptured) != 0u;
     candidate.aspect = static_cast<float>(description.Width)
         / static_cast<float>(description.Height);
     return true;
@@ -6260,6 +6385,7 @@ void commitUiTextureCandidate(
     renderer.retainedUiTextureAspect = candidate.aspect;
     renderer.retainedUiHostWindowCaptured = false;
     renderer.retainedUiLivePipBoySurface = false;
+    renderer.retainedUiIsolated = candidate.isolated;
     renderer.retainedUiAcceptedAt = std::chrono::steady_clock::now();
     renderer.livePipBoyUiUploadCount = 0u;
     renderer.retainedCpuUiTransactionId = 0u;
@@ -6272,8 +6398,41 @@ void commitUiTextureCandidate(
     candidate = {};
 }
 
+void snapshotWristUi(ID3D11Device* device, Renderer& renderer)
+{
+    if (!renderer.retainedUiTexture || !renderer.retainedUiIsolated) return;
+    D3D11_TEXTURE2D_DESC description {};
+    renderer.retainedUiTexture->GetDesc(&description);
+    if (renderer.wristUiTexture)
+    {
+        D3D11_TEXTURE2D_DESC previous {};
+        renderer.wristUiTexture->GetDesc(&previous);
+        if (previous.Width != description.Width || previous.Height != description.Height
+            || previous.Format != description.Format)
+        { renderer.wristUiTexture.Reset(); renderer.wristUiTextureView.Reset(); }
+    }
+    if (!renderer.wristUiTexture)
+    {
+        if (FAILED(device->CreateTexture2D(&description, nullptr, &renderer.wristUiTexture))
+            || FAILED(device->CreateShaderResourceView(renderer.wristUiTexture.Get(), nullptr,
+                &renderer.wristUiTextureView)))
+        { renderer.wristUiTexture.Reset(); renderer.wristUiTextureView.Reset(); return; }
+    }
+    ComPtr<ID3D11DeviceContext> context;
+    device->GetImmediateContext(&context);
+    context->CopyResource(renderer.wristUiTexture.Get(), renderer.retainedUiTexture.Get());
+    renderer.wristUiIsolated = true;
+    renderer.wristUiProducerEpoch = renderer.retainedUiRendererProducerEpoch;
+    renderer.wristUiProducerProcessId = renderer.retainedUiProducerProcessId;
+}
+
 void clearRetainedUiResource(Renderer& renderer) noexcept
 {
+    renderer.wristUiTexture.Reset();
+    renderer.wristUiTextureView.Reset();
+    renderer.wristUiIsolated = false;
+    renderer.wristUiProducerEpoch = 0;
+    renderer.wristUiProducerProcessId = 0;
     renderer.uiScratchTexture.Reset();
     renderer.uiScratchTextureView.Reset();
     renderer.retainedUiTexture.Reset();
@@ -6286,6 +6445,7 @@ void clearRetainedUiResource(Renderer& renderer) noexcept
     renderer.retainedUiTextureAspect = 16.0f / 9.0f;
     renderer.retainedUiHostWindowCaptured = false;
     renderer.retainedUiLivePipBoySurface = false;
+    renderer.retainedUiIsolated = false;
     renderer.retainedUiAcceptedAt = {};
     renderer.livePipBoyUiUploadCount = 0u;
     renderer.retainedCpuUiTransactionId = 0u;
@@ -6404,6 +6564,7 @@ bool uploadCpuEngineUiTexture(
     }
 
     renderer.retainedUiSourceFrame = frame.identity.sourceFrame;
+    renderer.retainedUiIsolated = false;
     renderer.retainedUiRuntimeStateSample = frame.identity.runtimeStateSample;
     renderer.retainedUiTextureAspect = frame.aspect;
     renderer.retainedUiHostWindowCaptured = false;
@@ -6452,6 +6613,32 @@ MenuPointer menuPointerFromAimPose(const XrPosef& aimPose, const GamePlane& game
         return {};
 
     return { true, clamp01(pointerX), clamp01(pointerY) };
+}
+
+std::optional<TexturedVertex> wristSurfacePoint(const Renderer& renderer, const MenuPointer& panel)
+{
+    if (!panel.active) return {};
+    const float x = panel.x - 0.5f, y = 0.5f - panel.y;
+    const auto& mesh = renderer.pipBoyNativeUiVertices;
+    for (std::size_t i = 0; i + 2 < mesh.size(); i += 3)
+    {
+        const auto& a = mesh[i]; const auto& b = mesh[i + 1]; const auto& c = mesh[i + 2];
+        const float area = (b.y - c.y) * (a.x - c.x) + (c.x - b.x) * (a.y - c.y);
+        if (std::fabs(area) < 1e-8f) continue;
+        const float wa = ((b.y - c.y) * (x - c.x) + (c.x - b.x) * (y - c.y)) / area;
+        const float wb = ((c.y - a.y) * (x - c.x) + (a.x - c.x) * (y - c.y)) / area;
+        const float wc = 1.f - wa - wb;
+        if (wa < -1e-4f || wb < -1e-4f || wc < -1e-4f) continue;
+        return TexturedVertex { x, y, wa*a.z + wb*b.z + wc*c.z,
+            wa*a.u + wb*b.u + wc*c.u, wa*a.v + wb*b.v + wc*c.v };
+    }
+    return {};
+}
+
+MenuPointer nativeWristTexturePointer(const Renderer& renderer, const MenuPointer& panel)
+{
+    const auto surface = wristSurfacePoint(renderer, panel);
+    return surface ? MenuPointer { true, clamp01(surface->u), clamp01(surface->v) } : MenuPointer {};
 }
 
 HeadspaceLook sampleRightHandspaceLook(
@@ -6522,7 +6709,8 @@ void drawMenuPointer(
     if (!pointer.active)
         return;
 
-    drawLocalCube(
+    const float size = std::clamp(gamePlane.width * 0.003f, 0.002f, 0.006f);
+    drawLocalRounded(
         context,
         renderer,
         viewProjection,
@@ -6530,11 +6718,11 @@ void drawMenuPointer(
         {
             pointer.x * gamePlane.width - gamePlane.width * 0.5f,
             gamePlane.height * 0.5f - pointer.y * gamePlane.height,
-            0.015f
+            0.002f
         },
         { 0.0f, 0.0f, 0.0f },
-        { 0.025f, 0.025f, 0.004f },
-        { 1.0f, 0.95f, 0.05f, 1.0f });
+        { size, size, 0.001f },
+        { 1.0f, 0.88f, 0.40f, 1.0f });
 }
 
 void drawPipBoyPointer(
@@ -6547,10 +6735,12 @@ void drawPipBoyPointer(
     if (!pointer.active || !envEnabled("FNVXR_SHOW_PIPBOY_POINTER", true))
         return;
     const float size = std::clamp(
-        envFloat("FNVXR_PIPBOY_POINTER_SIZE", 0.007f),
-        0.003f,
-        0.015f);
-    drawLocalCube(
+        envFloat("FNVXR_PIPBOY_POINTER_SIZE", plane.width * 0.014f),
+        0.0012f,
+        0.0025f);
+    const auto surface = wristSurfacePoint(renderer, pointer);
+    if (!surface) return;
+    drawLocalRounded(
         context,
         renderer,
         viewProjection,
@@ -6558,11 +6748,11 @@ void drawPipBoyPointer(
         {
             pointer.x * plane.width - plane.width * 0.5f,
             plane.height * 0.5f - pointer.y * plane.height,
-            0.012f,
+            surface->z * plane.width + 0.001f,
         },
         { 0.0f, 0.0f, 0.0f },
-        { size, size, 0.003f },
-        { 1.0f, 0.82f, 0.05f, 1.0f });
+        { size, size, 0.001f },
+        { 1.0f, 0.88f, 0.40f, 1.0f });
 }
 
 void drawWeaponOrbitWheel(
@@ -6714,7 +6904,7 @@ void drawPipboyRig(
     const SolvedArm& leftArm,
     const GamePlane& screenPlane)
 {
-    const float scale = envFloat("FNVXR_PIPBOY_SCALE", 1.0f);
+    const float scale = 1.0f;
     const float width = screenPlane.width;
     const float height = screenPlane.height;
     if (renderer.retailPipBoyVertexBuffer
@@ -6725,9 +6915,7 @@ void drawPipboyRig(
             context,
             renderer,
             viewProjection,
-            modelFromPose(
-                screenPlane.pose,
-                { width * scale, height * scale, width * scale }),
+            pipBoyModelFromPlane(screenPlane),
             renderer.retailPipBoyVertexBuffer.Get(),
             renderer.retailPipBoyVertexCount,
             renderer.retailPipBoyTextureView.Get(),
@@ -6821,6 +7009,11 @@ void drawHandFingers(
     bool left,
     const XrQuaternionf* rightHandGripLocalRotation)
 {
+    // Engine-owned skinned hands already share the weapon's eye color and
+    // depth. Never draw a second independently posed hand over those pixels.
+    if (envEnabled(left ? "FNVXR_FIRST_PERSON_LEFT_HAND_ROOT"
+                        : "FNVXR_FIRST_PERSON_RIGHT_HAND_ROOT", false))
+        return;
     if (!envEnabled("FNVXR_SHOW_HAND_FINGERS", true))
         return;
     drawHandPrimitive(
@@ -7000,7 +7193,8 @@ bool captureSwapchainRenderProof(
     proof.valid = proof.samples >= 64
         && proof.nonBlackSamples >= 16
         && proof.variedSamples >= 16;
-    if (proof.valid && headsetMirrorCapture && headsetMirrorCapture->writer && eyeIndex < 2u)
+    if (headsetMirrorCapture && headsetMirrorCapture->writer && eyeIndex < 2u
+        && (proof.valid || headsetMirrorCapture->includeEmptyDiagnosticSources))
     {
         auto& capture = *headsetMirrorCapture;
         const auto decision = capture.request(hostFrame);
@@ -7022,6 +7216,7 @@ bool captureSwapchainRenderProof(
                 image.rowPitch = desc.Width * 4u;
                 image.format = static_cast<std::uint32_t>(desc.Format);
                 image.rgba = layout == HeadsetMirrorPixelLayout::Rgba;
+                image.jpeg = capture.jpeg;
                 image.pixels.resize(static_cast<std::size_t>(image.rowPitch) * image.height);
                 for (UINT y = 0; y != image.height; ++y)
                     std::memcpy(image.pixels.data() + static_cast<std::size_t>(y) * image.rowPitch,
@@ -7231,14 +7426,13 @@ bool renderEye(
         && (drawLegacyWorldProps || productionWorldTextureView);
     if (drawWorldProps && envEnabled("FNVXR_SHOW_BODY_RIG", true))
     {
-        // Keep the wrist device physically connected to an authored retail
-        // arm even when the debug full-arm primitives are disabled.
-        drawRetailForearm(
-            context.Get(), renderer, viewProjection, bodyRig.left, true);
-        drawRetailForearm(
-            context.Get(), renderer, viewProjection, bodyRig.right, false);
-        if (envEnabled("FNVXR_SHOW_FULL_ARMS", false))
+        if (envEnabled("FNVXR_SHOW_FULL_ARMS", false)
+            && !envEnabled("FNVXR_FIRST_PERSON_UPPER_BODY_ROOT", false))
         {
+            drawRetailForearm(
+                context.Get(), renderer, viewProjection, bodyRig.left, true);
+            drawRetailForearm(
+                context.Get(), renderer, viewProjection, bodyRig.right, false);
             drawSolvedArm(
                 context.Get(),
                 renderer,
@@ -7272,7 +7466,8 @@ bool renderEye(
             context.Get(), renderer, viewProjection,
             rightPose, false, rightHandGripLocalRotation);
     }
-    if (drawWristDevice && envEnabled("FNVXR_SHOW_PIPBOY_RIG", true))
+    const bool nativePipBoy = envEnabled("FNVXR_FIRST_PERSON_PIPBOY_ROOT", false);
+    if (drawWristDevice && !nativePipBoy && envEnabled("FNVXR_SHOW_PIPBOY_RIG", true))
         drawPipboyRig(
             context.Get(),
             renderer,
@@ -7285,28 +7480,23 @@ bool renderEye(
     if (drawWorldProps && rightAimTracked
         && envEnabled("FNVXR_SHOW_RIGHT_AIM_RAY", true))
         drawAimRay(context.Get(), renderer, viewProjection, rightAimPose);
-    if (drawWristDevice && pipBoyScreenVisible)
+    if (drawWristDevice)
     {
-        // The texture is the fresh retail eye source for this exact frame.
-        // Its authored screen crop is spatialized on the tracked wrist after
-        // the stable housing, with depth disabled so the bezel cannot z-fight
-        // or blink the live screen away.
-        context->OMSetDepthStencilState(renderer.gamePlaneDepthState.Get(), 0);
-        drawPipBoyScreen(
+        // The display shares the housing's authored screen-local mesh and
+        // scale. Test against its depth so the screen cannot draw through the
+        // bezel, cuff or underside as the wrist turns.
+        context->OMSetDepthStencilState(renderer.depthState.Get(), 0);
+        if (!nativePipBoy) drawPipBoyScreen(
             context.Get(),
             renderer,
             viewProjection,
             livePipBoyPlane,
-            pipBoyScreenTextureView);
+            pipBoyScreenVisible ? pipBoyScreenTextureView : nullptr);
+        // The pointer uses the same physical display depth policy.
+        drawPipBoyPointer(
+            context.Get(), renderer, viewProjection, livePipBoyPointer, livePipBoyPlane);
         context->OMSetDepthStencilState(renderer.depthState.Get(), 0);
     }
-    if (drawWristDevice && rightAimTracked)
-        drawPipBoyPointer(
-            context.Get(),
-            renderer,
-            viewProjection,
-            livePipBoyPointer,
-            livePipBoyPlane);
 
     const bool diagnosticReadbackRequested = fnvxr::host::eyeReadbackRequired(
         headsetMirrorCapture != nullptr,
@@ -8310,7 +8500,9 @@ bool loadRetailTexturedMesh(
 bool loadRetailPipBoyScreenMesh(
     ID3D11Device* device,
     ComPtr<ID3D11Buffer>& buffer,
-    UINT& vertexCount)
+    UINT& vertexCount,
+    ComPtr<ID3D11Buffer>& nativeUiBuffer,
+    std::vector<TexturedVertex>& nativeVertices)
 {
     buffer.Reset();
     vertexCount = 0u;
@@ -8336,7 +8528,7 @@ bool loadRetailPipBoyScreenMesh(
     if (length < static_cast<std::streamoff>(sizeof(header))
         || !stream.read(reinterpret_cast<char*>(&header), sizeof(header))
         || std::memcmp(header.magic, "FPS1", 4u) != 0
-        || header.version != 1u
+        || (header.version != 1u && header.version != 2u)
         || header.reserved != 0u
         || header.vertexCount < 3u
         || header.vertexCount > 10000u
@@ -8344,17 +8536,29 @@ bool loadRetailPipBoyScreenMesh(
         || length != static_cast<std::streamoff>(
             sizeof(header)
             + static_cast<std::uint64_t>(header.vertexCount)
-                * sizeof(TexturedVertex)))
+                * (header.version == 2u ? 7u * sizeof(float) : sizeof(TexturedVertex))))
     {
         return false;
     }
     std::vector<TexturedVertex> vertices(header.vertexCount);
-    if (!stream.read(
-            reinterpret_cast<char*>(vertices.data()),
-            static_cast<std::streamsize>(
-                vertices.size() * sizeof(TexturedVertex))))
+    nativeVertices.resize(header.vertexCount);
+    for (UINT index = 0; index < header.vertexCount; ++index)
     {
-        return false;
+        auto& vertex = vertices[index];
+        if (!stream.read(reinterpret_cast<char*>(&vertex), sizeof(vertex))) return false;
+        nativeVertices[index] = vertex;
+        if (header.version == 2u)
+        {
+            if (!stream.read(reinterpret_cast<char*>(&nativeVertices[index].u), 2 * sizeof(float))) return false;
+        }
+        else
+        {
+            constexpr auto crop = fnvxr::pipboy::RetailScreenCrop;
+            nativeVertices[index].u = (vertex.u - crop.left) / (crop.right - crop.left);
+            nativeVertices[index].v = (vertex.v - crop.top) / (crop.bottom - crop.top);
+        }
+        if (!std::isfinite(nativeVertices[index].u) || !std::isfinite(nativeVertices[index].v)
+            || std::fabs(nativeVertices[index].u) > 2.f || std::fabs(nativeVertices[index].v) > 2.f) return false;
     }
     for (const TexturedVertex& vertex : vertices)
     {
@@ -8374,6 +8578,9 @@ bool loadRetailPipBoyScreenMesh(
     D3D11_SUBRESOURCE_DATA initial {};
     initial.pSysMem = vertices.data();
     if (FAILED(device->CreateBuffer(&description, &initial, &buffer)))
+        return false;
+    initial.pSysMem = nativeVertices.data();
+    if (FAILED(device->CreateBuffer(&description, &initial, &nativeUiBuffer)))
         return false;
     vertexCount = header.vertexCount;
     std::cout << "retailPipBoyScreenMesh loaded vertices="
@@ -8552,7 +8759,8 @@ float4 PSMain(VSOutput input) : SV_TARGET
         normalize(float3(-0.35, 0.72, -0.58))));
     float rim = pow(saturate(1.0 - abs(normal.z)), 2.0);
     float light = 0.42 + lambert * 0.50 + rim * 0.08;
-    return float4(diffuse.rgb * color.rgb * light, diffuse.a * color.a);
+    // Retail diffuse alpha carries material data, not holes in hands/casing.
+    return float4(diffuse.rgb * color.rgb * light, color.a);
 }
 )";
     ComPtr<ID3DBlob> retailHandVertexBlob;
@@ -9009,12 +9217,15 @@ float4 PSHudOverlay(VSOutput input) : SV_TARGET
     if (!loadRetailPipBoyScreenMesh(
             device,
             renderer.pipBoyScreenTexturedVertexBuffer,
-            renderer.pipBoyScreenTexturedVertexCount))
+            renderer.pipBoyScreenTexturedVertexCount,
+            renderer.pipBoyNativeUiVertexBuffer,
+            renderer.pipBoyNativeUiVertices))
     {
         return false;
     }
     if (!renderer.pipBoyScreenTexturedVertexBuffer)
     {
+        renderer.pipBoyNativeUiVertexBuffer = renderer.texturedVertexBuffer;
         constexpr auto pipBoyCrop = fnvxr::pipboy::RetailScreenCrop;
         static_assert(fnvxr::pipboy::validScreenCrop(pipBoyCrop));
         const TexturedVertex pipBoyScreenVertices[] = {
@@ -9310,6 +9521,9 @@ float4 PSHudOverlay(VSOutput input) : SV_TARGET
     alphaBlendDesc.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
     alphaBlendDesc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
     if (FAILED(device->CreateBlendState(&alphaBlendDesc, &renderer.alphaBlendState)))
+        return false;
+    alphaBlendDesc.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
+    if (FAILED(device->CreateBlendState(&alphaBlendDesc, &renderer.premultipliedUiBlendState)))
         return false;
 
     D3D11_RASTERIZER_DESC rasterizerDesc {};
@@ -9716,7 +9930,11 @@ fnvxr::kernel::performance::MonotonicNanoseconds monotonicNow() noexcept
 
 int main(int argc, char** argv)
 {
-    std::cout.setf(std::ios::unitbuf);
+    // The supervisor redirects stdout to a file. unitbuf flushes after every
+    // field insertion, turning one submit record into hundreds of blocking
+    // writes and making the next pose stale. Keep records buffered; readiness
+    // and completed submit records already have explicit flush boundaries.
+    std::ios::sync_with_stdio(false);
     std::cerr.setf(std::ios::unitbuf);
     const fnvxr::host::ProcessEnvironmentConfigSource configSource;
     const fnvxr::host::RuntimeConfigLoadResult loadedRuntimeConfig =
@@ -9779,6 +9997,7 @@ int main(int argc, char** argv)
             && (captureDirectoryAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0u)
         {
             headsetMirrorCapture.enabled = true;
+            headsetMirrorCapture.jpeg = envEnabled("FNVXR_HMD_MIRROR_CAPTURE_JPEG", false);
             headsetMirrorCapture.writer = std::make_unique<fnvxr::host::mirror::Writer>();
             headsetMirrorCapture.everyFrames = static_cast<std::uint32_t>(
                 std::clamp(envInt("FNVXR_HMD_MIRROR_CAPTURE_EVERY_N_FRAMES", 6), 1, 600));
@@ -9796,6 +10015,23 @@ int main(int argc, char** argv)
             std::wcerr
                 << L"fnvxrHeadsetMirrorCaptureDisabled missing-directory="
                 << headsetMirrorCapture.directory << L"\n";
+        }
+    }
+
+    HeadsetMirrorCapture uiSourceCapture {};
+    if (headsetMirrorCapture.enabled)
+    {
+        uiSourceCapture.directory = headsetMirrorCapture.directory + L"\\ui-source";
+        if (CreateDirectoryW(uiSourceCapture.directory.c_str(), nullptr)
+            || GetLastError() == ERROR_ALREADY_EXISTS)
+        {
+            uiSourceCapture.enabled = true;
+            uiSourceCapture.jpeg = headsetMirrorCapture.jpeg;
+            uiSourceCapture.eventName = "fnvxrUiSourceCapture";
+            uiSourceCapture.includeEmptyDiagnosticSources = true;
+            uiSourceCapture.everyFrames = 180u;
+            uiSourceCapture.maximumPairs = 12u;
+            uiSourceCapture.writer = std::make_unique<fnvxr::host::mirror::Writer>();
         }
     }
 
@@ -10061,6 +10297,13 @@ int main(int argc, char** argv)
     if (result != XR_SUCCESS)
         return 16;
 
+    XrActionCreateInfo vibrationInfo = poseActionInfo;
+    vibrationInfo.actionType = XR_ACTION_TYPE_VIBRATION_OUTPUT;
+    strcpy_s(vibrationInfo.actionName, "controller_feedback");
+    strcpy_s(vibrationInfo.localizedActionName, "Controller Feedback");
+    if (xr.createAction(actionSet, &vibrationInfo, &actions.vibration) != XR_SUCCESS)
+        return 16;
+
     XrActionCreateInfo aimPoseActionInfo = poseActionInfo;
     strcpy_s(aimPoseActionInfo.actionName, "aim_pose");
     strcpy_s(aimPoseActionInfo.localizedActionName, "Aim Pose");
@@ -10088,6 +10331,8 @@ int main(int argc, char** argv)
     }
 
     XrActionSuggestedBinding bindings[] = {
+        { actions.vibration, path(xr, instance, "/user/hand/left/output/haptic") },
+        { actions.vibration, path(xr, instance, "/user/hand/right/output/haptic") },
         { actions.handPose, path(xr, instance, "/user/hand/left/input/grip/pose") },
         { actions.handPose, path(xr, instance, "/user/hand/right/input/grip/pose") },
         { actions.aimPose, path(xr, instance, "/user/hand/left/input/aim/pose") },
@@ -10179,6 +10424,11 @@ int main(int argc, char** argv)
         closeSharedD3D9VideoFrame(renderer);
         return 21;
     }
+    fnvxr::shared::HapticBridge hapticBridge;
+    if (!hapticBridge.create(sharedBridge.producerEpoch))
+        std::cerr << "Native controller feedback mapping unavailable\n";
+    std::uint64_t lastHapticUpdate = 0;
+    float lastHapticAmplitude[2]{};
     // This is the launcher handshake. The OpenXR instance/session/actions and
     // all cross-bitness mappings now exist, so retail may start safely even
     // when the runtime keeps an unworn headset in IDLE. Input remains neutral
@@ -10240,10 +10490,14 @@ int main(int argc, char** argv)
     bool hasLastActiveMenuPointer = false;
     std::uint32_t livePipBoyHoverFrames = 0u;
     fnvxr::engine::live_pipboy::FocusDecision livePipBoyFocus {};
+    fnvxr::kernel::wrist::DeviceScaleTransition wristDeviceScale;
     fnvxr::kernel::wrist::WristActivation wristActivation;
     fnvxr::kernel::wrist::ActivationDecision wristActivationDecision {};
     std::optional<GamePlane> submittedWristPlane;
     MenuPointer submittedWristPointer {};
+    SubmittedWorldSnapshot submittedWorld;
+    XrTime lastWorldMenuDisplayTime = 0;
+    std::uint32_t anchoredMenuBits = 0;
     HeadspaceLookTracker headspaceLookTracker {};
     HandspaceLookTracker handspaceLookTracker {};
     HeadspaceLookTracker gyroAimLookTracker {};
@@ -10306,6 +10560,7 @@ int main(int argc, char** argv)
         wristActivationDecision = {};
         submittedWristPlane.reset();
         submittedWristPointer = {};
+        wristDeviceScale.reset();
     };
     fnvxr::kernel::performance::CadenceTracker cadenceTracker(runtimeConfig);
     std::uint64_t cadenceEpoch = 1u;
@@ -10326,6 +10581,7 @@ int main(int argc, char** argv)
     for (uint64_t frameIndex = 1; frameIndex <= targetFrames; ++frameIndex)
     {
         headsetMirrorCapture.reportCompleted();
+        uiSourceCapture.reportCompleted();
         const ULONGLONG progressNow = GetTickCount64();
         if (progressNow >= nextProgressHeartbeatMilliseconds)
         {
@@ -10489,7 +10745,7 @@ int main(int argc, char** argv)
             productionGpuColorV5 && gpuColorConsumerReady
                 ? gpuColorConsumer.consume()
                 : fnvxr::host::gpu_color::ConsumeResult {};
-        const fnvxr::host::gpu_color::RoutedFrame gpuColorFrame =
+        fnvxr::host::gpu_color::RoutedFrame gpuColorFrame =
             productionGpuColorV5 && gpuColorConsumerReady
                 ? fnvxr::host::gpu_color::routeConsumedFrame(
                     gpuColorConsume,
@@ -11070,7 +11326,14 @@ int main(int argc, char** argv)
         {
             previousPipBoyUiWarmupMode = pipBoyMenuMode;
             renderer.livePipBoyUiUploadCount = 0u;
+            renderer.livePipBoyOpenedDisplayTime = 0;
             renderer.retainedUiLivePipBoySurface = false;
+            if (!pipBoyMenuMode)
+            {
+                renderer.wristUiTexture.Reset();
+                renderer.wristUiTextureView.Reset();
+                renderer.wristUiIsolated = false;
+            }
         }
         const bool livePipBoyScreenFocused =
             fnvxr::engine::live_pipboy::worldPresentationContinues(
@@ -11078,6 +11341,60 @@ int main(int argc, char** argv)
                 runtimeMenuBits,
                 runtimeShowroomActive,
                 runtimeCameraActive);
+        const bool worldMenuActive = haveRuntimeUiState && runtimeShowroomActive == 0u
+            && (runtimePhase == fnvxr::shared::RuntimePhaseMenu
+                || runtimePhase == fnvxr::shared::RuntimePhaseLoading);
+        const bool submittedWorldLifetimeMatches = submittedWorld.valid
+            && submittedWorld.routed.frame.producerEpoch == activeGpuColorProducerEpoch
+            && submittedWorld.routed.frame.producerProcessId == activeGpuColorProducerProcessId
+            && submittedWorld.pose.hostProducerEpoch == sharedBridge.producerEpoch
+            && submittedWorld.pose.referenceSpaceGeneration == trackingLifetime.generation();
+        if (!submittedWorldLifetimeMatches)
+            submittedWorld.valid = false;
+        if (worldMenuActive && submittedWorldLifetimeMatches)
+            lastWorldMenuDisplayTime = frameState.predictedDisplayTime;
+        const fnvxr::host::gpu_color::RuntimeEvidence continuityRuntime {
+            runtimeStateSample, runtimePhase, runtimeMenuBits, runtimeShowroomActive,
+            runtimeCameraActive, haveRuntimeUiState };
+        runtimeEvidenceHistory.record(continuityRuntime);
+        fnvxr::host::gpu_color::RuntimeEvidence continuitySourceRuntime {};
+        const bool currentWorldRuntimeMatches = runtimeEvidenceHistory.findStableSource(
+            gpuColorFrame.frame.runtimeStateSample, continuityRuntime, continuitySourceRuntime);
+        fnvxr::host::SourceViewPublication productSourceView {};
+        bool productSourceViewFound = sourceViewHistory.find(
+            gpuColorFrame.frame, sharedBridge.producerEpoch,
+            trackingLifetime.generation(), productSourceView);
+        const fnvxr::kernel::SpatialCalibrationIdentity currentRigIdentity {
+            productSourceView.hostProducerEpoch,
+            productSourceView.referenceSpaceGeneration,
+            productSourceView.poseSequence };
+        XrQuaternionf currentRightHandCalibration {};
+        PipBoyScreenCalibration currentLeftScreenCalibration {};
+        const bool currentWorldRigCalibrationReady = productSourceViewFound
+            && sharedBridge.rightHandGripCalibrationHistory.find(
+                currentRigIdentity, currentRightHandCalibration)
+            && sharedBridge.leftPipBoyScreenCalibrationHistory.find(
+                currentRigIdentity, currentLeftScreenCalibration);
+        const bool currentWorldReady = currentWorldRuntimeMatches && productSourceViewFound
+            && gpuColorFrame.content == fnvxr::host::gpu_color::RoutedContent::BinocularWorld
+            && fnvxr::stereo::sourcePoseAgeWithinBudget(frameState.predictedDisplayTime,
+                gpuColorFrame.frame.renderedDisplayTime,
+                runtimeConfig.maximumPoseAgeNanoseconds(), 5000000LL, nullptr);
+        const bool pausedWorldRetained = fnvxr::host::retainSubmittedWorld({
+            submittedWorldLifetimeMatches, currentWorldReady, haveRuntimeUiState,
+            runtimeShowroomActive == 0u && (worldMenuActive || runtimeGameplayActive),
+            worldMenuActive, frameState.predictedDisplayTime,
+            submittedWorld.pose.predictedDisplayTime, lastWorldMenuDisplayTime,
+            !productionGpuColorV5 || currentWorldRigCalibrationReady });
+        if (pausedWorldRetained)
+        {
+            gpuColorFrame = submittedWorld.routed;
+            gpuColorFrame.retainedConsumerFrame = true;
+        }
+        const auto worldEyeView = [&](std::size_t eye) {
+            return pausedWorldRetained ? submittedWorld.views[eye].Get()
+                : gpuColorConsumer.eyeView(static_cast<std::uint32_t>(eye));
+        };
         // Interaction consumes the exact pose generation accepted by the
         // previous successful submission. The candidate for this frame is
         // computed beside final-eye composition and committed only after
@@ -11094,7 +11411,9 @@ int main(int argc, char** argv)
             envFloat("FNVXR_LIVE_PIPBOY_FOCUS_HIT_SCALE_Y", 1.0f),
             1.0f,
             4.0f);
-        const MenuPointer livePipBoyBasePointer = submittedWristPointer;
+        const MenuPointer livePipBoyBasePointer = pausedWorldRetained && livePipBoyBasePlane && rightAimTracked
+            ? menuPointerFromAimPose(rawRightAimPose, *livePipBoyBasePlane)
+            : submittedWristPointer;
         const bool livePipBoyActivationGripHeld = rightGrip.active
             && rightGrip.value >= envFloat(
                 "FNVXR_LIVE_PIPBOY_GRIP_THRESHOLD",
@@ -11115,21 +11434,28 @@ int main(int argc, char** argv)
                 1,
                 envInt("FNVXR_LIVE_PIPBOY_FOCUS_FRAMES", 12))),
         });
-        std::optional<GamePlane> livePipBoyPlaneResult = livePipBoyBasePlane;
-        if (livePipBoyPlaneResult)
-        {
-            const float scale = std::clamp(livePipBoyFocus.scale, 1.0F, 1.5F);
-            livePipBoyPlaneResult->width =
-                runtimeConfig.get().wristUi.widthMeters * scale;
-            livePipBoyPlaneResult->height =
-                runtimeConfig.get().wristUi.heightMeters * scale;
-        }
+        // Input follows the last submitted surface, including its socket
+        // offset and scale. The new focus scale is applied atomically to the
+        // candidate surface beside final-eye composition below.
+        const std::optional<GamePlane> livePipBoyPlaneResult = livePipBoyBasePlane;
         const GamePlane livePipBoyPlane =
             livePipBoyPlaneResult.value_or(livePipBoyFocusPlane);
         const bool dialoguePlaneSize =
             haveRuntimeUiState
             && (runtimeMenuBits & fnvxr::shared::RuntimeDialogMenuBit) != 0
-            && envEnabled("FNVXR_DIALOG_USES_GAMEPLAY_PLANE", true);
+            && envEnabled("FNVXR_DIALOG_USES_GAMEPLAY_PLANE", false);
+        const auto activePanelBits = worldMenuActive
+            ? runtimeMenuBits & fnvxr::shared::RuntimeWorldPresentationBlockingMenuBits
+            : 0u;
+        if (activePanelBits != anchoredMenuBits)
+        {
+            anchoredMenuBits = activePanelBits;
+            if (activePanelBits != 0u && hmdTracked)
+            {
+                anchoredGamePlane = gamePlaneFromHmd(rawHmdPose, runtimeConfig.get().presentation, true);
+                gamePlane = anchoredGamePlane;
+            }
+        }
         const bool gameplayPlaneSize =
             haveRuntimeUiState
             && (runtimeGameplayActive || dialoguePlaneSize)
@@ -11159,7 +11485,7 @@ int main(int argc, char** argv)
             gamePlane.pose.position.y += deltaFloat.y;
             gamePlane.pose.position.z += deltaFloat.z;
         }
-        if (pipBoyMenuMode && livePipBoyPlaneResult)
+        if (livePipBoyScreenFocused && livePipBoyPlaneResult)
             gamePlane = livePipBoyPlane;
         if (gameplayPlaneSize != previousLoggedGameplayPlaneSize
             || pipBoyMenuMode != previousLoggedPipBoyMenuMode
@@ -11252,9 +11578,7 @@ int main(int argc, char** argv)
         int64_t sourcePoseAgeNanoseconds = 0;
         bool sourcePoseAgeValid = false;
         const int64_t maximumSourcePoseAgeNanoseconds =
-            static_cast<int64_t>(std::llround(
-                runtimeConfig.get().performance.maximumPoseAgeMilliseconds
-                * 1000000.0F));
+            runtimeConfig.maximumPoseAgeNanoseconds();
         const int64_t sourcePoseFutureToleranceNanoseconds =
             static_cast<int64_t>(std::max(
                 0,
@@ -11314,7 +11638,11 @@ int main(int argc, char** argv)
         const bool gpuPresentationAuthority =
             presentationAuthority.authority
                 == fnvxr::kernel::transport::PresentationAuthority::
-                    GpuProductKernel;
+                    GpuProductKernel
+            // Only GPU product submissions can populate submittedWorld. A
+            // suspended publisher leaves that ownership intact; the kernel
+            // still checks the exact previously accepted source below.
+            || pausedWorldRetained;
         const bool cpuPresentationAuthority =
             presentationAuthority.authority
                 == fnvxr::kernel::transport::PresentationAuthority::
@@ -11596,12 +11924,11 @@ int main(int argc, char** argv)
         bool cpuEngineRuntimeLineageFound = false;
         bool cpuEngineRuntimeLineageBracketed = false;
         std::uint64_t cpuEngineSourceRuntimeSample = 0u;
-        fnvxr::host::SourceViewPublication productSourceView {};
-        const bool productSourceViewFound = sourceViewHistory.find(
-            gpuColorFrame.frame,
-            sharedBridge.producerEpoch,
-            trackingLifetime.generation(),
-            productSourceView);
+        if (pausedWorldRetained)
+        {
+            productSourceView = submittedWorld.pose;
+            productSourceViewFound = true;
+        }
         if (gpuColorFrame.frame.renderedDisplayTime != 0)
         {
             sourcePoseAgeValid =
@@ -11653,7 +11980,18 @@ int main(int argc, char** argv)
                 const auto consecutiveFrames = renderer.livePipBoyUiUploadCount + 1u;
                 commitUiTextureCandidate(renderer, uiCandidate);
                 renderer.livePipBoyUiUploadCount = consecutiveFrames;
-                renderer.retainedUiLivePipBoySurface = consecutiveFrames >= 2u;
+                if (renderer.livePipBoyOpenedDisplayTime == 0
+                    || frameState.predictedDisplayTime < renderer.livePipBoyOpenedDisplayTime)
+                    renderer.livePipBoyOpenedDisplayTime = frameState.predictedDisplayTime;
+                // The native opening animation initially carries the world and
+                // bezel through the UI channel. Keep the display covered during
+                // its observed 0.6 s transition instead of flashing those pixels.
+                const bool openingAnimationSettled = frameState.predictedDisplayTime
+                    - renderer.livePipBoyOpenedDisplayTime >= 750000000LL;
+                renderer.retainedUiLivePipBoySurface = consecutiveFrames >= 2u
+                    && openingAnimationSettled;
+                if (renderer.retainedUiLivePipBoySurface)
+                    snapshotWristUi(device.Get(), renderer);
             }
         }
         const fnvxr::host::ui_capture::RuntimeSample hostUiRuntimeBefore {
@@ -11665,9 +12003,9 @@ int main(int argc, char** argv)
             haveRuntimeUiState,
         };
         fnvxr::host::gpu_color::RoutedFrame controllerRouted =
-            fnvxr::product::classifyRetailState(runtimeAuthorityInput)
+            (pausedWorldRetained || currentWorldReady || fnvxr::product::classifyRetailState(runtimeAuthorityInput)
                     == fnvxr::product::RetailState::Gameplay
-                ? gpuColorFrame : gpuUiFrame;
+                ) ? gpuColorFrame : gpuUiFrame;
         if (controllerRouted.content
                 == fnvxr::host::gpu_color::RoutedContent::MonoUiQuad
             && !incomingUiResourceReady)
@@ -11701,9 +12039,69 @@ int main(int argc, char** argv)
             fnvxr::host::gpu_color::makePresentationInput(
                 controllerRuntimeEvidence,
                 controllerRouted,
-                productSourceViewFound,
+                productSourceViewFound
+                    && (!productionGpuColorV5 || currentWorldRigCalibrationReady
+                        || pausedWorldRetained),
                 controllerRouted.content == fnvxr::host::gpu_color::RoutedContent::MonoUiQuad
                     ? gpuUiFresh : sourcePoseAgeValid);
+        if (pausedWorldRetained)
+        {
+            // Keep the capture sample on the world. The kernel separately
+            // verifies its previously accepted background for this pause.
+            presentationInput.stereo = submittedWorld.proof;
+            presentationInput.stereo.fresh = false;
+            presentationInput.retainedWorldForContinuity = true;
+        }
+        presentationInput.runtimeStateSample = runtimeStateSample;
+        presentationInput.runtimePhase = runtimePhase;
+        presentationInput.menuBits = runtimeMenuBits;
+        presentationInput.showroomActive = runtimeShowroomActive;
+        presentationInput.cameraActive = runtimeCameraActive;
+        presentationInput.runtimeFresh = haveRuntimeUiState;
+        const auto hapticNow = GetTickCount64();
+        if (hapticNow - lastHapticUpdate >= 50u)
+        {
+            lastHapticUpdate = hapticNow;
+            const auto nativeFeedback = hapticBridge.read(fnvxr::shared::HapticChannel::NativeMotors);
+            const auto menuFeedback = hapticBridge.read(fnvxr::shared::HapticChannel::MenuClick);
+            for (unsigned side = 0; side != 2; ++side)
+            {
+                const bool tracked = side ? rightHandTracked : leftHandTracked;
+                const auto level = [&](const auto& feedback) {
+                    return fnvxr::kernel::haptics::amplitude(feedback, hapticNow,
+                        activeGpuColorProducerProcessId, side != 0, tracked,
+                        shouldReadInput && haveRuntimeUiState);
+                };
+                const float amplitude = std::max(level(nativeFeedback), level(menuFeedback));
+                XrHapticActionInfo info { XR_TYPE_HAPTIC_ACTION_INFO };
+                info.action = actions.vibration;
+                info.subactionPath = hands[side];
+                XrResult hapticResult = XR_SUCCESS;
+                if (amplitude > 0)
+                {
+                    XrHapticVibration pulse { XR_TYPE_HAPTIC_VIBRATION };
+                    pulse.amplitude = amplitude;
+                    pulse.frequency = XR_FREQUENCY_UNSPECIFIED;
+                    pulse.duration = 60000000LL;
+                    hapticResult = xr.applyHapticFeedback(session, &info,
+                        reinterpret_cast<const XrHapticBaseHeader*>(&pulse));
+                }
+                else if (lastHapticAmplitude[side] > 0)
+                    hapticResult = xr.stopHapticFeedback(session, &info);
+                if (amplitude != lastHapticAmplitude[side])
+                    std::cout << "fnvxrHapticFeedback hand=" << side << " amplitude=" << amplitude
+                        << " native=" << level(nativeFeedback) << " menu=" << level(menuFeedback)
+                        << " result=" << resultName(hapticResult) << "\n";
+                lastHapticAmplitude[side] = amplitude;
+            }
+        }
+        presentationInput.worldRuntimeLineageVerified = sourceRuntimeLineageFound;
+        if (gpuUiSourceEligible && incomingUiResourceReady)
+        {
+            presentationInput.ui = { gpuUiFrame.frame.sourceFrame,
+                gpuUiFrame.frame.runtimeStateSample, true, true, true };
+            presentationInput.uiRuntimeLineageVerified = true;
+        }
         const bool routedTransportReady = controllerRouted.content
             != fnvxr::host::gpu_color::RoutedContent::SafetyBlank;
         const fnvxr::host::PresentationTransportProof presentationTransport {
@@ -11717,9 +12115,15 @@ int main(int argc, char** argv)
             routedTransportReady,
             routedTransportReady,
         };
+        const bool uiTransportReady = gpuUiSourceEligible && incomingUiResourceReady;
+        const fnvxr::host::PresentationTransportProof uiPresentationTransport {
+            uiTransportReady ? gpuUiFrame.frame.producerEpoch : 0u,
+            uiTransportReady ? gpuUiFrame.frame.transactionId : 0u,
+            uiTransportReady, uiTransportReady, uiTransportReady,
+            uiTransportReady, uiTransportReady };
         const std::uint32_t exactRigFlags = productSourceView.trackingFlags;
         const bool exactTrackedRigReady = productSourceViewFound
-            && sourcePoseAgeValid
+            && (sourcePoseAgeValid || pausedWorldRetained)
             && (exactRigFlags & fnvxr::shared::VrPoseTrackingHmd) != 0u
             && (exactRigFlags
                 & fnvxr::shared::VrPoseTrackingLeftGripActive) != 0u
@@ -11730,7 +12134,7 @@ int main(int argc, char** argv)
             && (exactRigFlags
                 & fnvxr::shared::VrPoseTrackingRightGripCurrent) != 0u;
         const bool exactWristPoseReady = productSourceViewFound
-            && sourcePoseAgeValid
+            && (sourcePoseAgeValid || pausedWorldRetained)
             && (exactRigFlags & fnvxr::shared::VrPoseTrackingHmd) != 0u
             && (exactRigFlags
                 & fnvxr::shared::VrPoseTrackingLeftGripActive) != 0u
@@ -11815,16 +12219,24 @@ int main(int argc, char** argv)
                     runtimeConfig.get().wristUi
                         .maximumContentAgeMilliseconds,
                 });
+        // A child modal owns input and its own pixels. Keep the parent menu's
+        // already isolated screen beneath it for this same Pip-Boy session.
+        // Closing the parent or resetting the transport releases that copy.
+        const bool pipBoyModalContentHeld = pipBoyMenuMode && activePanelBits != 0u
+            && renderer.wristUiIsolated && renderer.wristUiTextureView
+            && renderer.wristUiProducerEpoch == activeGpuColorProducerEpoch
+            && renderer.wristUiProducerProcessId == activeGpuColorProducerProcessId;
         const bool pipBoySpatialContentReady =
-            pipBoyContentReadiness.ready;
+            pipBoyContentReadiness.ready || pipBoyModalContentHeld;
         productDecision = gpuPresentationAuthority
             ? presentationController.advance(
                 presentationInput,
                 presentationTransport,
                 exactTrackedRigReady,
                 exactWristPoseReady
-                    && livePipBoyScreenFocused
-                    && pipBoySpatialContentReady)
+                    && (livePipBoyScreenFocused || pipBoyModalContentHeld)
+                    && pipBoySpatialContentReady,
+                uiPresentationTransport)
             : fnvxr::product::PresentationDecision {};
         if (!gpuPresentationAuthority)
             presentationController.reset();
@@ -11836,9 +12248,7 @@ int main(int argc, char** argv)
             cpuPresentationAuthority
             || (gpuPresentationAuthority
                 && productDecision.wristScreenMayRender);
-        if (productDecision.mode
-                == fnvxr::product::PresentationMode::UiQuad
-            && uiCandidate.view
+        if (productDecision.presentedUiSourceFrame != 0u && uiCandidate.view
             && uiCandidate.sourceFrame
                 == productDecision.presentedUiSourceFrame)
         {
@@ -11849,13 +12259,24 @@ int main(int argc, char** argv)
             && renderer.retainedUiTextureView
             && renderer.retainedUiSourceFrame
                 == productDecision.presentedUiSourceFrame;
+        if (uiSourceCapture.enabled && worldMenuActive
+            && renderer.retainedUiTexture && uiSourceCapture.request(frameIndex).capture)
+        {
+            EyeRenderProof uiSourceProof {};
+            for (std::uint32_t eye = 0u; eye != 2u; ++eye)
+                captureSwapchainRenderProof(device.Get(), renderer.retainedUiTexture.Get(),
+                    uiSourceProof, &uiSourceCapture, frameIndex, eye);
+            std::cout << "{\"event\":\"fnvxrUiSourceLayout\",\"frame\":" << frameIndex
+                << ",\"isolated\":" << (renderer.retainedUiIsolated ? "true" : "false")
+                << ",\"sourceFrame\":" << renderer.retainedUiSourceFrame << "}\n";
+        }
         const bool worldResourcesReady = productSourceViewFound
             && gpuColorFrame.content
                 == fnvxr::host::gpu_color::RoutedContent::BinocularWorld
             && gpuColorFrame.bindLeftEyeView
             && gpuColorFrame.bindRightEyeView
-            && gpuColorConsumer.eyeView(0u)
-            && gpuColorConsumer.eyeView(1u);
+            && worldEyeView(0u)
+            && worldEyeView(1u);
         const fnvxr::host::gpu_color::ProductCompositionBindings
             productComposition = gpuPresentationAuthority
                 ? fnvxr::host::gpu_color::selectProductComposition(
@@ -11864,8 +12285,6 @@ int main(int argc, char** argv)
                     selectedUiResourceReady)
                 : fnvxr::host::gpu_color::ProductCompositionBindings {};
         const bool productionUiQuadActive = !livePipBoyScreenFocused
-            && productComposition.content
-                == fnvxr::host::gpu_color::RoutedContent::MonoUiQuad
             && productComposition.bindMonoUiView;
         const bool productionBinocularWorld =
             productComposition.content
@@ -11903,8 +12322,8 @@ int main(int argc, char** argv)
                 runtimeEvidence.cameraActive,
                 runtimeEvidence.fresh,
             },
-            gpuColorConsumer.eyeView(0u),
-            gpuColorConsumer.eyeView(1u),
+            worldEyeView(0u),
+            worldEyeView(1u),
         };
         const fnvxr::host::stereo_visual_trial::Decision
             stereoVisualTrialDecision = gpuPresentationAuthority
@@ -11992,7 +12411,10 @@ int main(int argc, char** argv)
                 ? (haveRuntimeUiState ? runtimeUiActive : gameUiMode)
                 : (productionUiQuadActive
                     && productComposition.pointerEnabled)
-                    || cpuEngineUiQuadActive);
+                    || cpuEngineUiQuadActive
+                    // The submitted wrist surface is an input destination
+                    // even when no front-facing menu quad is visible.
+                    || (livePipBoyScreenFocused && submittedWristPlane.has_value()));
         // Preserve the renderer-dependent gameplay-control boundary for
         // headspace/weapon behavior. Physical locomotion receives its own
         // runtime-authoritative gate below, so presentation readiness cannot
@@ -12177,10 +12599,16 @@ int main(int argc, char** argv)
             livePipBoyControl = fnvxr::engine::live_pipboy::physicalControl(
                 livePipBoyPointer.x,
                 livePipBoyPointer.y);
-        if (pipBoyMenuMode
+        if (livePipBoyScreenFocused
             && bridgedMenuPointer.active)
         {
-            if (livePipBoyControl
+            if (renderer.wristUiIsolated)
+            {
+                // Render and input consume the same authored NIF texture UVs.
+                bridgedMenuPointer = nativeWristTexturePointer(renderer, livePipBoyPointer);
+                hostClick = hostClick && bridgedMenuPointer.active;
+            }
+            else if (livePipBoyControl
                 == fnvxr::engine::live_pipboy::PhysicalControl::Screen)
             {
                 bridgedMenuPointer.x = fnvxr::pipboy::sourceUFromPanel(
@@ -12209,9 +12637,11 @@ int main(int argc, char** argv)
             interactionFlags |= fnvxr::PoseInteractionLivePipBoyFocused;
         if (livePipBoyFocus.requestOpen)
             interactionFlags |= fnvxr::PoseInteractionLivePipBoyOpenRequest;
-        if (livePipBoyPointer.active)
+        if (livePipBoyScreenFocused && livePipBoyPointer.active && !renderer.wristUiIsolated)
             interactionFlags |=
                 fnvxr::PoseInteractionLivePipBoyPointerActive;
+        if (livePipBoyScreenFocused && renderer.wristUiIsolated)
+            interactionFlags |= fnvxr::PoseInteractionPipBoyNativeTexturePointer;
         const bool weaponOrbitActive = shouldReadInput
             && runtimeGameplayActive
             && frame.rightGrip > envFloat(
@@ -12306,15 +12736,21 @@ int main(int argc, char** argv)
         bool exactPoseJoinSelected = false;
         EyeRenderProof leftRenderProof {};
         EyeRenderProof rightRenderProof {};
+        EyeRenderProof pipBoyUiRenderProof {};
+        std::array<std::uint64_t, 2> eyeRenderNanoseconds {};
+        std::uint64_t hostPrepareNanoseconds = 0u;
         fnvxr::kernel::wrist::WristActivation candidateWristActivation =
             wristActivation;
         fnvxr::kernel::wrist::ActivationDecision
             candidateWristActivationDecision {};
         std::optional<GamePlane> candidateWristPlane;
         MenuPointer candidateWristPointer {};
+        auto candidateWristScale = wristDeviceScale;
         bool candidateWristEvaluated = false;
         bool rightHandGripCalibrationExact = false;
         bool leftPipBoyScreenCalibrationExact = false;
+        XrQuaternionf candidateRightHandCalibration {};
+        PipBoyScreenCalibration candidateLeftScreenCalibration {};
 
         XrViewLocateInfo viewLocateInfo { XR_TYPE_VIEW_LOCATE_INFO };
         viewLocateInfo.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
@@ -12967,6 +13403,15 @@ int main(int argc, char** argv)
                 && sharedBridge.leftPipBoyScreenCalibrationHistory.find(
                     spatialCalibrationIdentity,
                     exactPipBoyScreenCalibration);
+            if (pausedWorldRetained)
+            {
+                exactRightHandCalibration = submittedWorld.rightHandCalibration;
+                exactPipBoyScreenCalibration = submittedWorld.leftScreenCalibration;
+                rightHandGripCalibrationExact = true;
+                leftPipBoyScreenCalibrationExact = true;
+            }
+            candidateRightHandCalibration = exactRightHandCalibration;
+            candidateLeftScreenCalibration = exactPipBoyScreenCalibration;
             const XrQuaternionf* const exactRightHandGripLocalRotation =
                 rightHandGripCalibrationExact
                     ? &exactRightHandCalibration
@@ -12990,13 +13435,19 @@ int main(int argc, char** argv)
                 livePipBoyInteractionPlane(
                     spatialLeftPose,
                     spatialSourceFound && spatialLeftTracked,
-                    livePipBoyFocus.scale,
+                    envEnabled("FNVXR_FIRST_PERSON_PIPBOY_ROOT", false)
+                        ? exactPipBoyScreenCalibration.nativeDeviceScale
+                        : pipBoyDeviceScale(candidateWristScale.advance(livePipBoyFocus.scale,
+                            frameState.predictedDisplayTime)),
                     runtimeConfig.get().wristUi,
                     leftPipBoyScreenCalibrationExact
                         ? &exactPipBoyScreenCalibration.gripLocalPosition
                         : nullptr,
                     leftPipBoyScreenCalibrationExact
                         ? &exactPipBoyScreenCalibration.gripLocalRotation
+                        : nullptr,
+                    leftPipBoyScreenCalibrationExact
+                        ? &exactPipBoyScreenCalibration.gripLocalScalePivot
                         : nullptr);
             wristSourcePoseMatched = spatialSourceFound
                 && spatialLeftTracked
@@ -13008,27 +13459,29 @@ int main(int argc, char** argv)
                 candidateWristActivation.advance(
                     runtimeConfig.get().wristUi,
                     fnvxr::kernel::wrist::PoseSnapshot(
-                        fnvxr::host::spatial::toKernelPose(spatialHmdPose),
-                        spatialSourceFound && spatialHmdTracked),
+                        fnvxr::host::spatial::toKernelPose(pausedWorldRetained ? rawHmdPose : spatialHmdPose),
+                        pausedWorldRetained ? hmdTracked : (spatialSourceFound && spatialHmdTracked)),
                     fnvxr::kernel::wrist::PoseSnapshot(
-                        fnvxr::host::spatial::toKernelPose(spatialRightAimPose),
-                        spatialSourceFound && spatialRightAimTracked),
+                        fnvxr::host::spatial::toKernelPose(pausedWorldRetained ? rawRightAimPose : spatialRightAimPose),
+                        pausedWorldRetained ? rightAimTracked : (spatialSourceFound && spatialRightAimTracked)),
                     fnvxr::kernel::wrist::PoseSnapshot(
                         fnvxr::host::spatial::toKernelPose(
                             activationPlane.pose),
                         candidateWristPlane.has_value()));
             candidateWristEvaluated = true;
-            if (candidateWristActivationDecision.active
+            if ((livePipBoyScreenFocused || candidateWristActivationDecision.active)
                 && candidateWristPlane
-                && spatialRightAimTracked)
+                && (pausedWorldRetained ? rightAimTracked : spatialRightAimTracked))
             {
                 candidateWristPointer = menuPointerFromAimPose(
-                    spatialRightAimPose, *candidateWristPlane);
+                    pausedWorldRetained ? rawRightAimPose : spatialRightAimPose, *candidateWristPlane);
             }
-            pipBoySpatialScreenVisible = pipBoySpatialContentReady
-                && wristSourcePoseMatched
-                && candidateWristActivationDecision.active
-                && wristScreenPolicyAuthorized;
+            pipBoySpatialScreenVisible = wristSourcePoseMatched
+                && (wristScreenPolicyAuthorized || (pausedWorldRetained && spatialRigPolicyAuthorized))
+                && pipBoyMenuMode && renderer.wristUiTextureView
+                && (livePipBoyScreenFocused ? pipBoySpatialContentReady
+                    : (pipBoyModalContentHeld || pausedWorldRetained));
+            if (!livePipBoyScreenFocused) candidateWristPointer = {};
             const GamePlane spatialLivePipBoyPlane =
                 candidateWristPlane.value_or(GamePlane {});
 
@@ -13068,7 +13521,7 @@ int main(int argc, char** argv)
                     cpuEngineStereoActive
                         ? renderer.stereoGameTextureViews[0].Get()
                         : (productionBinocularWorld
-                        ? gpuColorConsumer.eyeView(0u)
+                        ? worldEyeView(0u)
                         : (stereoVisualTrialActive
                             ? stereoVisualTrialDecision.bindings.leftEyeSrv
                             : nullptr));
@@ -13076,7 +13529,7 @@ int main(int argc, char** argv)
                     cpuEngineStereoActive
                         ? renderer.stereoGameTextureViews[1].Get()
                         : (productionBinocularWorld
-                        ? gpuColorConsumer.eyeView(1u)
+                        ? worldEyeView(1u)
                         : (stereoVisualTrialActive
                             ? stereoVisualTrialDecision.bindings.rightEyeSrv
                             : nullptr));
@@ -13090,6 +13543,11 @@ int main(int argc, char** argv)
                     weaponOrbitSlot,
                     spatialRightAimPose,
                 };
+                const auto leftEyeStarted = monotonicNow();
+                hostPrepareNanoseconds = leftEyeStarted.value - gpuConsumeFinished.value;
+                if (activeHeadsetMirrorCapture && pipBoySpatialScreenVisible)
+                    captureSwapchainRenderProof(device.Get(),
+                        renderer.wristUiTexture.Get(), pipBoyUiRenderProof);
                 leftRendered = renderEye(
                     xr,
                     device.Get(),
@@ -13114,7 +13572,7 @@ int main(int argc, char** argv)
                     gamePlane,
                     spatialLivePipBoyPlane,
                     pipBoySpatialScreenVisible,
-                    renderer.retainedUiTextureView.Get(),
+                    renderer.wristUiTextureView.Get(),
                     pauseSceneAnchor,
                     renderLegacyUiScene,
                     displayGamePlane,
@@ -13126,6 +13584,7 @@ int main(int argc, char** argv)
                     leftRenderProof,
                     activeHeadsetMirrorCapture,
                     frameIndex);
+                eyeRenderNanoseconds[0] = monotonicNow().value - leftEyeStarted.value;
                 if (leftRendered)
                 {
                     const auto outcome = cadenceTracker.recordEyeRendered(
@@ -13140,6 +13599,7 @@ int main(int argc, char** argv)
                                   << static_cast<unsigned>(outcome) << "\n";
                     }
                 }
+                const auto rightEyeStarted = monotonicNow();
                 rightRendered = renderEye(
                     xr,
                     device.Get(),
@@ -13164,7 +13624,7 @@ int main(int argc, char** argv)
                     gamePlane,
                     spatialLivePipBoyPlane,
                     pipBoySpatialScreenVisible,
-                    renderer.retainedUiTextureView.Get(),
+                    renderer.wristUiTextureView.Get(),
                     pauseSceneAnchor,
                     renderLegacyUiScene,
                     displayGamePlane,
@@ -13176,6 +13636,7 @@ int main(int argc, char** argv)
                     rightRenderProof,
                     activeHeadsetMirrorCapture,
                     frameIndex);
+                eyeRenderNanoseconds[1] = monotonicNow().value - rightEyeStarted.value;
                 if (rightRendered)
                 {
                     const auto outcome = cadenceTracker.recordEyeRendered(
@@ -13282,7 +13743,9 @@ int main(int argc, char** argv)
             endInfo.layerCount = 0;
             endInfo.layers = nullptr;
         }
+        const auto endFrameStarted = monotonicNow();
         const XrResult endResult = xr.endFrame(session, &endInfo);
+        const auto endFrameFinished = monotonicNow();
         const bool presentedExactFrameJoin =
             endResult == XR_SUCCESS
             && submitProjectionLayer
@@ -13296,12 +13759,17 @@ int main(int argc, char** argv)
         if (endResult == XR_SUCCESS
             && submitProjectionLayer
             && candidateWristEvaluated
-            && pipBoySpatialScreenVisible)
+            && wristSourcePoseMatched
+            && spatialPropsSourcePoseMatched)
         {
+            // The rendered wrist device supplies the focus geometry even
+            // before opening the menu has produced its first screen pixels.
+            // Requiring visible UI here creates an opening dependency cycle.
             wristActivation = candidateWristActivation;
             wristActivationDecision = candidateWristActivationDecision;
             submittedWristPlane = candidateWristPlane;
             submittedWristPointer = candidateWristPointer;
+            wristDeviceScale = candidateWristScale;
         }
         else if (endResult == XR_SUCCESS)
         {
@@ -13309,6 +13777,19 @@ int main(int argc, char** argv)
         }
         if (endResult == XR_SUCCESS && submitProjectionLayer)
         {
+            if (productionBinocularWorld && !pausedWorldRetained && productSourceViewFound
+                && rightHandGripCalibrationExact && leftPipBoyScreenCalibrationExact
+                && submittedWorld.copyEyes(device.Get(), gpuColorConsumer.eyeTexture(0u),
+                    gpuColorConsumer.eyeTexture(1u)))
+            {
+                submittedWorld.routed = gpuColorFrame;
+                submittedWorld.proof = presentationInput.stereo;
+                submittedWorld.pose = productSourceView;
+                submittedWorld.rightHandCalibration = candidateRightHandCalibration;
+                submittedWorld.leftScreenCalibration = candidateLeftScreenCalibration;
+                submittedWorld.cellFormId = currentCellFormId;
+                submittedWorld.valid = true;
+            }
             const auto leftSubmit = cadenceTracker.recordEyeSubmitted(
                 cadenceFrame,
                 fnvxr::kernel::performance::Eye::left,
@@ -13397,8 +13878,9 @@ int main(int argc, char** argv)
         if (envEnabled("FNVXR_TELEMETRY_HAMMER", false)
             || frameIndex <= 12
             || frameIndex % 60 == 0
+            || leftRenderProof.valid || rightRenderProof.valid
             || (headsetMirrorCapture.enabled
-                && headsetMirrorCapture.schedule.activeFrame == frameIndex)
+                && frameIndex % 3u == 0u)
             || submitProjectionLayer != previousProjectionSubmitted
             || endResult != XR_SUCCESS)
         {
@@ -13412,6 +13894,11 @@ int main(int argc, char** argv)
                 << ",\"predictedDisplayTime\":" << frameState.predictedDisplayTime
                 << ",\"runtimeWaitNanoseconds\":" << (cadenceBeginTimestamp.value - frameWaitStarted.value)
                 << ",\"gpuConsumeNanoseconds\":" << (gpuConsumeFinished.value - cadenceBeginTimestamp.value)
+                << ",\"hostPrepareNanoseconds\":" << hostPrepareNanoseconds
+                << ",\"leftEyeRenderNanoseconds\":" << eyeRenderNanoseconds[0]
+                << ",\"rightEyeRenderNanoseconds\":" << eyeRenderNanoseconds[1]
+                << ",\"runtimeEndFrameNanoseconds\":" << (endFrameFinished.value - endFrameStarted.value)
+                << ",\"hostFrameWorkNanoseconds\":" << (endFrameFinished.value - cadenceBeginTimestamp.value)
                 << ",\"cadenceEpoch\":" << cadence.epoch
                 << ",\"cadenceFrameBudgetNanoseconds\":"
                 << cadence.frameBudgetNanoseconds
@@ -13636,6 +14123,13 @@ int main(int argc, char** argv)
                 << renderer.gameTextureSourceHash << std::dec << "\""
                 << ",\"leftOutputProof\":" << (leftRenderProof.valid ? "true" : "false")
                 << ",\"leftOutputHash\":\"0x" << std::hex << leftRenderProof.hash << std::dec << "\""
+                << ",\"pipBoyUiOutputProof\":" << (pipBoyUiRenderProof.valid ? "true" : "false")
+                << ",\"pausedWorldRetained\":" << (pausedWorldRetained ? "true" : "false")
+                << ",\"pipBoyUiOutputHash\":\"0x" << std::hex << pipBoyUiRenderProof.hash << std::dec << "\""
+                << ",\"pipBoyUiOutputSourceFrame\":" << renderer.retainedUiSourceFrame
+                << ",\"pipBoyUiOutputRuntimeSample\":" << renderer.retainedUiRuntimeStateSample
+                << ",\"pipBoyUiOutputNonBlackSamples\":" << pipBoyUiRenderProof.nonBlackSamples
+                << ",\"pipBoyUiOutputVariedSamples\":" << pipBoyUiRenderProof.variedSamples
                 << ",\"leftOutputSamples\":" << leftRenderProof.samples
                 << ",\"leftOutputNonBlackSamples\":" << leftRenderProof.nonBlackSamples
                 << ",\"leftOutputVariedSamples\":" << leftRenderProof.variedSamples
@@ -13664,11 +14158,20 @@ int main(int argc, char** argv)
                 << wristActivationDecision.headDistanceMeters
                 << ",\"wristAimAngleDegrees\":"
                 << wristActivationDecision.aimAngleDegrees
-                << ",\"livePipBoyScale\":" << livePipBoyFocus.scale
+                << ",\"livePipBoyScale\":" << wristDeviceScale.value()
+                << ",\"livePipBoyTargetScale\":" << livePipBoyFocus.scale
+                << ",\"currentWorldRigCalibrationReady\":"
+                << (currentWorldRigCalibrationReady ? "true" : "false")
+                << ",\"wristPointerActive\":" << (submittedWristPointer.active ? "true" : "false")
+                << ",\"wristPointerX\":" << submittedWristPointer.x
+                << ",\"wristPointerY\":" << submittedWristPointer.y
                 << ",\"spatialRigAuthorized\":"
                 << (spatialRigPolicyAuthorized
                         ? "true"
                         : "false")
+                << ",\"spatialHandsOverlay\":"
+                << ((spatialPropsSourcePoseMatched && submitProjectionLayer)
+                        ? "true" : "false")
                 << ",\"spatialPropsSourcePoseMatched\":"
                 << (spatialPropsSourcePoseMatched ? "true" : "false")
                 << ",\"spatialPropsPoseSequence\":"
@@ -13694,6 +14197,8 @@ int main(int argc, char** argv)
                         : "false")
                 << ",\"pipBoyContentReady\":"
                 << (pipBoyContentReadiness.ready ? "true" : "false")
+                << ",\"pipBoyModalContentHeld\":"
+                << (pipBoyModalContentHeld ? "true" : "false")
                 << ",\"pipBoyContentReason\":"
                 << static_cast<unsigned>(pipBoyContentReadiness.reason)
                 << ",\"pipBoyContentAgeMilliseconds\":"
@@ -13833,6 +14338,11 @@ int main(int argc, char** argv)
         headsetMirrorCapture.writer->finish();
         headsetMirrorCapture.reportCompleted();
     }
+    if (uiSourceCapture.writer)
+    {
+        uiSourceCapture.writer->finish();
+        uiSourceCapture.reportCompleted();
+    }
     closeHostSharedBridge(sharedBridge);
     closeSharedD3D9VideoFrame(renderer);
     if (!waitForD3D11GpuIdle(device.Get()))
@@ -13881,5 +14391,6 @@ int main(int argc, char** argv)
     xr.destroyInstance(instance);
     FreeLibrary(xr.loader);
 
+    if (leftEye.fatalWaitFailure || rightEye.fatalWaitFailure) return 24;
     return stereoProgressWatchdogExpired ? 25 : 0;
 }

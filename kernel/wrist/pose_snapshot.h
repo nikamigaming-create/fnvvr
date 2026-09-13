@@ -31,8 +31,9 @@ private:
 class LocalScreenTransform final
 {
 public:
-    explicit LocalScreenTransform(const Pose& gripToScreen) noexcept
-        : gripToScreen_(gripToScreen)
+    explicit LocalScreenTransform(const Pose& gripToScreen,
+        const Vec3& gripLocalScalePivot = {}) noexcept
+        : gripToScreen_(gripToScreen), gripLocalScalePivot_(gripLocalScalePivot)
     {
     }
 
@@ -46,7 +47,13 @@ public:
         return gripToScreen_;
     }
 
+    [[nodiscard]] const Vec3& gripLocalScalePivot() const noexcept
+    {
+        return gripLocalScalePivot_;
+    }
+
 private:
     Pose gripToScreen_ {};
+    Vec3 gripLocalScalePivot_ {};
 };
 }

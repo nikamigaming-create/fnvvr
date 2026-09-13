@@ -33,7 +33,8 @@ public:
         const product::PresentationInput& input,
         const PresentationTransportProof& transport,
         bool trackedRigReady,
-        bool wristContentReady);
+        bool wristContentReady,
+        const PresentationTransportProof& uiTransport = {});
     void reset() noexcept;
 
 private:
@@ -41,7 +42,8 @@ private:
         const product::PresentationInput& input,
         const PresentationTransportProof& transport,
         bool trackedRigReady,
-        bool wristContentReady) noexcept;
+        bool wristContentReady,
+        const PresentationTransportProof& uiTransport) noexcept;
     [[nodiscard]] static product::PresentationDecision translate(
         const kernel::presentation::PresentationDecision& decision,
         const product::PresentationInput& input) noexcept;

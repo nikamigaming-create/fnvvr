@@ -16,10 +16,12 @@ $combatDemoPath =
 $patchPath = Join-Path $SourceRoot "patches\openxr-simulator-fnvxr-headless.patch"
 $controllerPosePatchPath =
     Join-Path $SourceRoot "patches\openxr-simulator-controller-local-6dof.patch"
+$frameTimingPatchPath =
+    Join-Path $SourceRoot "patches\openxr-simulator-frame-timing.patch"
 foreach ($path in @(
     $buildPath, $inputPath, $headSweepPath, $controllerSweepPath,
     $combatDemoPath, $patchPath,
-    $controllerPosePatchPath)) {
+    $controllerPosePatchPath, $frameTimingPatchPath)) {
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
         throw "Headless simulator CLI contract file is missing: $path"
     }
@@ -44,6 +46,7 @@ foreach ($contract in @(
     '48a70f440ac7d9bda385994937e3da8e15a4d9bb',
     'openxr-simulator-fnvxr-headless.patch',
     'openxr-simulator-controller-local-6dof.patch',
+    'openxr-simulator-frame-timing.patch',
     'LOCAL controller-pose patch',
     'apply --check --reverse',
     'MSBUILDDISABLENODEREUSE',

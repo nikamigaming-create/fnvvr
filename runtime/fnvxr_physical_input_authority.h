@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cmath>
 
 namespace fnvxr::physical_input
 {
@@ -112,6 +113,17 @@ struct LocomotionIntent
         return forward || backward || left || right;
     }
 };
+
+struct HeadRelativeStick { float x; float y; };
+
+inline HeadRelativeStick headRelativeStick(float x, float y, float yaw) noexcept
+{
+    // OpenXR forward is -Z. Positive rotation about +Y looks left, so a
+    // forward stick must become negative native strafe at +90 degrees.
+    const float cosine = std::cos(yaw);
+    const float sine = std::sin(yaw);
+    return { x * cosine - y * sine, x * sine + y * cosine };
+}
 
 constexpr LocomotionIntent classifyLocomotion(
     std::int32_t leftThumbX,

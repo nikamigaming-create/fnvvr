@@ -35,6 +35,7 @@ private:
     SourceKey retainedUiSource_ {};
     SourceKey latestAcceptedUiSource_ {};
     SourceKey lastAcceptedWorldSource_ {};
+    std::uint64_t lastAcceptedWorldRuntimeSample_ = 0;
     std::uint64_t retainedUiRuntimeSample_ = 0;
     std::uint32_t holdAdvances_ = 0;
 };

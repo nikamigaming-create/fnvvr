@@ -1,6 +1,7 @@
 #include "config_validation.h"
 
 #include <cmath>
+#include <limits>
 
 namespace fnvxr::kernel
 {
@@ -29,6 +30,9 @@ bool supportedRefreshRate(std::uint32_t refreshHz) noexcept
 ValidatedRuntimeConfig::ValidatedRuntimeConfig(const RuntimeConfig& value) noexcept
     : value_(value),
       frameBudgetMilliseconds_(1000.0F / static_cast<float>(value.performance.targetRefreshHz)),
+      maximumPoseAgeNanoseconds_(static_cast<std::int64_t>(std::ceil(
+          static_cast<double>(std::nextafter(value.performance.maximumPoseAgeMilliseconds,
+              std::numeric_limits<float>::infinity())) * 1000000.0))),
       wristHysteresisMeters_(
           value.wristUi.deactivationDistanceMeters - value.wristUi.activationDistanceMeters)
 {
@@ -47,6 +51,14 @@ float ValidatedRuntimeConfig::frameBudgetMilliseconds() const noexcept
 float ValidatedRuntimeConfig::wristHysteresisMeters() const noexcept
 {
     return wristHysteresisMeters_;
+}
+
+std::int64_t ValidatedRuntimeConfig::maximumPoseAgeNanoseconds() const noexcept
+{
+    // A decimal millisecond budget is stored as float. Use its upper adjacent
+    // representation when converting to integer nanoseconds so rounding does
+    // not exclude the exact refresh boundary (33,333,333 ns at 90 Hz).
+    return maximumPoseAgeNanoseconds_;
 }
 
 ConfigValidationResult::ConfigValidationResult(
@@ -76,8 +88,9 @@ ConfigValidationResult validateRuntimeConfig(const RuntimeConfig& candidate) noe
     // implemented and tested end-to-end.
     if (performance.poseHistoryCapacity != 128)
         return { ConfigError::InvalidPoseHistoryCapacity, candidate };
-    const float frameBudget = 1000.0F / static_cast<float>(performance.targetRefreshHz);
-    if (!finiteInRange(performance.maximumPoseAgeMilliseconds, 0.1F, frameBudget * 3.0F))
+    // A transport deadline is elapsed time, not a fixed count of XR refreshes.
+    // Faster headset refresh must not make the same completed game pair expire.
+    if (!finiteInRange(performance.maximumPoseAgeMilliseconds, 0.1F, 100.0F))
         return { ConfigError::InvalidPoseAge, candidate };
     if (!finiteInRange(
             performance.maximumCpuPoseAgeMilliseconds, 1.0F, 250.0F))

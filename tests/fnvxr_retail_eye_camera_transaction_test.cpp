@@ -632,6 +632,56 @@ void testFullOrientationRecenter()
         "vertical head motion did not remain a camera-local pitch after recenter");
 }
 
+void testCinematicCameraCannotMoveFirstPersonView()
+{
+    abi::RetailNiCameraLayout stock {};
+    initializeCamera(stock, 100.0f, 200.0f, 118.0f);
+    RetailTrackedFrame frame = validFrame();
+    const auto origin = prepareRetailVrOriginCandidate({}, frame);
+    const auto anchor = levelRetailCameraTransform(100.0f, 200.0f, 118.0f);
+    FirstPersonView firstPerson {};
+    std::memcpy(firstPerson.rotation, anchor.rotation, sizeof(anchor.rotation));
+    std::memcpy(firstPerson.position, anchor.translation, sizeof(anchor.translation));
+
+    // Native VATS starts playback, translates its camera to the target and
+    // changes heading. The submitted eye pair must retain the rig's anchor.
+    auto cinematic = levelRetailCameraTransform(1500.0f, -800.0f, 300.0f);
+    cinematic.rotation[2] = -1.0f;
+    cinematic.rotation[3] = -1.0f;
+    detail::retailCameraWriteTransform(&stock,
+        RetailNiAvObjectWorldTransformOffset, cinematic);
+    const auto stockBefore = stock;
+    const auto anchored = deriveRetailEyeCameraRig(
+        &stock, frame, origin.origin, 70.0f, &firstPerson);
+    require(anchored.complete()
+            && nearlyEqual(anchored.center.world.translation[0], 100.0f)
+            && nearlyEqual(anchored.center.world.translation[1], 200.0f)
+            && nearlyEqual(anchored.center.world.translation[2], 118.0f)
+            && cameraForward(anchored.center).y > 0.99f
+            && nearlyEqual(anchored.right.world.translation[0]
+                - anchored.left.world.translation[0], 4.48f),
+        "VATS cinematic took ownership of the first-person eye pair");
+
+    setTrackedOrientation(frame, axisAngle(0.0f, 1.0f, 0.0f, 0.3f));
+    const auto turned = deriveRetailEyeCameraRig(
+        &stock, frame, origin.origin, 70.0f, &firstPerson);
+    require(turned.complete()
+            && std::fabs(cameraForward(turned.center).x) > 0.29f
+            && nearlyEqual(turned.center.world.translation[0], 100.0f)
+            && std::memcmp(&stock, &stockBefore, sizeof(stock)) == 0,
+        "first-person VATS stopped head tracking or altered native camera state");
+
+    const auto native = deriveRetailEyeCameraRig(
+        &stock, frame, origin.origin, 70.0f);
+    require(native.complete()
+            && nearlyEqual(native.center.world.translation[0], 1500.0f),
+        "unbound camera path stopped preserving the native view");
+    firstPerson.position[0] = std::numeric_limits<float>::quiet_NaN();
+    require(!deriveRetailEyeCameraRig(
+            &stock, frame, origin.origin, 70.0f, &firstPerson).complete(),
+        "invalid first-person anchor silently fell back to a cinematic camera");
+}
+
 void testPrivateCameraOwnership()
 {
     abi::RetailNiCameraLayout center {};
@@ -682,6 +732,7 @@ int main()
     testOriginAndRig();
     testTrackedOrientationAxes();
     testFullOrientationRecenter();
+    testCinematicCameraCannotMoveFirstPersonView();
     testPrivateCameraOwnership();
     std::cout << "retail distinct-eye camera transaction passed\n";
     return EXIT_SUCCESS;

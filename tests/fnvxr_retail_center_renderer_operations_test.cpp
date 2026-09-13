@@ -122,121 +122,49 @@ void writeFixtureValue(
     std::memcpy(bytes + offset, &value, sizeof(value));
 }
 
-void verifyFirstPersonGeometryMutationContract()
+std::vector<void*> submittedFirstPersonLeaves;
+abi::RetailNiCullingProcessLayout* submittedFirstPersonCuller = nullptr;
+bool wrongFirstPersonSlot = false;
+void __fastcall nativeVisibilityProbe(void* geometry, void*,
+    abi::RetailNiCullingProcessLayout* culler)
 {
-    constexpr std::uint32_t OriginalGeometryFlags = 0xA5A500C1u;
-    constexpr std::uint32_t ExpectedGeometryFlags =
-        OriginalGeometryFlags & ~0x41u;
-    constexpr std::uint16_t OriginalPropertyFlags = 0x6004u;
-    constexpr std::uint16_t ExpectedPropertyFlags =
-        static_cast<std::uint16_t>(
-            (OriginalPropertyFlags | 0x0001u) & ~0x2000u);
-
-    QueueGeometryFixture normal;
-    normal.initialize(false);
-    writeFixtureValue(
-        normal.geometry.data(), 0x30u, OriginalGeometryFlags);
-    writeFixtureValue(
-        normal.property.data(), 0x18u, OriginalPropertyFlags);
-    detail::FirstPersonGeometryMutation mutation {};
-    const abi::RetailPointer32 geometryAddress =
-        static_cast<abi::RetailPointer32>(
-            reinterpret_cast<std::uintptr_t>(normal.geometry.data()));
-    require(
-        detail::applyFirstPersonGeometryMutation(
-            geometryAddress,
-            mutation),
-        "the authenticated first-person mutation rejected writable geometry");
-    require(
-        mutation.applied
-            && readFixtureValue<std::uint32_t>(
-                   normal.geometry.data(), 0x30u)
-                == ExpectedGeometryFlags
-            && readFixtureValue<std::uint16_t>(
-                   normal.property.data(), 0x18u)
-                == ExpectedPropertyFlags,
-        "the first-person mutation changed the wrong geometry/property bits");
-    require(
-        detail::restoreFirstPersonGeometryMutation(mutation)
-            && !mutation.applied
-            && readFixtureValue<std::uint32_t>(
-                   normal.geometry.data(), 0x30u)
-                == OriginalGeometryFlags
-            && readFixtureValue<std::uint16_t>(
-                   normal.property.data(), 0x18u)
-                == OriginalPropertyFlags,
-        "the first-person mutation did not restore exact source bytes");
-    require(
-        detail::restoreFirstPersonGeometryMutation(mutation),
-        "restoring an inactive first-person mutation was not idempotent");
-
-    QueueGeometryFixture rejected;
-    rejected.initialize(false);
-    writeFixtureValue(
-        rejected.geometry.data(), 0x30u, OriginalGeometryFlags);
-    writeFixtureValue<abi::RetailPointer32>(
-        rejected.geometry.data(), 0x9Cu, 0u);
-    require(
-        !detail::applyFirstPersonGeometryMutation(
-            static_cast<abi::RetailPointer32>(
-                reinterpret_cast<std::uintptr_t>(rejected.geometry.data())),
-            mutation)
-            && !mutation.applied
-            && readFixtureValue<std::uint32_t>(
-                   rejected.geometry.data(), 0x30u)
-                == OriginalGeometryFlags,
-        "an invalid property pointer partially mutated first-person geometry");
-
-    auto* readOnlyProperty = static_cast<std::uint8_t*>(VirtualAlloc(
-        nullptr,
-        4096u,
-        MEM_COMMIT | MEM_RESERVE,
-        PAGE_READWRITE));
-    require(readOnlyProperty != nullptr,
-        "could not allocate the partial-write fault fixture");
-    QueueGeometryFixture partial;
-    partial.initialize(false);
-    writeFixtureValue(
-        partial.geometry.data(), 0x30u, OriginalGeometryFlags);
-    writeFixtureValue(
-        readOnlyProperty, 0x18u, OriginalPropertyFlags);
-    writeFixtureValue(
-        partial.geometry.data(),
-        0x9Cu,
-        static_cast<abi::RetailPointer32>(
-            reinterpret_cast<std::uintptr_t>(readOnlyProperty)));
-    DWORD previousProtection = 0u;
-    require(
-        VirtualProtect(
-            readOnlyProperty,
-            4096u,
-            PAGE_READONLY,
-            &previousProtection) != FALSE,
-        "could not protect the partial-write fault fixture");
-    require(
-        !detail::applyFirstPersonGeometryMutation(
-            static_cast<abi::RetailPointer32>(
-                reinterpret_cast<std::uintptr_t>(partial.geometry.data())),
-            mutation)
-            && !mutation.applied
-            && readFixtureValue<std::uint32_t>(
-                   partial.geometry.data(), 0x30u)
-                == OriginalGeometryFlags
-            && readFixtureValue<std::uint16_t>(
-                   readOnlyProperty, 0x18u)
-                == OriginalPropertyFlags,
-        "a property write fault leaked the preceding geometry mutation");
-    DWORD ignoredProtection = 0u;
-    require(
-        VirtualProtect(
-            readOnlyProperty,
-            4096u,
-            previousProtection,
-            &ignoredProtection) != FALSE,
-        "could not restore the partial-write fixture protection");
-    require(
-        VirtualFree(readOnlyProperty, 0u, MEM_RELEASE) != FALSE,
-        "could not release the partial-write fault fixture");
+    submittedFirstPersonLeaves.push_back(geometry);
+    submittedFirstPersonCuller = culler;
+}
+void __fastcall wrongImmediateProbe(void*, void*, void*)
+{
+    wrongFirstPersonSlot = true;
+}
+void verifyNativeFirstPersonDispatch()
+{
+    // Model a body, a separately animated hammer and a hand without an alpha
+    // property. All must reach native registration with the same culler;
+    // DC has a deliberately incompatible meaning and must never be called.
+    std::array<void*, 0xE4u / 4u> vtable {};
+    vtable[0xD4u / 4u] = reinterpret_cast<void*>(&nativeVisibilityProbe);
+    vtable[0xDCu / 4u] = reinterpret_cast<void*>(&wrongImmediateProbe);
+    std::array<QueueGeometryFixture, 3> leaves {};
+    abi::RetailNiCullingProcessLayout culler {};
+    for (std::size_t i = 0; i < leaves.size(); ++i)
+    {
+        leaves[i].initialize(i == 1);
+        writeFixtureValue(leaves[i].geometry.data(), 0u, vtable.data());
+        if (i == 2)
+            writeFixtureValue<abi::RetailPointer32>(leaves[i].geometry.data(), 0x9Cu, 0u);
+        const auto originalGeometry = leaves[i].geometry;
+        const auto originalProperty = leaves[i].property;
+        require(detail::submitFirstPersonGeometry(static_cast<abi::RetailPointer32>(
+                    reinterpret_cast<std::uintptr_t>(leaves[i].geometry.data())), &culler),
+            "native first-person registration failed");
+        require(leaves[i].geometry == originalGeometry && leaves[i].property == originalProperty,
+            "native registration changed material or visibility bytes");
+    }
+    require(!wrongFirstPersonSlot && submittedFirstPersonLeaves.size() == 3
+            && submittedFirstPersonCuller == &culler,
+        "weapon parts did not use the native visibility callback");
+    for (std::size_t i = 0; i < leaves.size(); ++i)
+        require(submittedFirstPersonLeaves[i] == leaves[i].geometry.data(),
+            "native registration lost or reordered a weapon part");
 }
 
 struct State
@@ -576,7 +504,25 @@ int main()
     State state;
     gState = &state;
 
-    verifyFirstPersonGeometryMutationContract();
+    verifyNativeFirstPersonDispatch();
+
+    // A second VR pose in one retail frame must not reuse the first pose's
+    // bone palette. Only invalidate the cache key, never its storage/owners.
+    std::array<std::uint8_t, 0xC4> skinGeometry{};
+    std::array<std::uint8_t, 0x34> skin{};
+    skin.fill(0xA5);
+    writeFixtureValue<std::uint32_t>(skin.data(), 0, 0x01069B14u);
+    writeFixtureValue<std::uint32_t>(skin.data(), 0x18, 731u);
+    writeFixtureValue<abi::RetailPointer32>(skinGeometry.data(), 0xBC,
+        static_cast<abi::RetailPointer32>(reinterpret_cast<std::uintptr_t>(skin.data())));
+    auto expectedSkin = skin;
+    writeFixtureValue<std::uint32_t>(expectedSkin.data(), 0x18, 0xFFFFFFFFu);
+    require(invalidateRetailSkinPalette(reinterpret_cast<std::uintptr_t>(skinGeometry.data()))
+        && skin == expectedSkin, "VR bone changes retained a stale palette or changed its ownership");
+    writeFixtureValue<std::uint32_t>(skin.data(), 0, 0x12345678u);
+    const auto unknownSkin = skin;
+    require(!invalidateRetailSkinPalette(reinterpret_cast<std::uintptr_t>(skinGeometry.data()))
+        && skin == unknownSkin, "an unknown skin layout was modified");
 
     Binding binding;
     std::array<abi::RetailPointer32, Binding::OwnedVtableEntryCount> stock {};

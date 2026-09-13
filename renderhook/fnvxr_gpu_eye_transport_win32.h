@@ -7,6 +7,8 @@ struct IDirect3DTexture9;
 
 namespace fnvxr::d3d9::color_transport
 {
+// Process-local, bounded diagnostics. Does not enable Watson/GPU heap dumps.
+bool enableDeviceRemovalDiagnostics() noexcept;
 // D3D9On12 owns engine rendering; a private D3D12 queue copies complete eye
 // pairs to NT-shared textures. The D3D11 consumer releases the shared fence
 // before another pair can overwrite them. No pixels pass through CPU memory.
@@ -40,6 +42,7 @@ public:
     bool available() const noexcept;
     GpuEyeFailure failure() const noexcept;
     std::int32_t lastHresult() const noexcept;
+    const char* failureDetails() const noexcept;
     ProducerResources resources() const noexcept;
     ProducerPublication produce(const ProducerFrameIdentity& identity) noexcept;
 private:

@@ -28,6 +28,20 @@ PresentationDecision Coordinator::advance(const PresentationInput& input)
         || input.runtime.sample == 0
         || input.runtime.phase == RuntimePhase::Unknown)
     {
+        // A blocking engine load can suspend runtime publication. Keep only
+        // the pair already accepted in this lifetime, with its exact poses.
+        // No UI or pointer input gains authority from this presentation hold.
+        if (input.world.retainedForContinuity
+            && isValid(lastAcceptedWorldSource_)
+            && input.world.source == lastAcceptedWorldSource_
+            && input.world.runtimeSample == lastAcceptedWorldRuntimeSample_
+            && worldFailure(input) == DecisionReason::WorldFrameReady)
+        {
+            PresentationDecision held { PresentationMode::WorldStereo,
+                DecisionReason::WorldFrameReady, input.world.source };
+            held.spatialRigMayRender = input.trackedRigReady;
+            return held;
+        }
         reset();
         return {};
     }
@@ -43,10 +57,33 @@ void Coordinator::reset()
     clearRetainedUi();
     latestAcceptedUiSource_ = {};
     lastAcceptedWorldSource_ = {};
+    lastAcceptedWorldRuntimeSample_ = 0;
 }
 
 PresentationDecision Coordinator::decideBlockingUi(const PresentationInput& input)
 {
+    // Menus own input, not the entire visual field. A verified world and an
+    // independently verified menu surface can be composed in the same eyes.
+    if (worldFailure(input) == DecisionReason::WorldFrameReady)
+    {
+        PresentationDecision decision { PresentationMode::WorldStereo,
+            DecisionReason::WorldFrameReady, input.world.source };
+        decision.spatialRigMayRender = input.trackedRigReady;
+        decision.wristScreenMayRender = input.trackedRigReady
+            && pipBoyRequested(input.runtime.ui) && input.wristContentReady;
+        if (uiFailure(input) == DecisionReason::UiFrameReady)
+        {
+            retainedUiSource_ = input.ui.source;
+            latestAcceptedUiSource_ = input.ui.source;
+            retainedUiRuntimeSample_ = input.runtime.sample;
+            holdAdvances_ = 0;
+            decision.overlayUiSource = input.ui.source;
+            decision.pointerMayRender = input.runtime.phase != RuntimePhase::Loading;
+        }
+        lastAcceptedWorldSource_ = input.world.source;
+        lastAcceptedWorldRuntimeSample_ = input.world.runtimeSample;
+        return decision;
+    }
     const DecisionReason failure = uiFailure(input);
     if (failure == DecisionReason::UiFrameReady)
     {
@@ -80,7 +117,7 @@ PresentationDecision Coordinator::decideWorld(const PresentationInput& input)
         return { PresentationMode::SafetyBlank, failure };
     }
 
-    if (isValid(latestAcceptedUiSource_)
+    if (!input.world.retainedForContinuity && isValid(latestAcceptedUiSource_)
         && !isStrictlyNewer(input.world.source, latestAcceptedUiSource_))
     {
         if (isValid(retainedUiSource_)
@@ -103,6 +140,7 @@ PresentationDecision Coordinator::decideWorld(const PresentationInput& input)
         && input.wristContentReady;
     const SourceKey selected = input.world.source;
     lastAcceptedWorldSource_ = selected;
+    lastAcceptedWorldRuntimeSample_ = input.world.runtimeSample;
     clearRetainedUi();
     latestAcceptedUiSource_ = {};
     return { PresentationMode::WorldStereo, DecisionReason::WorldFrameReady,
@@ -119,17 +157,17 @@ DecisionReason Coordinator::uiFailure(const PresentationInput& input) const
         return DecisionReason::UiFrameIncomplete;
     }
     if (!input.ui.runtimeLineageVerified
-        || input.ui.runtimeSample != input.runtime.sample)
+        || (input.ui.runtimeSample != input.runtime.sample
+            && (input.ui.verifiedRuntimeSample != input.runtime.sample
+                || input.ui.runtimeSample > input.runtime.sample)))
     {
         return DecisionReason::UiRuntimeLineageInvalid;
     }
     if (!input.ui.gpu.completeFor(input.ui.source))
         return DecisionReason::UiGpuEvidenceInvalid;
-    if (isValid(lastAcceptedWorldSource_)
-        && !isSameOrNewer(input.ui.source, lastAcceptedWorldSource_))
-    {
-        return DecisionReason::UiSourceOlderThanWorld;
-    }
+    // World and menu pixels are independent producer channels. A newer world
+    // transaction must not blink an otherwise fresh, same-context menu out.
+    // Order UI against its own accepted source, with runtime/GPU checks above.
     if (isValid(latestAcceptedUiSource_)
         && !isSameOrNewer(input.ui.source, latestAcceptedUiSource_))
     {
@@ -140,17 +178,27 @@ DecisionReason Coordinator::uiFailure(const PresentationInput& input) const
 
 DecisionReason Coordinator::worldFailure(const PresentationInput& input) const
 {
+    // Retention never accepts a new source. Its pixels, poses, GPU ownership,
+    // and original runtime observation must still identify the accepted pair.
+    const bool pausedWorld = (input.runtime.ui == UiClassification::PipBoySpatial
+            || input.world.retainedForContinuity)
+        && isValid(lastAcceptedWorldSource_)
+        && input.world.source == lastAcceptedWorldSource_
+        && lastAcceptedWorldRuntimeSample_ != 0
+        && input.world.runtimeSample == lastAcceptedWorldRuntimeSample_;
     if (!isValid(input.world.source)
         || !input.world.completeStereoPair
         || !input.world.distinctEyeViews
-        || !input.world.fresh)
+        || (!input.world.fresh && !pausedWorld))
     {
         return DecisionReason::WorldFrameIncomplete;
     }
     if (!input.world.stereoIdentity.coherentWith(input.world.source))
         return DecisionReason::WorldStereoIdentityInvalid;
-    if (!input.world.runtimeLineageVerified
-        || input.world.runtimeSample != input.runtime.sample)
+    if (!pausedWorld && (!input.world.runtimeLineageVerified
+        || (input.world.runtimeSample != input.runtime.sample
+            && (input.world.verifiedRuntimeSample != input.runtime.sample
+                || input.world.runtimeSample > input.runtime.sample))))
     {
         return DecisionReason::WorldRuntimeLineageInvalid;
     }

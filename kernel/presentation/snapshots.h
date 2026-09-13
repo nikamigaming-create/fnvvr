@@ -40,6 +40,10 @@ struct WorldFrameProof
     bool distinctEyeViews = false;
     bool runtimeLineageVerified = false;
     bool fresh = false;
+    // A private copy of the exact last accepted pair may bridge a bounded
+    // producer delay or remain behind an active retail menu.
+    bool retainedForContinuity = false;
+    std::uint64_t verifiedRuntimeSample = 0;
 };
 
 struct UiFrameProof
@@ -51,6 +55,7 @@ struct UiFrameProof
     bool monoRetailView = false;
     bool runtimeLineageVerified = false;
     bool fresh = false;
+    std::uint64_t verifiedRuntimeSample = 0;
 };
 
 struct PoseHistorySnapshot

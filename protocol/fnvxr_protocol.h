@@ -45,6 +45,7 @@ constexpr std::uint8_t PoseInteractionLivePipBoyFocused = 1u << 1;
 constexpr std::uint8_t PoseInteractionLivePipBoyOpenRequest = 1u << 2;
 constexpr std::uint8_t PoseInteractionWeaponOrbitActive = 1u << 3;
 constexpr std::uint8_t PoseInteractionLivePipBoyPointerActive = 1u << 4;
+constexpr std::uint8_t PoseInteractionPipBoyNativeTexturePointer = 1u << 5;
 
 #pragma pack(push, 1)
 struct PoseFrame

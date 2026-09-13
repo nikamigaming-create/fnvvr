@@ -61,13 +61,66 @@ $hostSource = Get-Content -LiteralPath $hostSourcePath -Raw
 $pluginSource = Get-Content -LiteralPath $pluginSourcePath -Raw
 $d3d9Source = Get-Content -LiteralPath $d3d9SourcePath -Raw
 
+# A pre-overlay submit used to terminate a live run under StrictMode instead
+# of leaving the Pip-Boy proof pending. Exercise that actual log-reader path.
+$pipBoyReaderStart = $launcher.IndexOf(
+    'function Get-FnvxrProductPipBoyOutputProof')
+$pipBoyReaderEnd = $launcher.IndexOf(
+    'function Get-FnvxrProductMeasuredPipBoySimulatorAim', $pipBoyReaderStart)
+Invoke-Expression $launcher.Substring(
+    $pipBoyReaderStart, $pipBoyReaderEnd - $pipBoyReaderStart)
+$pipBoyFixtureLog = [System.IO.Path]::GetTempFileName()
+try {
+    [System.IO.File]::WriteAllText($pipBoyFixtureLog,
+        '{"event":"fnvxrOpenXrSubmit","runtimeMenuBits":64,"runtimeUi":true,"runtimePhase":1,"runtimeCameraActive":false,"livePipBoy":true}' +
+        [Environment]::NewLine)
+    if ($null -ne (Get-FnvxrProductPipBoyOutputProof -LogPath $pipBoyFixtureLog)) {
+        throw 'A submit missing spatial overlay evidence was accepted.'
+    }
+} finally {
+    Remove-Item -LiteralPath $pipBoyFixtureLog -Force -ErrorAction SilentlyContinue
+}
+
 # Execute the measured-ray helper under the same Windows PowerShell runtime
 # used by the launcher. This catches API assumptions such as Double.IsFinite,
 # which exists in newer .NET but not the product machine's framework runtime.
+$gpuUiReaderStart = $launcher.IndexOf('function Get-FnvxrProductLatestGpuUiFrameProof')
+$gpuUiReaderEnd = $launcher.IndexOf('function Get-FnvxrProductHeadsetDemoInputProof', $gpuUiReaderStart)
+Invoke-Expression $launcher.Substring($gpuUiReaderStart, $gpuUiReaderEnd - $gpuUiReaderStart)
+$gpuUiFixtureLog = [System.IO.Path]::GetTempFileName()
+try {
+    $gpuUiFrame = [ordered]@{
+        event = 'fnvxrOpenXrSubmit'; frame = 100; gpuUiTransaction = 42
+        pipBoyUiOutputProof = $true; livePipBoy = $true
+        pipBoySpatialScreenVisible = $true; projectionLayerSubmitted = $true
+        leftOutputProof = $true; rightOutputProof = $true
+        gpuUiRuntimeLineage = $true; gpuUiFresh = $true
+        pipBoyUiOutputSourceFrame = 42; pipBoyUiOutputRuntimeSample = 84
+        pipBoyUiOutputHash = '0xabcdef12'; pipBoyUiOutputNonBlackSamples = 100
+        pipBoyUiOutputVariedSamples = 100
+    }
+    [System.IO.File]::WriteAllText($gpuUiFixtureLog, ($gpuUiFrame | ConvertTo-Json -Compress))
+    $uiProof = Get-FnvxrProductLatestGpuUiFrameProof -HostLogPath $gpuUiFixtureLog
+    if (-not $uiProof -or $uiProof.sourceFrame -ne 42 -or $uiProof.pixelHash -cne '0xabcdef12') {
+        throw 'Current GPU UI pixels were not accepted with their submitted source identity.'
+    }
+    $gpuUiFrame.rightOutputProof = $false
+    [System.IO.File]::WriteAllText($gpuUiFixtureLog, ($gpuUiFrame | ConvertTo-Json -Compress))
+    if (Get-FnvxrProductLatestGpuUiFrameProof -HostLogPath $gpuUiFixtureLog) {
+        throw 'A UI texture without proof in both submitted eyes was accepted.'
+    }
+    [System.IO.File]::WriteAllText($gpuUiFixtureLog, '{"event":"fnvxrOpenXrSubmit"}')
+    if (Get-FnvxrProductLatestGpuUiFrameProof -HostLogPath $gpuUiFixtureLog) {
+        throw 'An older submit without GPU UI pixel evidence was accepted.'
+    }
+} finally {
+    Remove-Item -LiteralPath $gpuUiFixtureLog -Force -ErrorAction SilentlyContinue
+}
+
 $aimHelperStart = $launcher.IndexOf(
     'function Get-FnvxrProductMeasuredPipBoySimulatorAim')
 $aimHelperEnd = $launcher.IndexOf(
-    'function Get-FnvxrProductLatestCpuUiFrameProof',
+    'function Get-FnvxrProductLatestGpuUiFrameProof',
     $aimHelperStart)
 if ($aimHelperStart -lt 0 -or $aimHelperEnd -le $aimHelperStart) {
     throw "Could not isolate the measured Pip-Boy simulator-ray helper."
@@ -98,7 +151,7 @@ try {
 }
 
 $uiReaderStart = $launcher.IndexOf(
-    'function Get-FnvxrProductLatestCpuUiFrameProof')
+    'function Get-FnvxrProductLatestGpuUiFrameProof')
 $uiReaderEnd = $launcher.IndexOf(
     'function Get-FnvxrProductHeadsetDemoInputProof',
     $uiReaderStart)
@@ -110,13 +163,16 @@ Invoke-Expression $launcher.Substring(
     $uiReaderEnd - $uiReaderStart)
 $uiFixtureLog = [System.IO.Path]::GetTempFileName()
 try {
-    $uiLine = 'prefix {"event":"fnvxrRetailEngineCenterCpuUiQuad","transaction":9,"sourceFrame":10,"poseFrame":11,"poseSequence":12,"runtimeStateSample":13,"producerMode":5,"uiActive":true,"pixelProof":true,"monoProof":true,"pixelHash":"0x1234abcd","nonBlackSamples":77}'
+    $gpuUiFrame.rightOutputProof = $true
+    $gpuUiFrame.pipBoyUiOutputSourceFrame = 10
+    $gpuUiFrame.pipBoyUiOutputHash = '0x1234abcd'
+    $uiLine = 'prefix ' + ($gpuUiFrame | ConvertTo-Json -Compress)
     [System.IO.File]::WriteAllText(
         $uiFixtureLog,
         $uiLine + [Environment]::NewLine,
         [System.Text.UTF8Encoding]::new($false))
-    $uiProof = Get-FnvxrProductLatestCpuUiFrameProof `
-        -RetailVrLogPath $uiFixtureLog
+    $uiProof = Get-FnvxrProductLatestGpuUiFrameProof `
+        -HostLogPath $uiFixtureLog
     if (-not $uiProof -or [uint64]$uiProof.sourceFrame -ne 10 -or
         [string]$uiProof.pixelHash -cne '0x1234abcd') {
         throw "The shared-read live retail UI log fixture was not parsed."
@@ -127,8 +183,8 @@ try {
         [System.IO.FileAccess]::ReadWrite,
         [System.IO.FileShare]::None)
     try {
-        $lockedProof = Get-FnvxrProductLatestCpuUiFrameProof `
-            -RetailVrLogPath $uiFixtureLog
+        $lockedProof = Get-FnvxrProductLatestGpuUiFrameProof `
+            -HostLogPath $uiFixtureLog
         if ($lockedProof) {
             throw "An exclusively locked live log produced false UI evidence."
         }
@@ -147,7 +203,7 @@ foreach ($sandboxContract in @(
     'New-Item -ItemType HardLink',
     'sourceRootsMutated = $false',
     'processOrUiControl = $false')) {
-    if (-not ($retailSandbox.Contains($sandboxContract) -or
+if (-not ($retailSandbox.Contains($sandboxContract) -or
             $common.Contains($sandboxContract) -or
             $launcher.Contains($sandboxContract))) {
         throw "Retail sandbox isolation contract is missing: $sandboxContract"
@@ -157,13 +213,13 @@ if (-not $launcher.Contains(
         'Automated retail headset/simulator fixture runs require an isolated')) {
     throw "Automated retail headset runs can still stage or launch the installed Library root."
 }
-if (-not $retailProps.Contains('1hphandgrip1.kf') -or
-    -not $retailProps.Contains('rightHandPose = "_1stperson/1hphandgrip1@end"') -or
-    -not $launcher.Contains('"_1stperson/1hphandgrip1@end"') -or
-    $retailProps.Contains('1hpaim.kf')) {
-    throw "Retail right-hand preparation no longer bakes the dedicated authored closed pistol-grip finger pose."
+if (-not $retailProps.Contains('meshes\characters\_1stperson\1hpaim.kf') -or
+    -not $retailProps.Contains('rightHandPose = "_1stperson/1hpaim@end"') -or
+    -not $launcher.Contains('"_1stperson/1hpaim@end"') -or
+    $retailProps.Contains('1hphandgrip1.kf')) {
+    throw "Retail right-hand preparation must match the 9mm fixture's default first-person grip."
 }
-if (-not $retailProps.Contains('fnvxr-retail-props/v4') -or
+if (-not $retailProps.Contains('fnvxr-retail-props/v5') -or
     -not $retailProps.Contains('--side right') -or
     -not $common.Contains('FNVXR_RETAIL_RIGHT_FOREARM_MESH_PATH') -or
     -not $hostSource.Contains('retailRightForearmVertexBuffer')) {
@@ -949,6 +1005,12 @@ if ([string]$headsetControllerRigEnvironment.FNVXR_RETAIL_VR_FIRST_PERSON_PRIVAT
     [string]$headsetControllerRigEnvironment.FNVXR_RETAIL_CENTER_INTEGRATED_FIRST_PERSON -cne "1") {
     throw "The controller-rig visual trial must publish at the observed outer seam through the zero-private-eye center-integrated branch."
 }
+$sourceAgeMilliseconds = [single]::Parse(
+    $headsetControllerRigEnvironment.FNVXR_STEREO_MAX_SOURCE_POSE_AGE_MS,
+    [System.Globalization.CultureInfo]::InvariantCulture)
+if ([Math]::Abs([double]$sourceAgeMilliseconds - 75.0) -gt 0.00001) {
+    throw 'The launch environment must match the bounded 75 ms elapsed-time transport policy.'
+}
 $headsetCombatEnvironment = Get-FnvxrProductMinimalEnvironment `
     -RunId "headset-combat-contract" `
     -RunDirectory "C:\fnvxr-headset-combat-contract" `
@@ -1195,9 +1257,26 @@ foreach ($forbiddenReadOnlyAction in @(
     }
 }
 
-if (-not $launcher.Contains('[ValidateRange(5, 900)][int]$MaximumRunSeconds = 40')) {
-    throw "Product launcher must allow a bounded lunch/headset wait of up to 900 seconds."
+if (-not $launcher.Contains('Resolve-FnvxrProductSessionLimits') -or
+    -not $launcher.Contains('[DateTime]::MaxValue')) {
+    throw "Product launcher must apply the physical session lifetime policy."
 }
+$playLimits = Resolve-FnvxrProductSessionLimits -PhysicalHeadsetPlay $true
+if ($playLimits.MaximumRunSeconds -ne 0 -or $playLimits.HostFrames -ne 2000000000) {
+    throw "Default headset play must not expire at the diagnostic time or frame limit."
+}
+$captureLimits = Resolve-FnvxrProductSessionLimits
+if ($captureLimits.MaximumRunSeconds -ne 40 -or $captureLimits.HostFrames -ne 60000) {
+    throw "Default capture limits changed."
+}
+$explicitLimits = Resolve-FnvxrProductSessionLimits -PhysicalHeadsetPlay $true `
+    -MaximumRunSeconds 120 -MaximumRunSecondsExplicit $true `
+    -HostFrames 10800 -HostFramesExplicit $true
+if ($explicitLimits.MaximumRunSeconds -ne 120 -or $explicitLimits.HostFrames -ne 10800) {
+    throw "Explicit headset time and frame limits must remain effective."
+}
+Require-Throws { Resolve-FnvxrProductSessionLimits -MaximumRunSeconds 0 -MaximumRunSecondsExplicit $true } "requires -PhysicalHeadsetPlay"
+Require-Throws { Resolve-FnvxrProductSessionLimits -MaximumRunSeconds 1 -MaximumRunSecondsExplicit $true } "5 to 900"
 if (-not $launcher.Contains('[ValidateRange(5, 900)][int]$RetailReadyTimeoutSeconds = 60')) {
     throw "Product launcher must allow the combined pose/runtime readiness wait to remain bounded at up to 900 seconds."
 }
@@ -1351,7 +1430,7 @@ foreach ($headsetDemoContract in @(
     'Get-FnvxrProductPipBoyOutputProof',
     'Get-FnvxrProductHeadsetDemoInputProof',
     'Get-FnvxrProductHeadsetMirrorCaptureProof',
-    '$left.Name -replace ''_left\.png$'', ''_right.png''',
+    '$left.Name -replace ''_left(?=\.(png|jpg)$)'', ''_right''',
     'Get-FnvxrProductStereoContinuityProof',
     'rejectedGameplaySubmitFrames',
     '$transactions = [ordered]@{}',
@@ -1625,7 +1704,7 @@ foreach ($required in @(
 }
 foreach ($firstPersonDiagnosticContract in @(
         '[switch]$StockFirstPersonBaseline',
-        '[ValidateRange(0, 31)][int]$FirstPersonRootMask = 1',
+        '[ValidateRange(0, 31)][int]$FirstPersonRootMask = 31',
         '$PSBoundParameters.ContainsKey("FirstPersonRootMask")',
         'First-person root mask 0 is valid only for a headless world-only diagnostic capture.',
         'The stock first-person baseline requires first-person root mask 0.',

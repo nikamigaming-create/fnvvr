@@ -33,6 +33,12 @@ int main()
         return fail("production defaults must select the GPU-v5 eye transport");
     if (!close(defaults.config->frameBudgetMilliseconds(), 1000.0F / 90.0F))
         return fail("validated config must normalize refresh rate to a frame budget once");
+    if (defaults.config->get().performance.maximumPoseAgeMilliseconds
+            < defaults.config->frameBudgetMilliseconds() * 3.0F)
+        return fail("rounding must not reject the third compositor cycle");
+    if (defaults.config->maximumPoseAgeNanoseconds() < 75000000LL
+        || defaults.config->maximumPoseAgeNanoseconds() >= 75000020LL)
+        return fail("integer pose age must retain the complete 75 ms transport window");
     if (!close(defaults.config->wristHysteresisMeters(), 0.10F))
         return fail("validated config must expose normalized wrist hysteresis");
 
@@ -53,12 +59,22 @@ int main()
         return fail("unsupported pose history capacity must fail instead of becoming a fake knob");
 
     invalid = {};
-    invalid.performance.maximumPoseAgeMilliseconds = 34.0F;
+    invalid.performance.maximumPoseAgeMilliseconds = 101.0F;
     if (validateRuntimeConfig(invalid).error != ConfigError::InvalidPoseAge)
-        return fail("retained source age must fit inside three host cycles");
+        return fail("transport retention must remain bounded to 100 ms");
     invalid.performance.maximumPoseAgeMilliseconds = 22.0F;
     if (!validateRuntimeConfig(invalid))
         return fail("a frame arriving on the next host cycle must remain displayable");
+
+    for (const auto refresh : { 72u, 80u, 90u, 120u })
+    {
+        RuntimeConfig cadence = {};
+        cadence.performance.targetRefreshHz = refresh;
+        const auto validated = validateRuntimeConfig(cadence);
+        if (!validated || validated.config->maximumPoseAgeNanoseconds()
+                != defaults.config->maximumPoseAgeNanoseconds())
+            return fail("changing headset cadence must preserve elapsed-time transport retention");
+    }
 
     invalid = {};
     invalid.performance.maximumCpuPoseAgeMilliseconds = 251.0F;

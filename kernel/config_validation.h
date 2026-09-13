@@ -31,6 +31,7 @@ class ValidatedRuntimeConfig final
 public:
     const RuntimeConfig& get() const noexcept;
     float frameBudgetMilliseconds() const noexcept;
+    std::int64_t maximumPoseAgeNanoseconds() const noexcept;
     float wristHysteresisMeters() const noexcept;
 
 private:
@@ -39,6 +40,7 @@ private:
 
     RuntimeConfig value_;
     float frameBudgetMilliseconds_ = 0.0F;
+    std::int64_t maximumPoseAgeNanoseconds_ = 0;
     float wristHysteresisMeters_ = 0.0F;
 };
 

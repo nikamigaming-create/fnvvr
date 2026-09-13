@@ -16,6 +16,9 @@
 #include "fnvxr_gpu_eye_transport_win32.h"
 #include "fnvxr_d3d9ex_game_creation.h"
 #include "fnvxr_retail_ui_quad_capture_win32.h"
+#include "fnvxr_native_ui_capture_win32.h"
+#include "fnvxr_native_pip_ui_win32.h"
+#include "fnvxr_live_pipboy_contract.h"
 #include "fnvxr_retail_vr_bridge_win32.h"
 #include "fnvxr_stereo_math.h"
 
@@ -279,6 +282,10 @@ LONG gLoggedShaderSanityOffset = 0;
 IDirect3DTexture9* gLeftEyeTexture = nullptr;
 IDirect3DTexture9* gRightEyeTexture = nullptr;
 IDirect3DSurface9* gLeftEyeSurface = nullptr;
+fnvxr::d3d9::NativeUiCapture gNativeUiCapture;
+fnvxr::d3d9::NativePipUiCapture gNativePipUiCapture;
+bool gNativeUiRenderHookInstalled = false;
+bool gNativeUiSourceIsolated = false;
 IDirect3DSurface9* gRightEyeSurface = nullptr;
 IDirect3DSurface9* gLeftEyeDepth = nullptr;
 IDirect3DSurface9* gRightEyeDepth = nullptr;
@@ -697,9 +704,56 @@ double secondsBetween(const LARGE_INTEGER& start, const LARGE_INTEGER& end)
 // the helpers can also change shader, texture, transform, and fixed-function
 // state consumed by later desktop passes.  Keep that whole device state
 // transaction-scoped so a private eye can never bleed into the retail frame.
+bool synchronizeRetailShaderCache(IDirect3DDevice9* device) noexcept
+{
+    if (!device) return false;
+    IDirect3DVertexShader9* vertex = nullptr;
+    IDirect3DPixelShader9* pixel = nullptr;
+    if (FAILED(device->GetVertexShader(&vertex))) return false;
+    if (FAILED(device->GetPixelShader(&pixel)))
+    { if (vertex) vertex->Release(); return false; }
+    bool synchronized = false;
+    bool changed = false;
+    __try
+    {
+        const auto renderer = *reinterpret_cast<const std::uintptr_t*>(0x011F4748u);
+        const auto state = renderer
+            ? *reinterpret_cast<const std::uintptr_t*>(renderer + 0x8B8u) : 0u;
+        // Retail 1.4.0.525: SetPixelShader at E88870 and SetVertexShader at
+        // E90E00 skip the device call when these borrowed identities match.
+        if (state && *reinterpret_cast<const std::uintptr_t*>(state) == 0x010F088Cu
+            && *reinterpret_cast<IDirect3DDevice9* const*>(state + 0x10F8u) == device)
+        {
+            auto& cachedVertex = *reinterpret_cast<IDirect3DVertexShader9**>(state + 0x10E0u);
+            auto& cachedPixel = *reinterpret_cast<IDirect3DPixelShader9**>(state + 0x10E8u);
+            changed = cachedVertex != vertex || cachedPixel != pixel;
+            cachedVertex = vertex;
+            cachedPixel = pixel;
+            synchronized = true;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { synchronized = false; }
+    if (vertex) vertex->Release();
+    if (pixel) pixel->Release();
+    if (changed)
+    {
+        static LONG changes = 0;
+        const auto count = InterlockedIncrement(&changes);
+        if (count <= 3 || count % 600 == 0)
+        {
+            char line[160] {};
+            sprintf_s(line, "retail shader cache synchronized after device state restore count=%ld", count);
+            logRetailVrLine(line);
+        }
+    }
+    return synchronized;
+}
+
 struct ScopedD3D9StateBlock
 {
     IDirect3DStateBlock9* block = nullptr;
+    IDirect3DDevice9* owner = nullptr;
+    bool nativeShaderCache = false;
     bool captured = false;
     bool restoreAttempted = false;
     bool restored = false;
@@ -708,6 +762,9 @@ struct ScopedD3D9StateBlock
     {
         if (!device)
             return;
+        owner = device;
+        nativeShaderCache = context && (std::strcmp(context, "retail-private-eyes") == 0
+            || std::strcmp(context, "retail-first-person-eyes") == 0);
 
         const HRESULT createResult = device->CreateStateBlock(D3DSBT_ALL, &block);
         if (SUCCEEDED(createResult) && block)
@@ -752,8 +809,11 @@ struct ScopedD3D9StateBlock
         const HRESULT result = block->Apply();
         if (SUCCEEDED(result))
         {
-            restored = true;
-            return true;
+            // Applying a D3D state block bypasses NiDX9RenderState's cache.
+            // Otherwise the next native draw can pair the restored pixel shader
+            // with the last eye's vertex shader because its bind is skipped.
+            restored = !nativeShaderCache || synchronizeRetailShaderCache(owner);
+            return restored;
         }
         char message[160] {};
         sprintf_s(
@@ -769,7 +829,8 @@ struct ScopedD3D9StateBlock
         if (captured && block && !restoreAttempted)
         {
             restoreAttempted = true;
-            restored = SUCCEEDED(block->Apply());
+            restored = SUCCEEDED(block->Apply())
+                && (!nativeShaderCache || synchronizeRetailShaderCache(owner));
             if (!restored)
             {
                 InterlockedIncrement(&gStrictEyeTargetUnprovenWrites);
@@ -7260,6 +7321,9 @@ void releaseWideWorldTargets()
 
 void releaseStereoTargets()
 {
+    gNativeUiCapture.reset();
+    gNativePipUiCapture.reset();
+    gNativeUiSourceIsolated = false;
     // The D3D11 views must be released before the D3D9 allocations that back
     // them. D3D9 pSharedHandle values are legacy resource tokens, not NT
     // handles, so they are cleared but never passed to CloseHandle.
@@ -8202,6 +8266,24 @@ produceRetailEngineColorPair(
             frame.leftColor.height, frame.resourceSetId, frame.gpuReadySequence, frame.renderFlags);
         logRetailVrLine(message);
     }
+    if (!publication.complete
+        && publication.failure != fnvxr::d3d9::color_transport::ProducerFailure::ConsumerReleasePending)
+    {
+        static std::uint64_t failures = 0;
+        if (++failures <= 8u || failures % 120u == 0u)
+        {
+            const auto& producer = identity.presentationMode == fnvxr::gpu::color_v5::PresentationMode::MonoUiQuad
+                ? gRetailUiColorProducer : gRetailEngineColorProducer;
+            char message[384] {};
+            sprintf_s(message,
+                "GPU eye publication rejected count=%llu mode=%u transaction=%llu failure=%u backend=%u hresult=0x%08x",
+                failures, unsigned(identity.presentationMode), identity.transactionId,
+                unsigned(publication.failure), unsigned(producer.failure()),
+                unsigned(producer.lastHresult()));
+            logRetailVrLine(message);
+            if (producer.failureDetails()[0]) logRetailVrLine(producer.failureDetails());
+        }
+    }
     return publication;
 }
 
@@ -9038,23 +9120,6 @@ bool prepareRetailVrFrame(
     using namespace fnvxr::engine;
     using namespace fnvxr::engine::abi;
     frame = {};
-    // Do not queue private stereo work while the previous pair still owns
-    // the shared resources. Otherwise an uncapped retail loop can bury the
-    // current pose under GPU work that can never be published.
-    static ULONGLONG releasePendingSince = 0;
-    if (!gRetailEngineColorProducer.available())
-    {
-        const ULONGLONG now = GetTickCount64();
-        if (releasePendingSince == 0) releasePendingSince = now;
-        if (now - releasePendingSince < 500) return false;
-        // One bounded retry reaches the bridge's existing lost-consumer
-        // recovery, which replaces both resource generations.
-        releasePendingSince = now;
-    }
-    else
-    {
-        releasePendingSince = 0;
-    }
     static std::uint64_t admittedEpoch = 0;
     static std::uint32_t admittedReferenceSpace = 0;
     static LONG admittedPoseSequence = 0;
@@ -9067,7 +9132,7 @@ bool prepareRetailVrFrame(
                                  RetailPointer32 sceneCuller) noexcept {
         const LONG diagnostic = InterlockedIncrement(
             &gRetailWorldFramePreparationFailureLogged);
-        if (diagnostic <= 8)
+        if (diagnostic <= 8 || diagnostic % 240 == 0)
         {
             char message[640] {};
             sprintf_s(
@@ -9127,6 +9192,21 @@ bool prepareRetailVrFrame(
         return rejectFrame("scene-culler-mismatch", sceneCullerAddress);
     }
     frame.stockCullingProcess = call.stockCullingProcess;
+    // Only the world invocation may spend the recovery retry. Menu/preview
+    // accumulation calls share this hook; allowing them to restart the timer
+    // before scene validation can starve world publication after a door load.
+    static ULONGLONG releasePendingSince = 0;
+    if (!gRetailEngineColorProducer.available())
+    {
+        const ULONGLONG now = GetTickCount64();
+        if (releasePendingSince == 0) releasePendingSince = now;
+        if (now - releasePendingSince < 500) return false;
+        releasePendingSince = now;
+    }
+    else
+    {
+        releasePendingSince = 0;
+    }
     SharedPlayerState playerState {};
     LONG playerSequence = 0;
     bool playerStateReady = readStableSharedPlayerState(
@@ -9261,7 +9341,358 @@ fnvxr::d3d9::color_transport::ProducerPublication produceRetailVrColorPair(
     const fnvxr::d3d9::color_transport::ProducerFrameIdentity& identity)
     noexcept
 {
-    return produceRetailEngineColorPair(identity);
+    auto routed = identity;
+    if (gNativeUiSourceIsolated
+        && (routed.renderFlags & fnvxr::gpu::color_v5::RetailMenuCaptured) != 0u)
+        routed.renderFlags |= fnvxr::gpu::color_v5::IsolatedMenuCaptured;
+    return produceRetailEngineColorPair(routed);
+}
+
+// This is the authorized retail bridge's UI consumer. The older full-device
+// interposer is deliberately absent from this product, so its draw hooks cannot
+// supply native menu pixels here.
+DrawPrimitiveFn gNativeUiDrawPrimitive = nullptr;
+DrawIndexedPrimitiveFn gNativeUiDrawIndexedPrimitive = nullptr;
+DrawPrimitiveUPFn gNativeUiDrawPrimitiveUP = nullptr;
+DrawIndexedPrimitiveUPFn gNativeUiDrawIndexedPrimitiveUP = nullptr;
+SetRenderTargetFn gNativeUiSetTarget = nullptr;
+SetDepthStencilSurfaceFn gNativeUiSetDepth = nullptr;
+ClearFn gNativeUiClear = nullptr;
+std::uint32_t gNativeUiMenuBits = 0;
+DWORD gNativeUiPipOpenedAt = 0;
+
+// Private, bounded texture inspection exists only in an explicitly requested
+// final-eye recording. It never supplies product pixels or bypasses ownership.
+void inspectNativePipTextures(IDirect3DDevice9* device) noexcept
+{
+    if ((gNativeUiMenuBits & fnvxr::shared::RuntimePipBoyMenuBit) != 0u)
+        gNativePipUiCapture.observe(device);
+    static std::array<IDirect3DBaseTexture9*, 32> seen {};
+    static std::size_t count = 0;
+    if (count == seen.size() || !gNativeUiPipOpenedAt
+        || GetTickCount() - gNativeUiPipOpenedAt < 1800u
+        || (gNativeUiMenuBits & fnvxr::shared::RuntimePipBoyMenuBit) == 0u) return;
+    static const bool requested = [] {
+        char recording[MAX_PATH] {}, directory[MAX_PATH] {}, path[MAX_PATH] {};
+        if (!GetEnvironmentVariableA("FNVXR_HMD_MIRROR_CAPTURE_DIR", recording, MAX_PATH)
+            || !GetEnvironmentVariableA("FNVXR_RUN_LOG_DIR", directory, MAX_PATH)) return false;
+        sprintf_s(path, "%s\\capture-native-ui-textures.enabled", directory);
+        return GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES;
+    }();
+    if (!requested) return;
+    for (DWORD stage = 0; stage != 4 && count < seen.size(); ++stage)
+    {
+        IDirect3DBaseTexture9* base = nullptr;
+        if (FAILED(device->GetTexture(stage, &base)) || !base) continue;
+        if (std::find(seen.begin(), seen.begin() + count, base) != seen.begin() + count)
+        { base->Release(); continue; }
+        IDirect3DTexture9* texture = nullptr;
+        if (FAILED(base->QueryInterface(__uuidof(IDirect3DTexture9), reinterpret_cast<void**>(&texture))))
+        { base->Release(); continue; }
+        D3DSURFACE_DESC desc {};
+        const bool eligible = SUCCEEDED(texture->GetLevelDesc(0, &desc))
+            && (desc.Usage & D3DUSAGE_RENDERTARGET) && desc.Width >= 128 && desc.Height >= 128
+            && (desc.Format == D3DFMT_A8R8G8B8 || desc.Format == D3DFMT_X8R8G8B8);
+        if (!eligible) { texture->Release(); base->Release(); continue; }
+        seen[count++] = base; // Identity only; the game owns texture lifetime.
+        IDirect3DSurface9* surface = nullptr;
+        IDirect3DSurface9* staging = nullptr;
+        HRESULT status = texture->GetSurfaceLevel(0, &surface);
+        if (SUCCEEDED(status)) status = device->CreateOffscreenPlainSurface(desc.Width, desc.Height,
+            desc.Format, D3DPOOL_SYSTEMMEM, &staging, nullptr);
+        if (SUCCEEDED(status)) status = device->GetRenderTargetData(surface, staging);
+        if (SUCCEEDED(status))
+        {
+            D3DLOCKED_RECT locked {};
+            status = staging->LockRect(&locked, nullptr, D3DLOCK_READONLY);
+            if (SUCCEEDED(status))
+            {
+                char directory[MAX_PATH] {}, path[MAX_PATH] {};
+                if (GetEnvironmentVariableA("FNVXR_RUN_LOG_DIR", directory, MAX_PATH))
+                {
+                    sprintf_s(path, "%s\\native-pip-texture-%02u.bmp", directory, static_cast<unsigned>(count));
+                    FILE* file = nullptr;
+                    if (fopen_s(&file, path, "wb") == 0 && file)
+                    {
+                        BITMAPFILEHEADER header {}; BITMAPINFOHEADER info {};
+                        header.bfType = 0x4d42; header.bfOffBits = sizeof(header) + sizeof(info);
+                        header.bfSize = header.bfOffBits + desc.Width * desc.Height * 4;
+                        info.biSize = sizeof(info); info.biWidth = desc.Width; info.biHeight = -static_cast<LONG>(desc.Height);
+                        info.biPlanes = 1; info.biBitCount = 32; info.biCompression = BI_RGB;
+                        fwrite(&header, sizeof(header), 1, file); fwrite(&info, sizeof(info), 1, file);
+                        for (UINT row = 0; row != desc.Height; ++row)
+                            fwrite(static_cast<const BYTE*>(locked.pBits) + row * locked.Pitch, desc.Width * 4, 1, file);
+                        fclose(file);
+                    }
+                }
+                staging->UnlockRect();
+            }
+        }
+        char line[256] {};
+        sprintf_s(line, "native Pip texture candidate=%u stage=%lu texture=%p size=%ux%u format=%u readHr=0x%08lx",
+            static_cast<unsigned>(count), stage, base, desc.Width, desc.Height,
+            static_cast<unsigned>(desc.Format), static_cast<unsigned long>(status));
+        logRetailVrLine(line);
+        if (staging) staging->Release();
+        if (surface) surface->Release();
+        texture->Release(); base->Release();
+    }
+}
+
+HRESULT WINAPI nativeUiDrawPrimitive(IDirect3DDevice9* device,
+    D3DPRIMITIVETYPE type, UINT start, UINT count)
+{
+    const auto result = gNativeUiDrawPrimitive(device, type, start, count);
+    if (SUCCEEDED(result)) inspectNativePipTextures(device);
+    if (SUCCEEDED(result)) gNativeUiCapture.mirror(device, gNativeUiSetTarget,
+        gNativeUiSetDepth, gNativeUiDrawPrimitive, type, start, count);
+    return result;
+}
+HRESULT WINAPI nativeUiDrawIndexedPrimitive(IDirect3DDevice9* device,
+    D3DPRIMITIVETYPE type, INT base, UINT minimum, UINT vertices, UINT start, UINT count)
+{
+    const auto result = gNativeUiDrawIndexedPrimitive(device, type, base, minimum, vertices, start, count);
+    if (SUCCEEDED(result)) inspectNativePipTextures(device);
+    if (SUCCEEDED(result)) gNativeUiCapture.mirror(device, gNativeUiSetTarget,
+        gNativeUiSetDepth, gNativeUiDrawIndexedPrimitive, type, base, minimum, vertices, start, count);
+    return result;
+}
+HRESULT WINAPI nativeUiDrawPrimitiveUP(IDirect3DDevice9* device,
+    D3DPRIMITIVETYPE type, UINT count, const void* vertices, UINT stride)
+{
+    const auto result = gNativeUiDrawPrimitiveUP(device, type, count, vertices, stride);
+    if (SUCCEEDED(result)) inspectNativePipTextures(device);
+    if (SUCCEEDED(result)) gNativeUiCapture.mirror(device, gNativeUiSetTarget,
+        gNativeUiSetDepth, gNativeUiDrawPrimitiveUP, type, count, vertices, stride);
+    return result;
+}
+HRESULT WINAPI nativeUiDrawIndexedPrimitiveUP(IDirect3DDevice9* device,
+    D3DPRIMITIVETYPE type, UINT minimum, UINT vertices, UINT count,
+    const void* indices, D3DFORMAT format, const void* data, UINT stride)
+{
+    const auto result = gNativeUiDrawIndexedPrimitiveUP(device, type, minimum, vertices,
+        count, indices, format, data, stride);
+    if (SUCCEEDED(result)) inspectNativePipTextures(device);
+    if (SUCCEEDED(result)) gNativeUiCapture.mirror(device, gNativeUiSetTarget,
+        gNativeUiSetDepth, gNativeUiDrawIndexedPrimitiveUP, type, minimum, vertices,
+        count, indices, format, data, stride);
+    return result;
+}
+
+bool installNativeUiDrawHooks(IDirect3DDevice9* device) noexcept
+{
+    if (!device) return false;
+    auto** table = *reinterpret_cast<void***>(device);
+    DWORD protection = 0;
+    if (!VirtualProtect(table + 81, 4 * sizeof(void*), PAGE_READWRITE, &protection)) return false;
+    gNativeUiSetTarget = reinterpret_cast<SetRenderTargetFn>(table[37]);
+    gNativeUiSetDepth = reinterpret_cast<SetDepthStencilSurfaceFn>(table[39]);
+    gNativeUiClear = reinterpret_cast<ClearFn>(table[43]);
+    gNativeUiDrawPrimitive = reinterpret_cast<DrawPrimitiveFn>(table[81]);
+    gNativeUiDrawIndexedPrimitive = reinterpret_cast<DrawIndexedPrimitiveFn>(table[82]);
+    gNativeUiDrawPrimitiveUP = reinterpret_cast<DrawPrimitiveUPFn>(table[83]);
+    gNativeUiDrawIndexedPrimitiveUP = reinterpret_cast<DrawIndexedPrimitiveUPFn>(table[84]);
+    table[81] = reinterpret_cast<void*>(&nativeUiDrawPrimitive);
+    table[82] = reinterpret_cast<void*>(&nativeUiDrawIndexedPrimitive);
+    table[83] = reinterpret_cast<void*>(&nativeUiDrawPrimitiveUP);
+    table[84] = reinterpret_cast<void*>(&nativeUiDrawIndexedPrimitiveUP);
+    DWORD ignored = 0;
+    VirtualProtect(table + 81, 4 * sizeof(void*), protection, &ignored);
+    return true;
+}
+
+void __fastcall captureNativeInterfaceRender(void* manager, void*, void* culler, bool pipBoy)
+{
+    using RenderUi = void (__thiscall*)(void*, void*, bool);
+    fnvxr::engine::RetailTrackedFrame frame {};
+    const bool eligible = gRetailVrBridge && gRetailVrProxyContext.device
+        && gRetailUiTrackedFrames.readPublishedFrame(frame)
+        && fnvxr::engine::validateRetailTrackedPublishedFrame(frame).complete();
+    gNativeUiMenuBits = eligible ? frame.runtime.menuBits : 0u;
+    const bool pipVisible = (gNativeUiMenuBits & fnvxr::shared::RuntimePipBoyMenuBit) != 0u;
+    if (!pipVisible) { gNativeUiPipOpenedAt = 0; gNativePipUiCapture.reset(); }
+    else if (!gNativeUiPipOpenedAt) gNativeUiPipOpenedAt = GetTickCount();
+    const bool popupVisible = fnvxr::engine::live_pipboy::hasConflictingMenu(gNativeUiMenuBits);
+    gNativeUiCapture.begin(eligible && (!pipVisible || popupVisible) ? gRetailVrProxyContext.device : nullptr,
+        gNativeUiMenuBits, gNativeUiSetTarget, gNativeUiSetDepth, gNativeUiClear);
+    __try { reinterpret_cast<RenderUi>(0x007134D0)(manager, culler, pipBoy); }
+    __finally { gNativeUiCapture.end(); }
+    static DWORD previousLog = 0;
+    const DWORD now = GetTickCount();
+    if (eligible && frame.runtime.menuBits && now - previousLog >= 3000u)
+    {
+        previousLog = now;
+        char line[256] {};
+        sprintf_s(line, "native UI capture menuBits=%u nativeDraws=%u capturedDraws=%u firstTarget=%ux%u complete=%u beginHr=0x%08lx setTarget=%u setDepth=%u",
+            frame.runtime.menuBits, gNativeUiCapture.observedDraws(), gNativeUiCapture.draws(),
+            gNativeUiCapture.firstTargetWidth(), gNativeUiCapture.firstTargetHeight(),
+            static_cast<unsigned>(gNativeUiCapture.complete()),
+            static_cast<unsigned long>(gNativeUiCapture.beginStatus()),
+            gNativeUiSetTarget ? 1u : 0u, gNativeUiSetDepth ? 1u : 0u);
+        logRetailVrLine(line);
+    }
+}
+
+using NativeWorldViewRender = void (__thiscall*)(void*, void*, std::uint32_t, std::uint32_t);
+void* gNativeWorldViewTrampoline = nullptr;
+
+bool nativePausedWorldRenderingAllowed(fnvxr::engine::RetailTrackedFrame& frame)
+{
+    return gRetailVrBridge
+        && !gRetailVrBridge->privateRenderDispatchActive()
+        && gRetailUiTrackedFrames.readPublishedFrame(frame)
+        && fnvxr::engine::validateRetailTrackedPublishedFrame(frame).complete()
+        && frame.runtime.phase == fnvxr::shared::RuntimePhaseMenu
+        && fnvxr::shared::runtimeHasLoadedWorld(frame.runtime);
+}
+
+// Only the two calls in the native frame renderer use these wrappers. The
+// original queries everywhere else retain their simulation and input policy.
+bool __cdecl nativeFrameRendererMenuMode()
+{
+    const bool menuMode = reinterpret_cast<bool (__cdecl*)()>(0x00702360)();
+    fnvxr::engine::RetailTrackedFrame frame {};
+    return menuMode && !nativePausedWorldRenderingAllowed(frame);
+}
+
+bool __cdecl nativeFrameRendererPauseVisible(std::uint32_t menuId, std::uint32_t flags)
+{
+    const bool visible = reinterpret_cast<bool (__cdecl*)(std::uint32_t, std::uint32_t)>(
+        0x00702680)(menuId, flags);
+    fnvxr::engine::RetailTrackedFrame frame {};
+    return visible && !(menuId == 1013u && nativePausedWorldRenderingAllowed(frame));
+}
+
+void __fastcall renderNativeWorldThroughMenu(void* renderer, void*, void* target,
+    std::uint32_t cachedMenuBackground, std::uint32_t renderOption)
+{
+    fnvxr::engine::RetailTrackedFrame frame {};
+    const bool liveWorld = nativePausedWorldRenderingAllowed(frame);
+    if (liveWorld && cachedMenuBackground)
+    {
+        // The native render dispatcher takes its ordinary world branch.
+        // Simulation/menu pause flags and all three native draw lifetimes
+        // remain owned by the game; no cached accumulator is replayed.
+        cachedMenuBackground = 0u;
+        static DWORD previousLog = 0;
+        const DWORD now = GetTickCount();
+        if (now - previousLog >= 3000u)
+        {
+            previousLog = now;
+            char line[192] {};
+            sprintf_s(line, "native menu world render menuBits=%u runtimeSample=%llu poseFrame=%llu simulationPauseUnchanged=1",
+                frame.runtime.menuBits, static_cast<unsigned long long>(frame.runtime.frame),
+                static_cast<unsigned long long>(frame.pose.frame));
+            logRetailVrLine(line);
+        }
+    }
+    reinterpret_cast<NativeWorldViewRender>(gNativeWorldViewTrampoline)(
+        renderer, target, cachedMenuBackground, renderOption);
+}
+
+bool installNativeMenuWorldRendering() noexcept
+{
+    if (gNativeWorldViewTrampoline) return true;
+#if !defined(_M_IX86)
+    return false;
+#else
+    __try
+    {
+        // Loaded retail 1.4.0.525 dispatcher, 185 bytes ending in ret 0x0c.
+        // Its second stack argument selects a cached menu background at
+        // 0x870730 versus the normal world callers at 0x87074b/0x87075e.
+        constexpr std::uint32_t address = 0x008706B0u;
+        auto* body = reinterpret_cast<std::uint8_t*>(address);
+        auto matchesBody = [](std::uintptr_t start, std::size_t size, std::uint64_t expected)
+        {
+            const auto* bytes = reinterpret_cast<const std::uint8_t*>(start);
+            std::uint64_t hash = 14695981039346656037ull;
+            for (std::size_t i = 0; i != size; ++i) hash = (hash ^ bytes[i]) * 1099511628211ull;
+            return hash == expected;
+        };
+        if (!matchesBody(address, 185u, 0xf6ae4a2332b92c0bull)
+            || !matchesBody(0x0087024Eu, 101u, 0xabd6b6f743988034ull)
+            || !matchesBody(0x00702360u, 49u, 0xd79817fd702f582full)
+            || !matchesBody(0x00702680u, 292u, 0xa17e9d24540dd4a4ull)) return false;
+        auto* relay = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, 11u,
+            MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+        if (!relay) return false;
+        // push ebp; mov ebp,esp; sub esp,8: six complete position-independent bytes.
+        std::memcpy(relay, body, 6u);
+        relay[6] = 0xE9;
+        const auto back = static_cast<std::uint32_t>(address + 6u
+            - (reinterpret_cast<std::uintptr_t>(relay) + 11u));
+        std::memcpy(relay + 7u, &back, sizeof(back));
+        DWORD protection = 0;
+        if (!VirtualProtect(relay, 11u, PAGE_EXECUTE_READ, &protection))
+        { VirtualFree(relay, 0, MEM_RELEASE); return false; }
+        FlushInstructionCache(GetCurrentProcess(), relay, 11u);
+        if (!VirtualProtect(body, 6u, PAGE_EXECUTE_READWRITE, &protection))
+        { VirtualFree(relay, 0, MEM_RELEASE); return false; }
+        auto* queries = reinterpret_cast<std::uint8_t*>(0x0087024Eu);
+        DWORD queryProtection = 0;
+        if (!VirtualProtect(queries, 101u, PAGE_EXECUTE_READWRITE, &queryProtection))
+        {
+            DWORD ignored = 0;
+            VirtualProtect(body, 6u, protection, &ignored);
+            VirtualFree(relay, 0, MEM_RELEASE);
+            return false;
+        }
+        gNativeWorldViewTrampoline = relay;
+        const auto jump = static_cast<std::uint32_t>(
+            reinterpret_cast<std::uintptr_t>(&renderNativeWorldThroughMenu) - address - 5u);
+        body[0] = 0xE9;
+        std::memcpy(body + 1u, &jump, sizeof(jump));
+        body[5] = 0x90;
+        const auto menuQuery = static_cast<std::uint32_t>(
+            reinterpret_cast<std::uintptr_t>(&nativeFrameRendererMenuMode) - 0x0087025Fu);
+        const auto pauseQuery = static_cast<std::uint32_t>(
+            reinterpret_cast<std::uintptr_t>(&nativeFrameRendererPauseVisible) - 0x00870272u);
+        std::memcpy(reinterpret_cast<void*>(0x0087025Bu), &menuQuery, sizeof(menuQuery));
+        std::memcpy(reinterpret_cast<void*>(0x0087026Eu), &pauseQuery, sizeof(pauseQuery));
+        DWORD ignored = 0;
+        VirtualProtect(body, 6u, protection, &ignored);
+        VirtualProtect(queries, 101u, queryProtection, &ignored);
+        FlushInstructionCache(GetCurrentProcess(), body, 6u);
+        FlushInstructionCache(GetCurrentProcess(), queries, 101u);
+        logRetailVrLine("native menu world rendering installed: native world branch and frame-local pause queries, independent paused simulation");
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+#endif
+}
+
+bool installNativeInterfaceCapture() noexcept
+{
+    if (gNativeUiRenderHookInstalled) return true;
+    __try
+    {
+        const auto* body = reinterpret_cast<const std::uint8_t*>(0x007134D0);
+        std::uint64_t hash = 14695981039346656037ull;
+        for (std::size_t i = 0; i != 1830u; ++i) hash = (hash ^ body[i]) * 1099511628211ull;
+        auto* call = reinterpret_cast<std::uint8_t*>(0x007144D3);
+        const std::uint8_t expected[] { 0xE8, 0xF8, 0xEF, 0xFF, 0xFF };
+        if (hash != 0xbad2a9c616f70f88ull || std::memcmp(call, expected, sizeof(expected)))
+            return false;
+        DWORD protection = 0;
+        if (!VirtualProtect(call, 5u, PAGE_EXECUTE_READWRITE, &protection)) return false;
+        if (!installNativeUiDrawHooks(gRetailVrProxyContext.device))
+        {
+            DWORD ignored = 0;
+            VirtualProtect(call, 5u, protection, &ignored);
+            return false;
+        }
+        const auto relative = static_cast<std::uint32_t>(
+            reinterpret_cast<std::uintptr_t>(&captureNativeInterfaceRender) - 0x007144D8u);
+        std::memcpy(call + 1u, &relative, sizeof(relative));
+        DWORD ignored = 0;
+        VirtualProtect(call, 5u, protection, &ignored);
+        FlushInstructionCache(GetCurrentProcess(), call, 5u);
+        gNativeUiRenderHookInstalled = true;
+        logRetailVrLine("native UI capture installed: exact InterfaceManager render boundary, original menu callbacks preserved");
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
 bool readRetailUiPublishedFrame(
@@ -9279,6 +9710,7 @@ bool copyRetailUiBackBufferToMonoTargets(
     void* opaque,
     void* deviceOpaque) noexcept
 {
+    gNativeUiSourceIsolated = false;
     auto* context = static_cast<RetailVrProxyContext*>(opaque);
     auto* device = static_cast<IDirect3DDevice9*>(deviceOpaque);
     if (!context
@@ -9290,6 +9722,41 @@ bool copyRetailUiBackBufferToMonoTargets(
         return false;
     }
 
+    fnvxr::engine::RetailTrackedFrame uiFrame {};
+    if (gRetailUiTrackedFrames.readPublishedFrame(uiFrame)
+        && (uiFrame.runtime.menuBits & fnvxr::shared::RuntimePipBoyMenuBit) != 0u
+        && !fnvxr::engine::live_pipboy::hasConflictingMenu(uiFrame.runtime.menuBits))
+    {
+        const auto targets = gNativePipUiCapture.targets();
+        const bool sampled = gNativePipUiCapture.sampled();
+        const auto region = gNativePipUiCapture.sourceRegion();
+        const bool copied = gNativePipUiCapture.copyTo(device, gLeftEyeSurface, gRightEyeSurface);
+        static DWORD previousLog = 0;
+        if (GetTickCount() - previousLog >= 3000u)
+        {
+            previousLog = GetTickCount();
+            char line[160] {};
+            sprintf_s(line, "native Pip UI source targets=%u sampled=%u copied=%u region=(%ld,%ld,%ld,%ld)",
+                static_cast<unsigned>(targets), sampled ? 1u : 0u, copied ? 1u : 0u,
+                region.left, region.top, region.right, region.bottom);
+            logRetailVrLine(line);
+        }
+        if (copied) { gNativeUiSourceIsolated = true; return true; }
+        // Never put a screenshot of the physical device inside its own screen.
+        // The host retains the last native menu texture while the game prepares
+        // a new sample; the backbuffer crop has different camera/zoom geometry.
+        return false;
+    }
+    if (gRetailUiTrackedFrames.readPublishedFrame(uiFrame)
+        && gNativeUiCapture.copyTo(device, gLeftEyeSurface, gRightEyeSurface,
+            uiFrame.runtime.menuBits))
+    {
+        gNativeUiSourceIsolated = true;
+        return true;
+    }
+
+    if ((uiFrame.runtime.menuBits & fnvxr::shared::RuntimePipBoyMenuBit) != 0u)
+        return false;
     IDirect3DSurface9* backBuffer = nullptr;
     if (FAILED(device->GetBackBuffer(
             0u,
@@ -10406,6 +10873,35 @@ void __cdecl retailVrAfterStockRenderAdapter() noexcept
         }
         if (!dispatched)
             return;
+        const auto completedFrame = bridge->frameDiagnostics();
+        if (diagnosticMode == RetailVrAccumulationDiagnosticMode::Full
+            && !readRawEnvBool("FNVXR_STOCK_FIRST_PERSON_BASELINE", false)
+            && readRawEnvBool("FNVXR_RETAIL_CENTER_INTEGRATED_FIRST_PERSON", false)
+            && completedFrame.controller.complete()
+            && bridge->firstPersonPublicationPendingForCurrentThread(1u))
+        {
+            const auto poseSequence = bridge->pendingFirstPersonPoseSequence();
+            const auto poseFrame = bridge->pendingFirstPersonPoseFrame();
+            std::uint32_t weaponFailure = 0u;
+            std::uint64_t weaponCommit = 0u;
+            // The rig was applied before either eye rendered. Record its
+            // consumption here, at the same completed world transaction.
+            // A hidden/unequipped weapon does not suppress the stereo world.
+            const bool weaponConsumed = consumeWeaponFrameForFirstPerson(
+                poseSequence, poseFrame, weaponFailure, weaponCommit);
+            const bool published = bridge->publishPendingCenterIntegratedWorld();
+            static std::uint64_t centerPublications = 0u;
+            if (++centerPublications <= 5u || centerPublications % 60u == 0u)
+            {
+                char event[768] {};
+                sprintf_s(event,
+                    "{\"event\":\"fnvxrRetailCenterIntegratedWorld\",\"transaction\":%llu,\"poseSequence\":%u,\"poseFrame\":%llu,\"weaponFrameConsumed\":%s,\"weaponFrameCommitId\":%llu,\"weaponFrameFailure\":%u,\"published\":%s,\"privateEyeCalls\":0}",
+                    completedFrame.controller.transactionId, poseSequence, poseFrame,
+                    weaponConsumed ? "true" : "false", weaponCommit, weaponFailure,
+                    published ? "true" : "false");
+                logRetailVrLine(event);
+            }
+        }
         const double dispatchMilliseconds =
             secondsBetween(dispatchStart, dispatchEnd) * 1000.0;
         const auto timingDiagnostics =
@@ -10946,59 +11442,8 @@ void __cdecl retailVrBeforeFirstPersonAdapter(
             "FNVXR_RETAIL_CENTER_INTEGRATED_FIRST_PERSON",
             false))
     {
-        const std::uint32_t pendingPoseSequence =
-            bridge->pendingFirstPersonPoseSequence();
-        const std::uint64_t pendingPoseFrame =
-            bridge->pendingFirstPersonPoseFrame();
-        std::uint32_t weaponFrameFailure = 0u;
-        std::uint64_t weaponFrameCommitId = 0u;
-        const bool livePipBoy =
-            bridge->pendingFirstPersonLivePipBoy();
-        const bool controllerRigRequired = readRawEnvBool(
-                "FNVXR_PHYSICAL_HEADSET_PLAY", false)
-            || (readRawEnvBool("OPENXR_SIMULATOR_HEADLESS", false)
-                && readRawEnvBool(
-                    "FNVXR_HEADSET_CONTROLLER_RIG_VISUAL_TRIAL", false));
-        const bool controllerRigPrepared = !controllerRigRequired
-            || bridge->preparePendingControllerRigForRender();
-        // A physical Pip-Boy frame must stay visible even if the stock menu
-        // has hidden or rebuilt the weapon branch.  Still run the controller
-        // preparation for its hand/Pip-Boy side effects, but require the
-        // weapon-frame commit only for ordinary gameplay.
-        const bool weaponFrameRequired = controllerRigRequired
-            && !livePipBoy;
-        const bool weaponFramePrepared = controllerRigPrepared
-            || livePipBoy;
-        if (weaponFrameRequired && !weaponFramePrepared)
-            weaponFrameFailure = static_cast<std::uint32_t>(
-                fnvxr::weapon_frame::Failure::Unavailable);
-        const bool weaponFrameConsumed = weaponFramePrepared
-            && (!weaponFrameRequired
-                || consumeWeaponFrameForFirstPerson(
-                    pendingPoseSequence,
-                    pendingPoseFrame,
-                    weaponFrameFailure,
-                    weaponFrameCommitId));
-        const bool published = weaponFrameConsumed
-            && bridge->publishPendingCenterIntegratedFirstPerson(callerId);
-        if (!weaponFrameConsumed)
-            bridge->discardPendingFirstPerson();
-        char event[768] {};
-        sprintf_s(
-            event,
-            "{\"event\":\"fnvxrRetailCenterIntegratedFirstPerson\",\"callerId\":%u,\"callerAddress\":\"0x%08X\",\"callerOrdinal\":%ld,\"poseSequence\":%u,\"poseFrame\":%llu,\"livePipBoy\":%s,\"controllerRigPrepared\":%s,\"weaponFrameConsumed\":%s,\"weaponFrameCommitId\":%llu,\"weaponFrameFailure\":%u,\"published\":%s,\"privateEyeCalls\":0}",
-            callerId,
-            retailVrFirstPersonCallerAddress(callerId),
-            callerOrdinal,
-            pendingPoseSequence,
-            static_cast<unsigned long long>(pendingPoseFrame),
-            livePipBoy ? "true" : "false",
-            controllerRigPrepared ? "true" : "false",
-            weaponFrameConsumed ? "true" : "false",
-            static_cast<unsigned long long>(weaponFrameCommitId),
-            weaponFrameFailure,
-            published ? "true" : "false");
-        logRetailVrLine(event);
+        // The completed world callback owns publication on this route.
+        // The optional desktop first-person draw has no VR work to finish.
         deferredTrace = {};
         gRetailFirstPersonBinocularDrawFanoutActive = false;
         return;
@@ -11431,23 +11876,18 @@ bool retailVrFirstPersonGameplayLeaseReady(void*) noexcept
         gRetailRuntimePublicationReadiness.readReadyPublication(
             runtime,
             runtimeSequence);
-    constexpr std::uint32_t RequiredPipBoy =
-        fnvxr::shared::PlayerSharedFlagPlayerNodeValid
-        | fnvxr::shared::PlayerSharedFlagCameraValid;
+    // Menu focus deliberately clears the gameplay-camera flag. The separately
+    // observed world camera/culler lifetime still supports the same native
+    // first-person render branch and its final publication.
+    constexpr std::uint32_t RequiredPausedWorld =
+        fnvxr::shared::PlayerSharedFlagPlayerNodeValid;
     return runtimeReady
         && runtimeSequence != 0
-        && fnvxr::engine::live_pipboy::worldPresentationContinues(
-            runtime.phase,
-            runtime.menuBits,
-            runtime.showroomActive,
-            runtime.cameraActive != 0u)
-        && (player.flags & RequiredPipBoy) == RequiredPipBoy
+        && fnvxr::shared::runtimeHasLoadedWorld(runtime)
+        && (player.flags & RequiredPausedWorld) == RequiredPausedWorld
         && (player.flags & fnvxr::shared::PlayerSharedFlagThirdPerson) == 0u
         && player.playerAddress != 0u
-        && player.playerNodeAddress != 0u
-        && player.reserved[
-            fnvxr::shared::PlayerSharedFirstPersonPipBoyNodeReservedIndex]
-            != 0u;
+        && player.playerNodeAddress != 0u;
 }
 
 bool prepareRetailVrControllerRigForRender(
@@ -11489,6 +11929,34 @@ bool prepareRetailVrControllerRigForRender(
         && apply(
             &tracked.pose,
             static_cast<LONG>(tracked.poseSequence));
+#endif
+}
+
+bool readPreparedRetailFirstPersonView(
+    void*, const fnvxr::engine::RetailTrackedFrame& tracked,
+    fnvxr::engine::FirstPersonView& view) noexcept
+{
+#if !defined(_M_IX86)
+    (void)tracked;
+    (void)view;
+    return false;
+#else
+    using ReadViewFn = bool (__cdecl*)(
+        std::uint64_t, LONG, fnvxr::engine::FirstPersonView*);
+    static ReadViewFn read = nullptr;
+    if (!read)
+    {
+        HMODULE plugin = GetModuleHandleA("nvse_fnvxr.dll");
+        if (plugin)
+        {
+            read = reinterpret_cast<ReadViewFn>(GetProcAddress(
+                plugin, "FNVXR_ReadFirstPersonViewForRender"));
+            if (!read)
+                read = reinterpret_cast<ReadViewFn>(GetProcAddress(
+                    plugin, "_FNVXR_ReadFirstPersonViewForRender"));
+        }
+    }
+    return read && read(tracked.pose.frame, tracked.poseSequence, &view);
 #endif
 }
 
@@ -12153,6 +12621,9 @@ bool initializeRetailVrBridge(IDirect3DDevice9* device) noexcept
     }
     fnvxr::d3d9::RetailVrBridgeOperations operations {};
     operations.context = &gRetailVrProxyContext;
+    operations.centerIncludesFirstPerson =
+        !readRawEnvBool("FNVXR_STOCK_FIRST_PERSON_BASELINE", false)
+        && readRawEnvBool("FNVXR_RETAIL_CENTER_INTEGRATED_FIRST_PERSON", false);
     // The supported renderer exports complete engine eye pairs on GPU. The
     // D3D9 API stays intact while 9On12 supplies explicit resource ownership.
     operations.publicationTransport =
@@ -12185,6 +12656,10 @@ bool initializeRetailVrBridge(IDirect3DDevice9* device) noexcept
         &retailVrFirstPersonGameplayLeaseReady;
     operations.prepareControllerRigForRender =
         &prepareRetailVrControllerRigForRender;
+    if (readRawEnvBool("FNVXR_PHYSICAL_HEADSET_PLAY", false)
+        || (readRawEnvBool("OPENXR_SIMULATOR_HEADLESS", false)
+            && readRawEnvBool("FNVXR_HEADSET_CONTROLLER_RIG_VISUAL_TRIAL", false)))
+        operations.readPreparedFirstPersonView = &readPreparedRetailFirstPersonView;
     operations.prepareDistinctCameraFrame = &prepareRetailVrFrame;
     operations.prepareColorProducer = &prepareRetailVrColorProducer;
     operations.produceColorPair = &produceRetailVrColorPair;
@@ -12241,6 +12716,10 @@ bool initializeRetailVrBridge(IDirect3DDevice9* device) noexcept
     // As with the bridge-owned gameplay reader, mapping names are configured
     // now and the first Present after NVSE publishes them opens them lazily.
     static_cast<void>(gRetailUiTrackedFrames.initialize());
+    if (!installNativeMenuWorldRendering())
+        logRetailVrLine("native menu world rendering unavailable: render dispatcher identity differs");
+    if (!installNativeInterfaceCapture())
+        logRetailVrLine("native UI capture unavailable: exact render function or call identity differs");
     char initializedMessage[416] {};
     sprintf_s(
         initializedMessage,
@@ -21088,6 +21567,9 @@ extern "C" IDirect3D9* WINAPI FNVXR_Direct3DCreate9(UINT sdkVersion)
     IDirect3D9* real = nullptr;
     if (retailVrVisualTrialRequested())
     {
+        logRetailVrLine(fnvxr::d3d9::color_transport::enableDeviceRemovalDiagnostics()
+            ? "GPU removal breadcrumbs enabled; heap dumps disabled"
+            : "GPU removal breadcrumbs unavailable");
         const auto createOn12 = resolve<PFN_Direct3DCreate9On12>("Direct3DCreate9On12");
         D3D9ON12_ARGS arguments {};
         arguments.Enable9On12 = TRUE;

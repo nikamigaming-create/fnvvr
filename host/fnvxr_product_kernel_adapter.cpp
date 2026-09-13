@@ -15,11 +15,12 @@ product::PresentationDecision ProductKernelAdapter::advance(
     const product::PresentationInput& input,
     const PresentationTransportProof& transport,
     bool trackedRigReady,
-    bool wristContentReady)
+    bool wristContentReady,
+    const PresentationTransportProof& uiTransport)
 {
     return translate(
         kernel_.present(translate(
-            input, transport, trackedRigReady, wristContentReady)),
+            input, transport, trackedRigReady, wristContentReady, uiTransport)),
         input);
 }
 
@@ -40,7 +41,9 @@ kp::RuntimeSnapshot ProductKernelAdapter::runtimeSnapshot(
         : retailState == product::RetailState::Loading
             ? kp::RuntimePhase::Loading : kp::RuntimePhase::Running;
     if (retailState == product::RetailState::InteractiveUi)
-        runtime.ui = kp::UiClassification::Blocking;
+        runtime.ui = (input.menuBits & shared::RuntimePipBoyMenuBit) != 0
+            ? kp::UiClassification::BlockingWithPipBoy
+            : kp::UiClassification::Blocking;
     else if (retailState == product::RetailState::Gameplay
         && (input.menuBits & shared::RuntimePipBoyMenuBit) != 0)
         runtime.ui = kp::UiClassification::PipBoySpatial;
@@ -51,7 +54,8 @@ kp::PresentationInput ProductKernelAdapter::translate(
     const product::PresentationInput& input,
     const PresentationTransportProof& transport,
     bool trackedRigReady,
-    bool wristContentReady) noexcept
+    bool wristContentReady,
+    const PresentationTransportProof& uiTransport) noexcept
 {
     kp::PresentationInput translated {};
     translated.runtime = runtimeSnapshot(input);
@@ -85,28 +89,36 @@ kp::PresentationInput ProductKernelAdapter::translate(
     translated.world.completeStereoPair = input.stereo.colorPairComplete;
     translated.world.distinctEyeViews = input.stereo.distinctBinocularViews;
     translated.world.runtimeLineageVerified =
-        input.stereo.runtimeStateSample == input.runtimeStateSample;
+        input.stereo.runtimeStateSample == input.runtimeStateSample
+        || input.worldRuntimeLineageVerified;
+    translated.world.verifiedRuntimeSample = input.worldRuntimeLineageVerified
+        ? input.runtimeStateSample : 0;
     translated.world.fresh = input.stereo.fresh;
+    translated.world.retainedForContinuity = input.retainedWorldForContinuity;
     translated.poseHistory = { worldSource, input.stereo.poseMatched };
 
+    const auto& menuTransport = uiTransport.producerEpoch != 0 ? uiTransport : transport;
     const kp::SourceKey uiSource {
-        transport.producerEpoch,
+        menuTransport.producerEpoch,
         input.ui.sourceFrame,
-        transport.transaction != 0
-            ? transport.transaction : input.ui.sourceFrame };
+        menuTransport.transaction != 0
+            ? menuTransport.transaction : input.ui.sourceFrame };
     translated.ui.source = uiSource;
     translated.ui.runtimeSample = input.ui.runtimeStateSample;
     translated.ui.gpu = {
         uiSource,
-        transport.producerOwned && input.ui.retailOwned,
-        transport.completionObserved,
-        transport.consumerAcquired,
-        transport.exclusiveInterval,
-        transport.synchronized };
+        menuTransport.producerOwned && input.ui.retailOwned,
+        menuTransport.completionObserved,
+        menuTransport.consumerAcquired,
+        menuTransport.exclusiveInterval,
+        menuTransport.synchronized };
     translated.ui.completeRetailColor = input.ui.retailColorComplete;
     translated.ui.monoRetailView = input.ui.retailOwned;
     translated.ui.runtimeLineageVerified =
-        input.ui.runtimeStateSample == input.runtimeStateSample;
+        input.ui.runtimeStateSample == input.runtimeStateSample
+        || input.uiRuntimeLineageVerified;
+    translated.ui.verifiedRuntimeSample = input.uiRuntimeLineageVerified
+        ? input.runtimeStateSample : 0;
     translated.ui.fresh = input.ui.fresh;
     translated.trackedRigReady = trackedRigReady;
     translated.wristContentReady = wristContentReady;
@@ -127,6 +139,9 @@ product::PresentationDecision ProductKernelAdapter::translate(
         translated.gameplayVrAccepted = input.stereo.completeForWorldStereo();
         translated.spatialRigMayRender = decision.spatialRigMayRender;
         translated.wristScreenMayRender = decision.wristScreenMayRender;
+        translated.presentedUiSourceFrame = decision.overlayUiSource.frame;
+        translated.pointerEnabled = decision.pointerMayRender
+            && shared::runtimeUiInputAllowed(input.menuBits);
         translated.presentedSourceEpoch = decision.selectedSource.epoch;
         translated.presentedSourceFrame = decision.selectedSource.frame;
         translated.presentedSourceTransaction =

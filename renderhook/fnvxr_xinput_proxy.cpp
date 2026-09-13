@@ -7,6 +7,7 @@
 #include <xinput.h>
 
 #include "../protocol/fnvxr_shared_state.h"
+#include "../protocol/fnvxr_haptic_feedback.h"
 #include "fnvxr_input_proxy_safety.h"
 
 #include <cstdarg>
@@ -674,10 +675,16 @@ extern "C" DWORD WINAPI FNVXR_XInputGetState(DWORD dwUserIndex, XINPUT_STATE* pS
 
 extern "C" DWORD WINAPI FNVXR_XInputSetState(DWORD dwUserIndex, XINPUT_VIBRATION* pVibration)
 {
+    const bool xrFeedback = dwUserIndex == 0 && pVibration
+        && fnvxr::shared::publishHapticFeedback(fnvxr::shared::HapticChannel::NativeMotors,
+            pVibration->wLeftMotorSpeed / 65535.0f, pVibration->wRightMotorSpeed / 65535.0f, 200u);
     using Fn = DWORD (WINAPI*)(DWORD, XINPUT_VIBRATION*);
     if (Fn fn = realProc<Fn>("XInputSetState"))
-        return fn(dwUserIndex, pVibration);
-    return ERROR_DEVICE_NOT_CONNECTED;
+    {
+        const DWORD result = fn(dwUserIndex, pVibration);
+        return xrFeedback ? ERROR_SUCCESS : result;
+    }
+    return xrFeedback ? ERROR_SUCCESS : ERROR_DEVICE_NOT_CONNECTED;
 }
 
 extern "C" DWORD WINAPI FNVXR_XInputGetCapabilities(DWORD dwUserIndex, DWORD dwFlags, XINPUT_CAPABILITIES* pCapabilities)
@@ -693,7 +700,9 @@ extern "C" DWORD WINAPI FNVXR_XInputGetCapabilities(DWORD dwUserIndex, DWORD dwF
         std::memset(pCapabilities, 0, sizeof(*pCapabilities));
         pCapabilities->Type = XINPUT_DEVTYPE_GAMEPAD;
         pCapabilities->SubType = XINPUT_DEVSUBTYPE_GAMEPAD;
-        pCapabilities->Flags = XINPUT_CAPS_VOICE_SUPPORTED;
+        pCapabilities->Flags = XINPUT_CAPS_VOICE_SUPPORTED | XINPUT_CAPS_FFB_SUPPORTED;
+        pCapabilities->Vibration.wLeftMotorSpeed = 65535;
+        pCapabilities->Vibration.wRightMotorSpeed = 65535;
         pCapabilities->Gamepad.wButtons = 0xF3FF;
         pCapabilities->Gamepad.bLeftTrigger = 255;
         pCapabilities->Gamepad.bRightTrigger = 255;

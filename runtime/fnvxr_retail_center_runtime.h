@@ -57,6 +57,8 @@ struct RetailCenterRuntimeFrame
     std::array<abi::RetailPointer32, RetailFirstPersonRootCapacity>
         firstPersonRootNodes {};
     std::uint32_t firstPersonRootNodeCount = 0u;
+    FirstPersonView firstPersonView {};
+    bool firstPersonViewValid = false;
 };
 
 struct RetailCenterCameraPoseProof
@@ -328,7 +330,8 @@ public:
             frame.stockCenterCamera,
             frame.tracked,
             originCandidate.origin,
-            frame.gameUnitsPerMeter);
+            frame.gameUnitsPerMeter,
+            frame.firstPersonViewValid ? &frame.firstPersonView : nullptr);
         if (!cameraRig.complete())
         {
             mEyeCameraFailure = cameraRig.failure;
@@ -372,7 +375,9 @@ public:
         };
         if (!mRendererContext.setFirstPersonRootNodes(
                 frame.firstPersonRootNodes,
-                frame.firstPersonRootNodeCount))
+                frame.firstPersonRootNodeCount,
+                frame.firstPersonViewValid
+                    ? frame.firstPersonView.excludedBodyRoot : 0u))
         {
             return reject(RetailCenterRuntimeFailure::InvalidFrame);
         }

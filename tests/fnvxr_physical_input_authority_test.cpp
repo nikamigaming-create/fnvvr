@@ -32,6 +32,17 @@ int main()
     using fnvxr::physical_input::GameplayAuthorityBlocker;
     using fnvxr::physical_input::LocomotionDelivery;
 
+    constexpr float halfPi = 1.57079632679f;
+    const auto leftFacing = fnvxr::physical_input::headRelativeStick(0, 1, halfPi);
+    const auto rightFacing = fnvxr::physical_input::headRelativeStick(0, 1, -halfPi);
+    const auto strafeLookingLeft = fnvxr::physical_input::headRelativeStick(1, 0, halfPi);
+    expect(std::fabs(leftFacing.x + 1) < 0.00001f && std::fabs(leftFacing.y) < 0.00001f,
+        "looking left makes forward locomotion travel left in body space");
+    expect(std::fabs(rightFacing.x - 1) < 0.00001f && std::fabs(rightFacing.y) < 0.00001f,
+        "looking right makes forward locomotion travel right in body space");
+    expect(std::fabs(strafeLookingLeft.x) < 0.00001f && std::fabs(strafeLookingLeft.y - 1) < 0.00001f,
+        "looking left makes right strafe travel forward in body space");
+
     const auto granted = fnvxr::physical_input::assessGameplayAuthority(
         physicalGameplayInput());
     expect(granted.granted(),

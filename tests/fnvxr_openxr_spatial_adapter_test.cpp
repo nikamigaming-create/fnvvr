@@ -105,19 +105,21 @@ int main()
         return fail("an untracked head must fail the complete rig closed");
 
     XrPosef calibration = pose(0.01F, 0.02F, -0.03F);
+    const XrVector3f forearmPivot {0.01F, 0.0F, -0.03F};
     const auto wrist = host::spatial::placeWristPlane(
         config.wristUi,
         pose(1.0F, 2.0F, 3.0F),
         true,
         1.25F,
-        &calibration);
+        &calibration,
+        &forearmPivot);
     if (!wrist || !wrist->calibrated
         || !close(wrist->pose.position.x, 1.01F)
-        || !close(wrist->pose.position.y, 2.02F)
+        || !close(wrist->pose.position.y, 2.025F)
         || !close(wrist->pose.position.z, 2.97F)
         || !close(wrist->widthMeters, config.wristUi.widthMeters * 1.25F)
         || !close(wrist->heightMeters, config.wristUi.heightMeters * 1.25F))
-        return fail("grip-local wrist calibration was not composed exactly");
+        return fail("forearm scale pivot was not carried through the OpenXR adapter");
 
     calibration.position.x = std::numeric_limits<float>::quiet_NaN();
     if (host::spatial::placeWristPlane(

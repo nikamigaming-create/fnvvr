@@ -1,0 +1,49 @@
+--- a/src/runtime.cpp
++++ b/src/runtime.cpp
+@@ -3003,20 +3003,40 @@
+         }
+     }
+ 
++    // Sleep(1..5) can sleep an entire 15.6 ms Windows timer tick. Use a
++    // process-local high-resolution timer so a 90 Hz runtime does not add
++    // artificial pose age or oscillate between long and catch-up frames.
++    struct FrameWaitTimer {
++        HANDLE handle = CreateWaitableTimerExW(nullptr, nullptr,
++            CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_MODIFY_STATE | SYNCHRONIZE);
++        ~FrameWaitTimer() { if (handle) CloseHandle(handle); }
++    };
++    static FrameWaitTimer frameWaitTimer;
++    LARGE_INTEGER enteredWait; QueryPerformanceCounter(&enteredWait);
++    if (nextTick < static_cast<double>(enteredWait.QuadPart) - periodSec * freq.QuadPart)
++        nextTick = static_cast<double>(enteredWait.QuadPart);
+     for (;;) {
+         LARGE_INTEGER now; QueryPerformanceCounter(&now);
+         double dt = (nextTick - (double)now.QuadPart) / (double)freq.QuadPart;
+         if (dt <= 0.0) break;
+-        double ms = dt * 1000.0;
+-        if (ms > 5.0) ms = 5.0;
+-        if (ms < 0.0) ms = 0.0;
+-        Sleep((DWORD)ms);
++        if (frameWaitTimer.handle && dt > 0.0005) {
++            LARGE_INTEGER due;
++            due.QuadPart = -static_cast<LONGLONG>((dt - 0.00025) * 10000000.0);
++            if (SetWaitableTimer(frameWaitTimer.handle, &due, 0, nullptr, nullptr, FALSE))
++                WaitForSingleObject(frameWaitTimer.handle, 1000);
++            else
++                SwitchToThread();
++        } else {
++            SwitchToThread();
++        }
+     }
+     nextTick += periodSec * (double)freq.QuadPart;
+     LARGE_INTEGER now; QueryPerformanceCounter(&now);
+     // Convert QPC to nanoseconds using double to avoid overflow on MSVC
+-    XrTime nowTime = (XrTime)((double)now.QuadPart * 1000000000.0 / (double)freq.QuadPart);
+-    s->type = XR_TYPE_FRAME_STATE; s->shouldRender = XR_TRUE; s->predictedDisplayPeriod = periodNs; s->predictedDisplayTime = nowTime + periodNs;
++    // The display prediction follows the refresh grid, not scheduler wakeup
++    // jitter. nextTick is already the next display deadline after this wait.
++    XrTime displayTime = (XrTime)(nextTick * 1000000000.0 / (double)freq.QuadPart);
++    s->type = XR_TYPE_FRAME_STATE; s->shouldRender = XR_TRUE; s->predictedDisplayPeriod = periodNs; s->predictedDisplayTime = displayTime;
+     return XR_SUCCESS;
+ }
+ static XrResult XRAPI_PTR xrBeginFrame_runtime(XrSession, const XrFrameBeginInfo*) { return XR_SUCCESS; }

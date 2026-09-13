@@ -1,0 +1,17 @@
+diff --git a/src/runtime.cpp b/src/runtime.cpp
+--- a/src/runtime.cpp
++++ b/src/runtime.cpp
+@@ -432,8 +432,11 @@ static XrFovf GetUiFov(uint32_t eyeIndex) {
+         int fovDeg = ui::g_uiState.fovDegrees;
+         if (fovDeg <= 0 || fovDeg > 180) fovDeg = 90;
+         float fovRadians = fovDeg * 0.5f * 3.14159265f / 180.0f;
+-        float fovTan = tanf(fovRadians);
+-        return XrFovf{ -fovTan, fovTan, fovTan, -fovTan };
++        // XrFovf stores angles, not their tangents. Generic desktop eyes
++        // use the declared 1280x720 raster with equal angular pixel scale;
++        // headset profiles keep their measured per-eye asymmetric angles.
++        const float verticalHalfAngle = atanf(tanf(fovRadians) * (720.0f / 1280.0f));
++        return XrFovf{ -fovRadians, fovRadians, verticalHalfAngle, -verticalHalfAngle };
+     }
+ 
+     switch (ui::g_uiState.headsetProfile) {

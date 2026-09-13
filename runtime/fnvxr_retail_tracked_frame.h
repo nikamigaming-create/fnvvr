@@ -173,11 +173,13 @@ inline bool retailTrackedRuntimeUiConfirmed(
 }
 
 // Call only after validateRetailTrackedPublishedFrame() succeeds. Keeping the
-// classification separate lets both the world hook and the UI-present path
-// consume the same mutually-exclusive runtime decision.
+// classification separate lets the world hook use a live loaded scene while
+// the UI-present path captures the independent native menu surface.
 inline RetailTrackedPresentationRoute retailTrackedPublishedPresentationRoute(
     const RetailTrackedFrame& frame) noexcept
 {
+    if (shared::runtimeHasLoadedWorld(frame.runtime))
+        return RetailTrackedPresentationRoute::BinocularWorld;
     if (live_pipboy::worldPresentationContinues(
             frame.runtime.phase,
             frame.runtime.menuBits,
@@ -236,9 +238,7 @@ inline RetailTrackedFrameValidation validateRetailTrackedUiSurfaceFrame(
         frame.runtime.menuBits,
         frame.runtime.showroomActive,
         frame.runtime.cameraActive != 0u);
-    if (!livePipBoy
-        && retailTrackedPublishedPresentationRoute(frame)
-            != RetailTrackedPresentationRoute::MonoUiQuad)
+    if (!livePipBoy && !retailTrackedRuntimeUiConfirmed(frame.runtime))
     {
         return { RetailTrackedFrameFailure::RuntimeNotUi };
     }

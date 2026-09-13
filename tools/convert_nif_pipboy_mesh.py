@@ -94,27 +94,44 @@ def main() -> int:
         (screen_min_z + screen_max_z) * 0.5,
     )
 
-    transformed_vertices = [vertex * housing_to_screen for vertex in housing.data.vertices]
-    transformed_normals = [normal * housing_to_screen_rotation for normal in housing.data.normals]
-    diffuse_uvs = housing.data.uv_sets[0]
+    # The casing, backing plate and physical controls share one retail atlas.
+    # Keep all of those authored opaque pieces in the same screen-local basis.
+    # Glare, light effects and ScreenLit use separate materials and are not
+    # housing geometry; the curved display is supplied by --screen-output.
+    def diffuse_path(geometry):
+        for prop in geometry.properties:
+            texture_set = getattr(prop, "texture_set", None)
+            if texture_set and len(texture_set.textures):
+                return bytes(texture_set.textures[0]).lower()
+        return b""
+
+    atlas = diffuse_path(housing)
+    housing_parts = [part for part in geometries
+        if part is housing or (atlas and diffuse_path(part) == atlas)]
     expanded: list[tuple[float, float, float, float, float, float, float, float]] = []
-    for triangle in housing.data.get_triangles():
-        for index in triangle:
-            vertex = transformed_vertices[index]
-            normal = transformed_normals[index]
-            uv = diffuse_uvs[index]
-            position = (
-                (float(vertex.x) - screen_center[0]) / screen_width,
-                (float(vertex.y) - screen_center[1]) / screen_height,
-                (float(vertex.z) - screen_center[2]) / screen_width,
-            )
-            mapped_normal = normalized(
-                (float(normal.x), float(normal.y), float(normal.z))
-            )
-            mapped_uv = (float(uv.u), float(uv.v))
-            if not all(math.isfinite(value) for value in (*position, *mapped_uv)):
-                raise SystemExit("Pip-Boy NIF produced non-finite geometry")
-            expanded.append((*position, *mapped_normal, *mapped_uv))
+    for part in housing_parts:
+        if part.data.num_uv_sets < 1:
+            raise SystemExit("Pip-Boy casing part has no diffuse UV set")
+        part_to_screen = part.get_transform(root) * screen_to_root.get_inverse()
+        _scale, part_rotation, _translation = part_to_screen.get_scale_rotation_translation()
+        transformed_vertices = [vertex * part_to_screen for vertex in part.data.vertices]
+        transformed_normals = [normal * part_rotation for normal in part.data.normals]
+        diffuse_uvs = part.data.uv_sets[0]
+        for triangle in part.data.get_triangles():
+            for index in triangle:
+                vertex = transformed_vertices[index]
+                normal = transformed_normals[index]
+                uv = diffuse_uvs[index]
+                position = (
+                    (float(vertex.x) - screen_center[0]) / screen_width,
+                    (float(vertex.y) - screen_center[1]) / screen_height,
+                    (float(vertex.z) - screen_center[2]) / screen_width,
+                )
+                mapped_normal = normalized((float(normal.x), float(normal.y), float(normal.z)))
+                mapped_uv = (float(uv.u), float(uv.v))
+                if not all(math.isfinite(value) for value in (*position, *mapped_uv)):
+                    raise SystemExit("Pip-Boy NIF produced non-finite geometry")
+                expanded.append((*position, *mapped_normal, *mapped_uv))
 
     if not 1000 <= len(expanded) <= 100_000 or len(expanded) % 3:
         raise SystemExit(f"unexpected expanded vertex count: {len(expanded)}")
@@ -136,7 +153,9 @@ def main() -> int:
             0.745,
             0.600,
         )
-        screen_expanded: list[tuple[float, float, float, float, float]] = []
+        if screen.data.num_uv_sets < 1:
+            raise SystemExit("Pip-Boy screen has no native rendered-menu UVs")
+        screen_expanded: list[tuple[float, ...]] = []
         for triangle in screen.data.get_triangles():
             for index in triangle:
                 vertex = screen_vertices[index]
@@ -156,7 +175,11 @@ def main() -> int:
                 )
                 if not all(math.isfinite(value) for value in (*position, *uv)):
                     raise SystemExit("Pip-Boy screen produced non-finite geometry")
-                screen_expanded.append((*position, *uv))
+                native_uv = screen.data.uv_sets[0][index]
+                native = (float(native_uv.u), float(native_uv.v))
+                if not all(math.isfinite(value) for value in native):
+                    raise SystemExit("Pip-Boy screen has non-finite native UVs")
+                screen_expanded.append((*position, *uv, *native))
         if not 3 <= len(screen_expanded) <= 10_000 or len(screen_expanded) % 3:
             raise SystemExit(
                 f"unexpected expanded screen vertex count: {len(screen_expanded)}"
@@ -164,10 +187,10 @@ def main() -> int:
         screen_output = Path(args.screen_output).resolve()
         screen_output.parent.mkdir(parents=True, exist_ok=True)
         screen_payload = bytearray(
-            struct.pack("<4sIII", b"FPS1", 1, len(screen_expanded), 0)
+            struct.pack("<4sIII", b"FPS1", 2, len(screen_expanded), 0)
         )
         for vertex in screen_expanded:
-            screen_payload.extend(struct.pack("<5f", *vertex))
+            screen_payload.extend(struct.pack("<7f", *vertex))
         screen_output.write_bytes(screen_payload)
         screen_output_hash = hashlib.sha256(screen_payload).hexdigest()
         screen_vertex_count = len(screen_expanded)

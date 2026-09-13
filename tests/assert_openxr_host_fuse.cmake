@@ -127,7 +127,7 @@ endforeach()
 
 string(FIND "${host_source}" "candidateWristActivation.advance(" wrist_candidate_at)
 string(FIND "${host_source}" "const XrResult endResult = xr.endFrame" end_frame_at)
-string(FIND "${host_source}" "&& pipBoySpatialScreenVisible)" wrist_commit_at)
+string(FIND "${host_source}" "wristActivation = candidateWristActivation;" wrist_commit_at)
 if(wrist_candidate_at EQUAL -1
     OR end_frame_at EQUAL -1
     OR wrist_commit_at EQUAL -1
@@ -136,6 +136,23 @@ if(wrist_candidate_at EQUAL -1
     message(FATAL_ERROR
         "Exact-source wrist state must be computed before xrEndFrame and committed only after success")
 endif()
+
+# A submitted device must remain focusable before its menu has opened. The
+# UI pixel gate belongs to screen rendering, while input retains only the
+# exact source-matched device pose after successful binocular submission.
+string(SUBSTRING "${host_source}" ${end_frame_at} -1 submitted_frame_source)
+foreach(required_wrist_commit IN ITEMS
+        "endResult == XR_SUCCESS"
+        "&& submitProjectionLayer"
+        "&& candidateWristEvaluated"
+        "&& wristSourcePoseMatched"
+        "&& spatialPropsSourcePoseMatched"
+        "submittedWristPlane = candidateWristPlane;")
+    string(FIND "${submitted_frame_source}" "${required_wrist_commit}" wrist_guard_at)
+    if(wrist_guard_at EQUAL -1)
+        message(FATAL_ERROR "Submitted wrist interaction lost its guard: ${required_wrist_commit}")
+    endif()
+endforeach()
 
 foreach(retired_fuse IN ITEMS
         "OpenXrLiveRuntimeProofComplete"

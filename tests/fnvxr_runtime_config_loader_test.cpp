@@ -135,7 +135,7 @@ int main()
 
     FakeSource invalidConfig({
         { "FNVXR_TARGET_REFRESH_HZ", "120" },
-        { "FNVXR_STEREO_MAX_SOURCE_POSE_AGE_MS", "26" },
+        { "FNVXR_STEREO_MAX_SOURCE_POSE_AGE_MS", "101" },
     });
     const host::RuntimeConfigLoadResult invalidConfigResult =
         host::loadRuntimeConfig(invalidConfig);

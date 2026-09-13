@@ -14,6 +14,20 @@ int fail(const char* message)
 
 int main()
 {
+    // Observed retail tab center: source pixel (360, 487.5), native tile
+    // (360, 650). Raw hit-testing used to select an inventory row above it.
+    const auto widescreen = fnvxr::pipboy::nativeMenuPointFromTexture(
+        360.0f, 487.5f, 1280.0f, 720.0f, 1024.0f, 768.0f);
+    const auto classic = fnvxr::pipboy::nativeMenuPointFromTexture(
+        360.0f, 650.0f, 1024.0f, 768.0f, 1024.0f, 768.0f);
+    if (!widescreen.valid || !classic.valid
+        || widescreen.x != classic.x || widescreen.y != classic.y
+        || widescreen.y != 650.0f)
+        return fail("rendered-menu aspect did not resolve the authored tab center");
+    if (fnvxr::pipboy::nativeMenuPointFromTexture(
+            360.0f, 487.5f, 1280.0f, 720.0f, 0.0f, 768.0f).valid)
+        return fail("unavailable native menu dimensions admitted a guessed hit");
+
     const fnvxr::pipboy::ScreenPixelEvidence authored {
         1'024u, 0.82f, 0.01f, 34.0f,
         2.0f, 56.0f, 48.0f, 5u,

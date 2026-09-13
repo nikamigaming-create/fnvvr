@@ -16,9 +16,9 @@ struct PerformanceConfig
     std::uint32_t targetRefreshHz = 90;
     std::uint32_t maximumFramesInFlight = 1;
     std::size_t poseHistoryCapacity = 128;
-    // A completed game pair normally arrives on a later compositor cycle.
-    // Keep its historical pose and bound retention to three refresh periods.
-    float maximumPoseAgeMilliseconds = 33.0F;
+    // Game and compositor cadence are independent. Keep the original source
+    // pose across the observed 33-56 ms producer/consumer and capture delay.
+    float maximumPoseAgeMilliseconds = 75.0F;
     float maximumCpuPoseAgeMilliseconds = 75.0F;
     EyeTransport eyeTransport = EyeTransport::GpuColorV5;
 };
@@ -28,10 +28,10 @@ struct PresentationConfig
     float renderScale = 1.0F;
     float nearClipMeters = 0.05F;
     float farClipMeters = 1000.0F;
-    float menuWidthMeters = 0.90F;
+    float menuWidthMeters = 1.35F;
     // Used until an accepted UI texture supplies its authoritative aspect.
-    float menuHeightMeters = 0.50625F;
-    float menuDistanceMeters = 1.20F;
+    float menuHeightMeters = 0.759375F;
+    float menuDistanceMeters = 0.90F;
 };
 
 struct BodyRigConfig

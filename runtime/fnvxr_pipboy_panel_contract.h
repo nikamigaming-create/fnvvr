@@ -1,9 +1,33 @@
 #pragma once
 
 #include <cstdint>
+#include <cmath>
 
 namespace fnvxr::pipboy
 {
+struct NativeMenuPoint
+{
+    float x {};
+    float y {};
+    bool valid = false;
+};
+
+inline NativeMenuPoint nativeMenuPointFromTexture(
+    float x, float y, float width, float height,
+    float authoredWidth, float authoredHeight) noexcept
+{
+    if (!std::isfinite(x) || !std::isfinite(y)
+        || !std::isfinite(width) || !std::isfinite(height)
+        || !std::isfinite(authoredWidth) || !std::isfinite(authoredHeight)
+        || width <= 0.0f || height <= 0.0f
+        || authoredWidth <= 0.0f || authoredHeight <= 0.0f
+        || x < 0.0f || y < 0.0f || x >= width || y >= height) return {};
+    // Retail's Pip-Boy uses the globals.xml authored aspect (1024 by 768)
+    // while its rendered-menu texture follows the display aspect. Preserve X
+    // and undo that vertical projection before hit-testing native tile bounds.
+    return { x, y * width * authoredHeight / (height * authoredWidth), true };
+}
+
 struct ScreenCrop
 {
     float left {};

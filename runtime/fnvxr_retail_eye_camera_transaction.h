@@ -1,4 +1,5 @@
 #pragma once
+#include "fnvxr_first_person_view.h"
 
 #include "fnvxr_retail_engine_calls.h"
 #include "fnvxr_retail_tracked_frame.h"
@@ -615,7 +616,8 @@ inline RetailDerivedEyeCameraRig deriveRetailEyeCameraRig(
     const abi::RetailNiCameraLayout* stockCamera,
     const RetailTrackedFrame& frame,
     const RetailVrOrigin& origin,
-    float gameUnitsPerMeter) noexcept
+    float gameUnitsPerMeter,
+    const FirstPersonView* firstPersonView = nullptr) noexcept
 {
     RetailDerivedEyeCameraRig result {};
     const RetailTrackedFrameValidation validation =
@@ -644,8 +646,19 @@ inline RetailDerivedEyeCameraRig deriveRetailEyeCameraRig(
         return result;
     }
 
-    const RetailCameraMutableState stock =
+    RetailCameraMutableState stock =
         detail::retailCameraMutableState(stockCamera);
+    if (firstPersonView)
+    {
+        // Keep the engine's lens/depth policy, but derive both eyes from the
+        // exact anchor used for hands and weapon. VATS may run its cinematic
+        // camera internally without taking ownership of the headset view.
+        std::memcpy(stock.world.rotation, firstPersonView->rotation,
+            sizeof(stock.world.rotation));
+        std::memcpy(stock.world.translation, firstPersonView->position,
+            sizeof(stock.world.translation));
+        stock.world.scale = 1.0f;
+    }
     if (!detail::retailTransformUsable(stock.world)
         || !detail::retailFrustumUsable(stock.frustum))
     {

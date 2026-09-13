@@ -61,6 +61,109 @@ int main()
 {
     {
         p::Coordinator coordinator;
+        auto input = running(10);
+        input.runtime.ui = p::UiClassification::Blocking;
+        addWorld(input, key(20));
+        addUi(input, key(19));
+        coordinator.advance(input);
+        addWorld(input, key(21));
+        const auto advancedWorld = coordinator.advance(input);
+        expect(advancedWorld.mode == p::PresentationMode::WorldStereo
+                && advancedWorld.overlayUiSource == key(19) && advancedWorld.pointerMayRender,
+            "independent world progress must not flicker a fresh native menu");
+        addUi(input, key(18));
+        expect(!p::isValid(coordinator.advance(input).overlayUiSource),
+            "UI source regression must still be rejected within its own channel");
+    }
+    {
+        p::Coordinator coordinator;
+        auto input = running(10);
+        addWorld(input, key(18));
+        input.trackedRigReady = true;
+        coordinator.advance(input);
+        input.runtime.sample = 11;
+        input.world.fresh = false;
+        input.world.runtimeLineageVerified = false;
+        input.world.retainedForContinuity = true;
+        auto held = coordinator.advance(input);
+        expect(held.mode == p::PresentationMode::WorldStereo
+                && held.selectedSource == key(18) && held.spatialRigMayRender,
+            "a bounded producer gap must retain the accepted pair and exact rig");
+        input.world.retainedForContinuity = false;
+        expect(coordinator.advance(input).mode == p::PresentationMode::SafetyBlank,
+            "expiry must remove the explicit continuity authorization");
+        input.world.retainedForContinuity = true;
+        input.runtime.ui = p::UiClassification::Blocking;
+        addUi(input, key(19));
+        auto menu = coordinator.advance(input);
+        expect(menu.mode == p::PresentationMode::WorldStereo
+                && menu.selectedSource == key(18) && menu.overlayUiSource == key(19)
+                && menu.pointerMayRender,
+            "pause/dialogue must compose native UI over the accepted binocular world");
+        input.runtime.ui = p::UiClassification::BlockingWithPipBoy;
+        input.wristContentReady = true;
+        expect(coordinator.advance(input).wristScreenMayRender,
+            "a child modal blanked its still-open parent Pip-Boy screen");
+        input.wristContentReady = false;
+        expect(!coordinator.advance(input).wristScreenMayRender,
+            "a child modal authorized missing parent screen content");
+        input.runtime.ui = p::UiClassification::None;
+        auto resumed = coordinator.advance(input);
+        expect(resumed.mode == p::PresentationMode::WorldStereo
+                && !p::isValid(resumed.overlayUiSource) && !resumed.pointerMayRender,
+            "closing a menu must immediately remove its panel during world handoff");
+        input.runtime = {};
+        auto loadingGap = coordinator.advance(input);
+        expect(loadingGap.mode == p::PresentationMode::WorldStereo
+                && loadingGap.selectedSource == key(18)
+                && !loadingGap.pointerMayRender && !p::isValid(loadingGap.overlayUiSource),
+            "suspended runtime must retain accepted stereo without UI input");
+        input.runtime = { 12, p::RuntimePhase::Loading, p::UiClassification::None, true };
+        expect(coordinator.advance(input).mode == p::PresentationMode::WorldStereo,
+            "loading publication must preserve the accepted pair");
+        input.runtime = { 13, p::RuntimePhase::Running, p::UiClassification::None, true };
+        addWorld(input, key(19));
+        input.world.retainedForContinuity = false;
+        expect(coordinator.advance(input).selectedSource == key(19),
+            "new cell must replace the suspended pair when its exact eyes arrive");
+        input.runtime = {};
+        input.world.retainedForContinuity = true;
+        input.world.source = key(20);
+        expect(coordinator.advance(input).mode == p::PresentationMode::SafetyBlank,
+            "continuity must never admit an unseen pair");
+        coordinator.reset();
+        input.world.source = key(18);
+        expect(coordinator.advance(input).mode == p::PresentationMode::SafetyBlank,
+            "a previous lifetime must not authorize retained world pixels");
+    }
+    {
+        p::Coordinator coordinator;
+        auto input = running(10);
+        addWorld(input, key(19));
+        expect(coordinator.advance(input).mode == p::PresentationMode::WorldStereo,
+            "paused-world fixture must first submit a real world");
+        input.runtime = { 11, p::RuntimePhase::Running, p::UiClassification::PipBoySpatial, true };
+        input.world.fresh = false;
+        input.world.runtimeLineageVerified = false;
+        input.trackedRigReady = true;
+        input.wristContentReady = true;
+        auto held = coordinator.advance(input);
+        expect(held.mode == p::PresentationMode::WorldStereo && held.wristScreenMayRender,
+            "paused Pip-Boy lost the exact previously submitted world");
+        input.poseHistory.exact = false;
+        expect(coordinator.advance(input).mode == p::PresentationMode::SafetyBlank,
+            "paused world was allowed without its exact pose");
+        input.poseHistory.exact = true;
+        input.runtime.ui = p::UiClassification::None;
+        expect(coordinator.advance(input).mode == p::PresentationMode::SafetyBlank,
+            "stale paused world escaped into resumed gameplay");
+        input.runtime.ui = p::UiClassification::PipBoySpatial;
+        coordinator.reset();
+        expect(coordinator.advance(input).mode == p::PresentationMode::SafetyBlank,
+            "paused mode accepted a world never submitted in this lifetime");
+    }
+    {
+        p::Coordinator coordinator;
         auto input = running();
         addWorld(input, key(20));
         const auto decision = coordinator.advance(input);

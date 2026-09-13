@@ -56,5 +56,6 @@ struct WristPlane final
     const XrPosef& leftGrip,
     bool leftGripTracked,
     float scale,
-    const XrPosef* calibratedGripToScreen = nullptr) noexcept;
+    const XrPosef* calibratedGripToScreen = nullptr,
+    const XrVector3f* calibratedGripLocalScalePivot = nullptr) noexcept;
 }

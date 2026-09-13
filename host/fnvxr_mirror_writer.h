@@ -13,6 +13,7 @@ struct Image
     std::wstring path;
     std::uint32_t width = 0, height = 0, rowPitch = 0, format = 0;
     bool rgba = false;
+    bool jpeg = false;
     std::vector<std::uint8_t> pixels;
 };
 struct Pair
@@ -31,7 +32,7 @@ struct Result
 };
 
 // No graphics/context pointers cross this boundary. The render thread copies
-// mapped bytes, then continues. PNG encoding and disk writes own a bounded
+// mapped bytes, then continues. Image encoding and disk writes own a bounded
 // queue of whole pairs, with completion reported back on the host thread.
 class Writer final
 {

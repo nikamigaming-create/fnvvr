@@ -4,6 +4,7 @@
 /deps/
 /local/
 /tmp/
+/output/*.mp4
 /assets/fnv-meshes/
 /.vs/
 __pycache__/

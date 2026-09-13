@@ -27,6 +27,7 @@ inline constexpr std::uint32_t MaximumTextureDimension = 16384u;
 inline constexpr std::uint32_t RetailWorldTransactionComplete = 1u << 0;
 inline constexpr std::uint32_t RetailMenuCaptured = 1u << 1;
 inline constexpr std::uint32_t LivePipBoyCaptured = 1u << 2;
+inline constexpr std::uint32_t IsolatedMenuCaptured = 1u << 3;
 
 enum class PresentationMode : std::uint32_t
 {

@@ -172,11 +172,16 @@ std::optional<WristPlane> placeWristPlane(
     const XrPosef& leftGrip,
     bool leftGripTracked,
     float scaleValue,
-    const XrPosef* calibratedGripToScreen) noexcept
+    const XrPosef* calibratedGripToScreen,
+    const XrVector3f* calibratedGripLocalScalePivot) noexcept
 {
     std::optional<kernel::wrist::LocalScreenTransform> calibration;
     if (calibratedGripToScreen != nullptr)
-        calibration.emplace(toKernelPose(*calibratedGripToScreen));
+        calibration.emplace(toKernelPose(*calibratedGripToScreen),
+            calibratedGripLocalScalePivot ? kernel::Vec3 {
+                calibratedGripLocalScalePivot->x,
+                calibratedGripLocalScalePivot->y,
+                calibratedGripLocalScalePivot->z } : kernel::Vec3 {});
 
     const std::optional<kernel::wrist::WristSurface> surface =
         kernel::wrist::placeWristSurface(

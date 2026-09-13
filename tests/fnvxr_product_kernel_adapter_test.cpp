@@ -110,6 +110,38 @@ int main()
         != fnvxr::product::PresentationMode::SafetyBlank)
         return fail("expired retained world remained visible");
 
+    auto paused = expired;
+    paused.runtimeStateSample = 6;
+    paused.runtimePhase = fnvxr::shared::RuntimePhaseMenu;
+    paused.menuBits = fnvxr::shared::RuntimePipBoyMenuBit;
+    paused.cameraActive = false;
+    const auto pausedDecision = adapter.advance(paused, transport(11), true, true);
+    if (pausedDecision.mode != fnvxr::product::PresentationMode::WorldStereo
+        || !pausedDecision.stereoPresentationReady
+        || !pausedDecision.wristScreenMayRender
+        || pausedDecision.gameplayVrAccepted
+        || pausedDecision.presentedSourceFrame != 11)
+        return fail("paused retail menu lost the previously accepted background or claimed fresh gameplay");
+    auto missingGpu = transport(11);
+    missingGpu.consumerAcquired = false;
+    if (adapter.advance(paused, missingGpu, true, true).mode
+        != fnvxr::product::PresentationMode::SafetyBlank)
+        return fail("paused background bypassed private GPU ownership");
+    paused.stereo.sourceFrame = 12;
+    if (adapter.advance(paused, transport(11), true, true).mode
+        != fnvxr::product::PresentationMode::SafetyBlank)
+        return fail("paused background accepted an unseen source");
+
+    paused.stereo.sourceFrame = 11;
+    paused.menuBits = fnvxr::shared::RuntimeStartMenuBit;
+    paused.retainedWorldForContinuity = true;
+    paused.ui = { 13, 6, true, true, true };
+    auto composed = adapter.advance(paused, transport(11), true, false, transport(13));
+    if (composed.mode != fnvxr::product::PresentationMode::WorldStereo
+        || composed.presentedSourceFrame != 11 || composed.presentedUiSourceFrame != 13
+        || !composed.pointerEnabled || composed.gameplayVrAccepted)
+        return fail("pause panel and historical world lost their independent source identities");
+
     adapter.reset();
     auto renderable = world(12);
     renderable.stereo.authoritativeTrackedRetailWeapon = false;
@@ -131,5 +163,15 @@ int main()
         || !pipBoyDecision.spatialRigMayRender
         || !pipBoyDecision.wristScreenMayRender)
         return fail("kernel wrist authorization was lost at the host adapter boundary");
+    pipBoy.menuBits |= fnvxr::shared::RuntimeGenericMenuBit;
+    pipBoy.ui = { 13, pipBoy.runtimeStateSample, true, true, true };
+    const auto childModal = adapter.advance(pipBoy, transport(12), true, true, transport(13));
+    if (childModal.mode != fnvxr::product::PresentationMode::WorldStereo
+        || !childModal.wristScreenMayRender || !childModal.pointerEnabled
+        || childModal.presentedUiSourceFrame != 13)
+        return fail("child modal took the parent Pip-Boy screen out of the stereo world");
+    const auto missingParent = adapter.advance(pipBoy, transport(12), true, false, transport(13));
+    if (missingParent.wristScreenMayRender)
+        return fail("child modal authorized a missing parent screen");
     return EXIT_SUCCESS;
 }

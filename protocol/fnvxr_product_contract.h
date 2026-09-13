@@ -120,6 +120,9 @@ struct PresentationInput
     bool cameraActive = false;
     StereoFrameProof stereo {};
     UiFrameProof ui {};
+    bool retainedWorldForContinuity = false;
+    bool worldRuntimeLineageVerified = false;
+    bool uiRuntimeLineageVerified = false;
 };
 
 struct PresentationDecision
@@ -138,7 +141,8 @@ struct PresentationDecision
     std::uint64_t presentedSourceEpoch = 0;
     std::uint64_t presentedSourceFrame = 0;
     std::uint64_t presentedSourceTransaction = 0;
-    // Nonzero only when UiQuad is visible. A transition hold must carry the
+    // Nonzero when a retail UI panel is visible, including over stereo world.
+    // A transition hold must carry the
     // exact source frame that was displayed during confirmed retail UI.
     std::uint64_t presentedUiSourceFrame = 0;
     // The product has no persistent gameplay HUD. Retail interface pixels are

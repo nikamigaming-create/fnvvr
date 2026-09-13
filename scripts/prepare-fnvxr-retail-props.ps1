@@ -53,7 +53,7 @@ $raw = [ordered]@{
     leftPipBoyGlove = Join-Path $assetRoot "lefthandpipboyglove1st.nif"
     rightHand = Join-Path $assetRoot "righthand1st.nif"
     skeleton = Join-Path $assetRoot "skeleton1st.nif"
-    pistolGrip = Join-Path $assetRoot "1hphandgrip1.kf"
+    pistolGrip = Join-Path $assetRoot "1hpaim-firstperson.kf"
     pipBoy = Join-Path $assetRoot "pipboyarm.nif"
     upperBody = Join-Path $assetRoot "upperbody.nif"
     handTexture = Join-Path $assetRoot "HandMale.dds"
@@ -85,9 +85,9 @@ function Test-PreparedManifest {
     try {
         $cached = Get-Content -LiteralPath $manifestPath -Raw |
             ConvertFrom-Json -ErrorAction Stop
-        if ([string]$cached.schema -cne "fnvxr-retail-props/v4" -or
+        if ([string]$cached.schema -cne "fnvxr-retail-props/v5" -or
             [string]$cached.coordinateBasis -cne "openxr-grip-minus-z" -or
-            [string]$cached.rightHandPose -cne "_1stperson/1hphandgrip1@end") {
+            [string]$cached.rightHandPose -cne "_1stperson/1hpaim@end") {
             return $false
         }
         foreach ($name in $toolHashes.Keys) {
@@ -161,8 +161,10 @@ Invoke-ExactExtraction -Archive $meshArchive `
 Invoke-ExactExtraction -Archive $meshArchive `
     -Entry "meshes\characters\_1stperson\skeleton.nif" `
     -Output $raw.skeleton
+# The owned 9mm fixture (WeapNV9mmPistol / 000E3778) has DNAM handGrip
+# 0xFF: the default first-person Aim pose, not the optional HandGrip1 override.
 Invoke-ExactExtraction -Archive $meshArchive `
-    -Entry "meshes\characters\_1stperson\1hphandgrip1.kf" `
+    -Entry "meshes\characters\_1stperson\1hpaim.kf" `
     -Output $raw.pistolGrip
 Invoke-ExactExtraction -Archive $meshArchive `
     -Entry "meshes\pipboy3000\pipboyarm.nif" `
@@ -238,11 +240,11 @@ foreach ($name in $outputs.Keys) {
     }
 }
 $manifest = [ordered]@{
-    schema = "fnvxr-retail-props/v4"
+    schema = "fnvxr-retail-props/v5"
     generatedAtUtc = [DateTime]::UtcNow.ToString("o")
     provenance = "locally derived from the user's installed Fallout BSAs; never staged into the game or distributed"
     coordinateBasis = "openxr-grip-minus-z"
-    rightHandPose = "_1stperson/1hphandgrip1@end"
+    rightHandPose = "_1stperson/1hpaim@end"
     tools = $toolHashes
     inputs = $inputRecords
     outputs = $outputRecords

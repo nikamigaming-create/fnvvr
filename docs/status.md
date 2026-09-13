@@ -1,6 +1,65 @@
 # FNVVR Retail Status
 
-Last updated: 2026-08-22
+Last updated: 2026-09-12
+
+## Current implementation
+
+The current retail path renders both eyes through the native engine, with the
+tracked arms, weapon, Pip-Boy housing and live Pip-Boy screen in the native
+first-person geometry pass. The device enlarges around the solved forearm;
+its housing and screen keep the same transform and depth path.
+
+The headset view and controllers now share one body anchor. Native VATS can
+execute its attack queue, but requests to switch the player to third person
+are redirected through the game's own first-person transition. This prevents
+the cinematic camera, third-person head and camera-dependent sky from taking
+over the VR image. The native attack/AP/ammunition paths remain active.
+
+Menus use native selection, button, character-key and polled-input handlers.
+Contextual menu surfaces preserve the loaded stereo world. Inventory, nested
+repair/mod menus, quantity/wait controls, VATS picking and special-action
+bindings, and native lockpick movement/tension are implemented. Coverage is
+not yet complete across all of these interactions.
+
+Physical play no longer has the previous default 40-second supervisor limit
+or 60,000-frame host limit. Explicit bounded diagnostic runs still expire.
+
+## Observed in the retail game
+
+- Two trigger shots consumed two rounds; reload restored the clip.
+- Native Pip-Boy open/close, wrist tilts, enlargement and five inventory tabs
+  were exercised with the arm remaining in the cuff.
+- A three-hour wait completed through the native wait menu.
+- VATS target cycling, torso selection, queued AP cost, confirmation and
+  three-shot execution were exercised. The latest three-shot replay retained
+  first-person stereo while the simulated headset moved, with no missing
+  projection submissions in the selected 32-second interval.
+- The Win32 and x64 focused build checks passed 52 test executions, including
+  the regression that a moving cinematic camera cannot move the rig's eyes.
+
+These runs use the actual retail game with simulated OpenXR tracking. They
+do not establish physical-headset comfort, working hardware haptics, full
+campaign completion or exhaustive menu/minigame coverage. Native rendering
+has measured roughly 37–44 stereo pairs/second in recent captures; the
+90 Hz performance target is still open.
+
+## Remaining work
+
+- Physical hand/weapon collision, contact and grabbing in the game world.
+- Complete campaign interaction coverage, including crafting, gambling,
+  terminals/lockpicking, dialogue/doors, VATS limbs/specials and transitions.
+  Lockpick and special-action bindings need live confirmation.
+- Physical-headset/controller/haptics sessions and sustained performance work.
+- An earlier VATS-exit animation heap corruption remains undiagnosed; later
+  successful runs are not enough to declare it fixed.
+- OpenMW and Godot adapter types compile against the local engine types;
+  those games are not yet integrated with the shared library.
+
+Recordings, owned assets and private runtime observations remain local.
+The earlier status below is retained as history and does not describe the
+current implementation.
+
+## Historical status — 2026-08-22
 
 ## Direction Locked
 

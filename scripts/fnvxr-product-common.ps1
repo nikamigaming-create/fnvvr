@@ -1,6 +1,35 @@
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version 3.0
 
+function Resolve-FnvxrProductSessionLimits {
+    param(
+        [bool]$PhysicalHeadsetPlay = $false,
+        [int]$MaximumRunSeconds = 40,
+        [bool]$MaximumRunSecondsExplicit = $false,
+        [int]$HostFrames = 60000,
+        [bool]$HostFramesExplicit = $false
+    )
+    if ($PhysicalHeadsetPlay -and -not $MaximumRunSecondsExplicit) {
+        $MaximumRunSeconds = 0
+    }
+    if ($MaximumRunSeconds -eq 0 -and -not $PhysicalHeadsetPlay) {
+        throw "An unlimited session requires -PhysicalHeadsetPlay."
+    }
+    if ($MaximumRunSeconds -ne 0 -and
+        ($MaximumRunSeconds -lt 5 -or $MaximumRunSeconds -gt 900)) {
+        throw "A timed session requires 5 to 900 seconds."
+    }
+    if ($PhysicalHeadsetPlay -and -not $HostFramesExplicit) {
+        # The host's existing signed frame counter supports months of play.
+        # Its short diagnostic default must not terminate a headset session.
+        $HostFrames = 2000000000
+    }
+    [pscustomobject]@{
+        MaximumRunSeconds = $MaximumRunSeconds
+        HostFrames = $HostFrames
+    }
+}
+
 # System.Diagnostics.Process.Modules is not a complete module census when an
 # x64 PowerShell supervisor observes a Win32 process. In that configuration it
 # can expose only the executable and the WOW64 support modules, omitting the
@@ -1227,7 +1256,7 @@ function Get-FnvxrProductSourceSnapshot {
     $paths = New-Object 'System.Collections.Generic.List[string]'
     $paths.Add((Join-Path $resolvedRoot "CMakeLists.txt"))
     $paths.Add((Join-Path $resolvedRoot "README.md"))
-    foreach ($name in @("docs", "host", "plugin", "protocol", "renderhook", "runtime", "scripts", "tests", "tools")) {
+    foreach ($name in @("adapters", "docs", "host", "kernel", "plugin", "protocol", "renderhook", "runtime", "scripts", "tests", "tools")) {
         $directory = Join-Path $resolvedRoot $name
         if (-not (Test-Path -LiteralPath $directory -PathType Container)) {
             throw "Build source directory is missing: $directory"
@@ -1237,6 +1266,8 @@ function Get-FnvxrProductSourceSnapshot {
             throw "Build source snapshot refuses a reparse-point directory: $directory"
         }
         foreach ($source in Get-ChildItem -LiteralPath $directory -File -Recurse -Force) {
+            $sourceRelative = $source.FullName.Substring($rootPrefix.Length).Replace('\', '/')
+            if ($sourceRelative -match '^tests/adapters/godot/(bin|obj)/') { continue }
             if (($source.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
                 throw "Build source snapshot refuses a reparse-point file: $($source.FullName)"
             }
@@ -1356,7 +1387,8 @@ function Write-FnvxrProductBuildAttestation {
         [Parameter(Mandatory = $true)][string]$Nonce,
         [Parameter(Mandatory = $true)]$Source,
         [Parameter(Mandatory = $true)]$Artifacts,
-        [Parameter(Mandatory = $true)]$Tests
+        [Parameter(Mandatory = $true)]$Tests,
+        [string]$ValidationFilter = ""
     )
 
     $value = [ordered]@{
@@ -1370,6 +1402,12 @@ function Write-FnvxrProductBuildAttestation {
         artifacts = $Artifacts
         tests = [ordered]@{
             passed = $true
+            validationScope = if ($ValidationFilter) { "focused" } else { "full" }
+            validationFilter = $ValidationFilter
+            executedCount = @($Tests.records | Where-Object {
+                -not $ValidationFilter -or ($_.key -replace '^x(64|86)/', '') -match $ValidationFilter
+            }).Count
+            # count/hash/records identify the catalog, not how many tests ran.
             count = $Tests.count
             sha256 = $Tests.sha256
             records = $Tests.records
@@ -2525,12 +2563,10 @@ function Get-FnvxrProductMinimalEnvironment {
     }
     if (($headsetFixtureVisualTrial -and -not $StockFirstPersonBaseline) -or
         $PhysicalHeadsetPlay) {
-        # The manual center collector can preserve the stock weapon root, but
-        # its separately skinned arm/hand/Pip-Boy categories have invalid
-        # transient skinning state and visibly blink or stretch. Replace only
-        # those failed categories in the final OpenXR eye pass. The overlay is
-        # driven directly from tracked OpenXR poses and samples the live retail
-        # Pip-Boy screen crop; it has no window, focus, cursor, or OS-input lane.
+        # Native skinned hands/arms now share the weapon's first-person pass.
+        # Keep the wrist UI presenter while its screen interaction is composed
+        # from the same source pose. Native root ownership suppresses duplicate
+        # host hand meshes; it does not change controller input authority.
         $environment.FNVXR_SPATIAL_HANDS_OVERLAY = "1"
         $environment.FNVXR_SHOW_WORLD_PROPS = "1"
         $environment.FNVXR_SHOW_BODY_RIG = "1"
@@ -2541,7 +2577,9 @@ function Get-FnvxrProductMinimalEnvironment {
         $environment.FNVXR_SHOW_RIGHT_AIM_RAY = "0"
         $environment.FNVXR_DEBUG_AXES = "0"
         $environment.FNVXR_DEBUG_LEFT_AXES = "0"
-        $environment.FNVXR_STEREO_MAX_SOURCE_POSE_AGE_MS = "33"
+        # Match the kernel's elapsed-time transport budget. Every retained eye
+        # and overlay still uses the exact original source pose and epoch.
+        $environment.FNVXR_STEREO_MAX_SOURCE_POSE_AGE_MS = "75"
         # Physical pipboyscreen:0 width (5.872956 retail units / 70 units per
         # meter). Runtime placement comes from the stock left-hand-to-screen
         # transform published through WeaponFrame v3; offsets below are only
@@ -2796,6 +2834,9 @@ function Get-FnvxrProductMinimalEnvironment {
                 # This lease leaves the per-run simulator stream manual so an
                 # authentic Pip-Boy inventory selection can be observed.
                 $environment.FNVXR_HEADSET_INVENTORY_VISUAL_TRIAL = "1"
+                # Interactive video needs RGB frames; retain PNG alpha only
+                # for the separate fixed-pose image analysis workflow.
+                $environment.FNVXR_HMD_MIRROR_CAPTURE_JPEG = "1"
                 $environment.FNVXR_LEFT_GRIP_PIPBOY_MODE = "0"
                 $environment.FNVXR_XINPUT_LEFT_GRIP_PIPBOY_ENABLE = "0"
                 $environment.FNVXR_XINPUT_PHYSICAL_MENU_BUTTONS_ENABLE = "1"
@@ -2813,6 +2854,10 @@ function Get-FnvxrProductMinimalEnvironment {
                 # not set the generic external-writer flags here: they are
                 # deliberately incompatible with the base visual-rig lease.
                 $environment.FNVXR_HEADSET_COMBAT_VISUAL_TRIAL = "1"
+                $environment.FNVXR_XINPUT_PHYSICAL_MENU_BUTTONS_ENABLE = "1"
+                $environment.FNVXR_DIRECT_UI_CLICK = "1"
+                $environment.FNVXR_PLUGIN_ACCEPT_ON_EXTERNAL_DINPUT_CLICK = "1"
+                $environment.FNVXR_BUFFERED_DIRECTINPUT_CALL = "1"
                 $environment.FNVXR_PLUGIN_KEYBOARD_MOVEMENT_ENABLE = "1"
                 $environment.FNVXR_PLUGIN_MENU_KEYBOARD_FALLBACK = "1"
                 $environment.FNVXR_PLUGIN_GAMEPLAY_KEYBOARD_FALLBACK = "1"

@@ -45,5 +45,6 @@ struct PresentationDecision
     bool wristScreenMayRender = false;
     bool pointerMayRender = false;
     bool transitionHold = false;
+    SourceKey overlayUiSource {};
 };
 }

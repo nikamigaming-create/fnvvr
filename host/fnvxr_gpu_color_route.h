@@ -86,8 +86,8 @@ constexpr ProductCompositionBindings selectProductComposition(
             RoutedContent::BinocularWorld,
             true,
             true,
-            false,
-            false,
+            selectedUiResourceReady && decision.presentedUiSourceFrame != 0,
+            decision.pointerEnabled,
         };
     }
     if (decision.mode == product::PresentationMode::UiQuad

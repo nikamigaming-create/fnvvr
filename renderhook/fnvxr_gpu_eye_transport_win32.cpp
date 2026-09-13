@@ -6,11 +6,31 @@
 #include <wrl/client.h>
 
 #include <array>
+#include <cstdio>
 #include <new>
 
 namespace fnvxr::d3d9::color_transport
 {
 using Microsoft::WRL::ComPtr;
+
+bool enableDeviceRemovalDiagnostics() noexcept
+{
+    const HMODULE library = LoadLibraryExW(L"d3d12.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!library) return false;
+    using GetDebugInterface = HRESULT (WINAPI*)(REFIID, void**);
+    const auto get = reinterpret_cast<GetDebugInterface>(GetProcAddress(library, "D3D12GetDebugInterface"));
+    ComPtr<ID3D12DeviceRemovedExtendedDataSettings> settings;
+    const bool available = get && SUCCEEDED(get(IID_PPV_ARGS(&settings)));
+    if (available)
+    {
+        settings->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+        settings->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+        settings->SetWatsonDumpEnablement(D3D12_DRED_ENABLEMENT_FORCED_OFF);
+    }
+    settings.Reset();
+    FreeLibrary(library);
+    return available;
+}
 
 struct GpuEyeTransport::State
 {
@@ -30,6 +50,7 @@ struct GpuEyeTransport::State
     HRESULT lastHresult = S_OK;
     std::uint64_t lastSubmitted = 0;
     bool recording = false;
+    std::array<char, 2048> details {};
 
     ~State()
     {
@@ -55,6 +76,34 @@ struct GpuEyeTransport::State
     {
         failure = reason;
         lastHresult = result;
+        if (reason == GpuEyeFailure::DeviceRemoved && !details[0])
+        {
+            ComPtr<ID3D12DeviceRemovedExtendedData> dred;
+            const auto completed = fence ? fence->GetCompletedValue() : 0;
+            int used = sprintf_s(details.data(), details.size(),
+                "GPU removal submitted=%llu completed=%llu", lastSubmitted, completed);
+            if (device && SUCCEEDED(device.As(&dred)))
+            {
+                D3D12_DRED_PAGE_FAULT_OUTPUT fault {};
+                if (SUCCEEDED(dred->GetPageFaultAllocationOutput(&fault)) && used > 0)
+                    used += sprintf_s(details.data() + used, details.size() - used,
+                        " fault=0x%llx", fault.PageFaultVA);
+                D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT breadcrumbs {};
+                if (SUCCEEDED(dred->GetAutoBreadcrumbsOutput(&breadcrumbs)))
+                {
+                    auto* node = breadcrumbs.pHeadAutoBreadcrumbNode;
+                    for (unsigned count = 0; node && count < 12 && used > 0; ++count, node = node->pNext)
+                    {
+                        const UINT done = node->pLastBreadcrumbValue ? *node->pLastBreadcrumbValue : 0;
+                        const UINT operation = node->pCommandHistory && done < node->BreadcrumbCount
+                            ? static_cast<UINT>(node->pCommandHistory[done]) : 0;
+                        used += sprintf_s(details.data() + used, details.size() - used,
+                            " [list=%p progress=%u/%u nextOp=%u]", node->pCommandList,
+                            done, node->BreadcrumbCount, operation);
+                    }
+                }
+            }
+        }
         return false;
     }
 
@@ -287,6 +336,7 @@ bool GpuEyeTransport::ready() const noexcept
 bool GpuEyeTransport::available() const noexcept { return ready() && state_->producer.available(); }
 GpuEyeFailure GpuEyeTransport::failure() const noexcept { return state_ ? state_->failure : failure_; }
 std::int32_t GpuEyeTransport::lastHresult() const noexcept { return state_ ? state_->lastHresult : lastHresult_; }
+const char* GpuEyeTransport::failureDetails() const noexcept { return state_ ? state_->details.data() : ""; }
 ProducerResources GpuEyeTransport::resources() const noexcept { return state_ ? state_->exported : ProducerResources {}; }
 ProducerPublication GpuEyeTransport::produce(const ProducerFrameIdentity& identity) noexcept
 {

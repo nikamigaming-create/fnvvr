@@ -137,6 +137,26 @@ int main()
             == RetailTrackedPresentationRoute::Withhold,
         "unknown runtime was guessed as UI or binocular world");
     frame = validFrame();
+    frame.runtime.phase = fnvxr::shared::RuntimePhaseMenu;
+    frame.runtime.menuBits = fnvxr::shared::RuntimeStartMenuBit;
+    frame.runtime.cameraActive = 0u;
+    frame.runtime.reserved[fnvxr::shared::RuntimeWorldSceneReservedIndex] =
+        fnvxr::shared::RuntimeWorldSceneLoaded;
+    require(validateRetailTrackedGameplayFrame(frame).complete()
+        && validateRetailTrackedUiSurfaceFrame(frame).complete(),
+        "loaded paused world and independent native menu cannot render together");
+    require(fnvxr::shared::runtimeControllerMode(frame.runtime.phase,
+        frame.runtime.menuBits, 0u, false, true)
+            == fnvxr::shared::RuntimeControllerMode::Ui,
+        "rendering a paused world enabled gameplay input");
+    frame.runtime.menuBits |= fnvxr::shared::RuntimeLoadingMenuBit;
+    require(!validateRetailTrackedGameplayFrame(frame).complete(),
+        "loading used a departing world scene");
+    frame.runtime.menuBits = fnvxr::shared::RuntimeStartMenuBit;
+    frame.runtime.reserved[fnvxr::shared::RuntimeWorldSceneReservedIndex] = 0u;
+    require(!validateRetailTrackedGameplayFrame(frame).complete(),
+        "title menu without a loaded world admitted stereo scene rendering");
+    frame = validFrame();
     frame.runtime.cameraActive = 0u;
     require(
         retailTrackedPresentationRoute(frame)

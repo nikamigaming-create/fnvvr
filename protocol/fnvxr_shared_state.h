@@ -29,9 +29,9 @@ constexpr std::uint32_t VrOriginStateCommitted = 2;
 // that exact commit.  Keeping this separate from camera/origin state prevents
 // unrelated stereo and weapon events from being joined into a false proof.
 constexpr std::uint32_t WeaponFrameSharedMagic = 0x57585646; // FVXW
-constexpr std::uint32_t WeaponFrameSharedVersion = 3;
+constexpr std::uint32_t WeaponFrameSharedVersion = 5;
 inline constexpr char WeaponFrameSharedMappingName[] =
-    "Local\\FNVXR_Weapon_Frame_v3";
+    "Local\\FNVXR_Weapon_Frame_v5";
 constexpr std::uint32_t WeaponFrameInvalid = 0;
 constexpr std::uint32_t WeaponFramePoseCommitted = 1;
 constexpr std::uint32_t WeaponFrameRenderConsumed = 2;
@@ -673,7 +673,7 @@ struct SharedWeaponFrameState
     std::uint32_t magic;
     std::uint32_t version;
     // Producer lane. Only xNVSE writes fields through
-    // leftPipBoyScreenGripLocalRot.
+    // leftPipBoyDeviceScale.
     volatile LONG producerSequence;
     std::uint32_t status;
     std::uint64_t commitId;
@@ -699,6 +699,11 @@ struct SharedWeaponFrameState
     // Pip-Boy merely touch the hand in 2D while floating away in stereo.
     float leftPipBoyScreenGripLocalPos[3];
     float leftPipBoyScreenGripLocalRot[4];
+    // Point on the posed native forearm underneath the screen. Uniform
+    // enlargement keeps this point fixed, instead of pivoting at the hand.
+    // Published with the same pose identity as the screen and native arm.
+    float leftPipBoyScalePivotGripLocalPos[3];
+    float leftPipBoyDeviceScale;
     // Consumer lane. Only the D3D9 first-person seam writes this lane.
     volatile LONG consumerSequence;
     std::uint32_t consumedStatus;
@@ -792,6 +797,20 @@ struct SharedRuntimeState
     std::uint32_t showroomCellFormId;
     std::uint32_t reserved[8];
 };
+
+// The game publisher observes a loaded player cell and the live world camera
+// and culler independently of menu input focus. This does not enable gameplay
+// controls or advance the simulation while a menu is open.
+inline constexpr std::size_t RuntimeWorldSceneReservedIndex = 0u;
+inline constexpr std::uint32_t RuntimeWorldSceneLoaded = 1u;
+
+inline bool runtimeHasLoadedWorld(const SharedRuntimeState& runtime) noexcept
+{
+    return (runtime.reserved[RuntimeWorldSceneReservedIndex] & RuntimeWorldSceneLoaded) != 0u
+        && runtime.showroomActive == 0u
+        && (runtime.phase == RuntimePhaseGameplay || runtime.phase == RuntimePhaseMenu)
+        && (runtime.menuBits & RuntimeLoadingMenuBit) == 0u;
+}
 
 struct SharedD3D9FrameHeader
 {
@@ -920,7 +939,7 @@ static_assert(sizeof(SharedXInputState) == 40, "SharedXInputState layout changed
 static_assert(sizeof(SharedDInputState) == 100, "SharedDInputState layout changed unexpectedly");
 static_assert(sizeof(SharedVrPoseState) == 288, "SharedVrPoseState layout changed unexpectedly");
 static_assert(sizeof(SharedVrOriginState) == 216, "SharedVrOriginState layout changed unexpectedly");
-static_assert(sizeof(SharedWeaponFrameState) == 200, "SharedWeaponFrameState layout changed unexpectedly");
+static_assert(sizeof(SharedWeaponFrameState) == 216, "SharedWeaponFrameState layout changed unexpectedly");
 static_assert(sizeof(SharedCameraState) == 80, "SharedCameraState layout changed");
 static_assert(sizeof(SharedRuntimeState) == 88, "SharedRuntimeState layout changed");
 static_assert(sizeof(SharedDesktopAssistUiQuadHeader) == 96, "SharedDesktopAssistUiQuadHeader layout changed");

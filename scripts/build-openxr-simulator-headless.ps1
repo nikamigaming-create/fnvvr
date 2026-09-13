@@ -13,6 +13,8 @@ Set-StrictMode -Version Latest
 $productRoot = Split-Path -Parent $PSScriptRoot
 $patchPath = Join-Path $productRoot "patches\openxr-simulator-fnvxr-headless.patch"
 $controllerPosePatchPath = Join-Path $productRoot "patches\openxr-simulator-controller-local-6dof.patch"
+$frameTimingPatchPath = Join-Path $productRoot "patches\openxr-simulator-frame-timing.patch"
+$fovAnglesPatchPath = Join-Path $productRoot "patches\openxr-simulator-fov-angles.patch"
 $expectedUpstreamCommit = "48a70f440ac7d9bda385994937e3da8e15a4d9bb"
 if ([string]::IsNullOrWhiteSpace($SourceRoot)) {
     $SourceRoot = Join-Path $productRoot "local\OpenXR-Simulator"
@@ -34,6 +36,12 @@ if (-not (Test-Path -LiteralPath $patchPath -PathType Leaf)) {
 }
 if (-not (Test-Path -LiteralPath $controllerPosePatchPath -PathType Leaf)) {
     throw "The reproducible LOCAL controller-pose patch is missing: $controllerPosePatchPath"
+}
+if (-not (Test-Path -LiteralPath $frameTimingPatchPath -PathType Leaf)) {
+    throw "The reproducible frame-timing patch is missing: $frameTimingPatchPath"
+}
+if (-not (Test-Path -LiteralPath $fovAnglesPatchPath -PathType Leaf)) {
+    throw "The reproducible FOV-angle patch is missing: $fovAnglesPatchPath"
 }
 
 $runtimeSource = Get-Content -LiteralPath $requiredSource -Raw
@@ -86,14 +94,14 @@ if (-not $runtimePatchPresent) {
     & $gitPath `
         -c "safe.directory=$safeDirectory" `
         -C $SourceRoot `
-        apply --check $patchPath
+        apply --recount --check $patchPath
     if ($LASTEXITCODE -ne 0) {
         throw "The FNVXR headless patch does not apply cleanly to $sourceCommit."
     }
     & $gitPath `
         -c "safe.directory=$safeDirectory" `
         -C $SourceRoot `
-        apply $patchPath
+        apply --recount $patchPath
     if ($LASTEXITCODE -ne 0) {
         throw "Failed to apply the FNVXR headless runtime patch."
     }
@@ -123,7 +131,7 @@ if (-not $controllerPosePatchPresent) {
     & $gitPath `
         -c "safe.directory=$safeDirectory" `
         -C $SourceRoot `
-        apply --check --reverse $patchPath
+        apply --recount --check --reverse $patchPath
     if ($LASTEXITCODE -ne 0) {
         throw "The OpenXR-Simulator source does not exactly contain the reviewed FNVXR headless patch."
     }
@@ -155,6 +163,30 @@ foreach ($requiredControllerContract in @(
 if ($LASTEXITCODE -ne 0) {
     throw "The OpenXR-Simulator source does not exactly contain the reviewed LOCAL controller-pose patch."
 }
+
+# The frame timer is independent of the controller-pose edits and remains a
+# separately checked layer, including on an already patched local checkout.
+if (-not $runtimeSource.Contains('struct FrameWaitTimer')) {
+    & $gitPath -c "safe.directory=$safeDirectory" -C $SourceRoot apply --check $frameTimingPatchPath
+    if ($LASTEXITCODE -ne 0) {
+        throw "The frame-timing patch does not apply cleanly to $sourceCommit."
+    }
+    & $gitPath -c "safe.directory=$safeDirectory" -C $SourceRoot apply $frameTimingPatchPath
+    if ($LASTEXITCODE -ne 0) { throw "Failed to apply the frame-timing patch." }
+}
+& $gitPath -c "safe.directory=$safeDirectory" -C $SourceRoot apply --check --reverse $frameTimingPatchPath
+if ($LASTEXITCODE -ne 0) {
+    throw "The OpenXR-Simulator source does not exactly contain the reviewed frame-timing patch."
+}
+
+if (-not $runtimeSource.Contains('const float verticalHalfAngle = atanf')) {
+    & $gitPath -c "safe.directory=$safeDirectory" -C $SourceRoot apply --check $fovAnglesPatchPath
+    if ($LASTEXITCODE -ne 0) { throw "The FOV-angle patch does not apply cleanly to $sourceCommit." }
+    & $gitPath -c "safe.directory=$safeDirectory" -C $SourceRoot apply $fovAnglesPatchPath
+    if ($LASTEXITCODE -ne 0) { throw "Failed to apply the FOV-angle patch." }
+}
+& $gitPath -c "safe.directory=$safeDirectory" -C $SourceRoot apply --check --reverse $fovAnglesPatchPath
+if ($LASTEXITCODE -ne 0) { throw "The OpenXR-Simulator source does not contain the complete FOV-angle patch." }
 
 function ConvertTo-NativeArgument {
     param([Parameter(Mandatory = $true)][string]$Value)
@@ -294,6 +326,14 @@ if (-not $ConfigureOnly) {
     controllerPosePatch = [ordered]@{
         path = (Resolve-Path -LiteralPath $controllerPosePatchPath).Path
         sha256 = (Get-FileHash -LiteralPath $controllerPosePatchPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    }
+    frameTimingPatch = [ordered]@{
+        path = (Resolve-Path -LiteralPath $frameTimingPatchPath).Path
+        sha256 = (Get-FileHash -LiteralPath $frameTimingPatchPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    }
+    fovAnglesPatch = [ordered]@{
+        path = (Resolve-Path -LiteralPath $fovAnglesPatchPath).Path
+        sha256 = (Get-FileHash -LiteralPath $fovAnglesPatchPath -Algorithm SHA256).Hash.ToLowerInvariant()
     }
     runtimeManifest = if (Test-Path -LiteralPath $manifestPath -PathType Leaf) {
         (Resolve-Path -LiteralPath $manifestPath).Path

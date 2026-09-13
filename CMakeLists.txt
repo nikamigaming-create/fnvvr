@@ -72,6 +72,14 @@ add_library(fnvxr_kernel STATIC
     kernel/wrist/placement.cpp)
 target_include_directories(fnvxr_kernel PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR})
+set_target_properties(fnvxr_kernel PROPERTIES POSITION_INDEPENDENT_CODE ON)
+add_library(fnvxr_rig SHARED adapters/rig_c_api.cpp)
+target_compile_definitions(fnvxr_rig PRIVATE FNVXR_RIG_BUILD)
+target_link_libraries(fnvxr_rig PRIVATE fnvxr_kernel)
+target_include_directories(fnvxr_rig PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/adapters)
+add_executable(fnvxr_rig_c_api_test tests/fnvxr_rig_c_api_test.cpp)
+target_link_libraries(fnvxr_rig_c_api_test PRIVATE fnvxr_rig)
+add_test(NAME fnvxr_rig_c_api_test COMMAND fnvxr_rig_c_api_test)
 if(MSVC)
     target_compile_options(fnvxr_kernel PRIVATE /W4 /WX)
 endif()
@@ -211,6 +219,20 @@ endif()
 add_test(
     NAME fnvxr_physical_input_authority_test
     COMMAND fnvxr_physical_input_authority_test)
+
+add_executable(fnvxr_native_control_pulses_test tests/fnvxr_native_control_pulses_test.cpp)
+target_include_directories(fnvxr_native_control_pulses_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/runtime)
+add_test(NAME fnvxr_native_control_pulses_test COMMAND fnvxr_native_control_pulses_test)
+
+add_executable(fnvxr_native_menu_geometry_test tests/fnvxr_native_menu_geometry_test.cpp)
+target_include_directories(fnvxr_native_menu_geometry_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/runtime)
+add_test(NAME fnvxr_native_menu_geometry_test COMMAND fnvxr_native_menu_geometry_test)
+
+add_executable(fnvxr_world_continuity_test tests/fnvxr_world_continuity_test.cpp)
+add_test(NAME fnvxr_world_continuity_test COMMAND fnvxr_world_continuity_test)
+
+add_executable(fnvxr_haptics_test tests/fnvxr_haptics_test.cpp)
+add_test(NAME fnvxr_haptics_test COMMAND fnvxr_haptics_test)
 
 add_executable(fnvxr_weapon_frame_contract_test
     tests/fnvxr_weapon_frame_contract_test.cpp)
@@ -444,6 +466,7 @@ if(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 4)
     )
     target_link_libraries(nvse_fnvxr PRIVATE
         fnvxr_protocol
+        fnvxr_kernel
         fnvxr_retail_runtime_authority
         )
     set_target_properties(nvse_fnvxr PROPERTIES

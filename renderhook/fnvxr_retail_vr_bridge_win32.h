@@ -35,6 +35,7 @@ struct RetailVrBridgeOperations
     void* context = nullptr;
     RetailVrPublicationTransport publicationTransport =
         RetailVrPublicationTransport::Unspecified;
+    bool centerIncludesFirstPerson = false;
     engine::RetailEyeTargetOperations eyeTargets {};
     // The replacement E8 must enter the verified stock target with the
     // caller's original register/stack context.  The proxy owns that naked
@@ -93,6 +94,9 @@ struct RetailVrBridgeOperations
     // either eye traverses the first-person branch.
     bool (*prepareControllerRigForRender)(
         void*, const engine::RetailTrackedFrame&) noexcept = nullptr;
+    bool (*readPreparedFirstPersonView)(
+        void*, const engine::RetailTrackedFrame&,
+        engine::FirstPersonView&) noexcept = nullptr;
     bool (*prepareDistinctCameraFrame)(
         void*,
         const engine::RetailWorldAccumulationCallFrame&,
@@ -680,14 +684,11 @@ public:
         mFrameDiagnostics.firstPerson = {};
     }
 
-    // Physical engine-center rendering already builds the live, calibrated
-    // first-person branch into both eye accumulators. Publish that completed
-    // pair synchronously at the authenticated RenderFirstPerson seam, before
-    // the untouched desktop-only stock invocation can restore or draw through
-    // one of its stale captured bindings. This performs no additional
-    // private-eye RenderFirstPerson calls.
-    bool publishPendingCenterIntegratedFirstPerson(
-        std::uint32_t callerId = 0u) noexcept
+    // The native world transaction already renders its first-person leaves
+    // into both eye accumulators. Once that transaction and its D3D state
+    // restoration finish, it can be submitted without waiting for a desktop
+    // RenderFirstPerson call, which retail omits in several menu states.
+    bool publishPendingCenterIntegratedWorld() noexcept
     {
         mFrameDiagnostics.firstPerson = {};
         if (!ready()
@@ -695,7 +696,9 @@ public:
             || !mPendingFirstPerson.valid
             || !mPendingFirstPerson.publicationStaged
             || mPendingFirstPerson.threadId != GetCurrentThreadId()
-            || callerId == 0u)
+            || !mFrameDiagnostics.controller.complete()
+            || mFrameDiagnostics.controller.transactionId
+                != mPendingFirstPerson.transactionId)
         {
             mPendingFirstPerson = {};
             return false;
@@ -709,7 +712,6 @@ public:
         diagnostics.stagedTransactionId = pending.transactionId;
         diagnostics.stagedPoseFrame = pending.tracked.pose.frame;
         diagnostics.stagedPoseSequence = pending.tracked.poseSequence;
-        diagnostics.callerId = callerId;
         diagnostics.published = publishStagedFirstPersonPair(pending);
         if (diagnostics.published)
             ++diagnostics.completeCount;
@@ -2119,10 +2121,24 @@ private:
             bridge->mFrameDiagnostics.renderer = rejected;
             return rejected;
         }
+        engine::RetailCenterRuntimeFrame renderFrame = frame;
+        if (bridge->mOperations.readPreparedFirstPersonView)
+        {
+            renderFrame.firstPersonViewValid =
+                bridge->mOperations.readPreparedFirstPersonView(
+                    bridge->mOperations.context, frame.tracked,
+                    renderFrame.firstPersonView);
+            if (!renderFrame.firstPersonViewValid)
+            {
+                bridge->mPrivateRenderDispatchGate.leave();
+                return { engine::RetailWorldHookDisposition::RejectGameplayFrame,
+                    engine::RetailCenterRuntimeFailure::StereoRenderRejected, {} };
+            }
+        }
         const engine::RetailCenterRuntimeFrameResult result =
             bridge->mCenterRuntime.renderWorld(
             bridge->mAuthority.authority.centerRenderer(),
-            frame);
+            renderFrame);
         bridge->mPrivateRenderDispatchGate.leave();
         bridge->mFrameDiagnostics.renderer = result;
         bridge->mFrameDiagnostics.accumulatorSnapshot =
@@ -2208,9 +2224,10 @@ private:
             && result.cameraRig.complete()
             && frame.stockCenterCamera
             && frame.generation != 0u
-            && bridge->mOperations.firstPersonGameplayLeaseReady(
-                bridge->mOperations.context)
-            && bridge->ensureFirstPersonGameplayLease())
+            && (bridge->mOperations.centerIncludesFirstPerson
+                || (bridge->mOperations.firstPersonGameplayLeaseReady(
+                        bridge->mOperations.context)
+                    && bridge->ensureFirstPersonGameplayLease())))
         {
             // A new world transaction supersedes any pair whose stock
             // desktop finalizer did not return.  Never let that stale private
@@ -2300,6 +2317,12 @@ private:
             return false;
         }
         releasePendingSince = 0u;
+        // A rejected producer attempt contains no publishable descriptor.
+        // Passing it to the mapping publisher poisons its lifetime readiness
+        // and prevents every subsequent world dispatch, including recovery.
+        if (!publication.complete
+            || publication.failure != color_transport::ProducerFailure::None)
+            return false;
         return mPublisher.publish(publication);
     }
 

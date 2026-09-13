@@ -15,8 +15,17 @@
 #include "fnvxr_headset_demo_authority.h"
 #include "fnvxr_physical_input_authority.h"
 #include "fnvxr_live_pipboy_contract.h"
+#include "fnvxr_pipboy_panel_contract.h"
 #include "fnvxr_stereo_visual_trial_automation_authority.h"
 #include "fnvxr_weapon_frame_contract.h"
+#include "fnvxr_native_control_pulses.h"
+#include "fnvxr_native_menu_geometry.h"
+#include "fnvxr_native_menu_stack.h"
+#include "fnvxr_first_person_view.h"
+#include "../protocol/fnvxr_haptic_feedback.h"
+#include "fnvxr_retail_engine_abi.h"
+#include "../kernel/runtime_config.h"
+#include "../kernel/wrist/placement.h"
 
 #include <windows.h>
 #include <intrin.h>
@@ -94,17 +103,19 @@ constexpr UInt32 DIK_F2 = 0x3C;
 constexpr UInt32 DIK_F3 = 0x3D;
 constexpr UInt32 DIK_RETURN = 0x1C;
 constexpr UInt32 DIK_UP = 0xC8;
+constexpr UInt32 DIK_PRIOR = 0xC9;
 constexpr UInt32 DIK_LEFT = 0xCB;
 constexpr UInt32 DIK_RIGHT = 0xCD;
 constexpr UInt32 DIK_DOWN = 0xD0;
-constexpr UInt32 TileValueId = 0x0FA9;
+constexpr UInt32 DIK_NEXT = 0xD1;
+constexpr UInt32 TileValueId = 0x0FAA;
 constexpr UInt32 TileValueClicked = 0x0FC7;
 constexpr UInt32 TileValueX = 0x0FA1;
 constexpr UInt32 TileValueY = 0x0FA2;
 constexpr UInt32 TileValueVisible = 0x0FA3;
-constexpr UInt32 TileValueMouseover = 0x0FC6;
-constexpr UInt32 TileValueHeight = 0x0FAF;
-constexpr UInt32 TileValueWidth = 0x0FB0;
+constexpr UInt32 TileValueMouseover = 0x0FC3;
+constexpr UInt32 TileValueHeight = 0x0FB0;
+constexpr UInt32 TileValueWidth = 0x0FB1;
 constexpr UInt32 InterfaceManagerAddress = 0x011D8A80;
 constexpr UInt32 InterfaceManagerOpenPipBoyAddress = 0x0070F4E0;
 constexpr UInt32 InterfaceManagerClosePipBoyAddress = 0x0070F690;
@@ -460,12 +471,16 @@ struct RetailArmNodes
     void* clavicle {};
     void* upperArm {};
     void* forearm {};
+    void* forearmTwist {};
     void* hand {};
 };
 
 struct RetailRigNodes
 {
     void* root {};
+    void* bodySkeleton {};
+    Vec3 bodyToShoulderCenter {};
+    bool bodyShoulderCalibrationValid {};
     RetailArmNodes left {};
     RetailArmNodes right {};
     void* weapon {};
@@ -502,6 +517,10 @@ struct RetailHandCalibration
     // the render-bound reapply to oscillate between solved and rejected.
     float upperArmLength {};
     float forearmLength {};
+    Vec3 forearmRestTranslation {};
+    Vec3 handRestTranslation {};
+    Matrix33 handToForearmTwistRotation {};
+    bool forearmTwistCalibrationValid {};
 };
 
 struct RetailWeaponCalibration
@@ -519,6 +538,7 @@ struct RetailWeaponCalibration
     // its grip instead of orbiting the whole model around a stale controller
     // delta captured in one pose.
     Vec3 weaponToWristLocal {};
+    Matrix33 weaponToHandRotation {};
     Quat rightHandGripLocalRotation { 0.0f, 0.0f, 0.0f, 1.0f };
 };
 
@@ -527,6 +547,8 @@ struct RetailPipBoyCalibration
     Matrix33 controllerToRootRotation {};
     Vec3 rootToScreenLocal {};
     Vec3 screenGripLocalPositionMeters {};
+    Vec3 scalePivotGripLocalPositionMeters {};
+    float nativeDeviceScale = 1.0f;
     Quat screenGripLocalRotation { 0.0f, 0.0f, 0.0f, 1.0f };
     bool hostSpatialValid {};
     bool valid {};
@@ -662,6 +684,22 @@ UInt16 g_lastExternalXInputButtons = 0;
 UInt32 g_lastExternalXInputNavMask = 0;
 UInt64 g_lastExternalXInputNavMs = 0;
 UInt64 g_lastPipBoyMenuChordMs = 0;
+UInt64 g_lastUserPauseRequestMs = 0;
+fnvxr::input::NativeControlPulses g_nativeControlPulses;
+fnvxr::input::NativeMenuKeyPulses g_nativeMenuKeyPulses;
+fnvxr::input::NativeInputPulses<8> g_nativeMenuMousePulses;
+fnvxr::input::NativeControlPulses g_nativeMenuControlPulses;
+fnvxr::input::NativeMenuAnalogMotion g_nativeLockPickMotion;
+std::int32_t g_nativeMenuMouseDelta = 0;
+void* g_nativeMenuMouseMovementOriginal = nullptr;
+void* g_nativeMenuKeyTrampoline = nullptr;
+void* g_nativeMenuMouseTrampoline = nullptr;
+DWORD g_nativeMenuKeyThreadId = 0;
+void* g_nativeMenuKeyOwner = nullptr;
+bool g_nativeMenuInputAllowed = false;
+void* g_nativeControlTrampoline = nullptr;
+DWORD g_nativeControlThreadId = 0;
+bool g_nativeControlInputAllowed = false;
 UInt32 g_loggedExternalXInput = 0;
 SharedXInputState g_lastStableExternalXInput {};
 bool g_haveLastStableExternalXInput = false;
@@ -746,6 +784,14 @@ RetailRigContinuityPose g_retailRigContinuityPose {};
 void* g_livePipBoyScaleNode = nullptr;
 float g_livePipBoyBaseScale = 1.0f;
 float g_livePipBoyAppliedScale = 1.0f;
+struct NativePipBoyMount
+{
+    void* root = nullptr;
+    Vec3 restLocalPosition {};
+    float restLocalScale = 1.0f;
+    fnvxr::kernel::wrist::DeviceScaleTransition scale;
+};
+NativePipBoyMount g_nativePipBoyMount;
 bool g_weaponOrbitWasActive = false;
 int g_weaponOrbitSelectedSlot = -1;
 Vec3 g_latestTrackedLeftHandWorld {};
@@ -792,6 +838,11 @@ UInt64 g_retailRigHeadOnlySamples = 0;
 UInt64 g_retailRigControllerOnlySamples = 0;
 bool g_renderRigPoseOverrideActive = false;
 VrRigPoseSnapshot g_renderRigPoseOverride {};
+fnvxr::engine::FirstPersonView g_preparedFirstPersonView {};
+UInt64 g_preparedFirstPersonViewFrame = 0;
+LONG g_preparedFirstPersonViewSequence = 0;
+DWORD g_preparedFirstPersonViewThread = 0;
+void* g_firstPersonToggleTrampoline = nullptr;
 LONG g_retailRigPoseOriginUnavailableCount = 0;
 LONG g_retailRigPoseOriginSkewCount = 0;
 LONG g_retailRigNoHmdCount = 0;
@@ -1106,6 +1157,14 @@ bool physicalHeadsetPlayRequested()
         && envEnabled("FNVXR_PHYSICAL_HEADSET_PLAY", false);
 }
 
+bool nativeLocomotionConsumerRequested()
+{
+    return physicalHeadsetPlayRequested()
+        || (stereoVisualTrialProfileSelected()
+            && (envEnabled("FNVXR_HEADSET_INVENTORY_VISUAL_TRIAL", false)
+                || envEnabled("FNVXR_HEADSET_COMBAT_VISUAL_TRIAL", false)));
+}
+
 bool physicalHeadsetEngineCenterRigRequested()
 {
     return physicalHeadsetPlayRequested()
@@ -1114,9 +1173,9 @@ bool physicalHeadsetEngineCenterRigRequested()
 
 bool hostSpatialPropReplacementRequested()
 {
-    // The final OpenXR eye owns these replacement categories directly. The
-    // retail scene seam may still move the stock weapon, but must not also
-    // mutate hidden arm/hand/Pip-Boy nodes and create two transform owners.
+    // Shared spatial input and calibration remain active with native geometry.
+    // The per-category FIRST_PERSON_*_ROOT settings choose the render owner;
+    // this flag alone does not mean hands or the Pip-Boy are host-rendered.
     return envEnabled("FNVXR_SPATIAL_HANDS_OVERLAY", false)
         && (stereoVisualTrialProfileSelected()
             || physicalHeadsetPlayProfileSelected());
@@ -3017,6 +3076,16 @@ void publishRuntimeState(
     g_runtimeState->showroomPhase = static_cast<UInt32>(g_showroomPhase);
     g_runtimeState->showroomSceneIndex = g_showroomSceneIndex;
     g_runtimeState->showroomCellFormId = g_showroomCellFormId;
+    using namespace fnvxr::engine::abi;
+    void* player = readPointer(PlayerCharacterAddress);
+    void* scene = readPointer(SceneGraphSingletonPointerAddress);
+    const bool loadedWorld = player && scene
+        && readPointer(reinterpret_cast<std::uintptr_t>(player) + TESObjectRefrParentCellOffset)
+        && readPointer(reinterpret_cast<std::uintptr_t>(player) + PlayerCharacterFirstPersonNodeOffset)
+        && readPointer(reinterpret_cast<std::uintptr_t>(scene) + offsetof(RetailSceneGraphLayout, camera))
+        && readPointer(reinterpret_cast<std::uintptr_t>(scene) + offsetof(RetailSceneGraphLayout, cullingProcess));
+    g_runtimeState->reserved[fnvxr::shared::RuntimeWorldSceneReservedIndex] = loadedWorld
+        ? fnvxr::shared::RuntimeWorldSceneLoaded : 0u;
     fnvxr::shared::endSequencedSharedWrite(g_runtimeState->sequence);
 }
 
@@ -3261,10 +3330,49 @@ void publishDInputMouseClick()
     fnvxr::shared::endSequencedSharedWrite(g_dinputState->sequence);
 }
 
+bool dispatchNativeMenuKey(UInt32 keycode);
+bool dispatchNativeGameplayKey(UInt32 keycode);
+bool dispatchNativeMenuInputKey(UInt32 keycode);
+
+UInt32 nativeControlForKey(UInt32 keycode)
+{
+    switch (keycode)
+    {
+        case MouseButtonOffset: return 4u;
+        case DIK_E: return 5u;
+        case MouseButtonOffset + 1: return 6u;
+        case DIK_R: return 7u;
+        case DIK_LCONTROL: return 8u;
+        case DIK_LSHIFT: return 9u;
+        case DIK_SPACE: return 12u;
+        case DIK_T: return 15u;
+        case 0x2F: return 16u; // VATS
+        case DIK_1: return 17u;
+        case DIK_2: return 18u; // Ammo swap
+        case DIK_3: return 19u;
+        case DIK_4: return 20u;
+        case DIK_5: return 21u;
+        case DIK_6: return 22u;
+        case DIK_7: return 23u;
+        case DIK_8: return 24u;
+        case 0x2C: return 27u; // Grab
+        default: return 28u;
+    }
+}
+
 bool tapDirectInputKey(UInt32 keycode)
 {
     if (keycode >= MaxDirectInputMacros)
         return false;
+
+    // Menus must reach the selected game-thread consumer. The transparent
+    // product DirectInput proxy does not consume the historical shared queue.
+    if (keycode == DIK_ESCAPE)
+        return dispatchNativeMenuKey(keycode);
+    if (g_nativeMenuInputAllowed)
+        return dispatchNativeMenuInputKey(keycode);
+    if (g_nativeControlInputAllowed && nativeControlForKey(keycode) < 28u)
+        return dispatchNativeGameplayKey(keycode);
 
     bool published = false;
     // The proxy-owned shared queue is the durable VR input lane: unlike the
@@ -3480,6 +3588,33 @@ UInt32 visibleGenericBlockingMenuType()
             return menuType;
     }
     return 0;
+}
+
+UInt32 topNativeMenuType()
+{
+    void* manager = readPointer(InterfaceManagerAddress);
+    if (!manager)
+        return 0;
+    std::array<std::uint32_t, 10> stack{};
+    for (std::size_t i = 0; i < stack.size(); ++i)
+        stack[i] = readUInt32(reinterpret_cast<std::uintptr_t>(manager) + 0x114 + i * 4);
+    const UInt32 top = fnvxr::ui::nativeMenuStackTop(stack);
+    if (top != 1)
+        return validatedVisibleMenu(top) ? top : 0;
+    const UInt32 pipBoyMenus[] = {
+        1035u, 1061u, kMenuTypeInventory, kMenuTypeMap, kMenuTypeStats
+    };
+    for (const UInt32 menuType : pipBoyMenus)
+        if (validatedVisibleMenu(menuType))
+            return menuType;
+    return 0;
+}
+
+bool nativeFirstPersonHandsRequested()
+{
+    return (stereoVisualTrialProfileSelected() || physicalHeadsetPlayProfileSelected())
+        && envEnabled("FNVXR_FIRST_PERSON_LEFT_HAND_ROOT", false)
+        && envEnabled("FNVXR_FIRST_PERSON_RIGHT_HAND_ROOT", false);
 }
 
 UInt32 activeInterfaceMenuType()
@@ -4018,6 +4153,14 @@ bool strictFirstPersonEnabled()
 bool forceFirstPersonCameraMode(const char* source, UInt64 frame)
 {
     if (!strictFirstPersonEnabled())
+        return true;
+
+    // VATS owns its attack animation/camera state until the queue completes.
+    // The engine-center VR view has a separate body anchor; toggling the
+    // native perspective repeatedly here rebuilds animation during playback.
+    if ((physicalHeadsetEngineCenterRigRequested()
+            || headsetControllerRigVisualTrialRequested())
+        && readUInt32(0x011F2258) != 0u)
         return true;
 
     void* player = readPointer(PlayerCharacterAddress);
@@ -5306,6 +5449,60 @@ bool writeJump(UInt32 source, void* target)
     return true;
 }
 
+bool __fastcall hookedFirstPersonToggle(void* player, void*, bool firstPerson)
+{
+    using ToggleFn = bool (__thiscall*)(void*, bool);
+    if (!firstPerson && strictFirstPersonEnabled()
+        && player == readPointer(PlayerCharacterAddress)
+        && (physicalHeadsetEngineCenterRigRequested()
+            || headsetControllerRigVisualTrialRequested()))
+    {
+        firstPerson = true;
+        static UInt32 prevented = 0;
+        if (++prevented <= 12u || prevented % 120u == 0u)
+            logTelemetry("firstPerson native cinematic switch prevented count=%lu vatsMode=%lu\n",
+                prevented, readUInt32(0x011F2258));
+    }
+    return reinterpret_cast<ToggleFn>(g_firstPersonToggleTrampoline)(player, firstPerson);
+}
+
+bool installFirstPersonTogglePolicy()
+{
+    if (g_firstPersonToggleTrampoline || !strictFirstPersonEnabled()) return true;
+    // Owned loaded 1.4.0.525 PlayerCharacter::ToggleFirstPerson: 375 bytes,
+    // __thiscall(bool), callee pops 4. Its native implementation updates both
+    // perspective and animation ownership. Redirecting the request BEFORE that
+    // transition keeps VATS on the native first-person world/sky/body path.
+    constexpr UInt32 address = PlayerCharacterToggleFirstPersonAddress;
+    __try
+    {
+        const auto* code = pointerFromAddress32<const UInt8*>(address);
+        UInt64 hash = 14695981039346656037ull;
+        for (std::size_t i = 0; i < 375u; ++i) hash = (hash ^ code[i]) * 1099511628211ull;
+        if (hash != 0xa728206a27242bfeull) return false;
+        auto* relay = static_cast<UInt8*>(VirtualAlloc(nullptr, 11u,
+            MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+        if (!relay) return false;
+        std::memcpy(relay, code, 6u); // push ebp; mov ebp,esp; sub esp,8
+        relay[6] = 0xE9;
+        const UInt32 back = address + 6u - (address32FromPointer(relay) + 11u);
+        std::memcpy(relay + 7u, &back, sizeof(back));
+        DWORD protection = 0;
+        if (!VirtualProtect(relay, 11u, PAGE_EXECUTE_READ, &protection))
+        { VirtualFree(relay, 0, MEM_RELEASE); return false; }
+        FlushInstructionCache(GetCurrentProcess(), relay, 11u);
+        g_firstPersonToggleTrampoline = relay;
+        if (!writeJump(address, reinterpret_cast<void*>(&hookedFirstPersonToggle)))
+        {
+            g_firstPersonToggleTrampoline = nullptr;
+            VirtualFree(relay, 0, MEM_RELEASE); return false;
+        }
+        logTelemetry("firstPerson native perspective policy installed address=0x00950110\n");
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
 bool installCameraHook()
 {
     if (stereoVisualTrialProfileSelected())
@@ -5469,12 +5666,9 @@ float quaternionAngularDistance(Quat left, Quat right)
 
 float matrixAngularDistance(const Matrix33& left, const Matrix33& right)
 {
-    const Matrix33 delta = multiplyMatrix33(transposeMatrix33(left), right);
-    const float cosine = std::clamp(
-        (delta.m[0][0] + delta.m[1][1] + delta.m[2][2] - 1.0f) * 0.5f,
-        -1.0f,
-        1.0f);
-    return std::acos(cosine);
+    // Native FK matrices have floating-point length error. The trace formula
+    // mistakes that error for an angle, even for identical orientations.
+    return quaternionAngularDistance(quatFromMatrix(left), quatFromMatrix(right));
 }
 
 bool finiteVec3(Vec3 value)
@@ -5852,37 +6046,19 @@ bool niObjectAncestorChainVisible(void* object, void* root)
     return false;
 }
 
-void makeRetailVrSurfaceVisible(void* node, int depth, UInt32& visits)
+void makeRetailVrSurfaceVisible(void* node)
 {
-    if (!node || depth > 64 || ++visits > 4096 || niObjectKind(node) == 0)
+    if (!node || niObjectKind(node) == 0)
         return;
+    // Only the published surface root is hidden by the stock first-person
+    // pass. Children retain native visibility (including dismemberment caps).
     const auto base = reinterpret_cast<std::uintptr_t>(node);
     __try
     {
         auto* flags = reinterpret_cast<UInt32*>(base + NiAvObjectFlagsOffset);
         *flags &= ~1u;
     }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
-        return;
-    }
-    void** children = nullptr;
-    UInt16 count = 0;
-    if (!readNiNodeChildren(node, &children, count))
-        return;
-    for (UInt16 index = 0; index < count; ++index)
-    {
-        void* child = nullptr;
-        __try { child = children[index]; }
-        __except (EXCEPTION_EXECUTE_HANDLER) { child = nullptr; }
-        makeRetailVrSurfaceVisible(child, depth + 1, visits);
-    }
-}
-
-void makeRetailVrSurfaceVisible(void* node)
-{
-    UInt32 visits = 0;
-    makeRetailVrSurfaceVisible(node, 0, visits);
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
 
 UInt32 countVisibleNiLeaves(void* node, void* root, int depth, UInt32& visits)
@@ -6516,6 +6692,8 @@ RetailArmNodes discoverRetailArm(void* root, bool left)
     arm.upperArm = findUniqueNiNode(root, name);
     sprintf_s(name, "Bip01 %s Forearm", side);
     arm.forearm = findUniqueNiNode(root, name);
+    sprintf_s(name, "Bip01 %s ForeTwist", side);
+    arm.forearmTwist = findUniqueNiNode(root, name);
     sprintf_s(name, "Bip01 %s Hand", side);
     arm.hand = findUniqueNiNode(root, name);
     return arm;
@@ -6527,6 +6705,7 @@ bool discoverRetailRigNodes(void* root)
         return false;
     RetailRigNodes discovered {};
     discovered.root = root;
+    discovered.bodySkeleton = findUniqueNiNode(root, "Bip");
     discovered.left = discoverRetailArm(root, true);
     discovered.right = discoverRetailArm(root, false);
     UInt32 weaponMatches = 0;
@@ -6545,9 +6724,9 @@ bool discoverRetailRigNodes(void* root)
     discovered.pipBoyScreen = discovered.pipBoy
         ? findUniqueNiNode(discovered.pipBoy, "ScreenLit")
         : nullptr;
-    discovered.pipBoyScreenSurface = discovered.pipBoyScreen
+    discovered.pipBoyScreenSurface = discovered.pipBoy
         ? findUniqueNiObjectByPrefix(
-            discovered.pipBoyScreen,
+            discovered.pipBoy,
             "pipboyscreen:0")
         : nullptr;
     discovered.projectileNode = findUniqueNiNode(root, "ProjectileNode", &projectileMatches);
@@ -7028,7 +7207,11 @@ bool alignBoneToDirection(void* bone, void* child, Vec3 desiredDirection)
         desiredWorldRotation);
     if (!finiteMatrix33(desiredLocalRotation))
         return false;
-    if (!writeMatrix33(boneBase + NiAvObjectLocalRotationOffset, desiredLocalRotation))
+    // This solve can run several times between native animation updates.
+    // Reproject onto a rotation each time so matrix multiplication cannot
+    // accumulate scale/shear into the skinned arm and its weapon socket.
+    if (!writeMatrix33(boneBase + NiAvObjectLocalRotationOffset,
+            matrixFromQuat(quatFromMatrix(desiredLocalRotation))))
         return false;
     forwardKinematics(bone);
     return true;
@@ -7156,15 +7339,17 @@ Matrix33 nifHandToXrMeshMatrix()
     };
 }
 
-bool measureHostSpatialPipBoyCalibration()
+bool measureHostSpatialPipBoyCalibration(bool refreshFromPosedForearm = false)
 {
-    if (g_retailPipBoyCalibration.hostSpatialValid)
+    if (g_retailPipBoyCalibration.hostSpatialValid && !refreshFromPosedForearm)
         return true;
     void* const hand = g_retailRigNodes.left.hand;
+    void* const forearm = g_retailRigNodes.left.forearm;
     void* const screen = g_retailRigNodes.pipBoyScreenSurface
         ? g_retailRigNodes.pipBoyScreenSurface
         : g_retailRigNodes.pipBoyScreen;
-    if (!hand || !screen || niObjectKind(hand) == 0
+    if (!hand || !screen || !forearm || niObjectKind(hand) == 0
+        || niObjectKind(forearm) == 0
         || niObjectKind(screen) == 0)
     {
         return false;
@@ -7183,12 +7368,18 @@ bool measureHostSpatialPipBoyCalibration()
         screenBase + NiAvObjectWorldRotationOffset);
     const Vec3 screenWorldPosition = readVec3(
         screenBase + NiAvObjectWorldTranslationOffset);
+    const Vec3 elbowWorldPosition = readVec3(
+        reinterpret_cast<std::uintptr_t>(forearm) + NiAvObjectWorldTranslationOffset);
+    const Vec3 forearmAxis = subtractVec3(handWorldPosition, elbowWorldPosition);
+    const float forearmLengthSquared = dotVec3(forearmAxis, forearmAxis);
     if (!finiteMatrix33(handWorldRotation)
         || !finiteVec3(handWorldPosition)
         || !std::isfinite(handWorldScale)
         || std::fabs(handWorldScale) < 0.0001f
         || !finiteMatrix33(screenWorldRotation)
-        || !finiteVec3(screenWorldPosition))
+        || !finiteVec3(screenWorldPosition)
+        || !finiteVec3(elbowWorldPosition)
+        || !std::isfinite(forearmLengthSquared) || forearmLengthSquared < 1.0f)
     {
         return false;
     }
@@ -7214,17 +7405,31 @@ bool measureHostSpatialPipBoyCalibration()
         1.0f / unitsPerMeter);
     g_retailPipBoyCalibration.screenGripLocalRotation = quatFromMatrix(
         multiplyMatrix33(handToHost, screenHandLocalRotation));
+    // The scale pivot lies inside the actual solved forearm, directly beneath
+    // the authored screen. Keeping the full hand-to-screen offset in the
+    // scale transform made enlargement pull the casing toward the elbow.
+    const float alongArm = std::clamp(dotVec3(
+        subtractVec3(screenWorldPosition, elbowWorldPosition), forearmAxis)
+        / forearmLengthSquared, 0.0f, 1.0f);
+    const Vec3 pivotWorld = addVec3(elbowWorldPosition, scaleVec3(forearmAxis, alongArm));
+    g_retailPipBoyCalibration.scalePivotGripLocalPositionMeters = scaleVec3(
+        transformVec3(handToHost, transformVec3(handInverse,
+            subtractVec3(pivotWorld, handWorldPosition))),
+        1.0f / (handWorldScale * unitsPerMeter));
     const float offsetMeters = lengthVec3(
         g_retailPipBoyCalibration.screenGripLocalPositionMeters);
     g_retailPipBoyCalibration.hostSpatialValid = finiteVec3(
             g_retailPipBoyCalibration.screenGripLocalPositionMeters)
+        && finiteVec3(g_retailPipBoyCalibration.scalePivotGripLocalPositionMeters)
         && std::isfinite(offsetMeters)
         && offsetMeters >= 0.02f
         && offsetMeters <= 0.40f
         && finiteUsableQuat(
             g_retailPipBoyCalibration.screenGripLocalRotation);
-    logTelemetry(
-        "retailPipBoy host calibration valid=%d hand=%p screen=%p source=stock-left-hand-to-screen gripLocalPositionMeters=(%.6f %.6f %.6f) gripLocalQuat=(%.7f %.7f %.7f %.7f) offsetMeters=%.6f\n",
+    static UInt64 calibrationUpdates = 0;
+    if (++calibrationUpdates <= 5u || calibrationUpdates % 240u == 0u)
+        logTelemetry(
+        "retailPipBoy host calibration valid=%d hand=%p screen=%p source=posed-native-forearm-screen gripLocalPositionMeters=(%.6f %.6f %.6f) gripLocalQuat=(%.7f %.7f %.7f %.7f) offsetMeters=%.6f\n",
         g_retailPipBoyCalibration.hostSpatialValid ? 1 : 0,
         hand,
         screen,
@@ -7237,6 +7442,129 @@ bool measureHostSpatialPipBoyCalibration()
         g_retailPipBoyCalibration.screenGripLocalRotation.w,
         offsetMeters);
     return g_retailPipBoyCalibration.hostSpatialValid;
+}
+
+void releaseOwnedNiObject(void* object)
+{
+    if (!object) return;
+    if (InterlockedDecrement(reinterpret_cast<volatile LONG*>(
+            reinterpret_cast<std::uintptr_t>(object) + 4u)) == 0)
+    {
+        using Free = void (__thiscall*)(void*);
+        reinterpret_cast<Free>((*reinterpret_cast<void***>(object))[1])(object);
+    }
+}
+
+void retainNiObject(void* object)
+{
+    if (object) InterlockedIncrement(reinterpret_cast<volatile LONG*>(
+        reinterpret_cast<std::uintptr_t>(object) + 4u));
+}
+
+void updateNativePipBoyScreenTexture()
+{
+    // Retail NiGeometry::shaderProp and BSShaderNoLightingProperty::srcTexture.
+    // Use the game's existing rendered-menu NiTexture, so native depth and the
+    // authored curved screen/UVs remain responsible for every screen pixel.
+    void* const screen = g_retailRigNodes.pipBoyScreenSurface;
+    if (!screen || niObjectKind(screen) != 1) return;
+    void* const property = readPointer(reinterpret_cast<std::uintptr_t>(screen) + 0xA8u);
+    if (!property || readUInt32(reinterpret_cast<std::uintptr_t>(property)) != 0x010AE670u)
+        return;
+    static void* heldProperty = nullptr;
+    static void* dormantTexture = nullptr;
+    const auto slot = reinterpret_cast<std::uintptr_t>(property) + 0x60u;
+    if (heldProperty != property)
+    {
+        void* const original = readPointer(slot);
+        retainNiObject(property);
+        retainNiObject(original);
+        releaseOwnedNiObject(dormantTexture);
+        releaseOwnedNiObject(heldProperty);
+        heldProperty = property;
+        dormantTexture = original;
+    }
+    void* texture = dormantTexture;
+    if (isPipboyVisible())
+    {
+        // BSTM_RT_INTERFACE_RENDEREDMENU, assigned by the native allocator at
+        // 0x871B02. BSRenderedTexture +0x30 owns its NiRenderedTexture.
+        void* const rendered = readPointer(0x011DEC64u);
+        texture = rendered ? readPointer(reinterpret_cast<std::uintptr_t>(rendered) + 0x30u) : nullptr;
+        if (!texture || readUInt32(reinterpret_cast<std::uintptr_t>(texture)) != 0x0109DF8Cu)
+            return;
+    }
+    void* const previous = readPointer(slot);
+    if (texture == previous) return;
+    retainNiObject(texture);
+    *reinterpret_cast<void**>(slot) = texture;
+    releaseOwnedNiObject(previous);
+    static UInt64 textureUpdates = 0;
+    static bool previousLive = false;
+    const bool live = isPipboyVisible();
+    if (++textureUpdates <= 5u || textureUpdates % 240u == 0u || previousLive != live)
+        logTelemetry("retailPipBoy native screen texture screen=%p property=%p texture=%p live=%d\n",
+            screen, property, texture, live ? 1 : 0);
+    previousLive = live;
+}
+
+bool updateNativePipBoyMount(const VrRigPoseSnapshot& pose)
+{
+    void* const root = g_retailRigNodes.pipBoy;
+    if (!root || niObjectKind(root) != 2) return false;
+    const auto rootBase = reinterpret_cast<std::uintptr_t>(root);
+    void* const parent = readPointer(rootBase + NiAvObjectParentOffset);
+    if (!parent || niObjectKind(parent) != 2) return false;
+    if (g_nativePipBoyMount.root != root)
+    {
+        g_nativePipBoyMount = {};
+        g_nativePipBoyMount.root = root;
+        g_nativePipBoyMount.restLocalPosition = readVec3(
+            rootBase + NiAvObjectLocalTranslationOffset);
+        g_nativePipBoyMount.restLocalScale = readFloat(
+            rootBase + NiAvObjectLocalScaleOffset, 0.0f);
+    }
+    const auto& mount = g_nativePipBoyMount;
+    if (!finiteVec3(mount.restLocalPosition)
+        || !std::isfinite(mount.restLocalScale) || mount.restLocalScale <= 0.0f)
+        return false;
+    // Reconstruct the authored attachment before measuring it. Never feed a
+    // previous enlargement back into the next frame's base transform.
+    if (!writeVec3(rootBase + NiAvObjectLocalTranslationOffset, mount.restLocalPosition)
+        || !writeFloat(rootBase + NiAvObjectLocalScaleOffset, mount.restLocalScale))
+        return false;
+    forwardKinematics(root);
+    if (!measureHostSpatialPipBoyCalibration(true)) return false;
+
+    const float focusScale = g_nativePipBoyMount.scale.advance(
+        isPipboyVisible() ? 1.35f : 1.0f, pose.predictedDisplayTime);
+    const float scale = focusScale
+        * std::clamp(getFloatFromEnv("FNVXR_PIPBOY_SCALE", 1.0f), 0.25f, 4.0f);
+    const auto handBase = reinterpret_cast<std::uintptr_t>(g_retailRigNodes.left.hand);
+    const float units = getFloatFromEnv("FNVXR_D3D9_GAME_UNITS_PER_METER", 70.0f);
+    const Vec3 pivotHand = scaleVec3(transformVec3(transposeMatrix33(nifHandToXrMeshMatrix()),
+        g_retailPipBoyCalibration.scalePivotGripLocalPositionMeters),
+        units * readFloat(handBase + NiAvObjectWorldScaleOffset, 1.0f));
+    const Vec3 pivotWorld = addVec3(readVec3(handBase + NiAvObjectWorldTranslationOffset),
+        transformVec3(readMatrix33(handBase + NiAvObjectWorldRotationOffset), pivotHand));
+    const auto parentBase = reinterpret_cast<std::uintptr_t>(parent);
+    const float parentScale = readFloat(parentBase + NiAvObjectWorldScaleOffset, 0.0f);
+    if (!std::isfinite(parentScale) || parentScale <= 0.0f) return false;
+    const Vec3 pivotLocal = scaleVec3(transformVec3(
+        transposeMatrix33(readMatrix33(parentBase + NiAvObjectWorldRotationOffset)),
+        subtractVec3(pivotWorld, readVec3(parentBase + NiAvObjectWorldTranslationOffset))),
+        1.0f / parentScale);
+    const Vec3 enlargedPosition = addVec3(pivotLocal,
+        scaleVec3(subtractVec3(mount.restLocalPosition, pivotLocal), scale));
+    if (!finiteVec3(enlargedPosition)
+        || !writeVec3(rootBase + NiAvObjectLocalTranslationOffset, enlargedPosition)
+        || !writeFloat(rootBase + NiAvObjectLocalScaleOffset, mount.restLocalScale * scale))
+        return false;
+    makeRetailVrSurfaceVisible(root);
+    forwardKinematics(root);
+    updateNativePipBoyScreenTexture();
+    g_retailPipBoyCalibration.nativeDeviceScale = scale;
+    return true;
 }
 
 Quat retailRightHandMeshGripLocalRotation(
@@ -7316,12 +7644,30 @@ void ensureRetailHandCalibration(
     calibration.forearmLength = lengthVec3(subtractVec3(
         handWorldPosition,
         forearmWorldPosition));
+    calibration.forearmRestTranslation = readVec3(
+        reinterpret_cast<std::uintptr_t>(arm.forearm) + NiAvObjectLocalTranslationOffset);
+    calibration.handRestTranslation = readVec3(handBase + NiAvObjectLocalTranslationOffset);
+    if (arm.forearmTwist)
+    {
+        calibration.handToForearmTwistRotation = multiplyMatrix33(
+            transposeMatrix33(handWorldRotation),
+            readMatrix33(reinterpret_cast<std::uintptr_t>(arm.forearmTwist)
+                + NiAvObjectWorldRotationOffset));
+        calibration.forearmTwistCalibrationValid =
+            finiteMatrix33(calibration.handToForearmTwistRotation);
+    }
     const bool bodyAnchoredControllerRig =
         (headsetControllerRigVisualTrialRequested()
             && headlessStereoRigVisualTrialLeaseCurrent())
         || physicalHeadsetEngineCenterRigRequested();
     if (bodyAnchoredControllerRig)
     {
+        const fnvxr::kernel::BodyRigConfig bodyConfig {};
+        const float units = getFloatFromEnv("FNVXR_D3D9_GAME_UNITS_PER_METER", 70.0f);
+        calibration.upperArmLength = units * getFloatFromEnv(
+            "FNVXR_BODY_UPPER_ARM_LENGTH", bodyConfig.upperArmLengthMeters);
+        calibration.forearmLength = units * getFloatFromEnv(
+            "FNVXR_BODY_FOREARM_LENGTH", bodyConfig.forearmLengthMeters);
         // The controller position is already an absolute, meter-scaled pose
         // in the stable body frame.  Only an explicit ergonomic offset may be
         // added here.  Calibrating from the animated hand would preserve a
@@ -7367,6 +7713,76 @@ void ensureRetailHandCalibration(
         envEnabled("FNVXR_RETAIL_RIG_AUTO_CALIBRATE_POSITION", false) ? 1 : 0);
 }
 
+bool placeRetailBodyAtShoulders(Vec3 target)
+{
+    auto& rig = g_retailRigNodes;
+    if (!rig.bodySkeleton || !rig.left.upperArm || !rig.right.upperArm
+        || !finiteVec3(target)) return false;
+    const auto body = reinterpret_cast<std::uintptr_t>(rig.bodySkeleton);
+    void* parent = readPointer(body + NiAvObjectParentOffset);
+    if (!parent) return false;
+    const auto parentBase = reinterpret_cast<std::uintptr_t>(parent);
+    const Matrix33 bodyRotation = readMatrix33(body + NiAvObjectWorldRotationOffset);
+    const float bodyScale = readFloat(body + NiAvObjectWorldScaleOffset, 0.0f);
+    const Matrix33 parentRotation = readMatrix33(parentBase + NiAvObjectWorldRotationOffset);
+    const float parentScale = readFloat(parentBase + NiAvObjectWorldScaleOffset, 0.0f);
+    if (!finiteMatrix33(bodyRotation) || !finiteMatrix33(parentRotation)
+        || !std::isfinite(bodyScale) || bodyScale < 0.0001f
+        || !std::isfinite(parentScale) || parentScale < 0.0001f) return false;
+    if (!rig.bodyShoulderCalibrationValid)
+    {
+        const Vec3 shoulders = scaleVec3(addVec3(
+            readVec3(reinterpret_cast<std::uintptr_t>(rig.left.upperArm)
+                + NiAvObjectWorldTranslationOffset),
+            readVec3(reinterpret_cast<std::uintptr_t>(rig.right.upperArm)
+                + NiAvObjectWorldTranslationOffset)), 0.5f);
+        rig.bodyToShoulderCenter = scaleVec3(transformVec3(transposeMatrix33(bodyRotation),
+            subtractVec3(shoulders, readVec3(body + NiAvObjectWorldTranslationOffset))),
+            1.0f / bodyScale);
+        rig.bodyShoulderCalibrationValid = finiteVec3(rig.bodyToShoulderCenter);
+        if (!rig.bodyShoulderCalibrationValid) return false;
+    }
+    // Retarget the skeleton supporting the torso before the two arms. Moving
+    // only clavicles leaves the stock view-model chest beside the eyes and
+    // stretches its shoulder weights through the lower field of view.
+    const Vec3 bodyTarget = subtractVec3(target, transformVec3(bodyRotation,
+        scaleVec3(rig.bodyToShoulderCenter, bodyScale)));
+    const Vec3 local = scaleVec3(transformVec3(transposeMatrix33(parentRotation),
+        subtractVec3(bodyTarget, readVec3(parentBase + NiAvObjectWorldTranslationOffset))),
+        1.0f / parentScale);
+    if (!finiteVec3(local) || !writeVec3(body + NiAvObjectLocalTranslationOffset, local))
+        return false;
+    forwardKinematics(rig.bodySkeleton);
+    return true;
+}
+
+bool nativeFirstPersonPipBoyRequested()
+{
+    return nativeFirstPersonHandsRequested()
+        && envEnabled("FNVXR_FIRST_PERSON_PIPBOY_ROOT", false);
+}
+
+bool placeRetailArmShoulder(const RetailArmNodes& arm, Vec3 target)
+{
+    if (!arm.clavicle || !arm.upperArm || !finiteVec3(target)) return false;
+    const auto clavicle = reinterpret_cast<std::uintptr_t>(arm.clavicle);
+    void* parent = readPointer(clavicle + NiAvObjectParentOffset);
+    if (!parent) return false;
+    const auto parentBase = reinterpret_cast<std::uintptr_t>(parent);
+    const Vec3 shoulder = readVec3(reinterpret_cast<std::uintptr_t>(arm.upperArm)
+        + NiAvObjectWorldTranslationOffset);
+    const Matrix33 parentRotation = readMatrix33(parentBase + NiAvObjectWorldRotationOffset);
+    const float parentScale = readFloat(parentBase + NiAvObjectWorldScaleOffset, 0.0f);
+    if (!finiteVec3(shoulder) || !finiteMatrix33(parentRotation)
+        || !std::isfinite(parentScale) || std::fabs(parentScale) < 0.0001f) return false;
+    const Vec3 localDelta = scaleVec3(transformVec3(transposeMatrix33(parentRotation),
+        subtractVec3(target, shoulder)), 1.0f / parentScale);
+    const Vec3 position = addVec3(readVec3(clavicle + NiAvObjectLocalTranslationOffset), localDelta);
+    if (!finiteVec3(position) || !writeVec3(clavicle + NiAvObjectLocalTranslationOffset, position)) return false;
+    forwardKinematics(arm.clavicle);
+    return true;
+}
+
 bool applyRetailArmFabrik(
     const RetailArmNodes& arm,
     RetailHandCalibration& calibration,
@@ -7404,8 +7820,45 @@ bool applyRetailArmFabrik(
             || (headsetControllerRigVisualTrialRequested()
                 && headlessStereoRigVisualTrialLeaseCurrent());
 
-    const Vec3 shoulder = readVec3(
+    if (controllerOwnedHand && applyWrites)
+    {
+        // Adjust both native bone lengths together from the shared body rig.
+        // Do not lengthen only the terminal wrist after solving a shorter arm.
+        const auto setLength = [](void* child, Vec3 authored, float worldLength) {
+            const auto childBase = reinterpret_cast<std::uintptr_t>(child);
+            void* parent = readPointer(childBase + NiAvObjectParentOffset);
+            if (!parent || !finiteVec3(authored) || lengthVec3(authored) < 0.0001f)
+                return false;
+            const float scale = readFloat(reinterpret_cast<std::uintptr_t>(parent)
+                + NiAvObjectWorldScaleOffset, 0.0f);
+            return std::isfinite(scale) && scale > 0.0001f
+                && std::isfinite(worldLength) && worldLength > 0.01f
+                && writeVec3(childBase + NiAvObjectLocalTranslationOffset,
+                    scaleVec3(normalizeVec3(authored), worldLength / scale));
+        };
+        if (!setLength(arm.forearm, calibration.forearmRestTranslation, calibration.upperArmLength)
+            || !setLength(arm.hand, calibration.handRestTranslation, calibration.forearmLength))
+            return false;
+        forwardKinematics(arm.upperArm);
+    }
+    Vec3 shoulder = readVec3(
         reinterpret_cast<std::uintptr_t>(arm.upperArm) + NiAvObjectWorldTranslationOffset);
+    if (controllerOwnedHand && applyWrites)
+    {
+        const Vec3 shoulderToTarget = subtractVec3(target, shoulder);
+        const float distance = lengthVec3(shoulderToTarget);
+        const float comfortableReach = (calibration.upperArmLength + calibration.forearmLength) * 0.97f;
+        const float units = getFloatFromEnv("FNVXR_D3D9_GAME_UNITS_PER_METER", 70.0f);
+        const float protraction = std::clamp(distance - comfortableReach, 0.0f,
+            units * std::clamp(getFloatFromEnv("FNVXR_RETAIL_RIG_MAX_SHOULDER_REACH_METERS", 0.10f), 0.0f, 0.15f));
+        if (protraction > 0.0f && distance > 0.0001f)
+        {
+            if (!placeRetailArmShoulder(arm, addVec3(shoulder,
+                    scaleVec3(shoulderToTarget, protraction / distance)))) return false;
+            shoulder = readVec3(reinterpret_cast<std::uintptr_t>(arm.upperArm)
+                + NiAvObjectWorldTranslationOffset);
+        }
+    }
     const Vec3 elbow = readVec3(
         reinterpret_cast<std::uintptr_t>(arm.forearm) + NiAvObjectWorldTranslationOffset);
     const Vec3 wrist = readVec3(
@@ -7427,7 +7880,20 @@ bool applyRetailArmFabrik(
         getFloatFromEnv("FNVXR_RETAIL_RIG_ELBOW_POLE_FORWARD", -15.0f),
         getFloatFromEnv("FNVXR_RETAIL_RIG_ELBOW_POLE_UP", -25.0f)
     };
-    const Vec3 pole = addVec3(shoulder, transformVec3(bodyWorldRotation, poleLocal));
+    Vec3 pole = addVec3(shoulder, transformVec3(bodyWorldRotation, poleLocal));
+    const Matrix33 desiredHandWorldRotation = multiplyMatrix33(
+        controller.wristRotation, calibration.controllerToHandRotation);
+    if (controllerOwnedHand)
+    {
+        // In the authored skeleton +X runs from elbow through wrist/fingers.
+        // Prefer an elbow behind that wrist axis, retaining a torso bias near
+        // singularities rather than bending the wrist sideways into its cuff.
+        const Vec3 wristElbow = subtractVec3(target,
+            scaleVec3(transformVec3(desiredHandWorldRotation, {1.0f, 0.0f, 0.0f}), lengths[1]));
+        const float wristWeight = std::clamp(
+            getFloatFromEnv("FNVXR_RETAIL_RIG_WRIST_ELBOW_WEIGHT", 0.75f), 0.0f, 1.0f);
+        pole = addVec3(scaleVec3(pole, 1.0f - wristWeight), scaleVec3(wristElbow, wristWeight));
+    }
     const float shoulderTargetDistance = lengthVec3(subtractVec3(target, shoulder));
     const float maximumReach = lengths[0] + lengths[1];
     const float minimumReach = std::fabs(lengths[0] - lengths[1]);
@@ -7539,9 +8005,6 @@ bool applyRetailArmFabrik(
     const Matrix33 parentWorldRotation = handParent
         ? readMatrix33(reinterpret_cast<std::uintptr_t>(handParent) + NiAvObjectWorldRotationOffset)
         : Matrix33 { { { 1.0f, 0.0f, 0.0f }, { 0.0f, 1.0f, 0.0f }, { 0.0f, 0.0f, 1.0f } } };
-    const Matrix33 desiredHandWorldRotation = multiplyMatrix33(
-        controller.wristRotation,
-        calibration.controllerToHandRotation);
     const Matrix33 desiredHandLocalRotation = multiplyMatrix33(
         transposeMatrix33(parentWorldRotation),
         desiredHandWorldRotation);
@@ -7577,11 +8040,34 @@ bool applyRetailArmFabrik(
     }
     if (!writeMatrix33(
             reinterpret_cast<std::uintptr_t>(arm.hand) + NiAvObjectLocalRotationOffset,
-            desiredHandLocalRotation))
+            matrixFromQuat(quatFromMatrix(desiredHandLocalRotation))))
     {
         return false;
     }
     forwardKinematics(arm.hand);
+
+    if (arm.forearmTwist && calibration.forearmTwistCalibrationValid)
+    {
+        // ForeTwist is a sibling of Hand, rooted at the elbow. Match wrist
+        // roll while keeping its longitudinal axis on the solved forearm.
+        const Matrix33 wantedTwist = multiplyMatrix33(desiredHandWorldRotation,
+            calibration.handToForearmTwistRotation);
+        const Vec3 forearmDirection = subtractVec3(target,
+            readVec3(reinterpret_cast<std::uintptr_t>(arm.forearm)
+                + NiAvObjectWorldTranslationOffset));
+        const Matrix33 swing = rotationFromTo(
+            transformVec3(wantedTwist, {1.0f, 0.0f, 0.0f}), forearmDirection);
+        void* twistParent = readPointer(reinterpret_cast<std::uintptr_t>(arm.forearmTwist)
+            + NiAvObjectParentOffset);
+        if (!twistParent) return false;
+        const Matrix33 twistLocal = multiplyMatrix33(transposeMatrix33(
+            readMatrix33(reinterpret_cast<std::uintptr_t>(twistParent) + NiAvObjectWorldRotationOffset)),
+            multiplyMatrix33(swing, wantedTwist));
+        if (!finiteMatrix33(twistLocal) || !writeMatrix33(
+                reinterpret_cast<std::uintptr_t>(arm.forearmTwist) + NiAvObjectLocalRotationOffset,
+                matrixFromQuat(quatFromMatrix(twistLocal)))) return false;
+        forwardKinematics(arm.forearmTwist);
+    }
 
     const Vec3 appliedWrist = readVec3(
         reinterpret_cast<std::uintptr_t>(arm.hand) + NiAvObjectWorldTranslationOffset);
@@ -7846,6 +8332,8 @@ RetailWeaponApplyResult applyRetailWeaponAim(
                 g_retailWeaponCalibration.weaponToWristLocal = transformVec3(
                     transposeMatrix33(weaponWorldRotation),
                     subtractVec3(stockWristWorld, weaponWorldPosition));
+                g_retailWeaponCalibration.weaponToHandRotation = multiplyMatrix33(
+                    transposeMatrix33(weaponWorldRotation), stockHandWorldRotation);
                 g_retailWeaponCalibration
                     .usesTrackedWristSocketPositionAnchor =
                         finiteVec3(
@@ -7989,7 +8477,7 @@ RetailWeaponApplyResult applyRetailWeaponAim(
             desiredLocalPosition);
         const bool rotationWritten = writeMatrix33(
             weaponBase + NiAvObjectLocalRotationOffset,
-            desiredLocalRotation);
+            matrixFromQuat(quatFromMatrix(desiredLocalRotation)));
         result.writeCommitted = positionWritten && rotationWritten;
         if (result.writeCommitted)
             forwardKinematics(weapon);
@@ -8181,8 +8669,11 @@ void restoreProjectileNodeConsumeHook()
 bool retailRigGameplayAllowed()
 {
     void* player = readPointer(PlayerCharacterAddress);
-    if (!player || readUInt8(
-        reinterpret_cast<std::uintptr_t>(player) + PlayerCharacterIsThirdPersonOffset) != 0)
+    const bool bodyAnchoredFirstPerson = strictFirstPersonEnabled()
+        && (physicalHeadsetEngineCenterRigRequested()
+            || headsetControllerRigVisualTrialRequested());
+    if (!player || (!bodyAnchoredFirstPerson && readUInt8(
+        reinterpret_cast<std::uintptr_t>(player) + PlayerCharacterIsThirdPersonOffset) != 0))
     {
         return false;
     }
@@ -8193,7 +8684,13 @@ bool retailRigGameplayAllowed()
     const bool livePipBoy = fnvxr::engine::live_pipboy::hasFocusedScreen(
             menuBits)
         && !fnvxr::engine::live_pipboy::hasConflictingMenu(menuBits);
-    return gameplay || livePipBoy;
+    const bool pausedWorld = g_runtimeState
+        && fnvxr::shared::runtimeHasLoadedWorld(*g_runtimeState)
+        && runtimePhaseFromMenuBits(menuBits) == RuntimePhase::Menu
+        && (menuBits & fnvxr::shared::RuntimeLoadingMenuBit) == 0u;
+    // Tracking and model publication continue while menu input owns the
+    // controllers. This path never applies gameplay actions or simulation ticks.
+    return gameplay || livePipBoy || pausedWorld;
 }
 
 void resetRetailRigOrigin(const char* reason)
@@ -8382,6 +8879,8 @@ void publishWeaponFrameCommit(
     bool pipBoyScreenPoseValid,
     const Vec3& pipBoyScreenGripLocalPosition,
     const Quat& pipBoyScreenGripLocalRotation,
+    const Vec3& pipBoyScalePivotGripLocalPosition,
+    float pipBoyDeviceScale,
     const Vec3& rightHandWorld,
     const Vec3& weaponWorld,
     const Matrix33& weaponWorldRotation)
@@ -8507,11 +9006,18 @@ void publishWeaponFrameCommit(
         pipBoyScreenGripLocalRotation.z,
         pipBoyScreenGripLocalRotation.w,
     };
+    const float pipBoyScalePivot[3] {
+        pipBoyScalePivotGripLocalPosition.x,
+        pipBoyScalePivotGripLocalPosition.y,
+        pipBoyScalePivotGripLocalPosition.z,
+    };
     for (int i = 0; i < 3; ++i)
     {
         state->leftPipBoyScreenGripLocalPos[i] =
             complete && pipBoyScreenPoseValid
                 ? pipBoyPosition[i] : 0.0f;
+        state->leftPipBoyScalePivotGripLocalPos[i] =
+            complete && pipBoyScreenPoseValid ? pipBoyScalePivot[i] : 0.0f;
     }
     for (int i = 0; i < 4; ++i)
     {
@@ -8520,6 +9026,8 @@ void publishWeaponFrameCommit(
                 ? pipBoyRotation[i]
                 : (i == 3 ? 1.0f : 0.0f);
     }
+    state->leftPipBoyDeviceScale = complete && pipBoyScreenPoseValid
+        ? pipBoyDeviceScale : 1.0f;
     fnvxr::shared::endSequencedSharedWrite(state->producerSequence);
 }
 
@@ -8740,6 +9248,20 @@ void onRetailPostAnimation(void* animData)
     const float bodyWorldScale = readFloat(
         reinterpret_cast<std::uintptr_t>(bodyRoot) + NiAvObjectWorldScaleOffset,
         0.0f);
+    if (nativeFirstPersonHandsRequested() && finiteVec3(bodyWorldPosition))
+    {
+        // Retail temporarily places its first-person skeleton at camera-local
+        // zero. Tracked targets are engine-world positions. Rebase the ENTIRE
+        // skeleton before IK; moving only the terminal hand leaves weighted
+        // forearm/twist vertices in a different coordinate frame.
+        writeVec3(reinterpret_cast<std::uintptr_t>(root)
+            + NiAvObjectWorldTranslationOffset, bodyWorldPosition);
+        void** children = nullptr;
+        UInt16 childCount = 0;
+        if (readNiNodeChildren(root, &children, childCount))
+            for (UInt16 i = 0; i < childCount; ++i)
+                forwardKinematics(children[i]);
+    }
     const Vec3 stableCameraWorld = bodyAnchoredEngineCenterRig
         ? readVec3(
             reinterpret_cast<std::uintptr_t>(root)
@@ -8802,6 +9324,25 @@ void onRetailPostAnimation(void* animData)
     if (!finiteVec3(bodyAnchorWorld))
         return;
 
+    if (g_renderRigPoseOverrideActive && bodyAnchoredEngineCenterRig)
+    {
+        // Actor columns are right/forward/up; NiCamera uses forward/up/right.
+        // Publish the exact body frame used by the two controller solves.
+        for (int row = 0; row < 3; ++row)
+        {
+            g_preparedFirstPersonView.rotation[row * 3] = bodyWorldRotation.m[row][1];
+            g_preparedFirstPersonView.rotation[row * 3 + 1] = bodyWorldRotation.m[row][2];
+            g_preparedFirstPersonView.rotation[row * 3 + 2] = bodyWorldRotation.m[row][0];
+        }
+        g_preparedFirstPersonView.position[0] = bodyAnchorWorld.x;
+        g_preparedFirstPersonView.position[1] = bodyAnchorWorld.y;
+        g_preparedFirstPersonView.position[2] = bodyAnchorWorld.z;
+        g_preparedFirstPersonView.excludedBodyRoot = sharedPointerAddress(bodyRoot);
+        g_preparedFirstPersonViewFrame = pose.frame;
+        g_preparedFirstPersonViewSequence = pose.sequence;
+        g_preparedFirstPersonViewThread = GetCurrentThreadId();
+    }
+
     const RetailControllerWorldPose leftController = retailControllerWorldPose(
         pose, true, bodyAnchorWorld, bodyWorldRotation);
     const RetailControllerWorldPose rightController = retailControllerWorldPose(
@@ -8809,9 +9350,63 @@ void onRetailPostAnimation(void* animData)
     const bool applyWrites = physicalHeadsetPlayRequested()
         || envEnabled("FNVXR_RETAIL_RIG_APPLY", false);
     const bool hostSpatialProps = hostSpatialPropReplacementRequested();
+    const bool nativeHands = nativeFirstPersonHandsRequested();
+    if (nativeHands && hostSpatialProps)
+    {
+        // Capture the authored sockets before either IK chain moves. The
+        // native skinned hands and weapon then use this one attachment chain.
+        measureHostSpatialPipBoyCalibration();
+        if (rightControllerUsable)
+        {
+            applyRetailWeaponAim(rightController, false);
+            ensureRetailHandCalibration(g_retailRightCalibration,
+                g_retailRigNodes.right, rightController, bodyWorldRotation, false);
+            if (g_retailRightCalibration.valid && g_retailWeaponCalibration.valid)
+            {
+                const Matrix33 weaponRotation = multiplyMatrix33(rightController.rotation,
+                    g_retailWeaponCalibration.controllerToWeaponRotation);
+                g_retailRightCalibration.controllerToHandRotation = multiplyMatrix33(
+                    transposeMatrix33(rightController.wristRotation),
+                    multiplyMatrix33(weaponRotation,
+                        g_retailWeaponCalibration.weaponToHandRotation));
+                g_retailRightCalibration.usesStageLocalBodyPositionAnchor = false;
+                g_retailRightCalibration.controllerToWristLocal = transformVec3(
+                    transposeMatrix33(rightController.wristRotation),
+                    subtractVec3(hostSpatialHandWristWorld(rightController, false),
+                        rightController.wristPosition));
+            }
+        }
+        if (leftControllerUsable)
+        {
+            ensureRetailHandCalibration(g_retailLeftCalibration,
+                g_retailRigNodes.left, leftController, bodyWorldRotation, true);
+            const Matrix33 xrToGame {{ {1,0,0}, {0,0,-1}, {0,1,0} }};
+            g_retailLeftCalibration.controllerToHandRotation = multiplyMatrix33(
+                xrToGame, nifHandToXrMeshMatrix());
+        }
+    }
+    if (nativeHands && applyWrites)
+    {
+        // The flat view-model places its shoulders beside the camera and
+        // behind its stock gun pose. Use the shared rig's anatomical shoulder
+        // anchors so tracked wrists do not stretch the glove/forearm weights.
+        const fnvxr::kernel::BodyRigConfig bodyConfig {};
+        const float units = getFloatFromEnv("FNVXR_D3D9_GAME_UNITS_PER_METER", 70.0f);
+        const Vec3 headLocal = xrDeltaToGamebryoVector(xrPositionInOriginFrame(
+            g_retailRigOriginHmdRot, g_retailRigOriginHmdPos, pose.hmdPos));
+        const Vec3 center = addVec3(bodyAnchorWorld, transformVec3(bodyWorldRotation,
+            scaleVec3(addVec3(headLocal, {0.0f,
+                -getFloatFromEnv("FNVXR_BODY_SHOULDER_BACK", bodyConfig.shoulderBackMeters),
+                -getFloatFromEnv("FNVXR_BODY_SHOULDER_DROP", bodyConfig.shoulderDropMeters)}), units)));
+        const Vec3 rightOffset = transformVec3(bodyWorldRotation,
+            {getFloatFromEnv("FNVXR_BODY_SHOULDER_WIDTH", bodyConfig.shoulderWidthMeters) * units * 0.5f, 0.0f, 0.0f});
+        if (!placeRetailBodyAtShoulders(center)) return;
+        placeRetailArmShoulder(g_retailRigNodes.left, subtractVec3(center, rightOffset));
+        placeRetailArmShoulder(g_retailRigNodes.right, addVec3(center, rightOffset));
+    }
     float leftError = 0.0f;
     float rightError = 0.0f;
-    const bool rightSolved = hostSpatialProps
+    const bool rightSolved = hostSpatialProps && !nativeHands
         ? rightControllerUsable
         : rightControllerUsable && applyRetailArmFabrik(
             g_retailRigNodes.right,
@@ -8821,7 +9416,7 @@ void onRetailPostAnimation(void* animData)
             false,
             applyWrites,
             rightError);
-    const bool leftSolved = hostSpatialProps
+    const bool leftSolved = hostSpatialProps && !nativeHands
         ? leftControllerUsable
         : leftControllerUsable && applyRetailArmFabrik(
             g_retailRigNodes.left,
@@ -8833,7 +9428,12 @@ void onRetailPostAnimation(void* animData)
             leftError);
     const bool pipBoyTracked = hostSpatialProps
         ? leftControllerUsable
-            && measureHostSpatialPipBoyCalibration()
+            // The Pip-Boy is parented to ForeTwist, not to Hand. Re-measure
+            // that actual posed socket so wrist flex cannot turn the casing
+            // away from the forearm passing through it.
+            && (nativeFirstPersonPipBoyRequested() && applyWrites
+                ? updateNativePipBoyMount(pose)
+                : measureHostSpatialPipBoyCalibration(nativeHands && applyWrites))
         : leftControllerUsable
             && applyRetailTrackedPipBoy(leftController, applyWrites);
     if (hostSpatialProps && leftControllerUsable)
@@ -8855,12 +9455,13 @@ void onRetailPostAnimation(void* animData)
         g_latestCompleteTrackedPropsApplied ? pose.sequence : 0;
     g_latestCompleteTrackedPropsPoseFrame =
         g_latestCompleteTrackedPropsApplied ? pose.frame : 0u;
-    if (applyWrites && !hostSpatialProps)
+    if (applyWrites && (!hostSpatialProps || nativeHands))
     {
         makeRetailVrSurfaceVisible(g_retailRigNodes.upperBodyMesh);
         makeRetailVrSurfaceVisible(g_retailRigNodes.leftHandMesh);
         makeRetailVrSurfaceVisible(g_retailRigNodes.rightHandMesh);
-        makeRetailVrSurfaceVisible(g_retailRigNodes.pipBoy);
+        if (!hostSpatialProps)
+            makeRetailVrSurfaceVisible(g_retailRigNodes.pipBoy);
     }
     // Weapon aim is controller-owned and remains valid even when the visual
     // arm chain is momentarily outside its FABRIK reach envelope. Coupling
@@ -8912,7 +9513,7 @@ void onRetailPostAnimation(void* animData)
     g_lastRetailRigAnimData = animData;
     ++g_retailRigSolveCount;
 
-    const Vec3 committedRightHandWorld = hostSpatialProps
+    const Vec3 committedRightHandWorld = hostSpatialProps && !nativeHands
         ? hostSpatialHandWristWorld(rightController, false)
         : g_retailRigNodes.right.hand
         ? readVec3(
@@ -8944,6 +9545,8 @@ void onRetailPostAnimation(void* animData)
             g_retailPipBoyCalibration.hostSpatialValid,
             g_retailPipBoyCalibration.screenGripLocalPositionMeters,
             g_retailPipBoyCalibration.screenGripLocalRotation,
+            g_retailPipBoyCalibration.scalePivotGripLocalPositionMeters,
+            g_retailPipBoyCalibration.nativeDeviceScale,
             committedRightHandWorld,
             committedWeaponWorld,
             committedWeaponWorldRotation);
@@ -9444,12 +10047,11 @@ TileValue* getTileValue(void* tile, UInt32 id)
 UInt32 getTileButtonId(void* tile)
 {
     TileValue* id = getTileValue(tile, TileValueId);
-    if (!id)
-        id = getTileValue(tile, 0x0FAA);
-    if (!id)
+    if (!id || !std::isfinite(id->num))
         return 0;
-
-    return static_cast<UInt32>(id->num);
+    // Dynamic ListBox rows use the native signed ID -1. Alpha is the adjacent
+    // trait at 0xFA9 and must never be interpreted as a menu command.
+    return static_cast<UInt32>(static_cast<std::int32_t>(id->num));
 }
 
 UInt32 tileTraitId(const char* name, UInt32 fallback)
@@ -9518,6 +10120,30 @@ void* tileRootFromMenu(void* menu, void* tileMenu)
 
 void* visibleMenuForInput(void** outTileMenu = nullptr, UInt32* outMenuType = nullptr)
 {
+    // The native stack owns modal ordering. Closing a visible ContainerMenu
+    // beneath QuantityMenu destroys the quantity callback's parent.
+    const UInt32 topType = topNativeMenuType();
+    void* topMenu = nullptr;
+    void* topTile = nullptr;
+    if (topType && validatedVisibleMenu(topType, nullptr, &topMenu, &topTile))
+    {
+        if (outTileMenu) *outTileMenu = topTile;
+        if (outMenuType) *outMenuType = topType;
+        return topMenu;
+    }
+    // Modal UI owns input above the still-open Pip-Boy.
+    const UInt32 modalType = visibleGenericBlockingMenuType();
+    if (modalType)
+    {
+        void* modalMenu = nullptr;
+        void* modalTile = nullptr;
+        if (validatedVisibleMenu(modalType, nullptr, &modalMenu, &modalTile))
+        {
+            if (outTileMenu) *outTileMenu = modalTile;
+            if (outMenuType) *outMenuType = modalType;
+            return modalMenu;
+        }
+    }
     void* interfaceManager = readPointer(InterfaceManagerAddress);
     void* activeMenu = interfaceManager
         ? readPointer(reinterpret_cast<std::uintptr_t>(interfaceManager) + 0x0D0)
@@ -9948,31 +10574,68 @@ bool findExactTtwStewieDependencyMessageMenuTarget(
     return true;
 }
 
+fnvxr::ui::MenuViewport nativeScreenMenuViewport()
+{
+    void* manager = readPointer(InterfaceManagerAddress);
+    void* root = manager ? readPointer(reinterpret_cast<std::uintptr_t>(manager) + 0x9C) : nullptr;
+    void* node = root ? readPointer(reinterpret_cast<std::uintptr_t>(root) + 0x2C) : nullptr;
+    if (!node) return {};
+    const auto address = reinterpret_cast<std::uintptr_t>(node);
+    return {getTileFloatByName(root, "width", TileValueWidth, 0.0f),
+        getTileFloatByName(root, "height", TileValueHeight, 0.0f),
+        readFloat(address + NiAvObjectWorldTranslationOffset),
+        readFloat(address + NiAvObjectWorldTranslationOffset + 8u),
+        readFloat(address + NiAvObjectWorldScaleOffset)};
+}
+
 void collectMenuButtons(
     void* tile,
     float parentX,
     float parentY,
     UInt32 depth,
-    std::vector<MenuButtonCandidate>& buttons)
+    std::vector<MenuButtonCandidate>& buttons,
+    const fnvxr::ui::MenuViewport* viewport,
+    fnvxr::ui::MenuRect clip)
 {
     if (!tile || depth > 18 || buttons.size() >= 384)
         return;
 
-    const float x = parentX + getTileFloatByName(tile, "x", TileValueX, 0.0f);
-    const float y = parentY + getTileFloatByName(tile, "y", TileValueY, 0.0f);
+    const float localX = getTileFloatByName(tile, "x", TileValueX, 0.0f);
+    const float localY = getTileFloatByName(tile, "y", TileValueY, 0.0f);
+    const float x = parentX + localX;
+    const float y = parentY + localY;
     const float visible = getTileFloatByName(tile, "visible", TileValueVisible, 1.0f);
+    if (visible == 0.0f) return; // A hidden container hides every descendant.
     const float width = getTileFloatByName(tile, "width", TileValueWidth, 0.0f);
     const float height = getTileFloatByName(tile, "height", TileValueHeight, 0.0f);
     const UInt32 buttonId = getTileButtonId(tile);
-    const bool plausibleButtonRect = width >= 4.0f && height >= 4.0f && width <= 900.0f && height <= 220.0f;
-    const bool overlapsViewport = x < DirectMenuViewportWidth
-        && y < DirectMenuViewportHeight
-        && x + width > 0.0f
-        && y + height > 0.0f;
-    if (visible != 0.0f && buttonId != 0 && plausibleButtonRect && overlapsViewport)
+    fnvxr::ui::MenuRect rect{x, y, width, height};
+    if (viewport)
     {
-        buttons.push_back({ tile, buttonId, x, y, width, height });
+        void* node = readPointer(reinterpret_cast<std::uintptr_t>(tile) + 0x2C);
+        if (node)
+        {
+            const auto address = reinterpret_cast<std::uintptr_t>(node);
+            rect = fnvxr::ui::renderedMenuRect(*viewport,
+                readFloat(address + NiAvObjectWorldTranslationOffset),
+                readFloat(address + NiAvObjectWorldTranslationOffset + 8u),
+                readFloat(address + NiAvObjectWorldScaleOffset),
+                getTileFloatByName(tile, "locus", 0xFA8u, 0.0f) != 0.0f,
+                localX, localY, width, height);
+        }
+        else rect = {};
     }
+    const auto hitRect = fnvxr::ui::clipMenuRect(rect, clip);
+    const bool target = getTileFloatByName(tile, "target", 0x0FAF, 0.0f) != 0.0f;
+    const TileValue* id = getTileValue(tile, TileValueId);
+    if (target && id && std::isfinite(id->num) && hitRect.valid())
+    {
+        buttons.push_back({tile, buttonId, hitRect.x, hitRect.y, hitRect.width, hitRect.height});
+    }
+
+    if (getTileFloatByName(tile, "clipwindow", 0xFA6u, 0.0f) != 0.0f && rect.valid())
+        clip = fnvxr::ui::clipMenuRect(clip, rect);
+    if (!clip.valid()) return;
 
     auto* node = reinterpret_cast<TileListNode*>(reinterpret_cast<std::uintptr_t>(tile) + 0x04);
     for (UInt32 count = 0; node && count < 512; ++count)
@@ -9980,7 +10643,7 @@ void collectMenuButtons(
         auto* childNode = static_cast<TileChildNode*>(node->data);
         void* child = childNode ? childNode->child : nullptr;
         if (child)
-            collectMenuButtons(child, x, y, depth + 1, buttons);
+            collectMenuButtons(child, x, y, depth + 1, buttons, viewport, clip);
         node = node->next;
     }
 }
@@ -10088,7 +10751,17 @@ std::vector<MenuButtonCandidate> visibleMenuButtons(void* menu, void* tileMenu)
     if (!root)
         return buttons;
 
-    collectMenuButtons(root, 0.0f, 0.0f, 0, buttons);
+    const UInt32 type = menu ? readUInt32(reinterpret_cast<std::uintptr_t>(menu) + 0x20) : 0u;
+    const bool wristMenu = type == kMenuTypeInventory || type == kMenuTypeStats || type == kMenuTypeMap;
+    const auto viewport = nativeScreenMenuViewport();
+    if (!wristMenu && !viewport.valid()) return buttons;
+    void* manager = wristMenu ? readPointer(InterfaceManagerAddress) : nullptr;
+    void* globals = manager ? readPointer(reinterpret_cast<std::uintptr_t>(manager) + 0xA0) : nullptr;
+    const fnvxr::ui::MenuRect clip{0.0f, 0.0f,
+        wristMenu ? getTileFloatByName(globals, "_pipboy_width", 0u, 0.0f) : viewport.width,
+        wristMenu ? getTileFloatByName(globals, "_pipboy_height", 0u, 0.0f) : viewport.height};
+    if (!clip.valid()) return buttons;
+    collectMenuButtons(root, 0.0f, 0.0f, 0, buttons, wristMenu ? nullptr : &viewport, clip);
 
     std::sort(buttons.begin(), buttons.end(), [](const MenuButtonCandidate& lhs, const MenuButtonCandidate& rhs) {
         if (std::fabs(lhs.y - rhs.y) > 8.0f)
@@ -10127,21 +10800,13 @@ PointerMenuPoint rawPointerMenuPoint()
 
 PointerMenuPoint scaledPointerMenuPoint()
 {
-    const auto atLeast = [](float value, float minimum) {
-        return value < minimum ? minimum : value;
-    };
-    const float sourceWidth = atLeast(getFloatFromEnv("FNVXR_UI_SHARED_WIDTH", static_cast<float>(SharedVideoPointerWidth)), 2.0f);
-    const float sourceHeight = atLeast(getFloatFromEnv("FNVXR_UI_SHARED_HEIGHT", static_cast<float>(SharedVideoPointerHeight)), 2.0f);
-    const float tileWidth = atLeast(getFloatFromEnv("FNVXR_MENU_TILE_WIDTH", 640.0f), 2.0f);
-    const float tileHeight = atLeast(getFloatFromEnv("FNVXR_MENU_TILE_HEIGHT", 480.0f), 2.0f);
-    const float sharedX = std::clamp(static_cast<float>(g_lastMenuPointerClient.x), 0.0f, sourceWidth - 1.0f);
-    const float sharedY = std::clamp(static_cast<float>(g_lastMenuPointerClient.y), 0.0f, sourceHeight - 1.0f);
-
-    return {
-        (sharedX * (tileWidth - 1.0f)) / (sourceWidth - 1.0f),
-        (sharedY * (tileHeight - 1.0f)) / (sourceHeight - 1.0f),
-        "scaled"
-    };
+    auto point = rawPointerMenuPoint();
+    if (!fnvxr::ui::nativeMenuPointer(nativeScreenMenuViewport(),
+        getFloatFromEnv("FNVXR_UI_SHARED_WIDTH", static_cast<float>(SharedVideoPointerWidth)),
+        getFloatFromEnv("FNVXR_UI_SHARED_HEIGHT", static_cast<float>(SharedVideoPointerHeight)),
+        point.x, point.y)) return {-1.0f, -1.0f, "native-screen-unavailable"};
+    point.space = "native-screen";
+    return point;
 }
 
 const MenuButtonCandidate* buttonUnderPointerInAnySpace(
@@ -10149,9 +10814,22 @@ const MenuButtonCandidate* buttonUnderPointerInAnySpace(
     PointerMenuPoint& resolved)
 {
     resolved = rawPointerMenuPoint();
-    if (const MenuButtonCandidate* hit = buttonUnderPointer(buttons, resolved.x, resolved.y))
-        return hit;
-
+    if (isPipboyVisible() && g_haveLastStableExternalXInput
+        && (g_lastStableExternalXInput.reserved[fnvxr::shared::XInputReservedInteractionFlags]
+            & fnvxr::PoseInteractionPipBoyNativeTexturePointer) != 0u)
+    {
+        void* manager = readPointer(InterfaceManagerAddress);
+        void* globals = manager ? readPointer(reinterpret_cast<std::uintptr_t>(manager) + 0xA0) : nullptr;
+        const auto point = fnvxr::pipboy::nativeMenuPointFromTexture(
+            resolved.x, resolved.y,
+            getFloatFromEnv("FNVXR_UI_SHARED_WIDTH", static_cast<float>(SharedVideoPointerWidth)),
+            getFloatFromEnv("FNVXR_UI_SHARED_HEIGHT", static_cast<float>(SharedVideoPointerHeight)),
+            getTileFloatByName(globals, "_pipboy_width", 0u, 0.0f),
+            getTileFloatByName(globals, "_pipboy_height", 0u, 0.0f));
+        if (!point.valid) return nullptr;
+        resolved = { point.x, point.y, "native-pipboy" };
+        return buttonUnderPointer(buttons, resolved.x, resolved.y);
+    }
     resolved = scaledPointerMenuPoint();
     if (const MenuButtonCandidate* hit = buttonUnderPointer(buttons, resolved.x, resolved.y))
         return hit;
@@ -10202,9 +10880,93 @@ void clearPointerHover()
 {
     if (g_directMenuPointerHoverTile)
     {
-        setTileFloatByName(g_directMenuPointerHoverTile, "mouseover", TileValueMouseover, 0.0f);
+        void* tileMenu = nullptr;
+        void* menu = visibleMenuForInput(&tileMenu);
+        if (menu == g_directMenuPointerHoverMenu)
+        {
+            const auto buttons = visibleMenuButtons(menu, tileMenu);
+            if (std::any_of(buttons.begin(), buttons.end(), [](const auto& button) {
+                    return button.tile == g_directMenuPointerHoverTile; }))
+                setTileFloatByName(g_directMenuPointerHoverTile, "mouseover", TileValueMouseover, 0.0f);
+        }
         g_directMenuPointerHoverTile = nullptr;
         g_directMenuPointerHoverMenu = nullptr;
+    }
+}
+
+void selectNativeMenuListRow(void* menu, void* tile)
+{
+    if (!menu || !tile) return;
+    __try
+    {
+        // The native mouse dispatcher selects the ListBox row before calling
+        // Menu::HandleMouseover/HandleClick. Merely changing the tile's hover
+        // trait leaves ContainerMenu::Selection null and clicks do nothing.
+        UInt32 offsets[6] {};
+        UInt32 count = 0;
+        switch (readUInt32(reinterpret_cast<std::uintptr_t>(menu) + 0x20))
+        {
+        case 1002: offsets[count++] = 0xB8; break; // Inventory
+        case 1003: // Stats
+            for (UInt32 offset = 0x180; offset <= 0x270; offset += 0x30) offsets[count++] = offset;
+            break;
+        case 1008: offsets[count++] = 0x98; offsets[count++] = 0xC8; break; // Container
+        case 1009: offsets[count++] = 0x40; break; // Dialogue
+        case 1013: // Pause/settings/save lists
+            for (UInt32 offset = 0x84; offset <= 0x174; offset += 0x30) offsets[count++] = offset;
+            break;
+        case 1023: // Map, quests, notes, radio, challenges
+            for (UInt32 offset = 0x130; offset <= 0x1F0; offset += 0x30) offsets[count++] = offset;
+            break;
+        case 1027: offsets[count++] = 0x64; offsets[count++] = 0x94; break; // Level-up skills/perks
+        case 1035: offsets[count++] = 0x5C; break; // Repair
+        case 1053: offsets[count++] = 0xA8; offsets[count++] = 0xD8; break; // Barter
+        case 1058: offsets[count++] = 0x68; break; // Repair service
+        case 1061: offsets[count++] = 0x60; break; // Weapon mods
+        case 1077: offsets[count++] = 0x6C; offsets[count++] = 0xA0; offsets[count++] = 0xD0; break; // Recipes
+        case 1084: offsets[count++] = 0x54; break; // Traits
+        default: return;
+        }
+        for (UInt32 index = 0; index < count; ++index)
+        {
+            const auto list = reinterpret_cast<std::uintptr_t>(menu) + offsets[index];
+            void* parentTile = readPointer(list + 0x0C);
+            if (!parentTile) continue;
+            void* row = tile;
+            for (UInt32 depth = 0; row && depth < 16; ++depth)
+            {
+                void* parent = readPointer(reinterpret_cast<std::uintptr_t>(row) + 0x28);
+                if (parent == parentTile) break;
+                row = parent;
+            }
+            if (!row || readPointer(reinterpret_cast<std::uintptr_t>(row) + 0x28) != parentTile) continue;
+            // Establish actual membership, not just a rectangle overlap.
+            void* item = readPointer(list + 0x04);
+            void* next = readPointer(list + 0x08);
+            for (UInt32 guard = 0; guard < 512; ++guard)
+            {
+                if (item && readPointer(reinterpret_cast<std::uintptr_t>(item)) == row)
+                {
+                    if (readPointer(list + 0x10) == row) return;
+                    void** vtable = *reinterpret_cast<void***>(list);
+                    if (!vtable || !vtable[0] || !vtable[3]) return;
+                    using OwnsMenuFn = bool (__thiscall*)(void*, void*);
+                    if (!reinterpret_cast<OwnsMenuFn>(vtable[3])(reinterpret_cast<void*>(list), menu)) return;
+                    using SelectTileFn = bool (__thiscall*)(void*, void*);
+                    const bool selected = reinterpret_cast<SelectTileFn>(vtable[0])(reinterpret_cast<void*>(list), row);
+                    logTelemetry("nativeMenu listSelection menu=%p list=%p row=%p selected=%d\n",
+                        menu, reinterpret_cast<void*>(list), row, static_cast<int>(selected));
+                    return;
+                }
+                if (!next) break;
+                item = readPointer(reinterpret_cast<std::uintptr_t>(next));
+                next = readPointer(reinterpret_cast<std::uintptr_t>(next) + 4);
+            }
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        logTelemetry("nativeMenu listSelection unavailable menu=%p tile=%p\n", menu, tile);
     }
 }
 
@@ -10226,29 +10988,6 @@ bool updateDirectMenuPointerHover()
     }
 
     auto buttons = visibleMenuButtons(menu, tileMenu);
-    if (menuType == kMenuTypeInventory)
-    {
-        std::vector<MenuButtonCandidate> inventoryControls;
-        inventoryControls.reserve(buttons.size());
-        for (const auto& item : buttons)
-        {
-            char itemLabel[160] {};
-            const bool haveItemLabel = copyFirstPrintableTileTextReadOnly(
-                item.tile, itemLabel, sizeof(itemLabel));
-            const bool inventoryRow = item.buttonId == 255
-                && item.x >= 80.0f && item.x <= 400.0f
-                && item.y >= 100.0f && item.width >= 100.0f;
-            const bool actionButton = item.buttonId == 128;
-            const bool textureAsset = haveItemLabel
-                && (std::strstr(itemLabel, ".dds") != nullptr
-                    || std::strstr(itemLabel, "interface\\") != nullptr
-                    || std::strstr(itemLabel, "Interface\\") != nullptr);
-            if (haveItemLabel && !textureAsset && (inventoryRow || actionButton))
-                inventoryControls.push_back(item);
-        }
-        if (!inventoryControls.empty())
-            buttons = std::move(inventoryControls);
-    }
     PointerMenuPoint point {};
     const MenuButtonCandidate* hit = buttonUnderPointerInAnySpace(buttons, point);
     if (!hit)
@@ -10257,14 +10996,28 @@ bool updateDirectMenuPointerHover()
         return false;
     }
 
-    if (g_directMenuPointerHoverTile && g_directMenuPointerHoverTile != hit->tile)
+    if (g_directMenuPointerHoverTile && g_directMenuPointerHoverTile != hit->tile
+        && std::any_of(buttons.begin(), buttons.end(), [](const auto& button) {
+            return button.tile == g_directMenuPointerHoverTile; }))
         setTileFloatByName(g_directMenuPointerHoverTile, "mouseover", TileValueMouseover, 0.0f);
 
+    const bool hoverChanged = g_directMenuPointerHoverMenu != menu || g_directMenuPointerHoverTile != hit->tile;
     g_directMenuPointerHoverMenu = menu;
     g_directMenuPointerHoverTile = hit->tile;
-    g_directMenuSelectionMenu = menu;
-    g_directMenuSelectionTile = hit->tile;
     setTileFloatByName(hit->tile, "mouseover", TileValueMouseover, 1.0f);
+    if (hoverChanged)
+    {
+        // A stationary ray must not undo a thumbstick selection every frame.
+        g_directMenuSelectionMenu = menu;
+        g_directMenuSelectionTile = hit->tile;
+        selectNativeMenuListRow(menu, hit->tile);
+        void** vtable = *reinterpret_cast<void***>(menu);
+        if (vtable && vtable[4])
+        {
+            using HandleMouseoverFn = void (__thiscall*)(void*, UInt32, void*);
+            reinterpret_cast<HandleMouseoverFn>(vtable[4])(menu, hit->buttonId, hit->tile);
+        }
+    }
 
     if (g_directMenuPointerHoverLogCount < 64)
     {
@@ -10291,11 +11044,12 @@ bool updateDirectMenuPointerHover()
 
 bool dispatchMenuClick(void* menu, void* tile, UInt32 buttonId, const char* source)
 {
-    if (!menu || !tile || buttonId == 0)
+    if (!menu || !tile || !getTileValue(tile, TileValueId))
         return false;
 
     __try
     {
+        selectNativeMenuListRow(menu, tile);
         setTileFloatByName(tile, "mouseover", TileValueMouseover, 1.0f);
         setTileFloatByName(tile, "clicked", TileValueClicked, 1.0f);
 
@@ -10309,6 +11063,7 @@ bool dispatchMenuClick(void* menu, void* tile, UInt32 buttonId, const char* sour
 
         using HandleClickFn = void (__thiscall*)(void*, UInt32, void*);
         reinterpret_cast<HandleClickFn>(vtable[3])(menu, buttonId, tile);
+        fnvxr::shared::publishHapticFeedback(fnvxr::shared::HapticChannel::MenuClick, 0.0f, 0.16f, 70u);
         logTelemetry("directMenu click source=%s menu=%p tile=%p buttonId=%u\n", source, menu, tile, buttonId);
         return true;
     }
@@ -10456,29 +11211,6 @@ bool dispatchPointerMenuClick()
         return false;
 
     auto buttons = visibleMenuButtons(menu, tileMenu);
-    if (menuType == kMenuTypeInventory)
-    {
-        std::vector<MenuButtonCandidate> inventoryControls;
-        inventoryControls.reserve(buttons.size());
-        for (const auto& item : buttons)
-        {
-            char itemLabel[160] {};
-            const bool haveItemLabel = copyFirstPrintableTileTextReadOnly(
-                item.tile, itemLabel, sizeof(itemLabel));
-            const bool inventoryRow = item.buttonId == 255
-                && item.x >= 80.0f && item.x <= 400.0f
-                && item.y >= 100.0f && item.width >= 100.0f;
-            const bool actionButton = item.buttonId == 128;
-            const bool textureAsset = haveItemLabel
-                && (std::strstr(itemLabel, ".dds") != nullptr
-                    || std::strstr(itemLabel, "interface\\") != nullptr
-                    || std::strstr(itemLabel, "Interface\\") != nullptr);
-            if (haveItemLabel && !textureAsset && (inventoryRow || actionButton))
-                inventoryControls.push_back(item);
-        }
-        if (!inventoryControls.empty())
-            buttons = std::move(inventoryControls);
-    }
     if (buttons.empty())
     {
         logTelemetry("directMenu pointer no-buttons menu=%p type=0x%lx tileMenu=%p\n", menu, static_cast<unsigned long>(menuType), tileMenu);
@@ -10550,6 +11282,8 @@ bool dispatchPointerMenuClick()
     return dispatchMenuClick(menu, best->tile, best->buttonId, "pointer");
 }
 
+bool dispatchNativeMenuSpecialKey(UInt32 keycode);
+
 bool directMenuNavigate(int delta)
 {
     void* tileMenu = nullptr;
@@ -10559,29 +11293,6 @@ bool directMenuNavigate(int delta)
         return false;
 
     auto buttons = visibleMenuButtons(menu, tileMenu);
-    if (menuType == kMenuTypeInventory)
-    {
-        std::vector<MenuButtonCandidate> inventoryControls;
-        inventoryControls.reserve(buttons.size());
-        for (const auto& item : buttons)
-        {
-            char itemLabel[160] {};
-            const bool haveItemLabel = copyFirstPrintableTileTextReadOnly(
-                item.tile, itemLabel, sizeof(itemLabel));
-            const bool inventoryRow = item.buttonId == 255
-                && item.x >= 80.0f && item.x <= 400.0f
-                && item.y >= 100.0f && item.width >= 100.0f;
-            const bool actionButton = item.buttonId == 128;
-            const bool textureAsset = haveItemLabel
-                && (std::strstr(itemLabel, ".dds") != nullptr
-                    || std::strstr(itemLabel, "interface\\") != nullptr
-                    || std::strstr(itemLabel, "Interface\\") != nullptr);
-            if (haveItemLabel && !textureAsset && (inventoryRow || actionButton))
-                inventoryControls.push_back(item);
-        }
-        if (!inventoryControls.empty())
-            buttons = std::move(inventoryControls);
-    }
     if (buttons.empty())
     {
         logTelemetry("directMenu nav no-buttons menu=%p type=0x%lx tileMenu=%p\n", menu, static_cast<unsigned long>(menuType), tileMenu);
@@ -10616,6 +11327,7 @@ bool directMenuNavigate(int delta)
 
     g_directMenuSelectionIndex = index;
     g_directMenuSelectionTile = buttons[index].tile;
+    selectNativeMenuListRow(menu, g_directMenuSelectionTile);
     setTileFloatByName(g_directMenuSelectionTile, "mouseover", TileValueMouseover, 1.0f);
     if (g_directMenuSelectionLogCount < 96)
     {
@@ -10641,14 +11353,14 @@ bool directMenuNavigate(int delta)
     return true;
 }
 
-bool directMenuAcceptSelection()
+bool directMenuAcceptSelection(bool usePointer = true)
 {
     void* tileMenu = nullptr;
     UInt32 menuType = 0;
     void* menu = visibleMenuForInput(&tileMenu, &menuType);
     if (!menu)
         return false;
-    if (g_hasMenuPointer && !updateDirectMenuPointerHover())
+    if (usePointer && g_hasMenuPointer && !updateDirectMenuPointerHover())
     {
         logTelemetry(
             "directMenu accept pointer-miss menu=%p type=0x%lx shared=(%ld,%ld)\n",
@@ -10657,6 +11369,12 @@ bool directMenuAcceptSelection()
             g_lastMenuPointerClient.x,
             g_lastMenuPointerClient.y);
         return false;
+    }
+    if (usePointer && g_hasMenuPointer && g_directMenuPointerHoverMenu == menu)
+    {
+        // Trigger explicitly accepts the ray target, including after stick use.
+        g_directMenuSelectionMenu = menu;
+        g_directMenuSelectionTile = g_directMenuPointerHoverTile;
     }
 
     const auto buttons = visibleMenuButtons(menu, tileMenu);
@@ -10712,25 +11430,228 @@ bool directMenuAcceptSelection()
     if (!selected)
         return false;
 
-    // A VR controller A press is one complete inventory accept. Resolve the
-    // exact clicked ListBox row and invoke the engine equip once. Previously
-    // we clicked the menu's Equip control and then invoked Actor::EquipItem a
-    // second time, while a stale global selection could point at another row.
-    // That produced the observed holster-without-replacement transition.
-    if (menuType == kMenuTypeInventory && candidate->buttonId == 255)
-    {
-        const bool engineEquipped = equipNativeInventorySelection(
-            "directMenuAcceptSelection", menu, candidate->tile);
-        const bool menuEquipped = !engineEquipped
-            && directMenuClickExactText("Equip");
-        logTelemetry(
-            "directMenu inventory accept label=\"%s\" selected=1 menuEquipped=%u engineEquipped=%u\n",
-            haveLabel ? label : "",
-            menuEquipped ? 1u : 0u,
-            engineEquipped ? 1u : 0u);
-        return engineEquipped || menuEquipped;
-    }
+    // The real tile ID and target let the native callback own equip/use/tab
+    // semantics. Do not follow it with a second guessed inventory mutation.
     return true;
+}
+
+void* visibleButtonById(void* tile, UInt32 id, UInt32 depth = 0u)
+{
+    if (!tile || depth > 18u
+        || getTileFloatByName(tile, "visible", TileValueVisible, 1.0f) == 0.0f)
+        return nullptr;
+    // Back is a semantic menu action. Its authored button need not overlap
+    // the 1280x720 capture rectangle: native menu coordinates can be larger.
+    if (getTileButtonId(tile) == id
+        && getTileFloatByName(tile, "target", 0x0FAF, 0.0f) != 0.0f)
+        return tile;
+    auto* node = reinterpret_cast<TileListNode*>(reinterpret_cast<std::uintptr_t>(tile) + 0x04);
+    for (UInt32 count = 0; node && count < 512u; ++count, node = node->next)
+    {
+        const auto* childNode = static_cast<TileChildNode*>(node->data);
+        if (void* button = visibleButtonById(childNode ? childNode->child : nullptr, id, depth + 1u))
+            return button;
+    }
+    return nullptr;
+}
+
+bool dispatchVisibleMenuButtonId(void* menu, void* tileMenu, UInt32 id, const char* source)
+{
+    __try
+    {
+        void* button = visibleButtonById(tileRootFromMenu(menu, tileMenu), id);
+        if (button)
+            return dispatchMenuClick(menu, button, id, source);
+        logTelemetry("directMenu semantic-button missing source=%s menu=%p id=%u\n", source, menu, id);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        logTelemetry("directMenu semantic-button exception source=%s menu=%p id=%u\n", source, menu, id);
+    }
+    return false;
+}
+
+bool dispatchNativeMenuSpecialKey(UInt32 keycode)
+{
+    // Menu::HandleSpecialKeyInput takes menu codes, not DirectInput scancodes.
+    // In particular, left/right adjust native sliders and hacking columns.
+    std::int32_t code = 0;
+    switch (keycode)
+    {
+        case DIK_RETURN: code = -2; break;
+        case DIK_UP: code = 1; break;
+        case DIK_DOWN: code = 2; break;
+        case DIK_RIGHT: code = 3; break;
+        case DIK_LEFT: code = 4; break;
+        case DIK_SPACE: code = 9; break;
+        case DIK_TAB: code = 10; break;
+        case DIK_PRIOR: code = 15; break;
+        case DIK_NEXT: code = 16; break;
+        default: return false;
+    }
+    void* menu = visibleMenuForInput();
+    if (!menu) return false;
+    const UInt32 menuType = readUInt32(reinterpret_cast<std::uintptr_t>(menu) + 0x20);
+    if (menuType == 1016u && (keycode == DIK_LEFT || keycode == DIK_RIGHT))
+        code = keycode == DIK_LEFT ? 13 : 14; // Quantity's authored slider step.
+    if (menuType == 1012u && (keycode == DIK_LEFT || keycode == DIK_RIGHT))
+        code = keycode == DIK_LEFT ? 15 : 16; // Sleep/wait hours.
+    __try
+    {
+        auto** vtable = *reinterpret_cast<void***>(menu);
+        using SpecialFn = bool (__thiscall*)(void*, std::int32_t, float);
+        const bool handled = vtable && vtable[14]
+            && reinterpret_cast<SpecialFn>(vtable[14])(menu, code, 1.0f);
+        if (handled || visibleMenuForInput() != menu)
+        {
+            logTelemetry("nativeMenu special menu=%p key=%lu code=%ld handled=1\n", menu, keycode, code);
+            return true;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+    return false;
+}
+
+UInt32 __fastcall hookedNativeMenuKeyState(void* input, void*, UInt32 key, UInt32 state)
+{
+    using ReadKeyFn = UInt32 (__thiscall*)(void*, UInt32, UInt32);
+    const UInt32 native = reinterpret_cast<ReadKeyFn>(g_nativeMenuKeyTrampoline)(input, key, state);
+    if (GetCurrentThreadId() != g_nativeMenuKeyThreadId || !g_nativeMenuInputAllowed
+        || !g_nativeMenuKeyPulses.sample(key, state, GetTickCount64())
+        || visibleMenuForInput() != g_nativeMenuKeyOwner)
+        return native;
+    if (state == 1u)
+        logTelemetry("nativeMenu keyObserved menu=%p key=%lu frame=%llu\n",
+            g_nativeMenuKeyOwner, key, g_runtimeObservationFrame);
+    return native ? native : 1u;
+}
+
+bool installNativeMenuKeyReader()
+{
+    if (g_nativeMenuKeyTrampoline) return GetCurrentThreadId() == g_nativeMenuKeyThreadId;
+    constexpr UInt32 address = 0x00A24180;
+    // Loaded retail 1.4.0.525 OSInputGlobals::GetKeyState, including its switch
+    // table. Keep native polling for VATS/other modal updates on the game thread.
+    __try
+    {
+        const auto* code = pointerFromAddress32<const UInt8*>(address);
+        UInt64 hash = 14695981039346656037ull;
+        for (std::size_t i = 0; i < 232u; ++i) hash = (hash ^ code[i]) * 1099511628211ull;
+        if (hash != 0x72ab0c2ef113d333ull) return false;
+        auto* relay = static_cast<UInt8*>(VirtualAlloc(nullptr, 11u, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+        if (!relay) return false;
+        std::memcpy(relay, code, 6u); // push ebp; mov ebp,esp; sub esp,0xC
+        relay[6] = 0xE9;
+        const UInt32 back = address + 6u - (address32FromPointer(relay) + 11u);
+        std::memcpy(relay + 7u, &back, sizeof(back));
+        DWORD oldProtection = 0;
+        if (!VirtualProtect(relay, 11u, PAGE_EXECUTE_READ, &oldProtection))
+        { VirtualFree(relay, 0, MEM_RELEASE); return false; }
+        FlushInstructionCache(GetCurrentProcess(), relay, 11u);
+        g_nativeMenuKeyThreadId = GetCurrentThreadId();
+        g_nativeMenuKeyTrampoline = relay;
+        if (!writeJump(address, reinterpret_cast<void*>(&hookedNativeMenuKeyState)))
+        {
+            g_nativeMenuKeyTrampoline = nullptr;
+            VirtualFree(relay, 0, MEM_RELEASE); return false;
+        }
+        logTelemetry("nativeMenu keyReader installed address=0x00A24180 owner=nvse-main-game-loop\n");
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+bool dispatchNativeMenuInputKey(UInt32 keycode)
+{
+    if (!g_nativeMenuInputAllowed || keycode >= 256u) return false;
+    if (dispatchNativeMenuSpecialKey(keycode)) return true;
+    // Character shortcuts and polled keys are distinct native interfaces.
+    // Never send a scancode to Menu::HandleKeyboardInput's character argument.
+    UInt32 character = 0;
+    switch (keycode)
+    {
+        case DIK_E: character = 'e'; break;
+        case DIK_R: character = 'r'; break;
+        case DIK_S: character = 's'; break;
+        case DIK_X: character = 'x'; break;
+        case DIK_F: character = 'f'; break;
+        case DIK_ESCAPE: character = 27; break;
+    }
+    void* menu = visibleMenuForInput();
+    if (!menu || menu != g_nativeMenuKeyOwner) return false;
+    if (character)
+    {
+        __try
+        {
+            auto** vtable = *reinterpret_cast<void***>(menu);
+            using CharacterFn = bool (__thiscall*)(void*, UInt32);
+            const bool handled = vtable && vtable[12]
+                && reinterpret_cast<CharacterFn>(vtable[12])(menu, character);
+            if (handled || visibleMenuForInput() != menu) return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    }
+    const bool queued = installNativeMenuKeyReader()
+        && g_nativeMenuKeyPulses.publish(keycode, GetTickCount64());
+    logTelemetry("nativeMenu keyRequested menu=%p key=%lu queued=%d\n", menu, keycode, static_cast<int>(queued));
+    return queued;
+}
+
+UInt32 __fastcall hookedNativeMenuMouseState(void* input, void*, UInt32 button, UInt32 state)
+{
+    using ReadMouseFn = UInt32 (__thiscall*)(void*, UInt32, UInt32);
+    const UInt32 native = reinterpret_cast<ReadMouseFn>(g_nativeMenuMouseTrampoline)(input, button, state);
+    if (GetCurrentThreadId() != g_nativeMenuKeyThreadId || !g_nativeMenuInputAllowed
+        || !g_nativeMenuMousePulses.sample(button, state, GetTickCount64())
+        || visibleMenuForInput() != g_nativeMenuKeyOwner)
+        return native;
+    if (state == 1u)
+        logTelemetry("nativeMenu mouseObserved menu=%p button=%lu frame=%llu\n",
+            g_nativeMenuKeyOwner, button, g_runtimeObservationFrame);
+    return native ? native : 1u;
+}
+
+bool dispatchNativeMenuMouseButton(UInt32 button)
+{
+    if (!g_nativeMenuInputAllowed || button >= 8u
+        || visibleMenuForInput() != g_nativeMenuKeyOwner) return false;
+    if (!g_nativeMenuMouseTrampoline)
+    {
+        // Retail GetMouseButtonState owns VATS picking/attack queue semantics.
+        // Preserve every ordinary caller; add only this menu's controller edge.
+        constexpr UInt32 address = 0x00A23A50;
+        __try
+        {
+            const auto* code = pointerFromAddress32<const UInt8*>(address);
+            UInt64 hash = 14695981039346656037ull;
+            for (std::size_t i = 0; i < 432u; ++i) hash = (hash ^ code[i]) * 1099511628211ull;
+            if (hash != 0x3d60c355685c59ecull) return false;
+            auto* relay = static_cast<UInt8*>(VirtualAlloc(nullptr, 11u, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+            if (!relay) return false;
+            std::memcpy(relay, code, 6u);
+            relay[6] = 0xE9;
+            const UInt32 back = address + 6u - (address32FromPointer(relay) + 11u);
+            std::memcpy(relay + 7u, &back, sizeof(back));
+            DWORD protection = 0;
+            if (!VirtualProtect(relay, 11u, PAGE_EXECUTE_READ, &protection))
+            { VirtualFree(relay, 0, MEM_RELEASE); return false; }
+            FlushInstructionCache(GetCurrentProcess(), relay, 11u);
+            g_nativeMenuKeyThreadId = GetCurrentThreadId();
+            g_nativeMenuMouseTrampoline = relay;
+            if (!writeJump(address, reinterpret_cast<void*>(&hookedNativeMenuMouseState)))
+            {
+                g_nativeMenuMouseTrampoline = nullptr;
+                VirtualFree(relay, 0, MEM_RELEASE); return false;
+            }
+            logTelemetry("nativeMenu mouseReader installed address=0x00A23A50 owner=nvse-main-game-loop\n");
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    }
+    const bool queued = GetCurrentThreadId() == g_nativeMenuKeyThreadId
+        && g_nativeMenuMousePulses.publish(button, GetTickCount64());
+    logTelemetry("nativeMenu mouseRequested menu=%p button=%lu queued=%d\n",
+        g_nativeMenuKeyOwner, button, static_cast<int>(queued));
+    return queued;
 }
 
 bool directMenuCancel(const char* source)
@@ -10740,6 +11661,27 @@ bool directMenuCancel(const char* source)
     void* menu = visibleMenuForInput(&tileMenu, &menuType);
     if (!menu)
         return false;
+
+    if (menuType == 1059u) // Native TutorialMenu's authored Close button.
+        return dispatchVisibleMenuButtonId(menu, tileMenu, 3u, source);
+    if (menuType == 1008u) // ContainerMenu's native Exit button (keyboard: E).
+        return dispatchVisibleMenuButtonId(menu, tileMenu, 11u, source);
+    if (menuType == 1016u || menuType == 1012u) // Quantity/wait native Cancel.
+        return dispatchVisibleMenuButtonId(menu, tileMenu, 5u, source);
+    if (menuType == kMenuTypeVats)
+        return dispatchVisibleMenuButtonId(menu, tileMenu, 5u, source);
+
+    __try
+    {
+        // Native Back lets save/settings submenus return to their parent and
+        // lets crafting, repair, terminals and gambling own their cleanup.
+        auto** vtable = *reinterpret_cast<void***>(menu);
+        using BackFn = bool (__thiscall*)(void*, UInt32, void*);
+        const bool handled = vtable && vtable[15]
+            && reinterpret_cast<BackFn>(vtable[15])(menu, 10u, nullptr);
+        if (handled || visibleMenuForInput() != menu) return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 
     if (menuType == kMenuTypeStart && g_console)
     {
@@ -10759,14 +11701,16 @@ bool directMenuCancel(const char* source)
         if (!vtable || !vtable[12])
             return false;
         using HandleKeyboardInputFn = bool (__thiscall*)(void*, UInt32);
-        reinterpret_cast<HandleKeyboardInputFn>(vtable[12])(menu, DIK_ESCAPE);
+        const bool handled = reinterpret_cast<HandleKeyboardInputFn>(vtable[12])(menu, 27u);
         logTelemetry(
-            "directMenu cancel source=%s menu=%p type=0x%lx key=0x%02lx\n",
+            "directMenu cancel source=%s menu=%p type=0x%lx key=0x%02lx handled=%d\n",
             source ? source : "unknown",
             menu,
             static_cast<unsigned long>(menuType),
-            static_cast<unsigned long>(DIK_ESCAPE));
-        return true;
+            static_cast<unsigned long>(DIK_ESCAPE), static_cast<int>(handled));
+        return handled || visibleMenuForInput() != menu
+            || (g_nativeMenuInputAllowed && installNativeMenuKeyReader()
+                && g_nativeMenuKeyPulses.publish(DIK_ESCAPE, GetTickCount64()));
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
     {
@@ -10779,23 +11723,238 @@ bool directMenuCancel(const char* source)
     }
 }
 
+bool dispatchNativeMenuKey(UInt32 keycode)
+{
+    if (keycode != DIK_ESCAPE)
+        return false;
+    const UInt32 menuBits = currentMenuBits();
+    if ((menuBits & fnvxr::shared::RuntimeLoadingMenuBit) != 0u)
+        return false;
+    if (visibleGenericBlockingMenuType() != 0u)
+        return directMenuCancel("controller:menu");
+    // Pause can sit above an open Pip-Boy. Let the native menu stack choose
+    // the top menu before considering the still-visible wrist parent.
+    if ((menuBits & fnvxr::shared::RuntimeStartMenuBit) != 0u)
+        return directMenuCancel("controller:menu");
+    if (isPipboyVisible())
+        return closeEnginePipBoy("controller:menu", g_runtimeObservationFrame);
+    if (fnvxr::shared::runtimeUiInputAllowed(menuBits))
+        return directMenuCancel("controller:menu");
+
+    __try
+    {
+        if (!activeGameCameraObject()
+            || !*pointerFromAddress32<void**>(InterfaceManagerAddress))
+            return false;
+        // Retail 1.4.0.525's own Escape branch at 0x0070E746 dispatches
+        // (6,0,0,0,1,0). That queue performs normal menu eligibility and
+        // transition handling, then calls StartMenu(true,false). Both complete
+        // function bodies were observed from this exact loaded retail build.
+        struct FunctionIdentity { UInt32 address; std::size_t size; UInt64 hash; };
+        constexpr FunctionIdentity functions[] {
+            { 0x00709470, 121u, 0x291203c362762005ull },
+            { 0x007CB7D0, 786u, 0x8c48af0044cec166ull },
+        };
+        for (const auto& function : functions)
+        {
+            const auto* bytes = pointerFromAddress32<const UInt8*>(function.address);
+            UInt64 hash = 14695981039346656037ull;
+            for (std::size_t i = 0; i < function.size; ++i)
+                hash = (hash ^ bytes[i]) * 1099511628211ull;
+            if (hash != function.hash)
+            {
+                logTelemetry("nativeMenu rejected address=0x%08lx reason=function-identity\n",
+                    static_cast<unsigned long>(function.address));
+                return false;
+            }
+        }
+        using QueueMenuFn = void (__cdecl*)(UInt32, UInt32, UInt32, UInt32, UInt32, UInt32);
+        g_lastUserPauseRequestMs = GetTickCount64();
+        pointerFromAddress32<QueueMenuFn>(0x00709470)(6u, 0u, 0u, 0u, 1u, 0u);
+        logTelemetry("nativeMenu pause requested frame=%llu finalConsumer=retail-menu-dispatch\n",
+            static_cast<unsigned long long>(g_runtimeObservationFrame));
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        logTelemetry("nativeMenu pause rejected reason=unavailable-retail-state\n");
+        return false;
+    }
+}
+
+UInt32 __fastcall hookedNativeControlState(void* input, void*, UInt32 control, UInt32 state)
+{
+    // Retail returns a full EAX input count, including two simultaneous
+    // keyboard/mouse bindings. Some SDK wrappers declare bool; matching that
+    // wrapper here leaves upper EAX undefined for the engine's integer callers.
+    using ReadControlFn = UInt32 (__thiscall*)(void*, UInt32, UInt32);
+    const UInt32 native = reinterpret_cast<ReadControlFn>(g_nativeControlTrampoline)(input, control, state);
+    if (GetCurrentThreadId() == g_nativeControlThreadId && g_nativeMenuInputAllowed
+        && g_nativeMenuControlPulses.sample(control, state, GetTickCount64())
+        && visibleMenuForInput() == g_nativeMenuKeyOwner)
+        return native ? native : 1u;
+    if (GetCurrentThreadId() != g_nativeControlThreadId
+        || !g_nativeControlPulses.sample(control, state, GetTickCount64()))
+        return native;
+    if (state == 1u)
+        logTelemetry("nativeControl observed control=%lu runtimeFrame=%llu finalConsumer=retail-control-state\n",
+            static_cast<unsigned long>(control), static_cast<unsigned long long>(g_runtimeObservationFrame));
+    return native ? native : 1u;
+}
+
+bool installNativeControlReader()
+{
+    if (g_nativeControlTrampoline) return GetCurrentThreadId() == g_nativeControlThreadId;
+    constexpr UInt32 address = 0x00A24660;
+    // Exact loaded 1.4.0.525 OSInputGlobals::GetControlState. Its ordinary
+    // callers retain all player, target, distance, dialogue and script checks.
+    // The first six bytes are three complete, position-independent instructions.
+    __try
+    {
+        const auto* code = pointerFromAddress32<const UInt8*>(address);
+        UInt64 hash = 14695981039346656037ull;
+        for (std::size_t i = 0; i < 456u; ++i) hash = (hash ^ code[i]) * 1099511628211ull;
+        if (hash != 0xa960a6923c6c179bull)
+        {
+            logTelemetry("nativeControl rejected reason=function-identity\n");
+            return false;
+        }
+        auto* relay = static_cast<UInt8*>(VirtualAlloc(nullptr, 11u, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+        if (!relay) return false;
+        std::memcpy(relay, code, 6u);
+        relay[6] = 0xE9;
+        const UInt32 back = address + 6u - (address32FromPointer(relay) + 11u);
+        std::memcpy(relay + 7u, &back, sizeof(back));
+        DWORD oldProtection = 0;
+        if (!VirtualProtect(relay, 11u, PAGE_EXECUTE_READ, &oldProtection))
+        { VirtualFree(relay, 0, MEM_RELEASE); return false; }
+        FlushInstructionCache(GetCurrentProcess(), relay, 11u);
+        g_nativeControlThreadId = GetCurrentThreadId();
+        g_nativeControlTrampoline = relay;
+        if (!writeJump(address, reinterpret_cast<void*>(&hookedNativeControlState)))
+        {
+            g_nativeControlTrampoline = nullptr;
+            VirtualFree(relay, 0, MEM_RELEASE);
+            return false;
+        }
+        logTelemetry("nativeControl installed owner=nvse-main-game-loop address=0x00A24660\n");
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+bool dispatchNativeGameplayKey(UInt32 keycode)
+{
+    if (!g_nativeControlInputAllowed || !installNativeControlReader()) return false;
+    const UInt32 control = nativeControlForKey(keycode);
+    const bool published = g_nativeControlPulses.publish(control, GetTickCount64());
+    logTelemetry("nativeControl requested key=%lu control=%lu runtimeFrame=%llu queued=%d\n",
+        static_cast<unsigned long>(keycode), static_cast<unsigned long>(control),
+        static_cast<unsigned long long>(g_runtimeObservationFrame), static_cast<int>(published));
+    return published;
+}
+
+std::int32_t __fastcall hookedNativeMenuMouseMovement(void* input, void*, UInt32 axis)
+{
+    using ReadMovementFn = std::int32_t (__thiscall*)(void*, UInt32);
+    const auto native = reinterpret_cast<ReadMovementFn>(g_nativeMenuMouseMovementOriginal)(input, axis);
+    if (axis != 1u || !g_nativeMenuInputAllowed || !g_nativeMenuMouseDelta
+        || GetCurrentThreadId() != g_nativeControlThreadId
+        || visibleMenuForInput() != g_nativeMenuKeyOwner)
+        return native;
+    return native + g_nativeMenuMouseDelta;
+}
+
+bool installNativeMenuMouseMovementReader()
+{
+    if (g_nativeMenuMouseMovementOriginal) return true;
+    __try
+    {
+        // JIP already wraps this native query. Verify and chain that wrapper,
+        // retaining its disabled-input and wheel handling for ordinary callers.
+        constexpr UInt32 address = 0x00A239E0;
+        const auto* code = pointerFromAddress32<const UInt8*>(address);
+        const UInt32 jip = address32FromPointer(GetModuleHandleA("jip_nvse.dll"));
+        if (!jip || code[0] != 0xE9 || code[5] != 0x0C) return false;
+        std::int32_t relative = 0;
+        std::memcpy(&relative, code + 1u, sizeof(relative));
+        const UInt32 target = address + 5u + relative;
+        if (target != jip + 0xB110u) return false;
+        UInt64 tailHash = 14695981039346656037ull;
+        for (std::size_t i = 6u; i < 76u; ++i) tailHash = (tailHash ^ code[i]) * 1099511628211ull;
+        if (tailHash != 0xb09b84af095183d5ull) return false;
+        const auto* wrapper = pointerFromAddress32<const UInt8*>(target);
+        if (readUInt32(target + 12u) != jip + 0x6A194u
+            || readUInt32(target + 44u) != jip + 0x763DCu) return false;
+        UInt64 hash = 14695981039346656037ull;
+        for (std::size_t i = 0u; i < 81u; ++i)
+        {
+            const UInt8 byte = (i >= 12u && i < 16u) || (i >= 44u && i < 48u) ? 0u : wrapper[i];
+            hash = (hash ^ byte) * 1099511628211ull;
+        }
+        if (hash != 0xe724835a370df3d5ull) return false;
+        g_nativeMenuMouseMovementOriginal = pointerFromAddress32<void*>(target);
+        if (!writeJump(address, reinterpret_cast<void*>(&hookedNativeMenuMouseMovement)))
+        { g_nativeMenuMouseMovementOriginal = nullptr; return false; }
+        logTelemetry("nativeMenu mouseMovementReader installed address=0x00A239E0 chained=jip+0xB110\n");
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+void updateNativeLockPickInput(bool active, const SharedXInputState& state,
+    const SharedDInputState* hostInput)
+{
+    g_nativeMenuControlPulses.authorize(active);
+    if (!active)
+    {
+        g_nativeLockPickMotion.reset();
+        g_nativeMenuMouseDelta = 0;
+        return;
+    }
+    const auto now = GetTickCount64();
+    if (installNativeControlReader())
+        g_nativeMenuControlPulses.hold(0u, state.rightTrigger > 180u, now);
+    // Native LockPickMenu converts mouse X to its pick slider. Native movement
+    // control 0 applies tension; the engine owns damage, breakage and success.
+    if (installNativeMenuMouseMovementReader())
+        g_nativeMenuMouseDelta = g_nativeLockPickMotion.step(
+            static_cast<float>(hostInput ? hostInput->leftStickX : state.leftThumbX) / 32767.0f, now);
+}
+
 POINT mapSharedPointerToWindow(HWND hwnd, POINT point);
 
-void updateGameCursorTile(HWND hwnd = nullptr)
+void updateGameCursorTile()
 {
     void* interfaceManager = *pointerFromAddress32<void**>(InterfaceManagerAddress);
     if (!interfaceManager || !g_hasMenuPointer)
         return;
 
     void* cursorTile = *reinterpret_cast<void**>(reinterpret_cast<std::uintptr_t>(interfaceManager) + 0x028);
-    if (!cursorTile)
-        return;
-
     __try
     {
-        const POINT windowPointer = hwnd ? mapSharedPointerToWindow(hwnd, g_lastMenuPointerClient) : g_lastMenuPointerClient;
-        setTileFloat(cursorTile, TileValueX, static_cast<float>(windowPointer.x));
-        setTileFloat(cursorTile, TileValueY, static_cast<float>(windowPointer.y));
+        const auto point = scaledPointerMenuPoint();
+        const auto viewport = nativeScreenMenuViewport();
+        const float converter = readFloat(0x11D8A48);
+        if (!viewport.valid() || point.x < 0.0f || point.y < 0.0f
+            || !std::isfinite(converter) || converter <= 0.0f) return;
+        // Native world/body-part picking reads these InterfaceManager fields,
+        // independently of ordinary menu tile hover. No OS cursor is involved.
+        // Menu-root dimensions already include the game's pixel-to-UI scale;
+        // the picking fields themselves are framebuffer pixels (JIP SetCursorPos).
+        *reinterpret_cast<float*>(reinterpret_cast<std::uintptr_t>(interfaceManager) + 0x38) = point.x / converter;
+        *reinterpret_cast<float*>(reinterpret_cast<std::uintptr_t>(interfaceManager) + 0x40) = point.y / converter;
+        if (cursorTile)
+        {
+            void* node = readPointer(reinterpret_cast<std::uintptr_t>(cursorTile) + 0x2C);
+            if (node)
+            {
+                auto* position = reinterpret_cast<float*>(reinterpret_cast<std::uintptr_t>(node)
+                    + NiAvObjectLocalTranslationOffset);
+                position[0] = point.x - viewport.width * 0.5f;
+                position[2] = viewport.height * 0.5f - point.y;
+            }
+        }
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
     {
@@ -10811,6 +11970,17 @@ bool dispatchActiveMenuClick()
         return false;
     if (!allowUiInput())
         return false;
+
+    UInt32 clickMenuType = 0;
+    visibleMenuForInput(nullptr, &clickMenuType);
+    if (clickMenuType == 1014u) return true; // RT is held lock tension, not a tile click.
+    if (clickMenuType == kMenuTypeVats && g_hasMenuPointer)
+    {
+        updateGameCursorTile();
+        // Arrow/accept/back tiles retain their native click callbacks. VATS
+        // body-part labels are native world picks, not clickable menu tiles.
+        return directMenuAcceptSelection() || dispatchNativeMenuMouseButton(0u);
+    }
 
     if (retailSidecarProfile() && g_hasMenuPointer)
     {
@@ -11064,6 +12234,14 @@ bool holdDirectInputKey(
 {
     if (keycode >= MaxDirectInputMacros)
         return false;
+
+    if (g_nativeControlInputAllowed)
+    {
+        const UInt32 control = nativeControlForKey(keycode);
+        if (control < 28u)
+            return installNativeControlReader()
+                && g_nativeControlPulses.hold(control, held, GetTickCount64());
+    }
 
     if (delivery
         == fnvxr::physical_input::LocomotionDelivery::InProcessNvseDirectInput)
@@ -11383,38 +12561,14 @@ bool drivePhysicalGameplayPrimaryAttack(
     bool previousHeld,
     UInt64 frame)
 {
-    bool applied = false;
-    void* process = nullptr;
-    __try
-    {
-        void* player = readPointer(PlayerCharacterAddress);
-        process = player
-            ? readPointer(reinterpret_cast<std::uintptr_t>(player)
-                + MobileObjectBaseProcessOffset)
-            : nullptr;
-        if (process)
-        {
-            // HighProcess::forceFireWeapon is consumed by Fallout's normal
-            // weapon pipeline. Reassert while squeezed because the engine
-            // clears the request after each gameplay update.
-            *reinterpret_cast<UInt8*>(
-                reinterpret_cast<std::uintptr_t>(process)
-                + HighProcessForceFireWeaponOffset) = held ? 1u : 0u;
-            applied = true;
-        }
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
-        applied = false;
-    }
+    const bool applied = holdDirectInputKey(MouseButtonOffset, held);
     if (held != previousHeld)
     {
         logTelemetry(
-            "primaryAttack physical frame=%llu held=%d applied=%d finalConsumer=HighProcess::forceFireWeapon process=%p\n",
+            "primaryAttack edge frame=%llu held=%s applied=%s finalConsumer=OSInputGlobals::GetControlState source=nativeVR\n",
             static_cast<unsigned long long>(frame),
-            static_cast<int>(held),
-            static_cast<int>(applied),
-            process);
+            held ? "true" : "false",
+            applied ? "true" : "false");
     }
     return applied;
 }
@@ -12488,6 +13642,17 @@ void recoverFocusLossPause(UInt64 frame, UInt32 menuBits, RuntimePhase phase)
     const bool focusPauseVisible =
         (menuBits & fnvxr::shared::RuntimeStartMenuBit) != 0u
         && (menuBits & nonStartBlockingBits) == 0u;
+    if (g_lastUserPauseRequestMs != 0u
+        && GetTickCount64() - g_lastUserPauseRequestMs < 2000u)
+    {
+        // A player-requested pause is intentional even when the desktop game
+        // has no focus. Never interpret that transition as fixture recovery.
+        focusLossArmed = false;
+        previousInteractive = interactive;
+        previousPhase = phase;
+        previousMenuBits = menuBits;
+        return;
+    }
     const bool observedForegroundLoss =
         previousInteractive && !interactive && cleanPreviousGameplay;
     const bool observedOwnedFixturePause =
@@ -13158,8 +14323,8 @@ void syncExternalDInputPointer(
                 0,
                 MAKELPARAM(static_cast<WORD>(windowPointer.x), static_cast<WORD>(windowPointer.y)));
         }
-        updateGameCursorTile(hwnd);
     }
+    updateGameCursorTile();
     if (directUiClickEnabled() || pointerTileFallbackEnabled())
         updateDirectMenuPointerHover();
 
@@ -13248,51 +14413,57 @@ void tapExternalXInputNav(UInt32 navMask, UInt32 menuBits)
     // path as well as the normal windowed path; it does not require a desktop
     // keyboard device or foreground-window acquisition.
     const bool directUiClick = directUiClickEnabled();
-    const bool pipBoyVisible =
-        (menuBits & fnvxr::shared::RuntimePipBoyMenuBit) != 0u;
-    HWND hwnd = gameWindow();
+    void* tileMenu = nullptr;
+    UInt32 menuType = 0;
+    void* menu = visibleMenuForInput(&tileMenu, &menuType);
+    if (menuType == kMenuTypeVats && (navMask & 12u))
+    {
+        // VATS owns target cycling through its authored arrows, not the
+        // generic ordering of target labels and action buttons.
+        dispatchVisibleMenuButtonId(menu, tileMenu, (navMask & 4u) ? 2u : 3u, "controller:vats-target");
+        return;
+    }
     if (navMask & 1u)
     {
-        const bool handled = directUiClick && directMenuNavigate(-1);
+        const bool handled = dispatchNativeMenuSpecialKey(DIK_UP)
+            || (directUiClick && directMenuNavigate(-1));
         if (!handled)
             tapDirectInputKey(DIK_UP);
-        if (hwnd && !handled)
-            postMenuKey(hwnd, VK_UP);
     }
     if (navMask & 2u)
     {
-        const bool handled = directUiClick && directMenuNavigate(1);
+        const bool handled = dispatchNativeMenuSpecialKey(DIK_DOWN)
+            || (directUiClick && directMenuNavigate(1));
         if (!handled)
             tapDirectInputKey(DIK_DOWN);
-        if (hwnd && !handled)
-            postMenuKey(hwnd, VK_DOWN);
     }
     if (navMask & 4u)
     {
-        const bool handled = directUiClick && directMenuNavigate(-1);
+        const bool handled = dispatchNativeMenuSpecialKey(DIK_LEFT)
+            || (directUiClick && directMenuNavigate(-1));
         if (!handled)
             tapDirectInputKey(DIK_LEFT);
-        if (hwnd && !handled)
-            postMenuKey(hwnd, VK_LEFT);
     }
     if (navMask & 8u)
     {
-        const bool handled = directUiClick && directMenuNavigate(1);
+        const bool handled = dispatchNativeMenuSpecialKey(DIK_RIGHT)
+            || (directUiClick && directMenuNavigate(1));
         if (!handled)
             tapDirectInputKey(DIK_RIGHT);
-        if (hwnd && !handled)
-            postMenuKey(hwnd, VK_RIGHT);
     }
 }
 
 void releaseExternalXInputGameplayHolds()
 {
     g_physicalSnapTurnLatch.reset();
+    if (nativeLocomotionConsumerRequested())
+        drivePhysicalPlayerMovement({}, false, false, 0);
     setGameplayRunMode(false, "externalXInput:release", 0);
     setGameplayAutoRun(false, "externalXInput:release", 0);
     holdDirectInputKey(MouseButtonOffset, false);
-    if (physicalHeadsetPlayRequested())
+    if (nativeLocomotionConsumerRequested())
         drivePhysicalGameplayPrimaryAttack(false, false, 0);
+    g_nativeControlPulses.authorize(false);
     holdDirectInputKey(MouseButtonOffset + 1, false);
     holdDirectInputKey(DIK_R, false);
     holdGameplayGrab(false);
@@ -13740,20 +14911,17 @@ void applyHeadRelativeLocomotion(SharedXInputState& state, UInt64 frame)
         pose.hmdRot);
     const Quat headYaw = gravityAlignedYawQuat(relativeHead);
     const float yaw = 2.0f * std::atan2(headYaw.y, headYaw.w);
-    const float cosine = std::cos(yaw);
-    const float sine = std::sin(yaw);
     const float inputX = static_cast<float>(state.leftThumbX);
     const float inputY = static_cast<float>(state.leftThumbY);
+    const auto rotated = fnvxr::physical_input::headRelativeStick(inputX, inputY, yaw);
     const auto clampAxis = [](float value) -> std::int16_t {
         return static_cast<std::int16_t>(std::lround(std::clamp(
             value,
             -32767.0f,
             32767.0f)));
     };
-    const std::int16_t rotatedX = clampAxis(
-        inputX * cosine + inputY * sine);
-    const std::int16_t rotatedY = clampAxis(
-        inputY * cosine - inputX * sine);
+    const std::int16_t rotatedX = clampAxis(rotated.x);
+    const std::int16_t rotatedY = clampAxis(rotated.y);
     static std::int16_t previousRawX = 0;
     static std::int16_t previousRawY = 0;
     static std::int16_t previousRotatedX = 0;
@@ -13805,7 +14973,7 @@ void consumeExternalXInputGameplayControls(
         state.leftThumbY);
     const bool keyboardMovement = pluginKeyboardMovementEnabled();
     const bool keyboardGameplayFallback = pluginGameplayKeyboardFallbackEnabled();
-    const bool physicalLocomotionRoute = physicalHeadsetPlayRequested();
+    const bool physicalLocomotionRoute = nativeLocomotionConsumerRequested();
     const int movementDeadzone = std::clamp(
         getIntFromEnv("FNVXR_PLUGIN_MOVEMENT_DEADZONE", 9000),
         1000,
@@ -13984,8 +15152,9 @@ void consumeExternalXInputGameplayControls(
     }
     else if (keyboardGameplayFallback && (pressed & XInputA))
     {
-        if (!tryPetFriendlyMobActivation(frame))
-            tapDirectInputKey(DIK_E);
+        // Activation belongs to the engine, including companion dialogue.
+        // The historical pet logger consumed this press without an action.
+        tapDirectInputKey(DIK_E);
     }
     if (keyboardGameplayFallback && (combatChordPressed & XInputB))
     {
@@ -14153,6 +15322,8 @@ void consumeExternalXInputGameplayControls(
 void consumeExternalXInputBridge(
     const RuntimeObservation& observation)
 {
+    static fnvxr::input::GripChordLatch leftGripChord;
+    static fnvxr::input::GripChordLatch rightGripChord;
     static bool previousRightTriggerHeld = false;
     static bool previousLeftTriggerHeld = false;
     static bool previousRunHeld = false;
@@ -14195,7 +15366,7 @@ void consumeExternalXInputBridge(
         return;
     }
 
-    if (physicalHeadsetPlayRequested())
+    if (nativeLocomotionConsumerRequested())
         applyHeadRelativeLocomotion(state, observation.frame);
 
     const UInt32 menuBits = observation.menuBits;
@@ -14208,7 +15379,7 @@ void consumeExternalXInputBridge(
             observation.frame != 0u);
     SharedDInputState hostInput {};
     const bool hostInputAvailable = readSharedDInputSnapshot(hostInput);
-    const bool physicalLocomotionRoute = physicalHeadsetPlayRequested();
+    const bool physicalLocomotionRoute = nativeLocomotionConsumerRequested();
     const bool hostGameplayControlsActive =
         hostInputAvailable && hostInput.gameplayControlsActive != 0u;
     const bool hostMenuInputActive =
@@ -14352,13 +15523,30 @@ void consumeExternalXInputBridge(
         logTelemetry("input rebaseline complete release-before-press=1 packet=%lu\n", static_cast<unsigned long>(state.packet));
     }
     wasInputAllowed = inputAllowed;
+    g_nativeControlInputAllowed = gameplayInputAllowed && state.connected != 0u;
+    g_nativeControlPulses.authorize(g_nativeControlInputAllowed);
+    void* inputMenu = uiInputAllowed ? visibleMenuForInput() : nullptr;
+    if (inputMenu != g_nativeMenuKeyOwner)
+    {
+        g_nativeMenuKeyPulses.authorize(false);
+        g_nativeMenuMousePulses.authorize(false);
+        g_nativeMenuControlPulses.authorize(false);
+        g_nativeLockPickMotion.reset();
+    }
+    g_nativeMenuKeyOwner = inputMenu;
+    g_nativeMenuInputAllowed = inputMenu && state.connected != 0u;
+    g_nativeMenuKeyPulses.authorize(g_nativeMenuInputAllowed);
+    g_nativeMenuMousePulses.authorize(g_nativeMenuInputAllowed);
+    const bool lockPickActive = g_nativeMenuInputAllowed
+        && readUInt32(reinterpret_cast<std::uintptr_t>(inputMenu) + 0x20) == 1014u;
+    updateNativeLockPickInput(lockPickActive, state, hostInputAvailable ? &hostInput : nullptr);
     const bool pipBoyGripEligible = gameplayInputAllowed || previousPipBoyGripHeld || pipBoyMenuVisible;
     const bool rawPipBoyGripHeld = pipBoyGripEligible && externalLeftGripPipBoyHeld();
     const bool pipBoyGripSuppressedForChord =
         rawPipBoyGripHeld
         && leftTriggerModifierHeld
         && envEnabled("FNVXR_LEFT_GRIP_COMBAT_CHORD_SUPPRESSES_PIPBOY", true);
-    const bool pipBoyGripHeld = rawPipBoyGripHeld && !pipBoyGripSuppressedForChord;
+    const bool pipBoyGripHeld = leftGripChord.standalone(rawPipBoyGripHeld, pipBoyGripSuppressedForChord);
     updateExternalPipBoyGripMode(pipBoyGripHeld, previousPipBoyGripHeld);
     const bool rightGripMenuEligible = gameplayInputAllowed || previousRightGripMenuHeld || startMenuVisible;
     const bool rawRightGripMenuHeld = rightGripMenuEligible && externalRightGripMenuHeld();
@@ -14366,7 +15554,7 @@ void consumeExternalXInputBridge(
         rawRightGripMenuHeld
         && leftTriggerModifierHeld
         && envEnabled("FNVXR_RIGHT_GRIP_COMBAT_CHORD_SUPPRESSES_MENU", true);
-    const bool rightGripMenuHeld = rawRightGripMenuHeld && !rightGripMenuSuppressedForChord;
+    const bool rightGripMenuHeld = rightGripChord.standalone(rawRightGripMenuHeld, rightGripMenuSuppressedForChord);
     updateExternalRightGripMenuMode(rightGripMenuHeld, previousRightGripMenuHeld);
     if (!inputAllowed)
     {
@@ -14394,7 +15582,7 @@ void consumeExternalXInputBridge(
     const bool physicalPipBoyMenuPressed =
         physicalLeftMenuPipBoyEnabled()
         && (pressed & XInputBack) != 0;
-    const UInt32 navMask = uiInputAllowed ? externalXInputNavMask(state, menuBits) : 0;
+    const UInt32 navMask = uiInputAllowed && !lockPickActive ? externalXInputNavMask(state, menuBits) : 0;
     const UInt64 nowMs = GetTickCount64();
     const bool navChanged = navMask != 0 && navMask != g_lastExternalXInputNavMask;
     const bool navRepeat = navMask != 0 && nowMs >= g_lastExternalXInputNavMs + 140;
@@ -14511,9 +15699,22 @@ void consumeExternalXInputBridge(
 
     if (menuKeyboardFallback && uiInputAllowed && (pressed & XInputA) && !(uiFavoriteAssignPressed & XInputA))
     {
-        if (pipBoyPointerOnly(menuBits))
+        void* acceptTileMenu = nullptr;
+        UInt32 acceptMenuType = 0;
+        void* acceptMenu = visibleMenuForInput(&acceptTileMenu, &acceptMenuType);
+        if (acceptMenuType == 1016u || acceptMenuType == 1012u)
         {
-            const bool handled = directUiClickEnabled() && directMenuAcceptSelection();
+            dispatchVisibleMenuButtonId(acceptMenu, acceptTileMenu, 4u, "controller:quantity-confirm");
+        }
+        else if (acceptMenuType == kMenuTypeVats)
+        {
+            // The game distinguishes queuing a body-part attack (pointer/RT)
+            // from executing the queue (E). A always confirms the VATS queue.
+            dispatchNativeMenuInputKey(DIK_E);
+        }
+        else if (pipBoyPointerOnly(menuBits))
+        {
+            const bool handled = directUiClickEnabled() && directMenuAcceptSelection(false);
             logTelemetry(
                 "uiButton fire source=A action=accept pointerOnly=1 pipBoy=%d menuBits=0x%02lx handled=%d\n",
                 static_cast<int>(pipBoyMenuVisible),
@@ -14522,7 +15723,8 @@ void consumeExternalXInputBridge(
         }
         else
         {
-            const bool handled = directUiClickEnabled() && directMenuAcceptSelection();
+            const bool handled = dispatchNativeMenuSpecialKey(DIK_RETURN)
+                || (directUiClickEnabled() && directMenuAcceptSelection(false));
             if (!handled)
                 tapDirectInputKey(DIK_RETURN);
             if (!handled)
@@ -14541,13 +15743,7 @@ void consumeExternalXInputBridge(
     if (menuKeyboardFallback && uiInputAllowed && (pressed & XInputB) && !(uiFavoriteAssignPressed & XInputB))
     {
         const UInt32 backKey = uiBackKeyForMenu(menuBits);
-        UInt32 topMenuType = 0;
-        visibleMenuForInput(nullptr, &topMenuType);
-        const bool handled = (topMenuType == kMenuTypeStart
-                && directMenuCancel("externalXInput:B:start"))
-            || (pipBoyMenuVisible
-                && closeEnginePipBoy("externalXInput:B", externalDInputFrame()))
-            || directMenuCancel("externalXInput:B:fallback");
+        const bool handled = dispatchNativeMenuKey(DIK_ESCAPE);
         if (!handled)
         {
             tapDirectInputKey(backKey);
@@ -14563,7 +15759,11 @@ void consumeExternalXInputBridge(
     }
     if (menuKeyboardFallback && uiInputAllowed && (pressed & XInputX) && !(uiFavoriteAssignPressed & XInputX))
     {
-        if (pipBoyMenuVisible)
+        if (topNativeMenuType() == kMenuTypeVats)
+        {
+            dispatchNativeMenuInputKey(DIK_R); // Native weapon-specific VATS special attack.
+        }
+        else if (pipBoyMenuVisible)
         {
             const UInt32 sortKey = uiSortKey();
             tapDirectInputKey(sortKey);
@@ -14582,7 +15782,11 @@ void consumeExternalXInputBridge(
     }
     if (menuKeyboardFallback && uiInputAllowed && (pressed & XInputY) && !(uiFavoriteAssignPressed & XInputY))
     {
-        if (pipBoyMenuVisible)
+        if (topNativeMenuType() == kMenuTypeVats)
+        {
+            dispatchNativeMenuInputKey(DIK_F); // Native secondary VATS special attack.
+        }
+        else if (pipBoyMenuVisible)
         {
             const bool utilityFavorite = state.leftTrigger > 64;
             assignUiFavoriteSlot(
@@ -14618,8 +15822,10 @@ void consumeExternalXInputBridge(
     }
     if (menuKeyboardFallback && uiInputAllowed && physicalPipBoyMenuPressed)
     {
-        const bool handled = pipBoyMenuVisible
-            && closeEnginePipBoy("externalXInput:LeftMenu", externalDInputFrame());
+        const bool handled = visibleGenericBlockingMenuType() != 0u
+            ? directMenuCancel("externalXInput:LeftMenu:modal")
+            : (pipBoyMenuVisible
+                && closeEnginePipBoy("externalXInput:LeftMenu", externalDInputFrame()));
         if (!handled)
             tapDirectInputKey(DIK_ESCAPE);
         logTelemetry(
@@ -16893,232 +18099,25 @@ void processTrackedPropAssistMainLoop(const RuntimeObservation& observation)
     logCameraTelemetry(observation.frame, observation.menuBits);
 }
 
-void consumeHeadlessCombatVisualTrialInput(
-    const RuntimeObservation& observation)
-{
-    static bool previousTriggerHeld = false;
-    static bool previousReloadHeld = false;
-    static UInt8 previousLocomotionMask = 0xffu;
-
-    const bool authorized =
-        envEnabled("FNVXR_HEADSET_COMBAT_VISUAL_TRIAL", false)
-        && headlessStereoRigVisualTrialLeaseCurrent()
-        && observation.phase == RuntimePhase::Gameplay
-        && observation.menuBits == 0u;
-    SharedXInputState state {};
-    const bool haveInput = authorized
-        && readSharedXInputFrameSnapshot(state)
-        && state.connected != 0u;
-    if (haveInput)
-        applyHeadRelativeLocomotion(state, observation.frame);
-    const bool rightTriggerHeld =
-        haveInput && state.rightTrigger > 64u;
-    const bool reloadHeld =
-        haveInput && (state.buttons & XInputX) != 0u;
-    const int movementDeadzone = std::clamp(
-        getIntFromEnv("FNVXR_PLUGIN_MOVEMENT_DEADZONE", 9000),
-        1000,
-        30000);
-    const auto requestedLocomotion =
-        fnvxr::physical_input::classifyLocomotion(
-            state.leftThumbX,
-            state.leftThumbY,
-            movementDeadzone);
-    const UInt8 locomotionMask = static_cast<UInt8>(
-        (requestedLocomotion.forward ? 0x1u : 0u)
-        | (requestedLocomotion.backward ? 0x2u : 0u)
-        | (requestedLocomotion.left ? 0x4u : 0u)
-        | (requestedLocomotion.right ? 0x8u : 0u));
-
-    // The headless acceptance harness must exercise the same final engine
-    // consumer as physical play. Simulator acknowledgement or generated key
-    // flags are not locomotion proof: PlayerMover receives the stick intent,
-    // and the supervisor separately requires the player's world coordinates
-    // to change before the run can pass.
-    const bool playerMoverApplied = drivePhysicalPlayerMovement(
-        requestedLocomotion,
-        haveInput,
-        gameplayAnalogRunHeld(state.leftThumbX, state.leftThumbY),
-        observation.frame);
-    if (haveInput)
-        applyControllerSnapTurn(
-            state.rightThumbX,
-            observation.frame,
-            "headless-simulator:right-stick");
-    else
-        g_physicalSnapTurnLatch.reset();
-    if (locomotionMask != previousLocomotionMask)
-    {
-        previousLocomotionMask = locomotionMask;
-        logTelemetry(
-            "headlessLocomotion frame=%llu stick=(%d,%d) requested=0x%02x authorized=%d finalConsumer=PlayerMover::SetMovementFlags applied=%d\n",
-            static_cast<unsigned long long>(observation.frame),
-            static_cast<int>(state.leftThumbX),
-            static_cast<int>(state.leftThumbY),
-            static_cast<unsigned int>(locomotionMask),
-            static_cast<int>(haveInput),
-            static_cast<int>(playerMoverApplied));
-    }
-
-    struct CombatAmmoSnapshot
-    {
-        void* process {};
-        void* ammoInfo {};
-        void* weapon {};
-        UInt32 loadedRounds {};
-        bool valid {};
-    };
-    const auto readCombatAmmo = []() -> CombatAmmoSnapshot
-    {
-        CombatAmmoSnapshot result {};
-        __try
-        {
-            void* player = readPointer(PlayerCharacterAddress);
-            result.process = player
-                ? readPointer(reinterpret_cast<std::uintptr_t>(player)
-                    + MobileObjectBaseProcessOffset)
-                : nullptr;
-            if (!result.process)
-                return result;
-            void** processVtable = *reinterpret_cast<void***>(result.process);
-            if (!processVtable
-                || !processVtable[BaseProcessGetWeaponInfoVtableSlot]
-                || !processVtable[BaseProcessGetAmmoInfoVtableSlot])
-            {
-                return result;
-            }
-            using GetAmmoInfoFn = void* (__thiscall*)(void*);
-            result.ammoInfo = reinterpret_cast<GetAmmoInfoFn>(
-                processVtable[BaseProcessGetAmmoInfoVtableSlot])(
-                    result.process);
-            if (!result.ammoInfo)
-                return result;
-            const auto ammoBase = reinterpret_cast<std::uintptr_t>(
-                result.ammoInfo);
-            result.loadedRounds = readUInt32(ammoBase + 0x04);
-            // xNVSE Actor::GetEquippedWeapon reads EntryData::type at +0x08
-            // from BaseProcess::GetWeaponInfo. AmmoInfo::weapon is not
-            // populated for every player weapon and cannot be the authority.
-            using GetWeaponInfoFn = void* (__thiscall*)(void*);
-            void* weaponInfo = reinterpret_cast<GetWeaponInfoFn>(
-                processVtable[BaseProcessGetWeaponInfoVtableSlot])(
-                    result.process);
-            result.weapon = weaponInfo
-                ? readPointer(reinterpret_cast<std::uintptr_t>(weaponInfo)
-                    + 0x08)
-                : nullptr;
-            result.valid = result.weapon != nullptr;
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER)
-        {
-            result = {};
-        }
-        return result;
-    };
-
-    // Drive the real engine action state, not an OS/DInput queue. Fallout
-    // consumes forceFireWeapon on its gameplay update even while its window is
-    // deliberately kept in the background by the headless simulator run.
-    if (rightTriggerHeld && !previousTriggerHeld)
-    {
-        const CombatAmmoSnapshot before = readCombatAmmo();
-        bool applied = false;
-        if (before.process && before.valid)
-        {
-            __try
-            {
-                *reinterpret_cast<UInt8*>(
-                    reinterpret_cast<std::uintptr_t>(before.process)
-                    + HighProcessForceFireWeaponOffset) = 1u;
-                applied = true;
-            }
-            __except (EXCEPTION_EXECUTE_HANDLER)
-            {
-                applied = false;
-            }
-        }
-        logTelemetry(
-            "primaryAttack edge frame=%llu source=headlessCombat:RT held=true applied=%s finalConsumer=HighProcess::forceFireWeapon loadedBefore=%lu process=%p weapon=%p\n",
-            static_cast<unsigned long long>(observation.frame),
-            applied ? "true" : "false",
-            static_cast<unsigned long>(before.loadedRounds),
-            before.process,
-            before.weapon);
-    }
-    else if (!rightTriggerHeld && previousTriggerHeld)
-    {
-        // forceFireWeapon is a level-triggered engine request. Clear it on
-        // the controller's release edge so the next squeeze is a distinct
-        // semi-automatic shot instead of a permanently asserted request.
-        const CombatAmmoSnapshot released = readCombatAmmo();
-        if (released.process)
-        {
-            __try
-            {
-                *reinterpret_cast<UInt8*>(
-                    reinterpret_cast<std::uintptr_t>(released.process)
-                    + HighProcessForceFireWeaponOffset) = 0u;
-            }
-            __except (EXCEPTION_EXECUTE_HANDLER)
-            {
-            }
-        }
-    }
-    previousTriggerHeld = rightTriggerHeld;
-    if (reloadHeld && !previousReloadHeld)
-    {
-        const CombatAmmoSnapshot before = readCombatAmmo();
-        bool reloadApplied = false;
-        __try
-        {
-            void* player = readPointer(PlayerCharacterAddress);
-            using ReloadFn = bool (__thiscall*)(
-                void*, void*, int, UInt8, UInt8);
-            ReloadFn reload = player
-                ? *pointerFromAddress32<ReloadFn*>(
-                    PlayerCharacterReloadVtableAddress)
-                : nullptr;
-            reloadApplied = reload && before.weapon
-                && reload(player, before.weapon, 1, 0u, 0u);
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER)
-        {
-            reloadApplied = false;
-        }
-        logTelemetry(
-            "buttonX reloadEdge frame=%llu held=true applied=%s finalConsumer=PlayerCharacter::Reload loadedBefore=%lu weapon=%p source=headlessCombat:X\n",
-            static_cast<unsigned long long>(observation.frame),
-            reloadApplied ? "true" : "false",
-            static_cast<unsigned long>(before.loadedRounds),
-            before.weapon);
-    }
-    previousReloadHeld = reloadHeld;
-}
-
 void processHeadlessStereoRigVisualTrialMainLoop(
     const RuntimeObservation& observation)
 {
-    static bool inventoryMeleeSeedAttempted = false;
-    if (!inventoryMeleeSeedAttempted
-        && envEnabled("FNVXR_HEADSET_INVENTORY_VISUAL_TRIAL", false)
-        && g_headsetDemoFixtureReady
-        && realRetailFixtureFreshGameplayState(observation))
-    {
-        inventoryMeleeSeedAttempted = true;
-        runPluginConsoleCommand(
-            "fnvxrInventoryTrialSeedMelee",
-            "player.additem 00004347 1");
-    }
     // The D3D bridge retains camera and same-tick eye authority. This
     // fixture-only path publishes observations solely for the separately
     // leased post-animation controller/weapon visual rig.
     updateSharedCamera(observation.frame, observation.menuBits);
     updateSharedPlayer(observation.frame, observation.phase);
     logCameraTelemetry(observation.frame, observation.menuBits);
-    if (envEnabled("FNVXR_HEADSET_COMBAT_VISUAL_TRIAL", false))
-        consumeHeadlessCombatVisualTrialInput(observation);
-    else if (envEnabled("FNVXR_HEADSET_INVENTORY_VISUAL_TRIAL", false))
+    if (envEnabled("FNVXR_HEADSET_COMBAT_VISUAL_TRIAL", false)
+        || envEnabled("FNVXR_HEADSET_INVENTORY_VISUAL_TRIAL", false))
+    {
+        syncExternalDInputPointer(observation);
+        consumeExternalDInputBridge(observation);
         consumeExternalXInputBridge(observation);
+        const UInt32 pending = (std::min)(g_pendingAcceptClicks.exchange(0), 5u);
+        for (UInt32 index = 0; index < pending; ++index)
+            executeAcceptClickOnGameThread();
+    }
 }
 
 void handleNvseMessage(NVSEMessagingInterface::Message* message)
@@ -17128,6 +18127,13 @@ void handleNvseMessage(NVSEMessagingInterface::Message* message)
 
     if (message->type == MessageMainGameLoop)
     {
+        g_nativeControlInputAllowed = false;
+        g_nativeControlPulses.beginFrame();
+        g_nativeMenuInputAllowed = false;
+        g_nativeMenuKeyPulses.beginFrame();
+        g_nativeMenuMousePulses.beginFrame();
+        g_nativeMenuControlPulses.beginFrame();
+        g_nativeMenuMouseDelta = 0;
         const fnvxr::engine::RetailPluginMainLoopDisposition
             visualTrialDisposition =
                 stereoVisualTrialMainLoopDisposition();
@@ -17686,12 +18692,7 @@ void injectRisingEdgeInput(
     if (uiInputAllowed && menuKeyboardFallback && (pressed & fnvxr::ButtonB) && !(uiFavoriteAssignPressed & fnvxr::ButtonB))
     {
         const UInt32 backKey = uiBackKeyForMenu(menuBits);
-        UInt32 topMenuType = 0;
-        visibleMenuForInput(nullptr, &topMenuType);
-        const bool handled = (topMenuType == kMenuTypeStart
-                && directMenuCancel("pose:B:start"))
-            || (pipBoyVisible && closeEnginePipBoy("pose:B", pose.frame))
-            || directMenuCancel("pose:B:fallback");
+        const bool handled = dispatchNativeMenuKey(DIK_ESCAPE);
         logTelemetry(
             "menuBack fire frame=%llu source=B key=0x%02lx pipBoy=%d handled=%d\n",
             static_cast<unsigned long long>(pose.frame),
@@ -17850,6 +18851,8 @@ FNVXR_ApplyWeaponFrameForRender(
     {
         return false;
     }
+    if (!installFirstPersonTogglePolicy())
+        return false;
     VrRigPoseSnapshot pose {};
     __try
     {
@@ -17934,6 +18937,7 @@ FNVXR_ApplyWeaponFrameForRender(
         const LONG after = InterlockedCompareExchange(
             &state->producerSequence, 0, 0);
         const bool transformStillOwned = hostSpatialPropReplacementRequested()
+            && !nativeFirstPersonHandsRequested()
             ? fnvxr::weapon_frame::committedPoseOwnsLiveWeaponTransform(
                 liveWeapon,
                 state->weaponWorldPos,
@@ -17957,6 +18961,7 @@ FNVXR_ApplyWeaponFrameForRender(
     // A right-hand/weapon commit alone cannot prove that stock animation did
     // not subsequently hide or restore the opposite hand and wrist device.
     g_renderRigPoseOverride = pose;
+    g_preparedFirstPersonViewSequence = 0;
     g_renderRigPoseOverrideActive = true;
     onRetailPostAnimation(g_lastRetailRigAnimData);
     g_renderRigPoseOverrideActive = false;
@@ -17984,6 +18989,19 @@ FNVXR_ApplyWeaponFrameForRender(
             static_cast<unsigned long long>(pose.frame));
     }
     return restored;
+}
+
+extern "C" __declspec(dllexport) bool __cdecl
+FNVXR_ReadFirstPersonViewForRender(
+    UInt64 poseFrame, LONG poseSequence, fnvxr::engine::FirstPersonView* destination)
+{
+    if (!destination || poseSequence == 0
+        || poseSequence != g_preparedFirstPersonViewSequence
+        || poseFrame != g_preparedFirstPersonViewFrame
+        || GetCurrentThreadId() != g_preparedFirstPersonViewThread)
+        return false;
+    *destination = g_preparedFirstPersonView;
+    return true;
 }
 
 extern "C" __declspec(dllexport) bool NVSEPlugin_Query(const NVSEInterface* nvse, PluginInfo* info)

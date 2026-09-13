@@ -187,8 +187,10 @@ int main()
         || offsetof(fnvxr::shared::SharedVrOriginState, bodyRootWorldScale) != 208)
     {
         return fail("SharedVrOriginState authoritative recenter layout mismatch");
+    }
 
-    if (sizeof(fnvxr::shared::SharedWeaponFrameState) != 200
+    if (fnvxr::shared::WeaponFrameSharedVersion != 5
+        || sizeof(fnvxr::shared::SharedWeaponFrameState) != 216
         || offsetof(fnvxr::shared::SharedWeaponFrameState, producerSequence) != 8
         || offsetof(fnvxr::shared::SharedWeaponFrameState, commitId) != 16
         || offsetof(fnvxr::shared::SharedWeaponFrameState, poseSequence) != 24
@@ -198,11 +200,12 @@ int main()
         || offsetof(fnvxr::shared::SharedWeaponFrameState, rightHandGripLocalRot) != 124
         || offsetof(fnvxr::shared::SharedWeaponFrameState, leftPipBoyScreenGripLocalPos) != 140
         || offsetof(fnvxr::shared::SharedWeaponFrameState, leftPipBoyScreenGripLocalRot) != 152
-        || offsetof(fnvxr::shared::SharedWeaponFrameState, consumerSequence) != 168
-        || offsetof(fnvxr::shared::SharedWeaponFrameState, consumedCommitId) != 176
-        || offsetof(fnvxr::shared::SharedWeaponFrameState, consumedPoseFrame) != 192)
+        || offsetof(fnvxr::shared::SharedWeaponFrameState, leftPipBoyScalePivotGripLocalPos) != 168
+        || offsetof(fnvxr::shared::SharedWeaponFrameState, leftPipBoyDeviceScale) != 180
+        || offsetof(fnvxr::shared::SharedWeaponFrameState, consumerSequence) != 184
+        || offsetof(fnvxr::shared::SharedWeaponFrameState, consumedCommitId) != 192
+        || offsetof(fnvxr::shared::SharedWeaponFrameState, consumedPoseFrame) != 208)
         return fail("SharedWeaponFrameState producer/consumer lane layout mismatch");
-    }
 
     if (fnvxr::shared::DesktopAssistUiQuadSharedVersion != 1
         || sizeof(fnvxr::shared::SharedDesktopAssistUiQuadHeader) != 96

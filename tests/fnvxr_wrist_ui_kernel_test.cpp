@@ -1,5 +1,6 @@
 #include "../kernel/wrist/activation.h"
 #include "../kernel/wrist/placement.h"
+#include "../kernel/wrist/geometry.h"
 
 #include <cmath>
 #include <cstdlib>
@@ -51,6 +52,29 @@ int main()
     const WristUiConfig config {};
 
     {
+        w::DeviceScaleTransition scale;
+        constexpr std::int64_t start = 1000000000LL;
+        expect(close(scale.advance(1.35F, start), 1.0F),
+            "opening enlarged the device in one frame");
+        for (int frame = 1; frame <= 18; ++frame)
+            static_cast<void>(scale.advance(1.35F, start + frame * 11111112LL));
+        expect(close(scale.value(), 1.35F), "enlargement did not finish in 200 ms");
+        const float closing = scale.advance(1.0F, start + 19 * 11111112LL);
+        expect(closing > 1.0F && closing < 1.35F,
+            "closing snapped the entire device back to its resting size");
+        expect(close(scale.advance(1.0F, start + 19 * 11111112LL), closing),
+            "duplicate display time advanced scale twice");
+        expect(close(scale.advance(1.0F, start), closing),
+            "backwards display time changed the scale");
+        expect(close(scale.advance(1.0F, start + 19 * 11111112LL), closing),
+            "historical render callback rewound the scale clock");
+        expect(close(scale.advance(std::numeric_limits<float>::quiet_NaN(), start), closing),
+            "invalid target contaminated the device transform");
+        scale.reset();
+        expect(close(scale.value(), 1.0F), "new tracking lifetime retained enlarged scale");
+    }
+
+    {
         constexpr float HalfSqrtTwo = 0.70710678118F;
         const Pose gripPose {
             { 1.0F, 2.0F, 3.0F },
@@ -99,6 +123,54 @@ int main()
                 placed->widthMeters / placed->heightMeters,
                 config.widthMeters / config.heightMeters),
             "surface scaling changed the configured aspect ratio");
+    }
+
+    {
+        constexpr float HalfSqrtTwo = 0.70710678118F;
+        const Pose grip {{1.0F, 2.0F, 3.0F}, {0.0F, 0.0F, HalfSqrtTwo, HalfSqrtTwo}};
+        const Pose screenSocket {{0.10F, 0.02F, -0.03F}, {}};
+        const fnvxr::kernel::Vec3 forearmPivot {0.10F, 0.0F, -0.03F};
+        const auto enlarged = w::placeWristSurface(config,
+            w::PoseSnapshot(grip, true), w::LocalScreenTransform(screenSocket, forearmPivot), 1.35F);
+        expect(enlarged && close(enlarged->pose.position.x, 0.973F)
+                && close(enlarged->pose.position.y, 2.10F)
+                && close(enlarged->pose.position.z, 2.97F),
+            "device enlargement slid along the arm instead of growing around it");
+        expect(enlarged && close(enlarged->widthMeters, config.widthMeters * 1.35F)
+                && close(enlarged->heightMeters, config.heightMeters * 1.35F),
+            "device and screen dimensions used different enlargement scales");
+        // Every scale and tracked orientation must leave the same physical
+        // attachment point fixed while all device dimensions grow uniformly.
+        for (float angle : {0.0F, 0.7F, 1.8F, 3.1F})
+        {
+            const Pose movingGrip {{0.2F, 1.4F, -0.3F},
+                {std::sin(angle * 0.5F), 0.0F, 0.0F, std::cos(angle * 0.5F)}};
+            const Pose rotatedScreen {{0.1F, 0.04F, -0.07F},
+                {0.0F, HalfSqrtTwo, 0.0F, HalfSqrtTwo}};
+            const auto expectedPivot = w::compose(movingGrip, Pose {forearmPivot, {}});
+            const fnvxr::kernel::Vec3 screenToPivot = w::rotate(
+                {0.0F, -HalfSqrtTwo, 0.0F, HalfSqrtTwo},
+                {forearmPivot.x - rotatedScreen.position.x,
+                 forearmPivot.y - rotatedScreen.position.y,
+                 forearmPivot.z - rotatedScreen.position.z});
+            for (float amount : {1.0F, 1.08F, 1.2F, 1.35F, 1.5F})
+            {
+                const auto surface = w::placeWristSurface(config,
+                    w::PoseSnapshot(movingGrip, true),
+                    w::LocalScreenTransform(rotatedScreen, forearmPivot), amount);
+                expect(surface.has_value(), "valid forearm-mounted device rejected");
+                if (!surface) continue;
+                const auto actualPivot = w::compose(surface->pose, Pose {{
+                    screenToPivot.x * amount, screenToPivot.y * amount,
+                    screenToPivot.z * amount}, {}});
+                expect(w::distance(actualPivot.position, expectedPivot.position) < 0.00001F,
+                    "enlargement detached the device from its anatomical mount");
+            }
+        }
+        expect(!w::placeWristSurface(config, w::PoseSnapshot(grip, true),
+            w::LocalScreenTransform(screenSocket,
+                {std::numeric_limits<float>::quiet_NaN(), 0.0F, 0.0F}), 1.35F),
+            "invalid forearm pivot produced a visible device");
     }
 
     {

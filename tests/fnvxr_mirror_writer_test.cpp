@@ -21,9 +21,9 @@ int main()
     {
         auto& image = pair.eyes[eye];
         image.path = std::wstring(directory) + (eye ? L"\\right.png" : L"\\left.png");
-        image.width = 16;
-        image.height = 8;
-        image.rowPitch = 80; // Padded GPU rows must not bleed into image pixels.
+        image.width = 256;
+        image.height = 96;
+        image.rowPitch = 1040; // Padded rows and multiple DEFLATE blocks.
         image.rgba = true;
         image.pixels.resize(image.rowPitch * image.height, 0xcd);
         for (std::uint32_t y = 0; y != image.height; ++y)
@@ -37,12 +37,17 @@ int main()
             }
     }
     const auto paths = std::array<std::wstring, 2> { pair.eyes[0].path, pair.eyes[1].path };
+    auto compact = pair;
+    compact.frame = 48; compact.ordinal = 10;
+    for (auto& eye : compact.eyes) { eye.path += L".jpg"; eye.jpeg = true; }
     fnvxr::host::mirror::Writer writer;
     if (!writer.submit(std::move(pair))) return 3;
+    if (!writer.submit(std::move(compact))) return 12;
     writer.finish();
     const auto results = writer.takeCompleted();
-    if (results.size() != 1 || results[0].frame != 47 || results[0].ordinal != 9
+    if (results.size() != 2 || results[0].frame != 47 || results[0].ordinal != 9
         || results[0].status[0] < 0 || results[0].status[1] < 0) return 4;
+    if (results[1].frame != 48 || results[1].status[0] < 0 || results[1].status[1] < 0) return 13;
     if (FAILED(CoInitializeEx(nullptr, COINIT_MULTITHREADED))) return 5;
     ComPtr<IWICImagingFactory> factory;
     if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr,
@@ -58,17 +63,33 @@ int main()
             || FAILED(factory->CreateFormatConverter(&converter))
             || FAILED(converter->Initialize(frame.Get(), GUID_WICPixelFormat32bppRGBA,
                 WICBitmapDitherTypeNone, nullptr, 0, WICBitmapPaletteTypeCustom))) return 7;
-        std::array<unsigned char, 16*8*4> decoded {};
-        if (FAILED(converter->CopyPixels(nullptr, 16*4, static_cast<UINT>(decoded.size()), decoded.data()))) return 8;
-        for (unsigned y = 0; y != 8; ++y)
-            for (unsigned x = 0; x != 16; ++x)
+        std::array<unsigned char, 256*96*4> decoded {};
+        if (FAILED(converter->CopyPixels(nullptr, 256*4, static_cast<UINT>(decoded.size()), decoded.data()))) return 8;
+        for (unsigned y = 0; y != 96; ++y)
+            for (unsigned x = 0; x != 256; ++x)
             {
-                const auto* pixel = decoded.data() + (y*16+x)*4;
+                const auto* pixel = decoded.data() + (y*256+x)*4;
                 if (pixel[0] != (eye ? 197 : 31) || pixel[1] != x
                     || pixel[2] != y || pixel[3] != 231) return 9;
             }
         converter.Reset(); frame.Reset(); decoder.Reset();
         if (!DeleteFileW(paths[eye].c_str())) return 10;
+        const auto compactPath = paths[eye] + L".jpg";
+        if (FAILED(factory->CreateDecoderFromFilename(compactPath.c_str(), nullptr,
+            GENERIC_READ, WICDecodeMetadataCacheOnLoad, &decoder))
+            || FAILED(decoder->GetFrame(0, &frame)) || FAILED(factory->CreateFormatConverter(&converter))
+            || FAILED(converter->Initialize(frame.Get(), GUID_WICPixelFormat32bppRGBA,
+                WICBitmapDitherTypeNone, nullptr, 0, WICBitmapPaletteTypeCustom))) return 14;
+        if (FAILED(converter->CopyPixels(nullptr, 256*4, static_cast<UINT>(decoded.size()), decoded.data()))) return 15;
+        for (unsigned y = 4; y < 92; y += 8)
+            for (unsigned x = 4; x < 252; x += 8)
+            {
+                const auto* pixel = decoded.data() + (y*256+x)*4;
+                if (abs(int(pixel[0]) - (eye ? 197 : 31)) > 8 || abs(int(pixel[1])-int(x)) > 8
+                    || abs(int(pixel[2])-int(y)) > 8 || pixel[3] != 255) return 16;
+            }
+        converter.Reset(); frame.Reset(); decoder.Reset();
+        if (!DeleteFileW(compactPath.c_str())) return 17;
     }
     factory.Reset();
     CoUninitialize();
