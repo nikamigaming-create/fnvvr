@@ -22,6 +22,7 @@
 #include "fnvxr_native_menu_geometry.h"
 #include "fnvxr_native_menu_stack.h"
 #include "fnvxr_first_person_view.h"
+#include "fnvxr_retail_rig_lifetime.h"
 #include "../protocol/fnvxr_haptic_feedback.h"
 #include "fnvxr_retail_engine_abi.h"
 #include "../kernel/runtime_config.h"
@@ -821,7 +822,7 @@ LONG g_retailRigOriginAuthoritySequence = 0;
 LONG g_lastRetailRigPoseSequence = 0;
 UInt64 g_retailRigSolveCount = 0;
 UInt64 g_retailRigDiscoveryCount = 0;
-void* g_lastRetailRigAnimData = nullptr;
+std::uintptr_t g_retailRigAnimationIdentity = 0;
 bool g_haveRetailRigMotionSample = false;
 Vec3 g_previousRetailRigHeadLocalMeters {};
 Quat g_previousRetailRigHeadLocalRotation { 0.0f, 0.0f, 0.0f, 1.0f };
@@ -6015,16 +6016,23 @@ void* findUniqueNiObjectByPrefix(
 
 bool niObjectDescendsFrom(void* object, void* ancestor)
 {
-    if (!object || !ancestor)
-        return false;
-    for (int depth = 0; object && depth < 64; ++depth)
-    {
-        if (object == ancestor)
-            return true;
-        object = readPointer(
-            reinterpret_cast<std::uintptr_t>(object) + NiAvObjectParentOffset);
-    }
-    return false;
+    return fnvxr::engine::retailOwnedDescendant(object, ancestor,
+        [](void* node) {
+            return readPointer(reinterpret_cast<std::uintptr_t>(node)
+                + NiAvObjectParentOffset);
+        },
+        [](void* parent, void* child) {
+            void** children = nullptr;
+            UInt16 count = 0;
+            if (!readNiNodeChildren(parent, &children, count)) return false;
+            __try
+            {
+                for (UInt16 i = 0; i < count; ++i)
+                    if (children[i] == child) return true;
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+            return false;
+        });
 }
 
 bool niObjectAncestorChainVisible(void* object, void* root)
@@ -6149,7 +6157,7 @@ void* retrievePlayerRootNode(bool firstPerson)
 #endif
 }
 
-void* currentPlayerThirdPersonAnimData()
+void* currentPlayerAnimData(bool firstPerson)
 {
 #if defined(_M_IX86)
     void* player = readPointer(PlayerCharacterAddress);
@@ -6157,8 +6165,23 @@ void* currentPlayerThirdPersonAnimData()
         return nullptr;
     __try
     {
-        using GetActorAnimDataFn = void* (__thiscall*)(void*);
-        return reinterpret_cast<GetActorAnimDataFn>(PlayerCharacterGetActorAnimDataAddress)(player);
+        // Verified from the owned loaded executable: 40 bytes ending RET 4.
+        // A previous zero-argument declaration read an unrelated stack byte as
+        // the perspective flag and let the callee remove unowned stack data.
+        static bool functionVerified = false;
+        if (!functionVerified)
+        {
+            const auto* code = pointerFromAddress32<const UInt8*>(
+                PlayerCharacterGetActorAnimDataAddress);
+            UInt64 hash = 14695981039346656037ull;
+            for (std::size_t i = 0; i < 40u; ++i)
+                hash = (hash ^ code[i]) * 1099511628211ull;
+            if (hash != 0x644ca1201c392145ull) return nullptr;
+            functionVerified = true;
+        }
+        return fnvxr::engine::readRetailPlayerAnimation(
+            pointerFromAddress32<fnvxr::engine::RetailGetActorAnimData>(
+                PlayerCharacterGetActorAnimDataAddress), player, firstPerson);
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
     {
@@ -6668,10 +6691,24 @@ bool captureTrackedPropAssistRigOrigin(
 
 bool retailRigNodesComplete(const RetailRigNodes& rig)
 {
+    const auto current = [&rig](void* node) {
+        return !node || niObjectDescendsFrom(node, rig.root);
+    };
     return rig.root
         && rig.left.clavicle && rig.left.upperArm && rig.left.forearm && rig.left.hand
         && rig.right.clavicle && rig.right.upperArm && rig.right.forearm && rig.right.hand
         && rig.weapon
+        && niObjectDescendsFrom(rig.left.clavicle, rig.root)
+        && niObjectDescendsFrom(rig.right.clavicle, rig.root)
+        && current(rig.bodySkeleton)
+        && current(rig.left.forearmTwist) && current(rig.right.forearmTwist)
+        && current(rig.upperBodyMesh)
+        && current(rig.armsGeometry0) && current(rig.armsGeometry1)
+        && current(rig.leftHandMesh) && current(rig.rightHandMesh)
+        && current(rig.pipBoy) && current(rig.pipBoyScreen)
+        && current(rig.pipBoyScreenSurface)
+        && current(rig.weaponModel) && current(rig.projectileNode)
+        && current(rig.muzzleFlash)
         && niObjectDescendsFrom(rig.left.upperArm, rig.left.clavicle)
         && niObjectDescendsFrom(rig.left.forearm, rig.left.upperArm)
         && niObjectDescendsFrom(rig.left.hand, rig.left.forearm)
@@ -9036,6 +9073,8 @@ void onRetailPostAnimation(void* animData)
     if (!physicalHeadsetPlayRequested()
         && !envEnabled("FNVXR_RETAIL_RIG_ENABLE", false))
         return;
+    if (GetCurrentThreadId() != g_gamePluginProducerThreadId)
+        return;
     const bool trackedPropAssist = trackedPropAssistProfileRequested();
     const bool headlessStereoRigVisualTrial =
         headsetControllerRigVisualTrialRequested();
@@ -9070,19 +9109,22 @@ void onRetailPostAnimation(void* animData)
         return;
     }
 
+    // Resolve the current first-person owner before touching the callback's
+    // pointer. Loading/equipment/VATS can replace animation data between draws.
+    if (!animData || animData != currentPlayerAnimData(true))
+        return;
     void* player = readPointer(PlayerCharacterAddress);
     void* actor = animData
         ? readPointer(reinterpret_cast<std::uintptr_t>(animData) + 0x04)
         : nullptr;
     if (!animData || actor != player)
         return;
-    void* thirdPersonAnimData = currentPlayerThirdPersonAnimData();
-    // This call site runs for both player animation sets. Solving the
-    // first-person arm a second time from the third-person AnimData produces
-    // a small but visible target shift every frame, so this is deliberately
-    // not configurable: the retail view-model pass is the sole IK owner.
-    if (animData == thirdPersonAnimData)
-        return;
+    if (g_retailRigAnimationIdentity != reinterpret_cast<std::uintptr_t>(animData))
+    {
+        g_retailRigAnimationIdentity = reinterpret_cast<std::uintptr_t>(animData);
+        g_retailRigRediscoveryRequested = true;
+        resetRetailRigOrigin("first-person-animation-owner-changed");
+    }
     // Keep the tracked-prop exclusion explicit: that lease must never reach
     // projectile-node mutation. The separate headless stereo lease is also
     // visual-only, so it remains inside the same outer exclusion.
@@ -9187,6 +9229,11 @@ void onRetailPostAnimation(void* animData)
     void* root = retrievePlayerRootNode(true);
     if (!root)
         root = readPointer(Camera1stBipedNodeAddress);
+    if (root != readPointer(reinterpret_cast<std::uintptr_t>(animData) + 0x08))
+    {
+        g_retailRigRediscoveryRequested = true;
+        return;
+    }
     if (!root)
     {
         logRetailRigGateSkip(g_retailRigNoRootCount, "first-person-root-unavailable", pose);
@@ -9510,7 +9557,6 @@ void onRetailPostAnimation(void* animData)
             0.08f);
 
     g_lastRetailRigPoseSequence = pose.sequence;
-    g_lastRetailRigAnimData = animData;
     ++g_retailRigSolveCount;
 
     const Vec3 committedRightHandWorld = hostSpatialProps && !nativeHands
@@ -9856,7 +9902,7 @@ void onRetailPostAnimation(void* animData)
                 && (pose.trackingFlags & fnvxr::shared::VrPoseTrackingRightAimCurrent) != 0),
             rightController.usesAimOrientation ? "aim" : "grip",
             animData,
-            thirdPersonAnimData,
+            currentPlayerAnimData(false),
             root,
             applyWrites ? 1 : 0,
             leftSolved ? 1 : 0,
@@ -18847,12 +18893,14 @@ FNVXR_ApplyWeaponFrameForRender(
         || poseSequence == 0
         || (!physicalHeadsetEngineCenterRigRequested()
             && !headsetControllerRigVisualTrialRequested())
-        || !g_lastRetailRigAnimData)
+        || GetCurrentThreadId() != g_gamePluginProducerThreadId)
     {
         return false;
     }
     if (!installFirstPersonTogglePolicy())
         return false;
+    void* const liveAnimation = currentPlayerAnimData(true);
+    if (!liveAnimation) return false;
     VrRigPoseSnapshot pose {};
     __try
     {
@@ -18963,7 +19011,7 @@ FNVXR_ApplyWeaponFrameForRender(
     g_renderRigPoseOverride = pose;
     g_preparedFirstPersonViewSequence = 0;
     g_renderRigPoseOverrideActive = true;
-    onRetailPostAnimation(g_lastRetailRigAnimData);
+    onRetailPostAnimation(liveAnimation);
     g_renderRigPoseOverrideActive = false;
     const bool completeTrackedPropsRestored =
         hostSpatialPropReplacementRequested()

@@ -27,7 +27,7 @@ $testArguments = @()
 $testFilter = ""
 if ($Focused) {
     if (-not $Incremental) { throw "Focused validation requires -Incremental." }
-    $testFilter = '^fnvxr_(mirror_writer|rig_c_api|runtime_config(_loader)?|presentation_coordinator_kernel|product_kernel_adapter|wrist_ui_kernel|wrist_content_readiness|pipboy_panel_contract|native_control_pulses|native_menu_geometry|world_continuity|haptics|input_proxy_(safety|inert_fuse)|physical_input_authority|product_launcher|source_pose_history|gpu_color_route|retail_(tracked_frame|world_accumulation_controller|center_runtime|center_renderer_operations|eye_camera_transaction|ui_quad_capture_source_fuse)|headset_mirror_capture)(_test)?$'
+    $testFilter = '^fnvxr_(mirror_writer|rig_c_api|runtime_config(_loader)?|presentation_coordinator_kernel|product_kernel_adapter|wrist_ui_kernel|wrist_content_readiness|pipboy_panel_contract|native_control_pulses|native_menu_geometry|world_continuity|haptics|input_proxy_(safety|inert_fuse)|physical_input_authority|product_launcher|source_pose_history|gpu_color_route|retail_(rig_lifetime|tracked_frame|world_accumulation_controller|center_runtime|center_renderer_operations|eye_camera_transaction|ui_quad_capture_source_fuse)|headset_mirror_capture)(_test)?$'
     $testArguments = @('-R', $testFilter)
 }
 

@@ -228,6 +228,10 @@ add_executable(fnvxr_native_menu_geometry_test tests/fnvxr_native_menu_geometry_
 target_include_directories(fnvxr_native_menu_geometry_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/runtime)
 add_test(NAME fnvxr_native_menu_geometry_test COMMAND fnvxr_native_menu_geometry_test)
 
+add_executable(fnvxr_retail_rig_lifetime_test tests/fnvxr_retail_rig_lifetime_test.cpp)
+target_include_directories(fnvxr_retail_rig_lifetime_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/runtime)
+add_test(NAME fnvxr_retail_rig_lifetime_test COMMAND fnvxr_retail_rig_lifetime_test)
+
 add_executable(fnvxr_world_continuity_test tests/fnvxr_world_continuity_test.cpp)
 add_test(NAME fnvxr_world_continuity_test COMMAND fnvxr_world_continuity_test)
 
