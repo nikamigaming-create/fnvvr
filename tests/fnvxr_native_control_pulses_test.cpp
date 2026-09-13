@@ -1,4 +1,5 @@
 #include "fnvxr_native_control_pulses.h"
+#include "fnvxr_native_movie_input.h"
 #include <iostream>
 
 int main()
@@ -8,6 +9,17 @@ int main()
     const auto expect = [&](bool value, const char* name) {
         if (!value) { std::cerr << name << '\n'; ++failures; }
     };
+    fnvxr::input::NativeMovieSkipInput movie;
+    expect(!movie.sample(1000, true, true), "Opening confirm cannot skip a movie");
+    expect(!movie.sample(1010, true, false), "Release arms native movie input");
+    expect(movie.sample(1020, true, true), "A new controller press skips");
+    expect(!movie.sample(1030, true, true), "Held skip cannot repeat");
+    expect(!movie.sample(1040, true, false), "Release rearms");
+    expect(!movie.sample(2000, true, true), "A new movie requires a fresh release");
+    expect(!movie.sample(2010, false, false), "Disconnected state cannot arm");
+    expect(!movie.sample(2020, true, true), "Reconnect with button held cannot skip");
+    expect(!movie.sample(2030, true, false), "Connected neutral rearms");
+    expect(!movie.sample(1500, true, true), "Clock rollback cannot reuse a press");
     pulses.beginFrame();
     expect(!pulses.publish(5, 1000), "An unauthorized action cannot be queued");
     pulses.authorize(true);

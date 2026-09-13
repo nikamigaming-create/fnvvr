@@ -4,8 +4,17 @@
 
 namespace fnvxr::engine
 {
-// The renderer and the tracked rig share this body anchor within one native
-// frame. It contains no HMD delta and no cinematic camera transform.
+// Scripted first-person movement (beds, chairs, character creation) owns the
+// player's authored view. VATS playback is a third-person camera and must not
+// take that authority. Head tracking is applied after this common rig anchor.
+inline bool useAuthoredFirstPersonCamera(bool movementLocked, bool lookLocked,
+    bool characterPreview, bool vatsActive) noexcept
+{
+    return !vatsActive && (movementLocked || lookLocked || characterPreview);
+}
+
+// The renderer and the tracked rig share this anchor within one native frame.
+// It contains the authored first-person frame, with no HMD delta applied yet.
 struct FirstPersonView
 {
     float rotation[9] {}; // NiCamera columns: forward, up, right.

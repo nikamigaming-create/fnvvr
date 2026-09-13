@@ -19,6 +19,7 @@
 #include "fnvxr_stereo_visual_trial_automation_authority.h"
 #include "fnvxr_weapon_frame_contract.h"
 #include "fnvxr_native_control_pulses.h"
+#include "fnvxr_native_movie_input.h"
 #include "fnvxr_native_menu_geometry.h"
 #include "fnvxr_native_menu_stack.h"
 #include "fnvxr_first_person_view.h"
@@ -644,6 +645,7 @@ bool g_authorizedRuntimeObservationStarted = false;
 bool g_headsetDemoFixtureReady = false;
 UInt32 g_retailObservationAuthorityAttempts = 0;
 UInt64 g_runtimeObservationFrame = 0;
+UInt64 g_lastRuntimeObservationMs = 0;
 NVSEConsoleInterface* g_console = nullptr;
 NVSEMessagingInterface* g_messaging = nullptr;
 NVSEPlayerControlsInterface* g_playerControls = nullptr;
@@ -5457,7 +5459,14 @@ bool writeJump(UInt32 source, void* target)
 bool __fastcall hookedFirstPersonToggle(void* player, void*, bool firstPerson)
 {
     using ToggleFn = bool (__thiscall*)(void*, bool);
+    const UInt8 controls = player == readPointer(PlayerCharacterAddress)
+        ? readUInt8(reinterpret_cast<std::uintptr_t>(player) + 0x680u) : 0u;
+    const bool authoredFirstPerson = fnvxr::engine::useAuthoredFirstPersonCamera(
+        (controls & 1u) != 0u, (controls & 2u) != 0u,
+        (currentMenuBits() & fnvxr::shared::RuntimeRaceSexMenuBit) != 0u,
+        readUInt32(0x011F2258) != 0u);
     if (!firstPerson && strictFirstPersonEnabled()
+        && !authoredFirstPerson
         && player == readPointer(PlayerCharacterAddress)
         && (physicalHeadsetEngineCenterRigRequested()
             || headsetControllerRigVisualTrialRequested()))
@@ -8950,6 +8959,9 @@ void publishWeaponFrameCommit(
         flags |= fnvxr::shared::WeaponFrameFlagHandMeshRotationValid;
     if (pipBoyScreenPoseValid)
         flags |= fnvxr::shared::WeaponFrameFlagPipBoyScreenPoseValid;
+    const bool pipBoyAbsent = !g_retailRigNodes.pipBoy;
+    if (pipBoyAbsent)
+        flags |= fnvxr::shared::WeaponFrameFlagPipBoyAbsent;
     const UInt32 required = fnvxr::shared::weaponFrameRequiredFlags(flags);
     const bool complete =
         (flags & required) == required
@@ -8962,9 +8974,9 @@ void publishWeaponFrameCommit(
         && (!hostSpatialPropReplacementRequested()
             || (handMeshRotationValid
                 && finiteUsableQuat(rightHandGripLocalRotation)
-                && pipBoyScreenPoseValid
-                && finiteVec3(pipBoyScreenGripLocalPosition)
-                && finiteUsableQuat(pipBoyScreenGripLocalRotation)));
+                && (pipBoyAbsent || (pipBoyScreenPoseValid
+                    && finiteVec3(pipBoyScreenGripLocalPosition)
+                    && finiteUsableQuat(pipBoyScreenGripLocalRotation)))));
     // Fallout invokes the animation seam more than once for one OpenXR pose.
     // A later cull/stock callback can temporarily hide the arm branch after an
     // earlier callback already committed the exact current controller pose.
@@ -9377,7 +9389,7 @@ void onRetailPostAnimation(void* animData)
     // The hand/controller origin follows only the engine-authored body frame.
     // It must never use the current render camera because that camera can
     // already contain the HMD overlay during the Gamebryo render traversal.
-    const Vec3 bodyAnchorWorld = addVec3(
+    Vec3 bodyAnchorWorld = addVec3(
         bodyWorldPosition,
         transformVec3(
             bodyWorldRotation,
@@ -9385,15 +9397,43 @@ void onRetailPostAnimation(void* animData)
     if (!finiteVec3(bodyAnchorWorld))
         return;
 
+    Matrix33 rigWorldRotation = bodyWorldRotation;
+    const UInt8 controls = readUInt8(reinterpret_cast<std::uintptr_t>(player) + 0x680u);
+    if (bodyAnchoredEngineCenterRig && fnvxr::engine::useAuthoredFirstPersonCamera(
+            (controls & 1u) != 0u, (controls & 2u) != 0u,
+            (currentMenuBits() & fnvxr::shared::RuntimeRaceSexMenuBit) != 0u,
+            readUInt32(0x011F2258) != 0u))
+    {
+        // The global WORLD camera retains the game's bed/chair animation.
+        // Camera1st and the body node can both be moved to portrait-local
+        // coordinates by RaceSexMenu, so neither is a world anchor there.
+        using namespace fnvxr::engine::abi;
+        void* scene = readPointer(SceneGraphSingletonPointerAddress);
+        void* camera = scene ? readPointer(reinterpret_cast<std::uintptr_t>(scene)
+            + offsetof(RetailSceneGraphLayout, camera)) : nullptr;
+        if (!camera || !looksLikeNiObject(camera)) return;
+        const auto cameraBase = reinterpret_cast<std::uintptr_t>(camera);
+        const Matrix33 cameraRotation = readMatrix33(cameraBase + NiAvObjectWorldRotationOffset);
+        const Vec3 cameraPosition = readVec3(cameraBase + NiAvObjectWorldTranslationOffset);
+        if (!finiteMatrix33(cameraRotation) || !finiteVec3(cameraPosition)) return;
+        bodyAnchorWorld = cameraPosition;
+        for (int row = 0; row < 3; ++row)
+        {
+            rigWorldRotation.m[row][0] = cameraRotation.m[row][2];
+            rigWorldRotation.m[row][1] = cameraRotation.m[row][0];
+            rigWorldRotation.m[row][2] = cameraRotation.m[row][1];
+        }
+    }
+
     if (g_renderRigPoseOverrideActive && bodyAnchoredEngineCenterRig)
     {
         // Actor columns are right/forward/up; NiCamera uses forward/up/right.
         // Publish the exact body frame used by the two controller solves.
         for (int row = 0; row < 3; ++row)
         {
-            g_preparedFirstPersonView.rotation[row * 3] = bodyWorldRotation.m[row][1];
-            g_preparedFirstPersonView.rotation[row * 3 + 1] = bodyWorldRotation.m[row][2];
-            g_preparedFirstPersonView.rotation[row * 3 + 2] = bodyWorldRotation.m[row][0];
+            g_preparedFirstPersonView.rotation[row * 3] = rigWorldRotation.m[row][1];
+            g_preparedFirstPersonView.rotation[row * 3 + 1] = rigWorldRotation.m[row][2];
+            g_preparedFirstPersonView.rotation[row * 3 + 2] = rigWorldRotation.m[row][0];
         }
         g_preparedFirstPersonView.position[0] = bodyAnchorWorld.x;
         g_preparedFirstPersonView.position[1] = bodyAnchorWorld.y;
@@ -9405,9 +9445,9 @@ void onRetailPostAnimation(void* animData)
     }
 
     const RetailControllerWorldPose leftController = retailControllerWorldPose(
-        pose, true, bodyAnchorWorld, bodyWorldRotation);
+        pose, true, bodyAnchorWorld, rigWorldRotation);
     const RetailControllerWorldPose rightController = retailControllerWorldPose(
-        pose, false, bodyAnchorWorld, bodyWorldRotation);
+        pose, false, bodyAnchorWorld, rigWorldRotation);
     const bool applyWrites = physicalHeadsetPlayRequested()
         || envEnabled("FNVXR_RETAIL_RIG_APPLY", false);
     const bool hostSpatialProps = hostSpatialPropReplacementRequested();
@@ -9422,7 +9462,7 @@ void onRetailPostAnimation(void* animData)
             if (weaponBindingReady && !noEquippedWeapon)
                 applyRetailWeaponAim(rightController, false);
             ensureRetailHandCalibration(g_retailRightCalibration,
-                g_retailRigNodes.right, rightController, bodyWorldRotation, false);
+                g_retailRigNodes.right, rightController, rigWorldRotation, false);
             if (g_retailRightCalibration.valid
                 && (noEquippedWeapon || !weaponBindingReady || !g_retailWeaponCalibration.valid))
             {
@@ -9458,7 +9498,7 @@ void onRetailPostAnimation(void* animData)
         if (leftControllerUsable)
         {
             ensureRetailHandCalibration(g_retailLeftCalibration,
-                g_retailRigNodes.left, leftController, bodyWorldRotation, true);
+                g_retailRigNodes.left, leftController, rigWorldRotation, true);
             const Matrix33 xrToGame {{ {1,0,0}, {0,0,-1}, {0,1,0} }};
             g_retailLeftCalibration.controllerToHandRotation = multiplyMatrix33(
                 xrToGame, nifHandToXrMeshMatrix());
@@ -9473,11 +9513,11 @@ void onRetailPostAnimation(void* animData)
         const float units = getFloatFromEnv("FNVXR_D3D9_GAME_UNITS_PER_METER", 70.0f);
         const Vec3 headLocal = xrDeltaToGamebryoVector(xrPositionInOriginFrame(
             g_retailRigOriginHmdRot, g_retailRigOriginHmdPos, pose.hmdPos));
-        const Vec3 center = addVec3(bodyAnchorWorld, transformVec3(bodyWorldRotation,
+        const Vec3 center = addVec3(bodyAnchorWorld, transformVec3(rigWorldRotation,
             scaleVec3(addVec3(headLocal, {0.0f,
                 -getFloatFromEnv("FNVXR_BODY_SHOULDER_BACK", bodyConfig.shoulderBackMeters),
                 -getFloatFromEnv("FNVXR_BODY_SHOULDER_DROP", bodyConfig.shoulderDropMeters)}), units)));
-        const Vec3 rightOffset = transformVec3(bodyWorldRotation,
+        const Vec3 rightOffset = transformVec3(rigWorldRotation,
             {getFloatFromEnv("FNVXR_BODY_SHOULDER_WIDTH", bodyConfig.shoulderWidthMeters) * units * 0.5f, 0.0f, 0.0f});
         if (!placeRetailBodyAtShoulders(center)) return;
         placeRetailArmShoulder(g_retailRigNodes.left, subtractVec3(center, rightOffset));
@@ -9491,7 +9531,7 @@ void onRetailPostAnimation(void* animData)
             g_retailRigNodes.right,
             g_retailRightCalibration,
             rightController,
-            bodyWorldRotation,
+            rigWorldRotation,
             false,
             applyWrites,
             rightError);
@@ -9501,7 +9541,7 @@ void onRetailPostAnimation(void* animData)
             g_retailRigNodes.left,
             g_retailLeftCalibration,
             leftController,
-            bodyWorldRotation,
+            rigWorldRotation,
             true,
             applyWrites,
             leftError);
@@ -11932,6 +11972,8 @@ bool dispatchNativeMenuKey(UInt32 keycode)
     }
 }
 
+bool g_nativeMovieControlPathVerified = false;
+
 UInt32 __fastcall hookedNativeControlState(void* input, void*, UInt32 control, UInt32 state)
 {
     // Retail returns a full EAX input count, including two simultaneous
@@ -11939,6 +11981,26 @@ UInt32 __fastcall hookedNativeControlState(void* input, void*, UInt32 control, U
     // wrapper here leaves upper EAX undefined for the engine's integer callers.
     using ReadControlFn = UInt32 (__thiscall*)(void*, UInt32, UInt32);
     const UInt32 native = reinterpret_cast<ReadControlFn>(g_nativeControlTrampoline)(input, control, state);
+    if (GetCurrentThreadId() == g_nativeControlThreadId
+        && g_nativeMovieControlPathVerified && control == 5u && state == 1u
+        && reinterpret_cast<std::uintptr_t>(_ReturnAddress()) == 0x008674C3u)
+    {
+        // BGSMoviePlayer polls Activate in its blocking loop, after the native
+        // movie permits skipping. Use the normal shared controller state and
+        // preserve the native return/teardown path.
+        static fnvxr::input::NativeMovieSkipInput skip;
+        SharedXInputState controller {};
+        const bool current = readEffectiveExternalXInputSnapshot(controller)
+            && controller.connected != 0u && !g_externalXInputNeutral;
+        const bool down = (controller.buttons & (XInputA | XInputStart | XInputBack)) != 0u;
+        if (skip.sample(GetTickCount64(), current, down))
+        {
+            g_lastExternalXInputButtons = controller.buttons;
+            logTelemetry("nativeMovie skip consumed source=controller finalConsumer=retail-activate\n");
+            return native ? native : 1u;
+        }
+        return native;
+    }
     if (GetCurrentThreadId() == g_nativeControlThreadId && g_nativeMenuInputAllowed
         && g_nativeMenuControlPulses.sample(control, state, GetTickCount64())
         && visibleMenuForInput() == g_nativeMenuKeyOwner)
@@ -11969,6 +12031,11 @@ bool installNativeControlReader()
             logTelemetry("nativeControl rejected reason=function-identity\n");
             return false;
         }
+        const auto* movieCode = pointerFromAddress32<const UInt8*>(0x00867440u);
+        UInt64 movieHash = 14695981039346656037ull;
+        for (std::size_t i = 0; i < 194u; ++i)
+            movieHash = (movieHash ^ movieCode[i]) * 1099511628211ull;
+        g_nativeMovieControlPathVerified = movieHash == 0xf5b67de91ec5b4f1ull;
         auto* relay = static_cast<UInt8*>(VirtualAlloc(nullptr, 11u, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
         if (!relay) return false;
         std::memcpy(relay, code, 6u);
@@ -15519,6 +15586,10 @@ void consumeExternalXInputBridge(
     if (nativeLocomotionConsumerRequested())
         applyHeadRelativeLocomotion(state, observation.frame);
 
+    // Install while this ordinary controller bridge owns the game thread,
+    // including the front end before its first blocking movie starts.
+    installNativeControlReader();
+
     const UInt32 menuBits = observation.menuBits;
     const fnvxr::shared::RuntimeControllerMode controllerMode =
         fnvxr::shared::runtimeControllerMode(
@@ -16152,8 +16223,9 @@ bool ensureAuthorizedRuntimeObservationStarted()
     return g_authorizedRuntimeObservationStarted;
 }
 
-RuntimeObservation observeAndPublishRuntime()
+RuntimeObservation observeAndPublishRuntime(const char* source = "compatibility-authorized-mainloop")
 {
+    g_lastRuntimeObservationMs = GetTickCount64();
     RuntimeObservation observation {};
     observation.frame = ++g_runtimeObservationFrame;
     observation.menuBits = currentMenuBits();
@@ -16194,12 +16266,12 @@ RuntimeObservation observeAndPublishRuntime()
     {
         previousMenuBits = observation.menuBits;
         logTelemetry(
-            "runtime observation frame=%llu bits=0x%02X phase=%lu ui=%d camera=%d source=compatibility-authorized-mainloop\n",
+            "runtime observation frame=%llu bits=0x%02X phase=%lu ui=%d camera=%d source=%s\n",
             static_cast<unsigned long long>(observation.frame),
             observation.menuBits,
             static_cast<unsigned long>(observation.phase),
             static_cast<int>(observation.uiInputAllowed),
-            static_cast<int>(observation.cameraActive));
+            static_cast<int>(observation.cameraActive), source);
     }
     return observation;
 }
@@ -18988,6 +19060,28 @@ void stopBridge()
 {
     releaseControllerHolds();
 }
+}
+
+extern "C" __declspec(dllexport) bool __cdecl
+FNVXR_ObserveNativeUiPresentation()
+{
+    if (!g_authorizedRuntimeObservationStarted
+        || !g_runtimeState || GetCurrentThreadId() != g_gamePluginProducerThreadId)
+        return false;
+    const auto now = GetTickCount64();
+    if (!g_lastRuntimeObservationMs || now < g_lastRuntimeObservationMs
+        || now - g_lastRuntimeObservationMs < 100u)
+        return false;
+    // Movies and synchronous UI run their own native Present loop without
+    // xNVSE updates. Observe their current menu state on that same thread.
+    // A stalled gameplay loop gets no synthetic heartbeat. These are UI
+    // observations, not simulation ticks; no input or scene update is re-entered.
+    const auto bits = currentMenuBits();
+    if (!fnvxr::shared::runtimeUiInputAllowed(bits)
+        && !(bits & fnvxr::shared::RuntimeLoadingMenuBit))
+        return false;
+    observeAndPublishRuntime("native-menu-present");
+    return true;
 }
 
 extern "C" __declspec(dllexport) bool __cdecl

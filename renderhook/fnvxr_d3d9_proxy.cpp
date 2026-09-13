@@ -9522,6 +9522,96 @@ bool installNativeUiDrawHooks(IDirect3DDevice9* device) noexcept
     return true;
 }
 
+bool gNativeCharacterUiCaptureActive = false;
+std::uint32_t gNativeCharacterUiCullCalls = 0;
+std::uint32_t gNativeCharacterUiCaptureCalls = 0;
+std::uint32_t gNativeCharacterUiRootFlags = 0;
+void* gNativeCharacterUiRoot = nullptr;
+
+void* gNativeSkinPaletteTrampoline = nullptr;
+thread_local fnvxr::engine::RetailSkinPaletteCameraCache gNativeSkinPaletteCameras;
+
+void __fastcall buildNativeSkinPalette(void* renderer, void*, void* skin,
+    void* transform, std::uint32_t transpose, std::uint32_t rows,
+    std::uint32_t worldSpace)
+{
+    using Build = void (__thiscall*)(void*, void*, void*, std::uint32_t,
+        std::uint32_t, std::uint32_t);
+    std::array<float, 3> camera {};
+    std::memcpy(camera.data(), reinterpret_cast<const void*>(0x011F474Cu), sizeof(camera));
+    if (skin && gNativeSkinPaletteCameras.needsRebuild(
+            reinterpret_cast<std::uintptr_t>(skin), camera))
+    {
+        // This is the native producer's own NiSkinInstance argument, after
+        // SetupCamera and before its frame-cache lookup. It covers skin that
+        // bypasses the conservative world's captured visibility list too.
+        *reinterpret_cast<std::uint32_t*>(static_cast<std::uint8_t*>(skin) + 0x18u)
+            = 0xFFFFFFFFu;
+    }
+    reinterpret_cast<Build>(gNativeSkinPaletteTrampoline)(
+        renderer, skin, transform, transpose, rows, worldSpace);
+}
+
+bool installNativeSkinPaletteCameraCache() noexcept
+{
+    if (gNativeSkinPaletteTrampoline) return true;
+    __try
+    {
+        auto* body = reinterpret_cast<std::uint8_t*>(0x00E6FE30u);
+        std::uint64_t hash = 14695981039346656037ull;
+        for (std::size_t i = 0; i != 782u; ++i)
+            hash = (hash ^ body[i]) * 1099511628211ull;
+        if (hash != 0x3cb7b5f1501b7254ull) return false;
+        auto* trampoline = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, 11u,
+            MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+        if (!trampoline) return false;
+        // One complete sub esp, B4 instruction; no relative operand.
+        std::memcpy(trampoline, body, 6u);
+        trampoline[6] = 0xE9;
+        const auto resume = static_cast<std::uint32_t>(0x00E6FE36u
+            - (reinterpret_cast<std::uintptr_t>(trampoline) + 11u));
+        std::memcpy(trampoline + 7u, &resume, 4u);
+        DWORD protection = 0;
+        if (!VirtualProtect(body, 6u, PAGE_EXECUTE_READWRITE, &protection))
+        {
+            VirtualFree(trampoline, 0, MEM_RELEASE);
+            return false;
+        }
+        gNativeSkinPaletteTrampoline = trampoline;
+        const auto jump = static_cast<std::uint32_t>(
+            reinterpret_cast<std::uintptr_t>(&buildNativeSkinPalette) - 0x00E6FE35u);
+        body[0] = 0xE9;
+        std::memcpy(body + 1u, &jump, 4u);
+        body[5] = 0x90;
+        DWORD ignored = 0;
+        VirtualProtect(body, 6u, protection, &ignored);
+        FlushInstructionCache(GetCurrentProcess(), trampoline, 11u);
+        FlushInstructionCache(GetCurrentProcess(), body, 6u);
+        logRetailVrLine("native skin palette cache installed: camera-relative matrices refreshed at original producer");
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+bool __fastcall captureNativeCharacterUiVisibility(void* root, void*)
+{
+    // The native RaceSex branch excludes this tile root from the ordinary
+    // interface pass, even when its logical menu visibility is true. It may
+    // already be culled on entry, so intercept the query before that branch.
+    ++gNativeCharacterUiCullCalls;
+    if (!gNativeCharacterUiCaptureActive)
+        return reinterpret_cast<bool (__thiscall*)(void*)>(0x00456610u)(root);
+    ++gNativeCharacterUiCaptureCalls;
+    auto* flags = reinterpret_cast<std::uint32_t*>(
+        static_cast<std::uint8_t*>(root) + 0x30u);
+    gNativeCharacterUiRoot = root;
+    gNativeCharacterUiRootFlags = *flags;
+    *flags &= ~1u;
+    // Skip the native hide/restore pair. Our enclosing render scope restores
+    // the exact entry flags after these original widgets have been drawn.
+    return true;
+}
+
 void __fastcall captureNativeInterfaceRender(void* manager, void*, void* culler, bool pipBoy)
 {
     using RenderUi = void (__thiscall*)(void*, void*, bool);
@@ -9536,20 +9626,34 @@ void __fastcall captureNativeInterfaceRender(void* manager, void*, void* culler,
     const bool popupVisible = fnvxr::engine::live_pipboy::hasConflictingMenu(gNativeUiMenuBits);
     gNativeUiCapture.begin(eligible && (!pipVisible || popupVisible) ? gRetailVrProxyContext.device : nullptr,
         gNativeUiMenuBits, gNativeUiSetTarget, gNativeUiSetDepth, gNativeUiClear);
+    gNativeCharacterUiCaptureActive = eligible
+        && (gNativeUiMenuBits & fnvxr::shared::RuntimeRaceSexMenuBit) != 0u;
+    const auto preAccumulated = *(static_cast<const std::uint8_t*>(manager) + 0x148u);
     __try { reinterpret_cast<RenderUi>(0x007134D0)(manager, culler, pipBoy); }
-    __finally { gNativeUiCapture.end(); }
+    __finally
+    {
+        if (gNativeCharacterUiRoot)
+            *reinterpret_cast<std::uint32_t*>(
+                static_cast<std::uint8_t*>(gNativeCharacterUiRoot) + 0x30u)
+                = gNativeCharacterUiRootFlags;
+        gNativeCharacterUiRoot = nullptr;
+        gNativeCharacterUiCaptureActive = false;
+        gNativeUiCapture.end();
+    }
     static DWORD previousLog = 0;
     const DWORD now = GetTickCount();
     if (eligible && frame.runtime.menuBits && now - previousLog >= 3000u)
     {
         previousLog = now;
-        char line[256] {};
-        sprintf_s(line, "native UI capture menuBits=%u nativeDraws=%u capturedDraws=%u firstTarget=%ux%u complete=%u beginHr=0x%08lx setTarget=%u setDepth=%u",
+        char line[384] {};
+        sprintf_s(line, "native UI capture menuBits=%u nativeDraws=%u capturedDraws=%u firstTarget=%ux%u complete=%u beginHr=0x%08lx setTarget=%u setDepth=%u preAccumulated=%u characterCullCalls=%u characterCaptureCalls=%u characterRootFlags=0x%08x",
             frame.runtime.menuBits, gNativeUiCapture.observedDraws(), gNativeUiCapture.draws(),
             gNativeUiCapture.firstTargetWidth(), gNativeUiCapture.firstTargetHeight(),
             static_cast<unsigned>(gNativeUiCapture.complete()),
             static_cast<unsigned long>(gNativeUiCapture.beginStatus()),
-            gNativeUiSetTarget ? 1u : 0u, gNativeUiSetDepth ? 1u : 0u);
+            gNativeUiSetTarget ? 1u : 0u, gNativeUiSetDepth ? 1u : 0u,
+            static_cast<unsigned>(preAccumulated), gNativeCharacterUiCullCalls,
+            gNativeCharacterUiCaptureCalls, gNativeCharacterUiRootFlags);
         logRetailVrLine(line);
     }
 }
@@ -9695,20 +9799,37 @@ bool installNativeInterfaceCapture() noexcept
         const std::uint8_t expected[] { 0xE8, 0xF8, 0xEF, 0xFF, 0xFF };
         if (hash != 0xbad2a9c616f70f88ull || std::memcmp(call, expected, sizeof(expected)))
             return false;
+        // The containing InterfaceManager function above authenticates this
+        // exact RaceSex-only visibility query and its original E8 operand.
+        auto* characterCall = reinterpret_cast<std::uint8_t*>(0x00713619u);
+        DWORD characterProtection = 0;
+        if (!VirtualProtect(characterCall, 5u, PAGE_EXECUTE_READWRITE, &characterProtection))
+            return false;
         DWORD protection = 0;
-        if (!VirtualProtect(call, 5u, PAGE_EXECUTE_READWRITE, &protection)) return false;
+        if (!VirtualProtect(call, 5u, PAGE_EXECUTE_READWRITE, &protection))
+        {
+            DWORD ignored = 0;
+            VirtualProtect(characterCall, 5u, characterProtection, &ignored);
+            return false;
+        }
         if (!installNativeUiDrawHooks(gRetailVrProxyContext.device))
         {
             DWORD ignored = 0;
             VirtualProtect(call, 5u, protection, &ignored);
+            VirtualProtect(characterCall, 5u, characterProtection, &ignored);
             return false;
         }
+        const auto characterRelative = static_cast<std::uint32_t>(
+            reinterpret_cast<std::uintptr_t>(&captureNativeCharacterUiVisibility) - 0x0071361Eu);
+        std::memcpy(characterCall + 1u, &characterRelative, sizeof(characterRelative));
         const auto relative = static_cast<std::uint32_t>(
             reinterpret_cast<std::uintptr_t>(&captureNativeInterfaceRender) - 0x007144D8u);
         std::memcpy(call + 1u, &relative, sizeof(relative));
         DWORD ignored = 0;
         VirtualProtect(call, 5u, protection, &ignored);
+        VirtualProtect(characterCall, 5u, characterProtection, &ignored);
         FlushInstructionCache(GetCurrentProcess(), call, 5u);
+        FlushInstructionCache(GetCurrentProcess(), characterCall, 5u);
         gNativeUiRenderHookInstalled = true;
         logRetailVrLine("native UI capture installed: exact InterfaceManager render boundary, original menu callbacks preserved");
         return true;
@@ -9720,6 +9841,29 @@ bool readRetailUiPublishedFrame(
     void* opaque,
     fnvxr::engine::RetailTrackedFrame& frame) noexcept
 {
+    // This is the product's native Present bootstrap, including Bink movies.
+    // Observe live UI here before taking the frame used for its GPU publication.
+#if defined(_M_IX86)
+    using ObserveNativeUiFn = bool (__cdecl*)();
+    static ObserveNativeUiFn observeNativeUi = nullptr;
+    if (!observeNativeUi)
+    {
+        if (HMODULE plugin = GetModuleHandleA("nvse_fnvxr.dll"))
+        {
+            observeNativeUi = reinterpret_cast<ObserveNativeUiFn>(
+                GetProcAddress(plugin, "FNVXR_ObserveNativeUiPresentation"));
+            if (!observeNativeUi)
+                observeNativeUi = reinterpret_cast<ObserveNativeUiFn>(
+                    GetProcAddress(plugin, "_FNVXR_ObserveNativeUiPresentation"));
+        }
+    }
+    if (observeNativeUi && observeNativeUi())
+    {
+        static unsigned observations = 0;
+        if (++observations <= 3u)
+            logRetailVrLine("native UI observation refreshed at product Present");
+    }
+#endif
     auto* context = static_cast<RetailVrProxyContext*>(opaque);
     return context
         && context->device
@@ -12741,6 +12885,8 @@ bool initializeRetailVrBridge(IDirect3DDevice9* device) noexcept
         logRetailVrLine("native menu world rendering unavailable: render dispatcher identity differs");
     if (!installNativeInterfaceCapture())
         logRetailVrLine("native UI capture unavailable: exact render function or call identity differs");
+    if (!installNativeSkinPaletteCameraCache())
+        logRetailVrLine("native skin palette cache unavailable: exact producer identity differs");
     char initializedMessage[416] {};
     sprintf_s(
         initializedMessage,

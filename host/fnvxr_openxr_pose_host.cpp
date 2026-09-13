@@ -503,6 +503,7 @@ struct PipBoyScreenCalibration final
     XrQuaternionf gripLocalRotation { 0.0f, 0.0f, 0.0f, 1.0f };
     XrVector3f gripLocalScalePivot {};
     float nativeDeviceScale = 1.0f;
+    bool devicePresent = false;
 };
 
 struct SubmittedWorldSnapshot final
@@ -612,6 +613,9 @@ struct HeadsetMirrorCapture
     std::wstring directory;
     std::uint32_t everyFrames = 1u;
     std::uint32_t maximumPairs = 0u;
+    std::uint32_t ringPairs = 0u;
+    std::uint64_t lastControlPoll = 0u;
+    bool recording = false;
     fnvxr::host::headset_mirror::ScheduleState schedule {};
     std::unique_ptr<fnvxr::host::mirror::Writer> writer;
     fnvxr::host::mirror::Pair pendingPair;
@@ -631,12 +635,31 @@ struct HeadsetMirrorCapture
                     << ",\"writeHr\":\"0x" << std::hex
                     << static_cast<std::uint32_t>(completed.status[eye])
                     << "\",\"outputHash\":\"0x" << completed.hashes[eye] << std::dec
-                    << "\"}\n";
+                    << "\",\"fileTime\":\"" << completed.fileTimes[eye]
+                    << "\",\"fileBytes\":" << completed.fileBytes[eye] << "}\n";
     }
 
     fnvxr::host::headset_mirror::ScheduleDecision request(
         std::uint64_t frame) noexcept
     {
+        if (ringPairs)
+        {
+            const auto now = GetTickCount64();
+            if (!lastControlPoll || now - lastControlPoll >= 100u)
+            {
+                lastControlPoll = now;
+                const auto path = directory + L"\\capture-control.txt";
+                const HANDLE control = CreateFileW(path.c_str(), GENERIC_READ,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+                char command = 0; DWORD bytes = 0;
+                recording = control != INVALID_HANDLE_VALUE
+                    && ReadFile(control, &command, 1, &bytes, nullptr)
+                    && bytes == 1 && command == '1';
+                if (control != INVALID_HANDLE_VALUE) CloseHandle(control);
+            }
+            if (!recording) return {};
+        }
         return fnvxr::host::headset_mirror::schedule(
             schedule,
             { enabled, frame, everyFrames, maximumPairs });
@@ -1287,7 +1310,7 @@ std::wstring headsetMirrorFramePath(
     if (swprintf_s(
             fileName,
             L"pair_%06u_%s.%s",
-            ordinal,
+            capture.ringPairs ? (ordinal - 1u) % capture.ringPairs + 1u : ordinal,
             eyeIndex == 0u ? L"left" : L"right", capture.jpeg ? L"jpg" : L"png") < 0)
     {
         return {};
@@ -3948,6 +3971,7 @@ bool updateSharedSpatialPropCalibration(HostSharedBridge& bridge)
                 bridge.leftPipBoyScreenGripLocalRotation,
                 scalePivot,
                 candidate.leftPipBoyDeviceScale,
+                true,
             };
             if (!bridge.leftPipBoyScreenCalibrationHistory.record(
                     identity, calibration))
@@ -3972,6 +3996,18 @@ bool updateSharedSpatialPropCalibration(HostSharedBridge& bridge)
                     << "," << scalePivot.z << ") scale="
                     << candidate.leftPipBoyDeviceScale << "\n";
             }
+        }
+        if ((candidate.flags & fnvxr::shared::WeaponFrameFlagPipBoyAbsent) != 0u)
+        {
+            if ((candidate.flags & fnvxr::shared::WeaponFrameFlagPipBoyScreenPoseValid) != 0u)
+                return false;
+            const fnvxr::kernel::SpatialCalibrationIdentity identity {
+                candidate.producerEpoch, candidate.referenceSpaceGeneration,
+                candidate.poseSequence };
+            if (!bridge.leftPipBoyScreenCalibrationHistory.record(identity, {}))
+                return false;
+            bridge.leftPipBoyScreenGripLocalPoseValid = false;
+            updated = true;
         }
         return updated;
     }
@@ -10003,11 +10039,14 @@ int main(int argc, char** argv)
                 std::clamp(envInt("FNVXR_HMD_MIRROR_CAPTURE_EVERY_N_FRAMES", 6), 1, 600));
             headsetMirrorCapture.maximumPairs = static_cast<std::uint32_t>(
                 std::clamp(envInt("FNVXR_HMD_MIRROR_CAPTURE_MAX_PAIRS", 180), 1, 3600));
+            headsetMirrorCapture.ringPairs = static_cast<std::uint32_t>(
+                std::clamp(envInt("FNVXR_HMD_MIRROR_RING_PAIRS", 0), 0, 32));
             std::wcout
                 << L"fnvxrHeadsetMirrorCaptureReady directory="
                 << headsetMirrorCapture.directory
                 << L" everyFrames=" << headsetMirrorCapture.everyFrames
                 << L" maximumPairs=" << headsetMirrorCapture.maximumPairs
+                << L" ringPairs=" << headsetMirrorCapture.ringPairs
                 << L"\n";
         }
         else
@@ -10019,7 +10058,7 @@ int main(int argc, char** argv)
     }
 
     HeadsetMirrorCapture uiSourceCapture {};
-    if (headsetMirrorCapture.enabled)
+    if (headsetMirrorCapture.enabled && !headsetMirrorCapture.ringPairs)
     {
         uiSourceCapture.directory = headsetMirrorCapture.directory + L"\\ui-source";
         if (CreateDirectoryW(uiSourceCapture.directory.c_str(), nullptr)
@@ -13402,13 +13441,14 @@ int main(int argc, char** argv)
             leftPipBoyScreenCalibrationExact = spatialSourceFound
                 && sharedBridge.leftPipBoyScreenCalibrationHistory.find(
                     spatialCalibrationIdentity,
-                    exactPipBoyScreenCalibration);
+                    exactPipBoyScreenCalibration)
+                && exactPipBoyScreenCalibration.devicePresent;
             if (pausedWorldRetained)
             {
                 exactRightHandCalibration = submittedWorld.rightHandCalibration;
                 exactPipBoyScreenCalibration = submittedWorld.leftScreenCalibration;
                 rightHandGripCalibrationExact = true;
-                leftPipBoyScreenCalibrationExact = true;
+                leftPipBoyScreenCalibrationExact = exactPipBoyScreenCalibration.devicePresent;
             }
             candidateRightHandCalibration = exactRightHandCalibration;
             candidateLeftScreenCalibration = exactPipBoyScreenCalibration;
@@ -13434,7 +13474,8 @@ int main(int argc, char** argv)
             candidateWristPlane =
                 livePipBoyInteractionPlane(
                     spatialLeftPose,
-                    spatialSourceFound && spatialLeftTracked,
+                    spatialSourceFound && spatialLeftTracked
+                        && leftPipBoyScreenCalibrationExact,
                     envEnabled("FNVXR_FIRST_PERSON_PIPBOY_ROOT", false)
                         ? exactPipBoyScreenCalibration.nativeDeviceScale
                         : pipBoyDeviceScale(candidateWristScale.advance(livePipBoyFocus.scale,
@@ -13778,7 +13819,7 @@ int main(int argc, char** argv)
         if (endResult == XR_SUCCESS && submitProjectionLayer)
         {
             if (productionBinocularWorld && !pausedWorldRetained && productSourceViewFound
-                && rightHandGripCalibrationExact && leftPipBoyScreenCalibrationExact
+                && currentWorldRigCalibrationReady
                 && submittedWorld.copyEyes(device.Get(), gpuColorConsumer.eyeTexture(0u),
                     gpuColorConsumer.eyeTexture(1u)))
             {

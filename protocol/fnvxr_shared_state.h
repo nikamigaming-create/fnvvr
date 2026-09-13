@@ -46,6 +46,9 @@ constexpr std::uint32_t WeaponFrameFlagPipBoyScreenPoseValid = 1u << 6;
 // Empty equipment or a rebuilding weapon mesh: hands and wrist stay current,
 // and no weapon transform is claimed for this frame.
 constexpr std::uint32_t WeaponFrameFlagHandsOnly = 1u << 7;
+// The current native skeleton has no wrist device (for example, before Doc
+// gives it to a new character). This is an observation, not a screen pose.
+constexpr std::uint32_t WeaponFrameFlagPipBoyAbsent = 1u << 8;
 constexpr std::uint32_t WeaponFrameRequiredFlags =
     WeaponFrameFlagRightGripCurrent
     | WeaponFrameFlagRightAimCurrent

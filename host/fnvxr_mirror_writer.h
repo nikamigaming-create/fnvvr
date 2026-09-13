@@ -29,6 +29,7 @@ struct Result
     std::uint32_t ordinal = 0, width = 0, height = 0, format = 0;
     std::array<std::int32_t, 2> status {};
     std::array<std::uint32_t, 2> hashes {};
+    std::array<std::uint64_t, 2> fileTimes {}, fileBytes {};
 };
 
 // No graphics/context pointers cross this boundary. The render thread copies

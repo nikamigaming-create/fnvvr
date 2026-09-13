@@ -16,8 +16,8 @@ function Resolve-FnvxrProductSessionLimits {
         throw "An unlimited session requires -PhysicalHeadsetPlay."
     }
     if ($MaximumRunSeconds -ne 0 -and
-        ($MaximumRunSeconds -lt 5 -or $MaximumRunSeconds -gt 900)) {
-        throw "A timed session requires 5 to 900 seconds."
+        ($MaximumRunSeconds -lt 5 -or $MaximumRunSeconds -gt 7200)) {
+        throw "A timed session requires 5 to 7200 seconds."
     }
     if ($PhysicalHeadsetPlay -and -not $HostFramesExplicit) {
         # The host's existing signed frame counter supports months of play.
@@ -2287,6 +2287,7 @@ function Get-FnvxrProductMinimalEnvironment {
         [string]$HeadsetMirrorCaptureDirectory = "",
         [ValidateRange(1, 600)][int]$HeadsetMirrorCaptureEveryFrames = 6,
         [ValidateRange(1, 3600)][int]$HeadsetMirrorCaptureMaxPairs = 180,
+        [ValidateRange(0, 32)][int]$HeadsetMirrorRingPairs = 0,
         [string]$MetaXrOperatorLayerDirectory = ""
     )
 
@@ -2890,6 +2891,7 @@ function Get-FnvxrProductMinimalEnvironment {
             [string]$HeadsetMirrorCaptureEveryFrames
         $environment.FNVXR_HMD_MIRROR_CAPTURE_MAX_PAIRS =
             [string]$HeadsetMirrorCaptureMaxPairs
+        $environment.FNVXR_HMD_MIRROR_RING_PAIRS = [string]$HeadsetMirrorRingPairs
     }
     if (-not [string]::IsNullOrWhiteSpace($MetaXrOperatorLayerDirectory)) {
         # This API layer is observation-only in FNVXR: the launcher never

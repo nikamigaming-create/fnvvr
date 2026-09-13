@@ -741,8 +741,9 @@ inline RetailDerivedEyeCameraRig deriveRetailEyeCameraRig(
     const stereo::Matrix3 rightCullRotation =
         stereo::columnRotationFromQuaternion(rightRelativeOrientation);
     const stereo::Matrix3 bodyWorldRotation =
-        stereo::gravityLevelCameraWorldRotation(
-            detail::retailMatrix3(stock.world.rotation));
+        firstPersonView ? detail::retailMatrix3(stock.world.rotation)
+            : stereo::gravityLevelCameraWorldRotation(
+                detail::retailMatrix3(stock.world.rotation));
 
     const abi::RetailNiFrustumLayout leftFrustum = detail::eyeFrustum(
         stock.frustum,

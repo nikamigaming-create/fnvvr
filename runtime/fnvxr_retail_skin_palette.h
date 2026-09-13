@@ -2,9 +2,29 @@
 
 #include <cstdint>
 #include <cstring>
+#include <array>
 
 namespace fnvxr::engine
 {
+// The retail palette producer (E6FE30) subtracts the current renderer camera
+// position from each bone, yet keys the result only by frame and row count.
+// Different cameras in one game frame therefore require a new palette. A
+// fixed table bounds storage; collisions cause a harmless extra rebuild.
+class RetailSkinPaletteCameraCache
+{
+public:
+    bool needsRebuild(std::uintptr_t skin, const std::array<float, 3>& camera) noexcept
+    {
+        auto& entry = mEntries[(skin >> 4u) % mEntries.size()];
+        const bool changed = entry.skin != skin || entry.camera != camera;
+        entry = { skin, camera };
+        return changed;
+    }
+private:
+    struct Entry { std::uintptr_t skin = 0; std::array<float, 3> camera {}; };
+    std::array<Entry, 4096> mEntries {};
+};
+
 // Exact retail NiGeometry::skinInstance (+BC), NiSkinInstance::frameID (+18).
 // NiSkinInstance's constructors at A8672D/A86878 initialize this cache key
 // to FFFFFFFF. Reusing a palette after VR changes its bones in the SAME game

@@ -48,6 +48,9 @@ int main()
     if (results.size() != 2 || results[0].frame != 47 || results[0].ordinal != 9
         || results[0].status[0] < 0 || results[0].status[1] < 0) return 4;
     if (results[1].frame != 48 || results[1].status[0] < 0 || results[1].status[1] < 0) return 13;
+    for (const auto& result : results)
+        for (std::size_t eye = 0; eye != 2; ++eye)
+            if (!result.fileTimes[eye] || !result.fileBytes[eye]) return 18;
     if (FAILED(CoInitializeEx(nullptr, COINIT_MULTITHREADED))) return 5;
     ComPtr<IWICImagingFactory> factory;
     if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr,

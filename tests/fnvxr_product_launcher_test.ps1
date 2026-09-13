@@ -1276,7 +1276,10 @@ if ($explicitLimits.MaximumRunSeconds -ne 120 -or $explicitLimits.HostFrames -ne
     throw "Explicit headset time and frame limits must remain effective."
 }
 Require-Throws { Resolve-FnvxrProductSessionLimits -MaximumRunSeconds 0 -MaximumRunSecondsExplicit $true } "requires -PhysicalHeadsetPlay"
-Require-Throws { Resolve-FnvxrProductSessionLimits -MaximumRunSeconds 1 -MaximumRunSecondsExplicit $true } "5 to 900"
+Require-Throws { Resolve-FnvxrProductSessionLimits -MaximumRunSeconds 1 -MaximumRunSecondsExplicit $true } "5 to 7200"
+$journeyLimits = Resolve-FnvxrProductSessionLimits -MaximumRunSeconds 7200 -MaximumRunSecondsExplicit $true
+if ($journeyLimits.MaximumRunSeconds -ne 7200) { throw "Long gameplay runs must retain their explicit deadline." }
+Require-Throws { Resolve-FnvxrProductSessionLimits -MaximumRunSeconds 7201 -MaximumRunSecondsExplicit $true } "5 to 7200"
 if (-not $launcher.Contains('[ValidateRange(5, 900)][int]$RetailReadyTimeoutSeconds = 60')) {
     throw "Product launcher must allow the combined pose/runtime readiness wait to remain bounded at up to 900 seconds."
 }

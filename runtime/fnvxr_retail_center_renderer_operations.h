@@ -1816,12 +1816,25 @@ struct RetailCenterRendererOperationsAdapter
             static_cast<abi::RetailPointer32>(
                 reinterpret_cast<std::uintptr_t>(context->mActiveEyeCamera));
         privateCuller->base.vtable = context->mStockCullerVtable;
+        std::uint32_t excludedBodyFlags = 0u;
+        bool excludedBodyHidden = false;
         __try
         {
             invalidateFirstPersonSkinPalettes(*context);
             context->mCalls.cullingProcessSetAccumulator(
                 privateCuller,
                 accumulator);
+            // The native per-eye traversal below repopulates opaque shader
+            // passes; filtering only the earlier alpha list does not exclude
+            // the player's third-person body from that traversal.
+            if (context->mExcludedWorldBody != 0u)
+            {
+                auto* flags = reinterpret_cast<std::uint32_t*>(
+                    static_cast<std::uintptr_t>(context->mExcludedWorldBody) + 0x30u);
+                excludedBodyFlags = *flags;
+                *flags = excludedBodyFlags | 1u;
+                excludedBodyHidden = true;
+            }
             context->mCalls.accumulateScene(
                 context->mActiveEyeCamera,
                 context->mFrameSceneObject,
@@ -1863,6 +1876,10 @@ struct RetailCenterRendererOperationsAdapter
         }
         __finally
         {
+            if (excludedBodyHidden)
+                *reinterpret_cast<std::uint32_t*>(
+                    static_cast<std::uintptr_t>(context->mExcludedWorldBody) + 0x30u)
+                    = excludedBodyFlags;
             privateCuller->base.vtable = cloneVtable;
         }
         RetailCenterEyeCameraDiagnostics& diagnostics =

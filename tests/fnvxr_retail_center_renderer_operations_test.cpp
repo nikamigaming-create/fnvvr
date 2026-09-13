@@ -496,6 +496,20 @@ bool restoreTargets(void* opaque) noexcept
 
 int main()
 {
+    {
+        RetailSkinPaletteCameraCache palettes;
+        const std::array<float, 3> left { 102.2f, 200.0f, 300.0f };
+        const std::array<float, 3> right { 97.8f, 200.0f, 300.0f };
+        const std::array<float, 3> stock { 100.0f, 200.0f, 300.0f };
+        require(palettes.needsRebuild(0x10000u, left), "first face palette must rebuild");
+        require(!palettes.needsRebuild(0x10000u, left), "same eye can reuse its palette");
+        require(palettes.needsRebuild(0x10000u, right), "other eye cannot reuse left-relative bones");
+        require(palettes.needsRebuild(0x10000u, stock), "stock render cannot reuse right-relative bones");
+        require(palettes.needsRebuild(0x10010u, stock), "separate skin has independent camera state");
+        require(!palettes.needsRebuild(0x10000u, stock), "other skins preserve this camera entry");
+        require(palettes.needsRebuild(0x20000u, stock), "bounded-table collision rebuilds safely");
+        require(palettes.needsRebuild(0x10000u, stock), "evicted skin rebuilds safely");
+    }
 #if !defined(_MSC_VER) || !defined(_M_IX86)
     static_assert(!RetailEngineCallArchitectureSupported);
     std::cout << "retail center renderer operations compile gate passed (non-x86 audit build)\n";

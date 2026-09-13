@@ -203,6 +203,15 @@ struct Writer::State
                 try { result.status[eye] = pair.eyes[eye].jpeg
                     ? writeJpeg(pair.eyes[eye]) : writePng(pair.eyes[eye]); }
                 catch (...) { result.status[eye] = E_OUTOFMEMORY; }
+                WIN32_FILE_ATTRIBUTE_DATA attributes {};
+                if (result.status[eye] >= 0 && GetFileAttributesExW(
+                    pair.eyes[eye].path.c_str(), GetFileExInfoStandard, &attributes))
+                {
+                    result.fileTimes[eye] = (std::uint64_t(attributes.ftLastWriteTime.dwHighDateTime) << 32)
+                        | attributes.ftLastWriteTime.dwLowDateTime;
+                    result.fileBytes[eye] = (std::uint64_t(attributes.nFileSizeHigh) << 32)
+                        | attributes.nFileSizeLow;
+                }
             }
             std::lock_guard<std::mutex> lock(mutex);
             completed.push_back(result);

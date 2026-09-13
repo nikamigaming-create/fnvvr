@@ -2,6 +2,35 @@
 
 Last updated: 2026-09-13
 
+## Native opening replay
+
+The new-character replay exposed two additional renderer faults. The native
+skin palette cache was keyed by game frame and row count even though its bone
+translations include the renderer camera position. Reusing it across eyes
+separated Doc Mitchell's skinned face from his rigid mouth, eyes and hair.
+The verified palette producer now also invalidates when that camera changes.
+Both-eye speech and head-movement frames in the latest reviewed opening clip
+keep those parts together. This is simulated OpenXR tracking in the retail
+game; it does not establish hardware-headset acceptance.
+
+The player view and tracked rig now share the authored bed/chair camera while
+scripted controls are locked. Doc stays at his native scene position. A new
+character without a Pip-Boy can publish current hands and stereo; absence of
+the device is explicit and disables wrist interaction until it is present.
+The intro movie accepts a fresh native controller skip press inside its own
+blocking input loop, without desktop input or a synthetic simulation tick.
+
+Character-creation controls now render in both eyes over the room. The native
+interface renderer had excluded their scene root from its ordinary UI pass;
+the VR capture temporarily includes it and restores its original visibility.
+The native Next callback advanced the Sex page to Race in the reviewed run.
+The live character portrait and tracked handheld Reflectron remain unfinished.
+
+The full Doc-to-Sunny replay remains incomplete. A hidden StartMenu entry after
+New Game currently requires an ordinary Pause/Continue cycle. Captures use an
+opt-in bounded ring with file identity checks so a long session does not
+accumulate raw video frames while recording is paused.
+
 ## Current implementation
 
 The current retail path renders both eyes through the native engine, with the

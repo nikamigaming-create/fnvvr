@@ -634,6 +634,12 @@ void testFullOrientationRecenter()
 
 void testCinematicCameraCannotMoveFirstPersonView()
 {
+    require(useAuthoredFirstPersonCamera(true, false, false, false)
+            && useAuthoredFirstPersonCamera(false, true, false, false)
+            && useAuthoredFirstPersonCamera(false, false, true, false)
+            && !useAuthoredFirstPersonCamera(true, true, false, true)
+            && !useAuthoredFirstPersonCamera(false, false, false, false),
+        "bed/chair/portrait camera authority was conflated with VATS playback");
     abi::RetailNiCameraLayout stock {};
     initializeCamera(stock, 100.0f, 200.0f, 118.0f);
     RetailTrackedFrame frame = validFrame();
@@ -676,6 +682,18 @@ void testCinematicCameraCannotMoveFirstPersonView()
     require(native.complete()
             && nearlyEqual(native.center.world.translation[0], 1500.0f),
         "unbound camera path stopped preserving the native view");
+    // A first-person bed animation pitches the authored frame upward. Keep
+    // that tilt for both eyes instead of leveling only the camera while the
+    // hands follow the animated frame.
+    const float bedRotation[9] { 0.0f, 0.0f, 1.0f,
+        0.6f, -0.8f, 0.0f, 0.8f, 0.6f, 0.0f };
+    std::memcpy(firstPerson.rotation, bedRotation, sizeof(bedRotation));
+    setTrackedOrientation(frame, stereo::Quaternion {});
+    const auto bed = deriveRetailEyeCameraRig(&stock, frame, origin.origin, 70.0f, &firstPerson);
+    require(bed.complete() && cameraForward(bed.center).z > 0.79f
+            && cameraForward(bed.left).z > 0.79f
+            && cameraForward(bed.right).z > 0.79f,
+        "scripted first-person bed tilt was flattened in the submitted eyes");
     firstPerson.position[0] = std::numeric_limits<float>::quiet_NaN();
     require(!deriveRetailEyeCameraRig(
             &stock, frame, origin.origin, 70.0f, &firstPerson).complete(),

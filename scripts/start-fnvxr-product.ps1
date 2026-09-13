@@ -20,7 +20,7 @@ param(
     [string]$MetaXrOperatorLayerDirectory = "",
     [ValidateRange(1, 2000000000)][int]$HostFrames = 60000,
     # Physical play defaults to no time limit. Zero is reserved for that mode.
-    [ValidateRange(0, 900)][int]$MaximumRunSeconds = 40,
+    [ValidateRange(0, 7200)][int]$MaximumRunSeconds = 40,
     [ValidateRange(5, 120)][int]$HostReadyTimeoutSeconds = 45,
     [ValidateRange(5, 900)][int]$RetailReadyTimeoutSeconds = 60,
     [switch]$UseAttestedBuild,
@@ -65,6 +65,9 @@ param(
     [switch]$CaptureHeadsetMirror,
     [ValidateRange(1, 600)][int]$HeadsetMirrorCaptureEveryFrames = 6,
     [ValidateRange(1, 3600)][int]$HeadsetMirrorCaptureMaxPairs = 180,
+    # Optional bounded ring for live encoding. In this mode capture-control.txt
+    # in this run's mirror directory starts ('1') or pauses ('0') recording.
+    [ValidateRange(0, 32)][int]$HeadsetMirrorRingPairs = 0,
     # Records the simulator's own native side-by-side preview window across
     # the controller and HMD sweeps after a ready weapon. This is a video
     # capture of the final OpenXR display, not a retail render path.
@@ -979,6 +982,7 @@ if ($ValidateOnly) {
             -HeadsetMirrorCaptureDirectory $validateHeadsetMirrorDirectory `
             -HeadsetMirrorCaptureEveryFrames $HeadsetMirrorCaptureEveryFrames `
             -HeadsetMirrorCaptureMaxPairs $HeadsetMirrorCaptureMaxPairs `
+            -HeadsetMirrorRingPairs $HeadsetMirrorRingPairs `
             -MetaXrOperatorLayerDirectory $(if ($metaXrOperatorIdentity) {
                 $metaXrOperatorIdentity.directory
             } else { "" })).Keys
@@ -1114,6 +1118,7 @@ $manifest = [ordered]@{
         directory = $headsetMirrorDirectory
         everyFrames = $HeadsetMirrorCaptureEveryFrames
         maximumPairs = $HeadsetMirrorCaptureMaxPairs
+        ringPairs = $HeadsetMirrorRingPairs
         status = if ($CaptureHeadsetMirror) { "directory-created" } else { "disabled" }
         captureProof = $null
         visualQualityProof = $null
@@ -3177,6 +3182,7 @@ try {
         -HeadsetMirrorCaptureDirectory $headsetMirrorDirectory `
         -HeadsetMirrorCaptureEveryFrames $HeadsetMirrorCaptureEveryFrames `
         -HeadsetMirrorCaptureMaxPairs $HeadsetMirrorCaptureMaxPairs `
+        -HeadsetMirrorRingPairs $HeadsetMirrorRingPairs `
         -MetaXrOperatorLayerDirectory $(if ($metaXrOperatorIdentity) {
             $metaXrOperatorIdentity.directory
         } else { "" })
