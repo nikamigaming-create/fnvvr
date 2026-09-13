@@ -1,4 +1,5 @@
 #include "fnvxr_weapon_frame_contract.h"
+#include "fnvxr_tracked_shot.h"
 #include "../protocol/fnvxr_shared_state.h"
 
 #include <cstdint>
@@ -14,6 +15,62 @@ int fail()
 
 int main()
 {
+    // The native shot uses +Y forward and positive-down pitch. Exercise
+    // compass directions and tilted aim independently of the player camera.
+    constexpr float halfPi = 1.57079632679f;
+    const float directions[][5] {
+        {0, 1, 0, 0, 0}, {1, 0, 0, 0, halfPi},
+        {0, -1, 0, 0, 2 * halfPi}, {-1, 0, 0, 0, -halfPi},
+        {0, 0.6f, 0.8f, -0.927295218f, 0},
+        {0.6f, 0, -0.8f, 0.927295218f, halfPi},
+    };
+    for (const auto& direction : directions)
+    {
+        fnvxr::tracked_shot::Pose shot {};
+        for (int i = 0; i < 3; ++i) shot.forward[i] = direction[i];
+        float pitch = 0, yaw = 0;
+        fnvxr::tracked_shot::angles(shot, pitch, yaw);
+        if (std::fabs(pitch - direction[3]) > 0.00001f
+            || std::fabs(yaw - direction[4]) > 0.00001f)
+            return fail();
+    }
+    fnvxr::tracked_shot::Pose shot {};
+    shot.valid = true;
+    shot.actor = 0x1000u; shot.weapon = 0x2000u; shot.cell = 0x3000u;
+    shot.epoch = 7u; shot.referenceSpace = 3u; shot.sequence = 24u;
+    shot.frame = 100u; shot.sampledAtMs = 1000u; shot.forward[1] = 1.0f;
+    const auto currentShot = [](const fnvxr::tracked_shot::Pose& candidate) {
+        return fnvxr::tracked_shot::current(candidate,
+            0x1000u, 0x2000u, 0x3000u, 7u, 3u, 106u, 1100u, true);
+    };
+    if (!currentShot(shot)) return fail();
+    // Never fire from a prior equip/cell/recenter or disconnected/stale pose.
+    for (int invalid = 0; invalid < 12; ++invalid)
+    {
+        auto candidate = shot;
+        switch (invalid)
+        {
+        case 0: candidate.valid = false; break;
+        case 1: candidate.actor++; break;
+        case 2: candidate.weapon++; break;
+        case 3: candidate.cell++; break;
+        case 4: candidate.epoch++; break;
+        case 5: candidate.referenceSpace++; break;
+        case 6: candidate.sequence = 0; break;
+        case 7: candidate.frame = 99; break;
+        case 8: candidate.frame = 107; break;
+        case 9: candidate.sampledAtMs = 999; break;
+        case 10: candidate.sampledAtMs = 1101; break;
+        case 11: candidate.position[0] = std::numeric_limits<float>::quiet_NaN(); break;
+        }
+        if (currentShot(candidate)) return fail();
+    }
+    if (fnvxr::tracked_shot::current(shot,
+            0x1000u, 0x2000u, 0x3000u, 7u, 3u, 106u, 1100u, false))
+        return fail();
+    shot.forward[1] = 0.5f;
+    if (currentShot(shot)) return fail();
+
     using fnvxr::weapon_frame::Failure;
     constexpr std::uint32_t committed = 1u;
     constexpr std::uint32_t required = 0x0fu;

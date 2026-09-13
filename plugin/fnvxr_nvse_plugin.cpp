@@ -20,6 +20,8 @@
 #include "fnvxr_weapon_frame_contract.h"
 #include "fnvxr_native_control_pulses.h"
 #include "fnvxr_native_movie_input.h"
+#include "fnvxr_retail_audio_1_4_0_525.h"
+#include "fnvxr_retail_shot_1_4_0_525.h"
 #include "fnvxr_native_menu_geometry.h"
 #include "fnvxr_native_menu_stack.h"
 #include "fnvxr_first_person_view.h"
@@ -861,6 +863,7 @@ void** g_projectileNodeVtable = nullptr;
 bool g_projectileNodeHookInstalled = false;
 LONG g_projectileNodeConsumeCalls = 0;
 LONG g_latestMuzzleProofPoseSequence = 0;
+fnvxr::tracked_shot::Pose g_trackedShotPose {};
 void* g_latestMuzzleProofNode = nullptr;
 Vec3 g_latestMuzzleAimForward {};
 bool g_haveVrOrigin = false;
@@ -8748,6 +8751,7 @@ bool retailRigGameplayAllowed()
 
 void resetRetailRigOrigin(const char* reason)
 {
+    g_trackedShotPose = {};
     if (g_haveRetailRigOrigin)
         logTelemetry("retailRig origin reset reason=%s\n", reason ? reason : "unknown");
     g_haveRetailRigOrigin = false;
@@ -9625,6 +9629,32 @@ void onRetailPostAnimation(void* animData)
         else if (!weaponResult.writeVerified)
             continuityReplayed = replayRetailRigContinuityPose();
     }
+    g_trackedShotPose = {};
+    if (!handsOnly && applyWrites && rightControllerUsable && rightAimUsable
+        && weaponResult.writeVerified && weaponResult.endpointMeasured
+        && weaponResult.endpointInWeaponBranch && equipmentKnown && equippedWeapon)
+    {
+        // Copy the authored muzzle committed for the tracked weapon. Stock
+        // animation/render restores cannot change this shot snapshot.
+        g_trackedShotPose.valid = true;
+        g_trackedShotPose.actor = reinterpret_cast<std::uintptr_t>(player);
+        g_trackedShotPose.weapon = reinterpret_cast<std::uintptr_t>(equippedWeapon);
+        const auto* cell = readPointer(reinterpret_cast<std::uintptr_t>(player) + 0x40u);
+        g_trackedShotPose.cell = cell ? readUInt32(reinterpret_cast<std::uintptr_t>(cell) + 0x0Cu) : 0u;
+        g_trackedShotPose.epoch = pose.producerEpoch;
+        g_trackedShotPose.referenceSpace = pose.referenceSpaceGeneration;
+        g_trackedShotPose.sequence = static_cast<UInt32>(pose.sequence);
+        g_trackedShotPose.frame = pose.frame;
+        g_trackedShotPose.sampledAtMs = GetTickCount64();
+        const auto& origin = weaponResult.endpointWorldPosition;
+        const auto& forward = weaponResult.endpointForward;
+        g_trackedShotPose.position[0] = origin.x;
+        g_trackedShotPose.position[1] = origin.y;
+        g_trackedShotPose.position[2] = origin.z;
+        g_trackedShotPose.forward[0] = forward.x;
+        g_trackedShotPose.forward[1] = forward.y;
+        g_trackedShotPose.forward[2] = forward.z;
+    }
     if (handsOnly)
     {
         g_latestMuzzleProofPoseSequence = 0;
@@ -10053,6 +10083,67 @@ __declspec(naked) void hookedRetailAnimationApply()
     }
 }
 #endif
+
+fnvxr::tracked_shot::Decision __cdecl prepareTrackedNativeShot(
+    void* actor, void* weapon, fnvxr::tracked_shot::Pose& output)
+{
+    using fnvxr::tracked_shot::Decision;
+    if (GetCurrentThreadId() != g_gamePluginProducerThreadId
+        || !actor || actor != readPointer(PlayerCharacterAddress))
+        return Decision::Stock;
+    // VATS chooses its native target/attack trajectory. Menus and NPC/script
+    // shots do not acquire controller aim merely because the hook exists.
+    if (readUInt32(0x011F2258u) != 0u
+        || (currentMenuBits() & fnvxr::shared::RuntimeBlockingMenuBits) != 0u)
+        return Decision::Stock;
+    const bool route = physicalHeadsetPlayRequested()
+        || (headsetControllerRigVisualTrialRequested()
+            && (envEnabled("FNVXR_HEADSET_INVENTORY_VISUAL_TRIAL", false)
+                || envEnabled("FNVXR_HEADSET_COMBAT_VISUAL_TRIAL", false)));
+    if (!route) return Decision::Stock;
+    VrRigPoseSnapshot latest {};
+    const bool havePose = readLatestRetailRigPose(latest);
+    constexpr UInt32 trackingRequired = fnvxr::shared::VrPoseTrackingHmd
+        | fnvxr::shared::VrPoseTrackingRightGripActive
+        | fnvxr::shared::VrPoseTrackingRightGripCurrent
+        | fnvxr::shared::VrPoseTrackingRightAimActive
+        | fnvxr::shared::VrPoseTrackingRightAimCurrent;
+    void* cell = readPointer(reinterpret_cast<std::uintptr_t>(actor) + 0x40u);
+    const UInt32 cellId = cell ? readUInt32(reinterpret_cast<std::uintptr_t>(cell) + 0x0Cu) : 0u;
+    output = g_trackedShotPose;
+    const bool usable = gamePluginProducerLeaseHeldByCurrentThread()
+        && weapon == currentEquippedWeaponForm()
+        && currentRetailWeaponBindingReady()
+        && fnvxr::tracked_shot::current(output,
+            reinterpret_cast<std::uintptr_t>(actor), reinterpret_cast<std::uintptr_t>(weapon),
+            cellId, latest.producerEpoch, latest.referenceSpaceGeneration, latest.frame,
+            GetTickCount64(), havePose && (latest.trackingFlags & trackingRequired) == trackingRequired);
+    logTelemetry("{\"event\":\"fnvxrTrackedShot\",\"applied\":%s,\"weapon\":\"%p\","
+        "\"poseSequence\":%lu,\"poseFrame\":%llu,\"latestFrame\":%llu,"
+        "\"origin\":[%.5f,%.5f,%.5f],\"forward\":[%.7f,%.7f,%.7f],"
+        "\"spread\":\"native\",\"impact\":\"native\"}\n",
+        usable ? "true" : "false", weapon, static_cast<unsigned long>(output.sequence),
+        static_cast<unsigned long long>(output.frame), static_cast<unsigned long long>(latest.frame),
+        output.position[0], output.position[1], output.position[2],
+        output.forward[0], output.forward[1], output.forward[2]);
+    return usable ? Decision::Tracked : Decision::Unavailable;
+}
+
+void __cdecl observeTrackedNativeProjectile(void* projectile)
+{
+    if (!projectile || GetCurrentThreadId() != g_gamePluginProducerThreadId) return;
+    const auto address = reinterpret_cast<std::uintptr_t>(projectile);
+    if (readPointer(address + 0xFCu) != readPointer(PlayerCharacterAddress)) return;
+    const Vec3 position = readVec3(address + 0x30u);
+    const Vec3 rotation = readVec3(address + 0x24u);
+    const auto impact = reinterpret_cast<std::uintptr_t>(readPointer(address + 0x88u));
+    const auto hit = reinterpret_cast<std::uintptr_t>(readPointer(impact));
+    logTelemetry("{\"event\":\"fnvxrNativeProjectile\",\"form\":%lu,\"position\":[%.5f,%.5f,%.5f],"
+        "\"rotation\":[%.7f,%.7f,%.7f],\"impactForm\":%lu}\n",
+        static_cast<unsigned long>(readUInt32(address + 0x0Cu)),
+        position.x, position.y, position.z, rotation.x, rotation.y, rotation.z,
+        static_cast<unsigned long>(hit ? readUInt32(hit + 0x0Cu) : 0u));
+}
 
 bool installRetailRigHook()
 {
@@ -15589,6 +15680,26 @@ void consumeExternalXInputBridge(
     // Install while this ordinary controller bridge owns the game thread,
     // including the front end before its first blocking movie starts.
     installNativeControlReader();
+    if (physicalHeadsetPlayRequested() || headsetControllerRigVisualTrialRequested())
+    {
+        static bool shotAttempted = false;
+        if (!shotAttempted)
+        {
+            shotAttempted = true;
+            const bool installed = fnvxr::retail_1_4_0_525::shot::install(
+                prepareTrackedNativeShot, observeTrackedNativeProjectile);
+            logTelemetry("nativeTrackedShot installed=%d origin=committed-muzzle aim=committed-muzzle spread=native impact=native\n",
+                static_cast<int>(installed));
+        }
+        static bool audioAttempted = false;
+        if (!audioAttempted)
+        {
+            audioAttempted = true;
+            const bool installed = fnvxr::retail_1_4_0_525::enableBackgroundAudio();
+            logTelemetry("nativeAudio backgroundPlayback=%d owner=retail-secondary-buffers desktopFocusRequired=0\n",
+                static_cast<int>(installed));
+        }
+    }
 
     const UInt32 menuBits = observation.menuBits;
     const fnvxr::shared::RuntimeControllerMode controllerMode =

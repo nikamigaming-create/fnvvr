@@ -11526,6 +11526,13 @@ int main(int argc, char** argv)
         }
         if (livePipBoyScreenFocused && livePipBoyPlaneResult)
             gamePlane = livePipBoyPlane;
+        else if (haveRuntimeUiState
+            && (runtimeMenuBits & fnvxr::shared::RuntimeDialogMenuBit) != 0u)
+        {
+            // Keep speech and choices below the speaker's face. Rendering
+            // and pointer hit testing consume this same anchored surface.
+            gamePlane.pose.position.y -= 0.12f;
+        }
         if (gameplayPlaneSize != previousLoggedGameplayPlaneSize
             || pipBoyMenuMode != previousLoggedPipBoyMenuMode
             || std::fabs(gamePlane.width - previousLoggedGamePlaneWidth) > 0.001f

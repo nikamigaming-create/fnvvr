@@ -2,6 +2,33 @@
 
 Last updated: 2026-09-13
 
+## Tracked firing and dialogue follow-up
+
+The Sunny bottle exercise exposed a gameplay fault: the visible weapon muzzle
+followed the controller, but native firing recalculated its direction from
+the player view. The new retail adapter supplies the committed tracked muzzle
+origin and direction immediately before the native pellet loop adds weapon
+spread. Fallout also corrects newly created player projectiles toward the
+camera crosshair; the adapter skips that correction only inside the matching
+tracked shot's creation scope. Existing projectile creation, hit and damage
+remain native. NPCs and VATS retain native targeting. Stale or mismatched
+tracking cannot reuse a prior weapon's shot pose.
+
+The retail simulator run hit three different Sunny tutorial bottles with
+three shots while standing still and changing only controller aim. Native
+impact references matched each intended bottle, the quest counter advanced
+0/1/2/3, and Sunny offered the next lesson. Accepting it advanced her quest
+to stage 25. Both eye recordings were reviewed; the low held-gun pose leaves
+most of the rifle below the recorded view. This verifies the rifle's tracked
+shot calculation, not every ranged weapon or physical headset behavior.
+
+Sunny's voiced conversation, bottle tutorial and return to the saloon have
+run through native controls. An earlier bottle exercise used player-view
+aim; the subsequent three-shot run above verifies tracked firing. Trudy's conversation is still
+pending. Native streamed audio buffers now permit background playback, so
+the simulator can record real dialogue without changing Windows focus.
+The dialogue surface is lowered to reduce overlap with the speaker's face.
+
 ## Native opening replay
 
 The new-character replay exposed two additional renderer faults. The native
@@ -96,6 +123,10 @@ has measured roughly 37–44 stereo pairs/second in recent captures; the
 
 ## Remaining work
 
+- Tracked melee/unarmed hit direction, reach and contact, preserving native
+  normal, power and special attacks; ranged weapon classes beyond the rifle.
+- Diagnose an intermittent native render-target fallback recursion observed
+  during the outdoor capture run.
 - Physical hand/weapon collision, contact and grabbing in the game world.
 - Complete campaign interaction coverage, including crafting, gambling,
   terminals/lockpicking, dialogue/doors, VATS limbs/specials and transitions.
