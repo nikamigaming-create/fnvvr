@@ -4631,6 +4631,8 @@ void updateSharedPlayer(UInt64 frame, RuntimePhase phase)
         flags |= fnvxr::shared::PlayerSharedFlagThirdPerson;
     const bool engineWeaponOut = playerWeaponOut();
     const bool combatWeaponReady = playerCombatWeaponReady();
+    if (engineWeaponOut)
+        flags |= fnvxr::shared::PlayerSharedFlagWeaponDrawn;
     const UInt32 weaponClass = currentWeaponClass();
     if (combatWeaponReady)
         flags |= fnvxr::shared::PlayerSharedFlagWeaponOut;
@@ -4659,7 +4661,8 @@ void updateSharedPlayer(UInt64 frame, RuntimePhase phase)
         // post-animation hook and performs no transform/culling write.
         static_cast<void>(discoverRetailRigNodes(playerNode));
     }
-    void* firstPersonSceneRoot = g_retailRigNodes.weapon;
+    void* firstPersonSceneRoot = g_retailEquippedWeaponFormId != 0u
+        && g_retailRigNodes.weaponModel ? g_retailRigNodes.weapon : nullptr;
     if (looksLikeNiObject(firstPersonSceneRoot))
     {
         g_playerState->reserved[
@@ -6698,7 +6701,6 @@ bool retailRigNodesComplete(const RetailRigNodes& rig)
     return rig.root
         && rig.left.clavicle && rig.left.upperArm && rig.left.forearm && rig.left.hand
         && rig.right.clavicle && rig.right.upperArm && rig.right.forearm && rig.right.hand
-        && rig.weapon
         && niObjectDescendsFrom(rig.left.clavicle, rig.root)
         && niObjectDescendsFrom(rig.right.clavicle, rig.root)
         && current(rig.bodySkeleton)
@@ -6716,7 +6718,7 @@ bool retailRigNodesComplete(const RetailRigNodes& rig)
         && niObjectDescendsFrom(rig.right.upperArm, rig.right.clavicle)
         && niObjectDescendsFrom(rig.right.forearm, rig.right.upperArm)
         && niObjectDescendsFrom(rig.right.hand, rig.right.forearm)
-        && niObjectDescendsFrom(rig.weapon, rig.root);
+        && current(rig.weapon);
 }
 
 RetailArmNodes discoverRetailArm(void* root, bool left)
@@ -6828,8 +6830,9 @@ bool discoverRetailRigNodes(void* root)
     return complete;
 }
 
-void* currentEquippedWeaponForm()
+void* currentEquippedWeaponForm(bool* known = nullptr)
 {
+    if (known) *known = false;
     __try
     {
         void* player = readPointer(PlayerCharacterAddress);
@@ -6847,9 +6850,11 @@ void* currentEquippedWeaponForm()
         void* weaponInfo = reinterpret_cast<GetWeaponInfoFn>(
             processVtable[BaseProcessGetWeaponInfoVtableSlot])(process);
         // xNVSE Actor::GetEquippedWeapon reads EntryData::type at +0x08.
-        return weaponInfo
+        void* form = weaponInfo
             ? readPointer(reinterpret_cast<std::uintptr_t>(weaponInfo) + 0x08)
             : nullptr;
+        if (known) *known = !weaponInfo || form != nullptr;
+        return form;
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
     {
@@ -6956,6 +6961,7 @@ bool refreshRetailWeaponNodes()
         // weapon from the same current controller sample.
         g_retailRightCalibration = {};
         g_retailWeaponCalibration = {};
+        g_retailRigNodes.bodyShoulderCalibrationValid = false;
         g_retailRigContinuityPose = {};
         // A model swap can complete without a new OpenXR sample. Permit that
         // exact pose to bind and render the replacement weapon immediately.
@@ -8912,6 +8918,7 @@ void publishWeaponFrameCommit(
     bool rightSolved,
     bool weaponWritten,
     bool weaponAligned,
+    bool handsOnly,
     bool handMeshRotationValid,
     const Quat& rightHandGripLocalRotation,
     bool pipBoyScreenPoseValid,
@@ -8937,19 +8944,21 @@ void publishWeaponFrameCommit(
         flags |= fnvxr::shared::WeaponFrameFlagWeaponWritten;
     if (weaponAligned)
         flags |= fnvxr::shared::WeaponFrameFlagWeaponAligned;
+    if (handsOnly)
+        flags |= fnvxr::shared::WeaponFrameFlagHandsOnly;
     if (handMeshRotationValid)
         flags |= fnvxr::shared::WeaponFrameFlagHandMeshRotationValid;
     if (pipBoyScreenPoseValid)
         flags |= fnvxr::shared::WeaponFrameFlagPipBoyScreenPoseValid;
+    const UInt32 required = fnvxr::shared::weaponFrameRequiredFlags(flags);
     const bool complete =
-        (flags & fnvxr::shared::WeaponFrameRequiredFlags)
-            == fnvxr::shared::WeaponFrameRequiredFlags
+        (flags & required) == required
         && g_retailRigNodes.root
         && g_retailRigNodes.right.hand
-        && g_retailRigNodes.weapon
+        && (handsOnly || g_retailRigNodes.weapon)
         && finiteVec3(rightHandWorld)
-        && finiteVec3(weaponWorld)
-        && finiteMatrix33(weaponWorldRotation)
+        && (handsOnly || (finiteVec3(weaponWorld)
+            && finiteMatrix33(weaponWorldRotation)))
         && (!hostSpatialPropReplacementRequested()
             || (handMeshRotationValid
                 && finiteUsableQuat(rightHandGripLocalRotation)
@@ -9004,7 +9013,7 @@ void publishWeaponFrameCommit(
         ? static_cast<UInt32>(reinterpret_cast<std::uintptr_t>(g_retailRigNodes.root)) : 0u;
     state->rightHandAddress = complete
         ? static_cast<UInt32>(reinterpret_cast<std::uintptr_t>(g_retailRigNodes.right.hand)) : 0u;
-    state->weaponAddress = complete
+    state->weaponAddress = complete && !handsOnly
         ? static_cast<UInt32>(reinterpret_cast<std::uintptr_t>(g_retailRigNodes.weapon)) : 0u;
     const float hand[3] { rightHandWorld.x, rightHandWorld.y, rightHandWorld.z };
     const float weapon[3] { weaponWorld.x, weaponWorld.y, weaponWorld.z };
@@ -9016,10 +9025,10 @@ void publishWeaponFrameCommit(
     for (int i = 0; i < 3; ++i)
     {
         state->rightHandWorldPos[i] = complete ? hand[i] : 0.0f;
-        state->weaponWorldPos[i] = complete ? weapon[i] : 0.0f;
+        state->weaponWorldPos[i] = complete && !handsOnly ? weapon[i] : 0.0f;
     }
     for (int i = 0; i < 9; ++i)
-        state->weaponWorldRot[i] = complete ? rotation[i] : 0.0f;
+        state->weaponWorldRot[i] = complete && !handsOnly ? rotation[i] : 0.0f;
     const float handRotation[4] {
         rightHandGripLocalRotation.x,
         rightHandGripLocalRotation.y,
@@ -9264,14 +9273,18 @@ void onRetailPostAnimation(void* animData)
     const UInt64 weaponRefreshStride = static_cast<UInt64>((std::max)(
         1,
         getIntFromEnv("FNVXR_RETAIL_WEAPON_REFRESH_SOLVES", 15)));
+    bool equipmentKnown = false;
+    void* equippedWeapon = currentEquippedWeaponForm(&equipmentKnown);
+    const bool noEquippedWeapon = equipmentKnown && !equippedWeapon;
     bool weaponBindingReady = currentRetailWeaponBindingReady();
     if (g_retailWeaponRefreshRequested
+        || equippedWeapon != g_retailEquippedWeaponForm
         || g_retailRigSolveCount == 0
         || (g_retailRigSolveCount % weaponRefreshStride) == 0)
     {
         weaponBindingReady = refreshRetailWeaponNodes();
     }
-    if (!retailRigNodesComplete(g_retailRigNodes) || !weaponBindingReady)
+    if (!retailRigNodesComplete(g_retailRigNodes) || !equipmentKnown)
     {
         logRetailRigGateSkip(
             g_retailRigIncompleteCount,
@@ -9406,10 +9419,28 @@ void onRetailPostAnimation(void* animData)
         measureHostSpatialPipBoyCalibration();
         if (rightControllerUsable)
         {
-            applyRetailWeaponAim(rightController, false);
+            if (weaponBindingReady && !noEquippedWeapon)
+                applyRetailWeaponAim(rightController, false);
             ensureRetailHandCalibration(g_retailRightCalibration,
                 g_retailRigNodes.right, rightController, bodyWorldRotation, false);
-            if (g_retailRightCalibration.valid && g_retailWeaponCalibration.valid)
+            if (g_retailRightCalibration.valid
+                && (noEquippedWeapon || !weaponBindingReady || !g_retailWeaponCalibration.valid))
+            {
+                // Empty hands retain the authored hand basis and tracked wrist;
+                // a missing gun muzzle is not a missing hand pose.
+                const Matrix33 xrToGame {{ {1,0,0}, {0,0,-1}, {0,1,0} }};
+                // The source right palm opposes the left palm about the
+                // wrist-to-finger axis (OpenXR -Z). Using the left-hand basis
+                // here twists the right forearm through a half turn.
+                g_retailRightCalibration.controllerToHandRotation = multiplyMatrix33(
+                    xrToGame, multiplyMatrix33(matrixFromQuat({0,0,1,0}), nifHandToXrMeshMatrix()));
+                g_retailRightCalibration.usesStageLocalBodyPositionAnchor = false;
+                g_retailRightCalibration.controllerToWristLocal = transformVec3(
+                    transposeMatrix33(rightController.wristRotation),
+                    subtractVec3(hostSpatialHandWristWorld(rightController, false),
+                        rightController.wristPosition));
+            }
+            else if (g_retailRightCalibration.valid && g_retailWeaponCalibration.valid)
             {
                 const Matrix33 weaponRotation = multiplyMatrix33(rightController.rotation,
                     g_retailWeaponCalibration.controllerToWeaponRotation);
@@ -9516,12 +9547,36 @@ void onRetailPostAnimation(void* animData)
     // these writes made the stock animation flash through during wide firing
     // motions despite a current, usable aim pose.
     RetailWeaponApplyResult weaponResult = rightControllerUsable
+        && weaponBindingReady && !noEquippedWeapon
         ? applyRetailWeaponAim(
             rightController,
             applyWrites)
         : RetailWeaponApplyResult {};
+    const bool handsOnly = noEquippedWeapon || !weaponResult.writeVerified;
+    const bool defaultHandBasis = noEquippedWeapon
+        || !weaponBindingReady || !g_retailWeaponCalibration.valid;
+    if (g_renderRigPoseOverrideActive && bodyAnchoredEngineCenterRig)
+    {
+        g_preparedFirstPersonView.excludedWeaponRoot = handsOnly || !playerWeaponOut()
+            ? sharedPointerAddress(g_retailRigNodes.weapon) : 0u;
+        g_preparedFirstPersonView.firstPersonRootCount = 0u;
+        const struct { void* node; bool enabled; } roots[] = {
+            {g_retailRigNodes.weapon, !handsOnly && playerWeaponOut()
+                && envEnabled("FNVXR_FIRST_PERSON_WEAPON_ROOT", true)},
+            {g_retailRigNodes.upperBodyMesh, envEnabled("FNVXR_FIRST_PERSON_UPPER_BODY_ROOT", true)},
+            {g_retailRigNodes.armsGeometry0, envEnabled("FNVXR_FIRST_PERSON_UPPER_BODY_ROOT", true)},
+            {g_retailRigNodes.armsGeometry1, envEnabled("FNVXR_FIRST_PERSON_UPPER_BODY_ROOT", true)},
+            {g_retailRigNodes.leftHandMesh, envEnabled("FNVXR_FIRST_PERSON_LEFT_HAND_ROOT", true)},
+            {g_retailRigNodes.rightHandMesh, envEnabled("FNVXR_FIRST_PERSON_RIGHT_HAND_ROOT", true)},
+            {g_retailRigNodes.pipBoy, envEnabled("FNVXR_FIRST_PERSON_PIPBOY_ROOT", true)},
+        };
+        for (const auto& entry : roots)
+            if (entry.node && entry.enabled)
+                g_preparedFirstPersonView.firstPersonRoots[
+                    g_preparedFirstPersonView.firstPersonRootCount++] = sharedPointerAddress(entry.node);
+    }
     bool continuityReplayed = false;
-    if (!hostSpatialProps
+    if (!noEquippedWeapon && !hostSpatialProps
         && (headlessStereoRigVisualTrial || physicalHeadsetEngineCenterRigRequested())
         && applyWrites)
     {
@@ -9530,7 +9585,12 @@ void onRetailPostAnimation(void* animData)
         else if (!weaponResult.writeVerified)
             continuityReplayed = replayRetailRigContinuityPose();
     }
-    if (weaponResult.endpointMeasured)
+    if (handsOnly)
+    {
+        g_latestMuzzleProofPoseSequence = 0;
+        g_latestMuzzleProofNode = nullptr;
+    }
+    else if (weaponResult.endpointMeasured)
     {
         g_latestMuzzleProofPoseSequence = pose.sequence;
         g_latestMuzzleProofNode = g_retailRigNodes.projectileNode
@@ -9587,8 +9647,9 @@ void onRetailPostAnimation(void* animData)
             rightSolved,
             weaponResult.writeVerified,
             weaponAligned,
-            g_retailWeaponCalibration.handMeshRotationValid,
-            g_retailWeaponCalibration.rightHandGripLocalRotation,
+            handsOnly,
+            defaultHandBasis || g_retailWeaponCalibration.handMeshRotationValid,
+            defaultHandBasis ? Quat {0,0,1,0} : g_retailWeaponCalibration.rightHandGripLocalRotation,
             g_retailPipBoyCalibration.hostSpatialValid,
             g_retailPipBoyCalibration.screenGripLocalPositionMeters,
             g_retailPipBoyCalibration.screenGripLocalRotation,
@@ -18995,31 +19056,42 @@ FNVXR_ApplyWeaponFrameForRender(
     const auto committedPoseStillOwnsLiveTransforms = [&]() noexcept
     {
         SharedWeaponFrameState* state = sharedWeaponFrameState();
-        if (!state || !g_retailRigNodes.right.hand || !g_retailRigNodes.weapon)
+        if (!state || !g_retailRigNodes.right.hand)
             return false;
         const LONG before = InterlockedCompareExchange(
             &state->producerSequence, 0, 0);
         if (!fnvxr::shared::sequencedValueIsPublished(before))
             return false;
         MemoryBarrier();
+        const bool handsOnly =
+            (state->flags & fnvxr::shared::WeaponFrameFlagHandsOnly) != 0u;
         const bool identityMatches =
             state->status == fnvxr::shared::WeaponFramePoseCommitted
             && state->poseSequence == static_cast<UInt32>(poseSequence)
             && state->poseFrame == pose.frame
             && state->rightHandAddress == static_cast<UInt32>(
                 reinterpret_cast<std::uintptr_t>(g_retailRigNodes.right.hand))
-            && state->weaponAddress == static_cast<UInt32>(
-                reinterpret_cast<std::uintptr_t>(g_retailRigNodes.weapon));
+            && (handsOnly ? state->weaponAddress == 0u
+                : g_retailRigNodes.weapon && state->weaponAddress == static_cast<UInt32>(
+                    reinterpret_cast<std::uintptr_t>(g_retailRigNodes.weapon)));
         const Vec3 hand = readVec3(
             reinterpret_cast<std::uintptr_t>(g_retailRigNodes.right.hand)
                 + NiAvObjectWorldTranslationOffset);
+        const float liveHand[3] { hand.x, hand.y, hand.z };
+        if (handsOnly)
+        {
+            const bool handMatches = fnvxr::weapon_frame::transformMatches(
+                liveHand, state->rightHandWorldPos, 3, 0.02f);
+            MemoryBarrier();
+            return before == InterlockedCompareExchange(&state->producerSequence, 0, 0)
+                && identityMatches && handMatches;
+        }
         const Vec3 weapon = readVec3(
             reinterpret_cast<std::uintptr_t>(g_retailRigNodes.weapon)
                 + NiAvObjectWorldTranslationOffset);
         const Matrix33 weaponRotation = readMatrix33(
             reinterpret_cast<std::uintptr_t>(g_retailRigNodes.weapon)
                 + NiAvObjectWorldRotationOffset);
-        const float liveHand[3] { hand.x, hand.y, hand.z };
         const float liveWeapon[3] { weapon.x, weapon.y, weapon.z };
         const float liveRotation[9] {
             weaponRotation.m[0][0], weaponRotation.m[0][1], weaponRotation.m[0][2],

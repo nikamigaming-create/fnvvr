@@ -27,6 +27,12 @@ zoom waits for the native transition and is consumed once; changing menus or
 disconnecting clears it. Animation lookup now uses the verified first-person
 argument and checks the current animation owner and scene-graph membership.
 
+Empty hands and equipment transitions keep publishing the tracked hands,
+Pip-Boy and world without requiring a weapon model or muzzle. The native
+renderer receives its current first-person objects with the applied pose,
+omits an unavailable or holstered gun, and restores it when its attachment
+is ready. Native equipment state, ammunition and attack behavior remain active.
+
 Physical play no longer has the previous default 40-second supervisor limit
 or 60,000-frame host limit. Explicit bounded diagnostic runs still expire.
 
@@ -44,8 +50,14 @@ or 60,000-frame host limit. Explicit bounded diagnostic runs still expire.
   cycles. Back was pressed before native target zoom finished in all 36;
   every cycle returned to gameplay without another press. Both-eye samples
   retained the first-person arms, weapon and world.
-- The Win32 and x64 focused build checks passed 54 test executions, including
-  native animation-call stack balance and deferred-input ownership checks.
+- Holster, draw, Pip-Boy unequip, empty-hand movement, re-equip and firing
+  completed in a subsequent retail run. The pistol consumed a round after
+  re-equipping. The 24.27-second recording retained stereo throughout, with
+  no fully black video frames. The previous 1.9-second re-equip hold fell to
+  a maximum source-pose age of 89 ms in this replay (median 33 ms).
+- The Win32 and x64 focused build checks passed 56 test executions, including
+  native animation-call stack balance, deferred-input ownership, and hand-only
+  frame identity without a stale weapon pointer.
 
 These runs use the actual retail game with simulated OpenXR tracking. They
 do not establish physical-headset comfort, working hardware haptics, full
@@ -63,8 +75,9 @@ has measured roughly 37–44 stereo pairs/second in recent captures; the
 - Earlier VATS-exit heap corruption was reproduced after the animation ABI
   fix. It did not recur in the 36-cycle run using native polled transitions;
   the corrupting writer has not been independently identified.
-- Holstering changes the native weapon state but still draws the gun in the
-  private eye collector. That presentation mismatch remains open.
+- Torso placement can still intrude at the bottom of the view after an
+  equipment change. Additional weapon classes and attack animations need
+  visual coverage beyond the pistol and empty-hand sequence.
 - OpenMW and Godot adapter types compile against the local engine types;
   those games are not yet integrated with the shared library.
 

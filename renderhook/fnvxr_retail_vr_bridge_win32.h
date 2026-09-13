@@ -2134,6 +2134,26 @@ private:
                 return { engine::RetailWorldHookDisposition::RejectGameplayFrame,
                     engine::RetailCenterRuntimeFailure::StereoRenderRejected, {} };
             }
+            const auto currentRootCount = renderFrame.firstPersonView.firstPersonRootCount;
+            if (currentRootCount != 0u
+                && currentRootCount <= renderFrame.firstPersonRootNodes.size())
+            {
+                for (std::uint32_t i = 0u; i < currentRootCount; ++i)
+                    renderFrame.firstPersonRootNodes[i] = renderFrame.firstPersonView.firstPersonRoots[i];
+                renderFrame.firstPersonRootNodeCount = currentRootCount;
+            }
+            // A native weapon model may rebuild while the controller hands
+            // remain valid. Exclude that weapon branch for this exact pose;
+            // keep drawing both eyes and the remaining first-person roots.
+            const auto excludedWeapon = renderFrame.firstPersonView.excludedWeaponRoot;
+            if (excludedWeapon != 0u)
+            {
+                std::uint32_t kept = 0u;
+                for (std::uint32_t i = 0u; i < renderFrame.firstPersonRootNodeCount; ++i)
+                    if (renderFrame.firstPersonRootNodes[i] != excludedWeapon)
+                        renderFrame.firstPersonRootNodes[kept++] = renderFrame.firstPersonRootNodes[i];
+                renderFrame.firstPersonRootNodeCount = kept;
+            }
         }
         const engine::RetailCenterRuntimeFrameResult result =
             bridge->mCenterRuntime.renderWorld(

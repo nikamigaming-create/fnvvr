@@ -43,11 +43,20 @@ constexpr std::uint32_t WeaponFrameFlagWeaponWritten = 1u << 3;
 constexpr std::uint32_t WeaponFrameFlagWeaponAligned = 1u << 4;
 constexpr std::uint32_t WeaponFrameFlagHandMeshRotationValid = 1u << 5;
 constexpr std::uint32_t WeaponFrameFlagPipBoyScreenPoseValid = 1u << 6;
+// Empty equipment or a rebuilding weapon mesh: hands and wrist stay current,
+// and no weapon transform is claimed for this frame.
+constexpr std::uint32_t WeaponFrameFlagHandsOnly = 1u << 7;
 constexpr std::uint32_t WeaponFrameRequiredFlags =
     WeaponFrameFlagRightGripCurrent
     | WeaponFrameFlagRightAimCurrent
     | WeaponFrameFlagArmSolved
     | WeaponFrameFlagWeaponWritten;
+constexpr std::uint32_t weaponFrameRequiredFlags(std::uint32_t flags) noexcept
+{
+    return (flags & WeaponFrameFlagHandsOnly) != 0u
+        ? WeaponFrameRequiredFlags & ~WeaponFrameFlagWeaponWritten
+        : WeaponFrameRequiredFlags;
+}
 constexpr std::uint32_t CameraSharedMagic = 0x43585646; // FNXC
 constexpr std::uint32_t CameraSharedVersion = 1;
 // This mapping exists only for the deliberately narrow desktop-assist camera
@@ -303,6 +312,9 @@ constexpr std::uint32_t PlayerSharedFlagThirdPerson = 1u << 3;
 constexpr std::uint32_t PlayerSharedFlagGameplay = 1u << 4;
 constexpr std::uint32_t PlayerSharedFlagWeaponOut = 1u << 5;
 constexpr std::uint32_t PlayerSharedFlagWeaponClassKnown = 1u << 6;
+// WeaponOut also permits native melee/unarmed input while holstered. Rendering
+// uses the actual engine draw state instead of that combat-readiness flag.
+constexpr std::uint32_t PlayerSharedFlagWeaponDrawn = 1u << 7;
 constexpr std::uint32_t PlayerSharedWeaponClassReservedIndex = 0;
 constexpr std::uint32_t PlayerSharedEquippedWeaponFormIdReservedIndex = 1;
 constexpr std::uint32_t PlayerSharedEquippedFavoriteSlotReservedIndex = 2;

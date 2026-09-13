@@ -26,7 +26,8 @@ constexpr Failure validateIdentity(
     std::uint32_t renderedPoseSequence,
     std::uint64_t renderedPoseFrame,
     std::uint32_t rightHandAddress,
-    std::uint32_t weaponAddress) noexcept
+    std::uint32_t weaponAddress,
+    bool weaponRequired = true) noexcept
 {
     if (status != committedStatus)
         return Failure::NotCommitted;
@@ -35,7 +36,7 @@ constexpr Failure validateIdentity(
         return Failure::PoseMismatch;
     if ((flags & requiredFlags) != requiredFlags)
         return Failure::Incomplete;
-    if (!rightHandAddress || !weaponAddress)
+    if (!rightHandAddress || (weaponRequired ? !weaponAddress : weaponAddress != 0u))
         return Failure::MissingNodes;
     return Failure::None;
 }

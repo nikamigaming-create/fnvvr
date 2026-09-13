@@ -2485,13 +2485,14 @@ bool consumeWeaponFrameForFirstPerson(
                 snapshot.status,
                 fnvxr::shared::WeaponFramePoseCommitted,
                 snapshot.flags,
-                fnvxr::shared::WeaponFrameRequiredFlags,
+                fnvxr::shared::weaponFrameRequiredFlags(snapshot.flags),
                 snapshot.poseSequence,
                 snapshot.poseFrame,
                 poseSequence,
                 poseFrame,
                 snapshot.rightHandAddress,
-                snapshot.weaponAddress));
+                snapshot.weaponAddress,
+                (snapshot.flags & fnvxr::shared::WeaponFrameFlagHandsOnly) == 0u));
         // The exact committed transform was applied before renderStereoWorld
         // drew both eye targets. Fallout's later desktop animation callback is
         // allowed to mutate the live scene tree before this publication seam;
@@ -9253,7 +9254,8 @@ bool prepareRetailVrFrame(
         } publishedRoots[] = {
             { playerState.reserved[
                   fnvxr::shared::PlayerSharedFirstPersonWeaponNodeReservedIndex],
-              readRawEnvBool("FNVXR_FIRST_PERSON_WEAPON_ROOT", true) },
+              readRawEnvBool("FNVXR_FIRST_PERSON_WEAPON_ROOT", true)
+                  && (playerState.flags & fnvxr::shared::PlayerSharedFlagWeaponDrawn) != 0u },
             { playerState.reserved[
                   fnvxr::shared::PlayerSharedFirstPersonUpperBodyNodeReservedIndex],
               readRawEnvBool("FNVXR_FIRST_PERSON_UPPER_BODY_ROOT", true) },

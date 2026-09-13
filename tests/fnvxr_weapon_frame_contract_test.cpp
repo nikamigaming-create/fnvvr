@@ -1,4 +1,5 @@
 #include "fnvxr_weapon_frame_contract.h"
+#include "../protocol/fnvxr_shared_state.h"
 
 #include <cstdint>
 #include <limits>
@@ -31,6 +32,35 @@ int main()
     if (fnvxr::weapon_frame::validateIdentity(
             committed, committed, required, required,
             42u, 900u, 42u, 900u, 0u, 0x2000u) != Failure::MissingNodes)
+        return fail();
+
+    constexpr auto emptyFlags = fnvxr::shared::WeaponFrameFlagHandsOnly
+        | fnvxr::shared::WeaponFrameFlagRightGripCurrent
+        | fnvxr::shared::WeaponFrameFlagRightAimCurrent
+        | fnvxr::shared::WeaponFrameFlagArmSolved;
+    constexpr auto emptyRequired = fnvxr::shared::weaponFrameRequiredFlags(emptyFlags);
+    if (fnvxr::weapon_frame::validateIdentity(
+            committed, committed, emptyFlags, emptyRequired,
+            42u, 900u, 42u, 900u, 0x1000u, 0u, false) != Failure::None)
+        return fail();
+    // Empty hands still need this exact solved pose; an old gun address cannot
+    // masquerade as an unarmed commit, and equipping restores gun requirements.
+    if (fnvxr::weapon_frame::validateIdentity(
+            committed, committed, emptyFlags, emptyRequired,
+            42u, 900u, 44u, 900u, 0x1000u, 0u, false) != Failure::PoseMismatch)
+        return fail();
+    if (fnvxr::weapon_frame::validateIdentity(
+            committed, committed, emptyFlags, emptyRequired,
+            42u, 900u, 42u, 900u, 0x1000u, 0x2000u, false) != Failure::MissingNodes)
+        return fail();
+    if (fnvxr::weapon_frame::validateIdentity(
+            committed, committed, emptyFlags & ~fnvxr::shared::WeaponFrameFlagArmSolved,
+            emptyRequired, 42u, 900u, 42u, 900u, 0x1000u, 0u, false) != Failure::Incomplete)
+        return fail();
+    if (fnvxr::shared::weaponFrameRequiredFlags(0u) != required
+        || fnvxr::weapon_frame::validateIdentity(
+            committed, committed, emptyFlags & ~fnvxr::shared::WeaponFrameFlagHandsOnly,
+            required, 42u, 900u, 42u, 900u, 0x1000u, 0u) != Failure::Incomplete)
         return fail();
 
     const float committedTransform[3] { 1.0f, 2.0f, 3.0f };
