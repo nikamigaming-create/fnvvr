@@ -20,6 +20,7 @@
 #include "fnvxr_native_pip_ui_win32.h"
 #include "fnvxr_live_pipboy_contract.h"
 #include "fnvxr_retail_vr_bridge_win32.h"
+#include "fnvxr_retail_target_retry_1_4_0_525.h"
 #include "fnvxr_stereo_math.h"
 
 #include <algorithm>
@@ -63,6 +64,8 @@ Direct3DCreate9ExFn gRealDirect3DCreate9Ex = nullptr;
 using PresentFn = HRESULT(WINAPI*)(IDirect3DDevice9*, const RECT*, const RECT*, HWND, const RGNDATA*);
 using EndSceneFn = HRESULT(WINAPI*)(IDirect3DDevice9*);
 using ResetFn = HRESULT(WINAPI*)(IDirect3DDevice9*, D3DPRESENT_PARAMETERS*);
+bool patchVTableSlot(void**, size_t, void*, void**);
+HRESULT WINAPI hookedReset(IDirect3DDevice9*, D3DPRESENT_PARAMETERS*);
 using ClearFn = HRESULT(WINAPI*)(IDirect3DDevice9*, DWORD, const D3DRECT*, DWORD, D3DCOLOR, float, DWORD);
 using SetTransformFn = HRESULT(WINAPI*)(IDirect3DDevice9*, D3DTRANSFORMSTATETYPE, const D3DMATRIX*);
 using SetVertexShaderFn = HRESULT(WINAPI*)(IDirect3DDevice9*, IDirect3DVertexShader9*);
@@ -10838,6 +10841,18 @@ bool initializeRetailVrPresentBootstrap(IDirect3DDevice9* device) noexcept
 {
     if (!device)
         return false;
+    if (!fnvxr::retail_1_4_0_525::target_retry::install([]() noexcept {
+            static unsigned failures = 0;
+            if (++failures <= 3 || failures % 120 == 0)
+                logRetailVrLine("retail target fallback stopped: default target also failed; returning native failure");
+        }))
+        return false;
+    // The retail bridge owns default-pool eye/UI resources even though the
+    // legacy full-device interposer is disabled. Release those resources at
+    // the native Reset boundary or a lost device can never recover.
+    if (!gRealReset && !patchVTableSlot(*reinterpret_cast<void***>(device), 16,
+            reinterpret_cast<void*>(&hookedReset), reinterpret_cast<void**>(&gRealReset)))
+        return false;
     if (!gRetailRuntimePublicationReadiness.initialized())
     {
         // Mapping creation is owned by the authenticated NVSE main-loop
@@ -18294,6 +18309,15 @@ HRESULT WINAPI hookedPresent(
 
 HRESULT WINAPI hookedReset(IDirect3DDevice9* device, D3DPRESENT_PARAMETERS* presentationParameters)
 {
+    const bool retail = device == gRetailVrProxyContext.device;
+    if (retail && gRetailVrBridge)
+    {
+        // Native Reset is outside a render transaction. Restore the engine
+        // call leases before discarding target operations; the next Present
+        // bootstraps a fresh bridge and GPU resource generation.
+        delete gRetailVrBridge;
+        gRetailVrBridge = nullptr;
+    }
     closeNativeStereoOriginLease("device-reset");
     publishSharedStereoInvalid(false, "device-reset");
     resetRetailEngineDepthDescription();
@@ -18316,6 +18340,17 @@ HRESULT WINAPI hookedReset(IDirect3DDevice9* device, D3DPRESENT_PARAMETERS* pres
     forceImmediatePresentation(presentationParameters, "Reset");
     logLine("IDirect3DDevice9::Reset");
     const HRESULT result = gRealReset(device, presentationParameters);
+    if (retail)
+    {
+        static unsigned attempts = 0;
+        if (++attempts <= 4 || SUCCEEDED(result) || attempts % 120 == 0)
+        {
+            char message[192] {};
+            sprintf_s(message, "retail device reset attempt=%u result=0x%08lx eyeResourcesReleased=1",
+                attempts, static_cast<unsigned long>(result));
+            logRetailVrLine(message);
+        }
+    }
     if (SUCCEEDED(result))
     {
         InterlockedExchange(&gStateBlockRecording, 0);

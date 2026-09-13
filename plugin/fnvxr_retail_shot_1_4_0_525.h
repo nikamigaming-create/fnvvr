@@ -24,7 +24,18 @@ inline constexpr std::uintptr_t SkipPellets = 0x0052467Fu;
 inline constexpr std::uintptr_t CreatedSite = 0x005245C2u;
 inline constexpr std::uintptr_t CreatedResume = 0x005245CBu;
 inline constexpr std::uintptr_t CameraAimSite = 0x009BD9E2u;
-struct PendingShot { tracked_shot::Decision decision; void* actor; void* weapon; };
+inline constexpr std::uintptr_t VelocitySite = 0x009BEBF4u;
+inline constexpr std::uintptr_t NativeSetVelocity = 0x0062B8D0u;
+struct PendingShot
+{
+    tracked_shot::Decision decision;
+    void* actor;
+    void* weapon;
+    ULONGLONG timeMs;
+    bool velocityOverride;
+    float velocity[3];
+    bool velocityApplied;
+};
 inline thread_local PendingShot pending[16] {};
 inline thread_local unsigned pendingDepth = 0;
 
@@ -41,6 +52,7 @@ inline void __fastcall cameraAim(void* player, void*, void* projectile,
             const auto& shot = pending[pendingDepth - 1];
             const auto address = reinterpret_cast<std::uintptr_t>(projectile);
             tracked = shot.decision == tracked_shot::Decision::Tracked
+                && GetTickCount64() - shot.timeMs <= 100u
                 && shot.actor == player
                 && *reinterpret_cast<void**>(address + 0xFCu) == shot.actor
                 && *reinterpret_cast<void**>(address + 0xF8u) == shot.weapon;
@@ -83,12 +95,57 @@ inline tracked_shot::Decision __cdecl apply(std::uintptr_t frame) noexcept
             if (pendingDepth < 16)
                 pending[pendingDepth] = { decision,
                     *reinterpret_cast<void**>(frame - 0x2Cu),
-                    *reinterpret_cast<void**>(frame - 0x238u) };
+                    *reinterpret_cast<void**>(frame - 0x238u), GetTickCount64(),
+                    pose.velocityOverride,
+                    {pose.linearVelocity[0], pose.linearVelocity[1], pose.linearVelocity[2]} };
             ++pendingDepth;
         }
         return decision;
     }
     __except (EXCEPTION_EXECUTE_HANDLER) { return tracked_shot::Decision::Unavailable; }
+}
+
+// Projectile::Initialize3D supplies its native world velocity to 62B8D0.
+// Replace only that vector for the matched tracked throw being constructed.
+// The native function still sets every rigid body, units, gravity and bounce.
+inline void __cdecl applyVelocity(std::uintptr_t frame) noexcept
+{
+    __try
+    {
+        if (!pendingDepth || pendingDepth > 16) return;
+        auto& shot = pending[pendingDepth - 1];
+        const auto projectile = *reinterpret_cast<std::uintptr_t*>(frame - 0x20u);
+        if (shot.decision == tracked_shot::Decision::Tracked && shot.velocityOverride
+            && GetTickCount64() - shot.timeMs <= 100u && projectile
+            && *reinterpret_cast<void**>(projectile + 0xFCu) == shot.actor
+            && *reinterpret_cast<void**>(projectile + 0xF8u) == shot.weapon)
+        {
+            std::memcpy(reinterpret_cast<void*>(frame - 0x1Cu), shot.velocity, sizeof(shot.velocity));
+            shot.velocityApplied = true;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+__declspec(naked) inline void velocityRelay()
+{
+    __asm
+    {
+        pushfd
+        pushad
+        sub esp, 0x220
+        lea esi, [esp + 15]
+        and esi, 0xfffffff0
+        fxsave [esi]
+        push ebp
+        call applyVelocity
+        add esp, 4
+        fxrstor [esi]
+        add esp, 0x220
+        popad
+        popfd
+        jmp NativeSetVelocity
+    }
 }
 
 __declspec(naked) inline void relay()
@@ -146,6 +203,15 @@ __declspec(naked) inline void createdRelay()
 }
 #endif
 
+inline bool creationUsedHandVelocity() noexcept
+{
+#if defined(_M_IX86)
+    return pendingDepth && pendingDepth <= 16 && pending[pendingDepth - 1].velocityApplied;
+#else
+    return false;
+#endif
+}
+
 inline bool install(Prepare callback, Observe observer) noexcept
 {
     if (installed) return true;
@@ -159,14 +225,20 @@ inline bool install(Prepare callback, Observe observer) noexcept
         constexpr unsigned char expected[] { 0xD9,0x45,0xA0,0xD9,0x9D,0x4C,0xFE,0xFF,0xFF };
         constexpr unsigned char createdExpected[] { 0x83,0xC4,0x40,0x89,0x85,0x58,0xFE,0xFF,0xFF };
         constexpr unsigned char aimExpected[] { 0xE8,0x39,0x7C,0xFA,0xFF };
+        constexpr unsigned char velocityExpected[] {0xE8,0xD7,0xCC,0xC6,0xFF};
         const auto* window = reinterpret_cast<const unsigned char*>(0x0052441Eu);
         std::uint64_t hash = 14695981039346656037ull;
         for (std::size_t i = 0; i < 96; ++i) hash = (hash ^ window[i]) * 1099511628211ull;
         const auto* aimWindow = reinterpret_cast<const unsigned char*>(0x009BD999u);
         std::uint64_t aimHash = 14695981039346656037ull;
         for (std::size_t i = 0; i < 96; ++i) aimHash = (aimHash ^ aimWindow[i]) * 1099511628211ull;
+        std::uint64_t velocityHash = 14695981039346656037ull;
+        for (unsigned i = 0; i < 96; ++i)
+            velocityHash = (velocityHash ^ reinterpret_cast<const unsigned char*>(0x009BEBBAu)[i]) * 1099511628211ull;
         if (!callback || !observer || hash != 0x6d6438a42e80e4f6ull
             || aimHash != 0x3f795c2a5cc053a7ull
+            || velocityHash != 0x55bf1e5978dc5f0bull
+            || std::memcmp(reinterpret_cast<void*>(VelocitySite), velocityExpected, 5) != 0
             || std::memcmp(reinterpret_cast<void*>(Site), expected, sizeof(expected)) != 0
             || std::memcmp(reinterpret_cast<void*>(CreatedSite), createdExpected, sizeof(createdExpected)) != 0
             || std::memcmp(reinterpret_cast<void*>(CameraAimSite), aimExpected, sizeof(aimExpected)) != 0)
@@ -185,6 +257,14 @@ inline bool install(Prepare callback, Observe observer) noexcept
             VirtualProtect(reinterpret_cast<void*>(Site), sizeof(expected), oldProtect, &unused);
             return false;
         }
+        DWORD velocityOldProtect = 0;
+        if (!VirtualProtect(reinterpret_cast<void*>(VelocitySite), 5, PAGE_EXECUTE_READWRITE, &velocityOldProtect))
+        {
+            DWORD unused = 0;
+            VirtualProtect(reinterpret_cast<void*>(Site), sizeof(expected), oldProtect, &unused);
+            VirtualProtect(reinterpret_cast<void*>(CameraAimSite), 5, aimOldProtect, &unused);
+            return false;
+        }
         prepare = callback;
         observe = observer;
         std::memcpy(reinterpret_cast<void*>(Site), replacement, sizeof(replacement));
@@ -198,12 +278,18 @@ inline bool install(Prepare callback, Observe observer) noexcept
             reinterpret_cast<std::uintptr_t>(&cameraAim) - (CameraAimSite + 5u));
         std::memcpy(aimReplacement + 1, &aimRelative, sizeof(aimRelative));
         std::memcpy(reinterpret_cast<void*>(CameraAimSite), aimReplacement, sizeof(aimReplacement));
+        const auto velocityRelative = static_cast<std::uint32_t>(
+            reinterpret_cast<std::uintptr_t>(&velocityRelay) - (VelocitySite + 5u));
+        std::memcpy(aimReplacement + 1, &velocityRelative, 4);
+        std::memcpy(reinterpret_cast<void*>(VelocitySite), aimReplacement, 5);
         DWORD unused = 0;
         VirtualProtect(reinterpret_cast<void*>(Site), sizeof(expected), oldProtect, &unused);
         VirtualProtect(reinterpret_cast<void*>(CameraAimSite), sizeof(aimExpected), aimOldProtect, &unused);
+        VirtualProtect(reinterpret_cast<void*>(VelocitySite), 5, velocityOldProtect, &unused);
         FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(Site), sizeof(expected));
         FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(CreatedSite), sizeof(createdExpected));
         FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(CameraAimSite), sizeof(aimExpected));
+        FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(VelocitySite), 5);
         installed = true;
         return true;
     }

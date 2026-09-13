@@ -1042,6 +1042,24 @@ $physicalHeadsetEnvironment = Get-FnvxrProductMinimalEnvironment `
     -RetailFixtureWeapon "Pistol" `
     -PhysicalHeadsetPlay `
     -PhysicalRuntimeManifest "C:\fnvxr-physical-headset-play-contract\oculus_openxr_64.json"
+if ($physicalHeadsetEnvironment.Contains("FNVXR_WEAPON_TEST_LOADOUT")) {
+    throw "Normal headset play must not enable inventory setup for weapon coverage."
+}
+$coverageArgs = @{
+    RunId = "weapon-coverage"; RunDirectory = "C:\fnvxr-coverage"
+    OpenXrLoaderPath = ""; SessionReadyTimeoutSeconds = 60
+    AutomateRetailFixture = $true; HeadsetWorldOnlyCapture = $true
+    HeadsetFixtureWeaponDraw = $true; HeadsetControllerRigVisualTrial = $true
+    HeadsetInventoryVisualTrial = $true; RetailWeaponCoverage = $true
+    RetailFixtureAction = "load"; RetailFixtureSaveName = "FNVXR_AutoRetail_L1_Pistol"
+    RetailFixtureWeapon = "Pistol"; HeadlessRuntimeManifest = "C:\fnvxr-coverage\openxr_simulator.json"
+}
+$coverageEnvironment = Get-FnvxrProductMinimalEnvironment @coverageArgs
+if ($coverageEnvironment.FNVXR_WEAPON_TEST_LOADOUT -cne "1") {
+    throw "Explicit simulator weapon coverage did not reach the native fixture."
+}
+$coverageArgs.HeadsetInventoryVisualTrial = $false
+Require-Throws { Get-FnvxrProductMinimalEnvironment @coverageArgs } "headless inventory fixture"
 if ([string]$physicalHeadsetEnvironment.FNVXR_RETAIL_VR_FIRST_PERSON_PRIVATE_CALLER -cne "third" -or
     [string]$physicalHeadsetEnvironment.FNVXR_PHYSICAL_HEADSET_PLAY -cne "1" -or
     [string]$physicalHeadsetEnvironment.FNVXR_RETAIL_CENTER_INTEGRATED_FIRST_PERSON -cne "1" -or

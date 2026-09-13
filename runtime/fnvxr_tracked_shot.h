@@ -18,6 +18,8 @@ struct Pose
     std::uint64_t sampledAtMs {};
     float position[3] {};
     float forward[3] {};
+    bool velocityOverride {};
+    float linearVelocity[3] {}; // native game units/second, thrown releases only
 };
 
 enum class Decision { Stock, Tracked, Unavailable };

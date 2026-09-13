@@ -13,6 +13,7 @@ namespace fnvxr::engine::abi
 // four bytes wide so these evidence layouts stay exact even in the x64 audit
 // build.  These are inspection layouts, not owning C++ object types.
 using RetailPointer32 = std::uint32_t;
+inline constexpr std::uintptr_t RetailWeaponTypeOffset = 0xF4u;
 
 struct RetailNiFrustumLayout
 {

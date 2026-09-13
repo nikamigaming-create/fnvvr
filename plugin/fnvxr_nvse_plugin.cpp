@@ -20,8 +20,11 @@
 #include "fnvxr_weapon_frame_contract.h"
 #include "fnvxr_native_control_pulses.h"
 #include "fnvxr_native_movie_input.h"
+#include "fnvxr_melee_gesture.h"
+#include "fnvxr_throw_motion.h"
 #include "fnvxr_retail_audio_1_4_0_525.h"
 #include "fnvxr_retail_shot_1_4_0_525.h"
+#include "fnvxr_retail_melee_1_4_0_525.h"
 #include "fnvxr_native_menu_geometry.h"
 #include "fnvxr_native_menu_stack.h"
 #include "fnvxr_first_person_view.h"
@@ -864,6 +867,28 @@ bool g_projectileNodeHookInstalled = false;
 LONG g_projectileNodeConsumeCalls = 0;
 LONG g_latestMuzzleProofPoseSequence = 0;
 fnvxr::tracked_shot::Pose g_trackedShotPose {};
+fnvxr::melee::Gesture g_meleeGesture;
+fnvxr::melee::AttackHold g_meleeAttackHold;
+fnvxr::throw_motion::History g_throwHistory;
+fnvxr::throw_motion::Release g_throwRelease;
+fnvxr::melee::AttackHold g_throwAttackHold;
+UInt64 g_throwReleaseAt = 0;
+bool g_throwArmed = false;
+struct RetailMeleeFrame
+{
+    bool valid{};
+    void* actor{};
+    void* weapon{};
+    UInt32 cell{}, space{}, sequence{};
+    UInt64 epoch{}, frame{}, timeMs{};
+    Vec3 grip{}, tip{};
+};
+RetailMeleeFrame g_meleeFrames[32] {};
+unsigned g_meleeFrameCount = 0;
+void* g_meleeGeometry = nullptr;
+void* g_meleeModel = nullptr;
+void* g_meleeWeapon = nullptr;
+Vec3 g_meleeTipLocal {};
 void* g_latestMuzzleProofNode = nullptr;
 Vec3 g_latestMuzzleAimForward {};
 bool g_haveVrOrigin = false;
@@ -900,6 +925,8 @@ UInt32 currentMenuBits();
 void logReadOnlyMessageMenuDiagnostic(UInt64 generation);
 bool playerWeaponOut();
 UInt32 currentWeaponClass();
+bool currentWeaponRequiresMuzzle();
+bool currentWeaponUsesPhysicalThrow();
 bool weaponClassKnown(UInt32 weaponClass);
 bool currentWeaponClassKnown();
 bool currentWeaponClassMeleeOrUnarmed();
@@ -6901,7 +6928,8 @@ bool currentRetailWeaponBindingReady()
         g_retailRigNodes.weaponModel != nullptr,
         endpointInCurrentModel,
         g_retailEquippedWeaponFormId,
-        g_retailWeaponModelFormId);
+        g_retailWeaponModelFormId,
+        currentWeaponRequiresMuzzle());
 }
 
 bool refreshRetailWeaponNodes()
@@ -8345,7 +8373,7 @@ RetailWeaponApplyResult applyRetailWeaponAim(
         // During an equip, Fallout replaces the model below the stable Weapon
         // attachment asynchronously. Never calibrate a replacement gun from
         // the departing model's muzzle axis.
-        if (bodyAnchoredControllerRig && !endpointUsable)
+        if (bodyAnchoredControllerRig && !endpointUsable && currentWeaponRequiresMuzzle())
             return result;
         const Matrix33 endpointWorldRotation = endpointUsable
             ? readMatrix33(
@@ -8752,6 +8780,14 @@ bool retailRigGameplayAllowed()
 void resetRetailRigOrigin(const char* reason)
 {
     g_trackedShotPose = {};
+    g_meleeFrameCount = 0;
+    g_meleeGeometry = nullptr;
+    g_meleeModel = nullptr;
+    g_meleeWeapon = nullptr;
+    g_meleeGesture.reset();
+    g_meleeAttackHold.reset();
+    g_throwHistory.reset(); g_throwRelease = {}; g_throwReleaseAt = 0;
+    g_throwArmed = false; g_throwAttackHold.reset();
     if (g_haveRetailRigOrigin)
         logTelemetry("retailRig origin reset reason=%s\n", reason ? reason : "unknown");
     g_haveRetailRigOrigin = false;
@@ -9092,6 +9128,81 @@ void publishWeaponFrameCommit(
     state->leftPipBoyDeviceScale = complete && pipBoyScreenPoseValid
         ? pipBoyDeviceScale : 1.0f;
     fnvxr::shared::endSequencedSharedWrite(state->producerSequence);
+}
+
+void findRetailMeleeTip(void* node, const Vec3& wrist, float& furthest, unsigned& visits, int depth = 0)
+{
+    if (!node || depth > 32 || ++visits > 256) return;
+    bool geometry = false;
+    __try
+    {
+        unsigned ancestry = 0;
+        for (auto* type = niObjectRtti(node); type && ancestry++ < 32; type = type->parent)
+            if (type->name && std::strcmp(type->name, "NiGeometry") == 0) { geometry = true; break; }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return; }
+    const auto address = reinterpret_cast<std::uintptr_t>(node);
+    if (geometry)
+    {
+        const auto data = reinterpret_cast<std::uintptr_t>(readPointer(address + 0xB8u));
+        const unsigned count = readUInt32(data + 8u) & 0xFFFFu;
+        const auto vertices = reinterpret_cast<std::uintptr_t>(readPointer(data + 0x20u));
+        const auto rotation = readMatrix33(address + NiAvObjectWorldRotationOffset);
+        const auto position = readVec3(address + NiAvObjectWorldTranslationOffset);
+        const float scale = readFloat(address + NiAvObjectWorldScaleOffset, 0);
+        if (vertices && count <= 32768 && finiteMatrix33(rotation) && finiteVec3(position)
+            && std::isfinite(scale) && scale > 0)
+            for (unsigned i = 0; i < count; ++i)
+            {
+                const Vec3 local = readVec3(vertices + i * 12u);
+                const Vec3 world = addVec3(position, scaleVec3(transformVec3(rotation, local), scale));
+                const float distance = lengthVec3(subtractVec3(world, wrist));
+                if (finiteVec3(local) && std::isfinite(distance) && distance > furthest && distance <= 105.0f)
+                { furthest = distance; g_meleeGeometry = node; g_meleeTipLocal = local; }
+            }
+    }
+    void** children = nullptr; UInt16 count = 0;
+    if (readNiNodeChildren(node, &children, count))
+        for (UInt16 i = 0; i < count; ++i) findRetailMeleeTip(children[i], wrist, furthest, visits, depth + 1);
+}
+
+void publishRetailMeleeFrame(void* player, void* weapon, const VrRigPoseSnapshot& pose,
+    bool valid, const Vec3& wrist, const Vec3& aimForward)
+{
+    if (!currentWeaponClassMeleeOrUnarmed() || !valid || !playerWeaponOut())
+    { g_meleeFrameCount = 0; return; }
+    Vec3 tip = addVec3(wrist, scaleVec3(aimForward, 6.0f));
+    if (weapon)
+    {
+        if (g_meleeModel != g_retailRigNodes.weaponModel || g_meleeWeapon != weapon)
+        {
+            g_meleeWeapon = weapon;
+            g_meleeModel = g_retailRigNodes.weaponModel;
+            g_meleeGeometry = nullptr;
+            float furthest = 0; unsigned visits = 0;
+            findRetailMeleeTip(g_meleeModel, wrist, furthest, visits);
+            logTelemetry("meleeGeometry weapon=%p model=%p geometry=%p gripToTipUnits=%.3f source=native-mesh-vertices\n",
+                weapon, g_meleeModel, g_meleeGeometry, furthest);
+        }
+        if (!g_meleeGeometry || !niObjectDescendsFrom(g_meleeGeometry, g_meleeModel))
+        { g_meleeFrameCount = 0; return; }
+        const auto geometry = reinterpret_cast<std::uintptr_t>(g_meleeGeometry);
+        tip = addVec3(readVec3(geometry + NiAvObjectWorldTranslationOffset),
+            scaleVec3(transformVec3(readMatrix33(geometry + NiAvObjectWorldRotationOffset), g_meleeTipLocal),
+                readFloat(geometry + NiAvObjectWorldScaleOffset, 0)));
+    }
+    if (!finiteVec3(wrist) || !finiteVec3(tip) || lengthVec3(subtractVec3(tip, wrist)) > 105.0f)
+    { g_meleeFrameCount = 0; return; }
+    if (g_meleeFrameCount && g_meleeFrames[(g_meleeFrameCount - 1) % 32].sequence == static_cast<UInt32>(pose.sequence))
+        --g_meleeFrameCount;
+    auto& sample = g_meleeFrames[g_meleeFrameCount++ % 32];
+    sample = {};
+    sample.valid = true; sample.actor = player; sample.weapon = weapon;
+    const auto cell = reinterpret_cast<std::uintptr_t>(readPointer(reinterpret_cast<std::uintptr_t>(player) + 0x40u));
+    sample.cell = cell ? readUInt32(cell + 0x0Cu) : 0u;
+    sample.space = pose.referenceSpaceGeneration; sample.epoch = pose.producerEpoch;
+    sample.sequence = static_cast<UInt32>(pose.sequence); sample.frame = pose.frame;
+    sample.timeMs = GetTickCount64(); sample.grip = wrist; sample.tip = tip;
 }
 
 void onRetailPostAnimation(void* animData)
@@ -9631,8 +9742,10 @@ void onRetailPostAnimation(void* animData)
     }
     g_trackedShotPose = {};
     if (!handsOnly && applyWrites && rightControllerUsable && rightAimUsable
-        && weaponResult.writeVerified && weaponResult.endpointMeasured
-        && weaponResult.endpointInWeaponBranch && equipmentKnown && equippedWeapon)
+        && weaponResult.writeVerified
+        && ((weaponResult.endpointMeasured && weaponResult.endpointInWeaponBranch)
+            || currentWeaponClass() == fnvxr::shared::PlayerWeaponClassThrown)
+        && equipmentKnown && equippedWeapon)
     {
         // Copy the authored muzzle committed for the tracked weapon. Stock
         // animation/render restores cannot change this shot snapshot.
@@ -9646,8 +9759,11 @@ void onRetailPostAnimation(void* animData)
         g_trackedShotPose.sequence = static_cast<UInt32>(pose.sequence);
         g_trackedShotPose.frame = pose.frame;
         g_trackedShotPose.sampledAtMs = GetTickCount64();
-        const auto& origin = weaponResult.endpointWorldPosition;
-        const auto& forward = weaponResult.endpointForward;
+        const bool thrown = currentWeaponClass() == fnvxr::shared::PlayerWeaponClassThrown;
+        const Vec3 origin = thrown ? readVec3(reinterpret_cast<std::uintptr_t>(g_retailRigNodes.weapon)
+            + NiAvObjectWorldTranslationOffset) : weaponResult.endpointWorldPosition;
+        const Vec3 forward = thrown ? normalizeVec3(transformVec3(rightController.rotation, {0,1,0}))
+            : weaponResult.endpointForward;
         g_trackedShotPose.position[0] = origin.x;
         g_trackedShotPose.position[1] = origin.y;
         g_trackedShotPose.position[2] = origin.z;
@@ -9655,6 +9771,9 @@ void onRetailPostAnimation(void* animData)
         g_trackedShotPose.forward[1] = forward.y;
         g_trackedShotPose.forward[2] = forward.z;
     }
+    if (currentWeaponUsesPhysicalThrow())
+        g_throwHistory.sample(g_trackedShotPose, static_cast<UInt64>(pose.predictedDisplayTime / 1000000));
+    else g_throwHistory.reset();
     if (handsOnly)
     {
         g_latestMuzzleProofPoseSequence = 0;
@@ -9668,24 +9787,24 @@ void onRetailPostAnimation(void* animData)
             : g_retailRigNodes.muzzleFlash;
         g_latestMuzzleAimForward = weaponResult.aimForward;
     }
-    const bool weaponAligned = weaponResult.writeVerified
-        && weaponResult.endpointMeasured
+    const bool meleeAttachment = equippedWeapon && !currentWeaponRequiresMuzzle()
+        && currentRetailWeaponBindingReady();
+    const bool endpointAligned = weaponResult.endpointMeasured
         && weaponResult.endpointInWeaponBranch
+        && niObjectAncestorChainVisible(
+            g_retailRigNodes.projectileNode ? g_retailRigNodes.projectileNode : g_retailRigNodes.muzzleFlash,
+            g_retailRigNodes.root)
+        && weaponResult.endpointAimResidualRadians <= getFloatFromEnv(
+            "FNVXR_RETAIL_MUZZLE_MAX_AIM_RESIDUAL_RADIANS", 0.08f);
+    const bool weaponAligned = weaponResult.writeVerified
+        && (meleeAttachment || endpointAligned)
         && (!hostSpatialProps
             || (weaponResult.wristSocketMeasured
                 && weaponResult.wristSocketResidualUnits
                     <= getFloatFromEnv(
                         "FNVXR_RETAIL_WEAPON_MAX_SOCKET_RESIDUAL_UNITS",
                         0.25f)))
-        && niObjectAncestorChainVisible(g_retailRigNodes.weapon, g_retailRigNodes.root)
-        && niObjectAncestorChainVisible(
-            g_retailRigNodes.projectileNode
-                ? g_retailRigNodes.projectileNode
-                : g_retailRigNodes.muzzleFlash,
-            g_retailRigNodes.root)
-        && weaponResult.endpointAimResidualRadians <= getFloatFromEnv(
-            "FNVXR_RETAIL_MUZZLE_MAX_AIM_RESIDUAL_RADIANS",
-            0.08f);
+        && niObjectAncestorChainVisible(g_retailRigNodes.weapon, g_retailRigNodes.root);
 
     g_lastRetailRigPoseSequence = pose.sequence;
     ++g_retailRigSolveCount;
@@ -9702,6 +9821,10 @@ void onRetailPostAnimation(void* animData)
             reinterpret_cast<std::uintptr_t>(g_retailRigNodes.weapon)
                 + NiAvObjectWorldTranslationOffset)
         : Vec3 {};
+    publishRetailMeleeFrame(player, equippedWeapon, pose,
+        applyWrites && rightControllerUsable && rightAimUsable && rightSolved
+            && (!equippedWeapon || weaponResult.writeVerified),
+        committedRightHandWorld, normalizeVec3(transformVec3(rightController.rotation, {0.0f, 1.0f, 0.0f})));
     const Matrix33 committedWeaponWorldRotation = g_retailRigNodes.weapon
         ? readMatrix33(
             reinterpret_cast<std::uintptr_t>(g_retailRigNodes.weapon)
@@ -10111,6 +10234,34 @@ fnvxr::tracked_shot::Decision __cdecl prepareTrackedNativeShot(
     void* cell = readPointer(reinterpret_cast<std::uintptr_t>(actor) + 0x40u);
     const UInt32 cellId = cell ? readUInt32(reinterpret_cast<std::uintptr_t>(cell) + 0x0Cu) : 0u;
     output = g_trackedShotPose;
+    if (currentWeaponUsesPhysicalThrow())
+    {
+        const UInt64 now = GetTickCount64();
+        output = g_throwRelease.pose;
+        const bool usable = gamePluginProducerLeaseHeldByCurrentThread() && havePose
+            && (latest.trackingFlags & trackingRequired) == trackingRequired
+            && output.valid && g_throwReleaseAt && now >= g_throwReleaseAt
+            && now - g_throwReleaseAt <= 1500 && output.actor == reinterpret_cast<std::uintptr_t>(actor)
+            && output.weapon == reinterpret_cast<std::uintptr_t>(weapon)
+            && weapon == currentEquippedWeaponForm() && output.cell == cellId
+            && output.epoch == latest.producerEpoch && output.referenceSpace == latest.referenceSpaceGeneration;
+        if (usable)
+        {
+            output.velocityOverride = true;
+            float speed2 = 0;
+            for (unsigned i = 0; i < 3; ++i)
+            { output.linearVelocity[i] = g_throwRelease.velocity[i]; speed2 += output.linearVelocity[i] * output.linearVelocity[i]; }
+            if (speed2 > 1.0f)
+                for (unsigned i = 0; i < 3; ++i) output.forward[i] = output.linearVelocity[i] / std::sqrt(speed2);
+        }
+        logTelemetry("trackedThrow applied=%d weapon=0x%08lx releaseAgeMs=%llu velocity=(%.3f,%.3f,%.3f) origin=(%.3f,%.3f,%.3f) physics=native\n",
+            usable ? 1 : 0, static_cast<unsigned long>(readUInt32(reinterpret_cast<std::uintptr_t>(weapon) + 0x0Cu)),
+            static_cast<unsigned long long>(now >= g_throwReleaseAt ? now - g_throwReleaseAt : 0),
+            output.linearVelocity[0], output.linearVelocity[1], output.linearVelocity[2],
+            output.position[0], output.position[1], output.position[2]);
+        g_throwReleaseAt = 0;
+        return usable ? Decision::Tracked : Decision::Unavailable;
+    }
     const bool usable = gamePluginProducerLeaseHeldByCurrentThread()
         && weapon == currentEquippedWeaponForm()
         && currentRetailWeaponBindingReady()
@@ -10129,11 +10280,74 @@ fnvxr::tracked_shot::Decision __cdecl prepareTrackedNativeShot(
     return usable ? Decision::Tracked : Decision::Unavailable;
 }
 
+bool __cdecl selectTrackedNativeMeleeTarget(void* actor, bool power, void*& target)
+{
+    if (!actor || actor != readPointer(PlayerCharacterAddress)
+        || GetCurrentThreadId() != g_gamePluginProducerThreadId
+        || !currentWeaponClassMeleeOrUnarmed() || readUInt32(0x011F2258u) != 0u)
+        return false;
+    const bool route = physicalHeadsetPlayRequested()
+        || (headsetControllerRigVisualTrialRequested()
+            && (envEnabled("FNVXR_HEADSET_INVENTORY_VISUAL_TRIAL", false)
+                || envEnabled("FNVXR_HEADSET_COMBAT_VISUAL_TRIAL", false)));
+    if (!route) return false;
+    target = nullptr;
+    VrRigPoseSnapshot pose {};
+    const UInt64 now = GetTickCount64();
+    constexpr UInt32 tracking = fnvxr::shared::VrPoseTrackingHmd
+        | fnvxr::shared::VrPoseTrackingRightGripActive | fnvxr::shared::VrPoseTrackingRightGripCurrent;
+    const bool tracked = g_nativeControlInputAllowed && gamePluginProducerLeaseHeldByCurrentThread()
+        && readLatestRetailRigPose(pose) && (pose.trackingFlags & tracking) == tracking;
+    void* const weapon = currentEquippedWeaponForm();
+    const auto cell = reinterpret_cast<std::uintptr_t>(readPointer(reinterpret_cast<std::uintptr_t>(actor) + 0x40u));
+    const UInt32 cellId = cell ? readUInt32(cell + 0x0Cu) : 0u;
+    const auto owns = [&](const RetailMeleeFrame& f, UInt64 maximumAge) {
+        return tracked && f.valid && f.actor == actor && f.weapon == weapon
+            && f.cell == cellId && f.epoch == pose.producerEpoch && f.space == pose.referenceSpaceGeneration
+            && now >= f.timeMs && now - f.timeMs <= maximumAge && pose.frame >= f.frame;
+    };
+    const auto cast = [&](const Vec3& from, const Vec3& to) -> void* {
+        const float a[] {from.x, from.y, from.z}, b[] {to.x, to.y, to.z};
+        void* hit = fnvxr::retail_1_4_0_525::melee::cast(actor, a, b);
+        if (!hit || hit == actor) return nullptr;
+        const auto type = readUInt32(reinterpret_cast<std::uintptr_t>(hit) + 4u) & 0xFFu;
+        return type == 59u || type == 60u ? hit : nullptr;
+    };
+    unsigned casts = 0;
+    if (g_meleeFrameCount && owns(g_meleeFrames[(g_meleeFrameCount - 1) % 32], 100))
+    {
+        // Trace the actual held geometry and its recent travel. Power changes
+        // retail's attack rules, never the size of this physical contact path.
+        const unsigned count = (std::min)(g_meleeFrameCount, 24u);
+        for (unsigned i = 0; i < count && !target; ++i)
+        {
+            const auto& frame = g_meleeFrames[(g_meleeFrameCount - 1 - i) % 32];
+            if (!owns(frame, 300)) break;
+            target = cast(frame.grip, frame.tip); ++casts;
+            if (!target && i + 1 < count)
+            {
+                const auto& before = g_meleeFrames[(g_meleeFrameCount - 2 - i) % 32];
+                if (owns(before, 300) && frame.timeMs >= before.timeMs && frame.timeMs - before.timeMs <= 60
+                    && lengthVec3(subtractVec3(before.tip, frame.tip)) <= 35.0f)
+                { target = cast(before.tip, frame.tip); ++casts; }
+            }
+        }
+    }
+    logTelemetry("meleeContact power=%d tracked=%d casts=%u target=0x%08lx geometry=%p reach=physical-weapon damage=native\n",
+        power ? 1 : 0, tracked ? 1 : 0, casts,
+        static_cast<unsigned long>(target ? readUInt32(reinterpret_cast<std::uintptr_t>(target) + 0x0Cu) : 0), g_meleeGeometry);
+    return true;
+}
+
 void __cdecl observeTrackedNativeProjectile(void* projectile)
 {
     if (!projectile || GetCurrentThreadId() != g_gamePluginProducerThreadId) return;
     const auto address = reinterpret_cast<std::uintptr_t>(projectile);
     if (readPointer(address + 0xFCu) != readPointer(PlayerCharacterAddress)) return;
+    if (currentWeaponUsesPhysicalThrow())
+        logTelemetry("throwPhysics projectile=0x%08lx handVelocityApplied=%d\n",
+            static_cast<unsigned long>(readUInt32(address + 0x0Cu)),
+            fnvxr::retail_1_4_0_525::shot::creationUsedHandVelocity() ? 1 : 0);
     const Vec3 position = readVec3(address + 0x30u);
     const Vec3 rotation = readVec3(address + 0x24u);
     const auto impact = reinterpret_cast<std::uintptr_t>(readPointer(address + 0x88u));
@@ -12878,7 +13092,7 @@ bool drivePhysicalGameplayPrimaryAttack(
             held ? "true" : "false",
             applied ? "true" : "false");
     }
-    return applied;
+    return held != previousHeld && applied;
 }
 
 UInt32 directInputMacroKeyFromEnv(const char* name, UInt32 fallback)
@@ -13104,7 +13318,18 @@ bool weaponClassMeleeOrUnarmed(UInt32 weaponClass)
 
 UInt32 currentWeaponClass()
 {
-    return g_lastKnownWeaponClass;
+    // Inventory equips and script grants do not pass through favorite slots.
+    bool known = false;
+    void* weapon = currentEquippedWeaponForm(&known);
+    if (!known) return fnvxr::shared::PlayerWeaponClassUnknown;
+    if (!weapon) return fnvxr::shared::PlayerWeaponClassUnarmed;
+    const auto type = readUInt32(reinterpret_cast<std::uintptr_t>(weapon)
+        + fnvxr::engine::abi::RetailWeaponTypeOffset) & 0xFFu;
+    if (type == 0u) return fnvxr::shared::PlayerWeaponClassUnarmed;
+    if (type <= 2u) return fnvxr::shared::PlayerWeaponClassMelee;
+    if (type <= 9u) return fnvxr::shared::PlayerWeaponClassRanged;
+    if (type <= 13u) return fnvxr::shared::PlayerWeaponClassThrown;
+    return fnvxr::shared::PlayerWeaponClassUnknown;
 }
 
 bool currentWeaponClassKnown()
@@ -14763,6 +14988,10 @@ void tapExternalXInputNav(UInt32 navMask, UInt32 menuBits)
 
 void releaseExternalXInputGameplayHolds()
 {
+    g_meleeGesture.reset();
+    g_meleeAttackHold.reset();
+    g_throwHistory.reset(); g_throwRelease = {}; g_throwReleaseAt = 0;
+    g_throwArmed = false; g_throwAttackHold.reset();
     g_physicalSnapTurnLatch.reset();
     if (nativeLocomotionConsumerRequested())
         drivePhysicalPlayerMovement({}, false, false, 0);
@@ -14890,14 +15119,7 @@ bool tapWaitKey(const char* source, UInt64 frame)
 struct PrimaryAttackState
 {
     bool held = false;
-    UInt64 lastTapMs = 0;
-    UInt32 lastWeaponClass = fnvxr::shared::PlayerWeaponClassUnknown;
 };
-
-UInt64 meleeTriggerRepeatMs()
-{
-    return static_cast<UInt64>((std::max)(80, getIntFromEnv("FNVXR_GAMEPLAY_MELEE_TRIGGER_REPEAT_MS", 420)));
-}
 
 bool driveGameplayPrimaryAttack(
     bool rightTriggerHeld,
@@ -14908,71 +15130,42 @@ bool driveGameplayPrimaryAttack(
         fnvxr::physical_input::LocomotionDelivery::SharedInputQueue)
 {
     const UInt32 weaponClass = currentWeaponClass();
-    const bool classTapMode =
-        envEnabled("FNVXR_GAMEPLAY_WEAPON_CLASS_TRIGGER_ENABLE", true)
-        && weaponClassMeleeOrUnarmed(weaponClass);
-
-    if (!classTapMode)
+    // Retail owns tap/hold timing: melee and unarmed use a held attack for
+    // power attacks (and automatic melee weapons need a continuous hold).
+    // Synthesizing repeated taps here erased those native attack distinctions.
+    const bool changed = state.held != rightTriggerHeld;
+    state.held = rightTriggerHeld;
+    const bool applied = holdDirectInputKey(
+        MouseButtonOffset, rightTriggerHeld, delivery);
+    if (changed)
     {
-        state.lastTapMs = 0;
-        state.lastWeaponClass = weaponClass;
-        const bool changed = state.held != rightTriggerHeld;
-        state.held = rightTriggerHeld;
-        const bool applied = holdDirectInputKey(
-            MouseButtonOffset,
-            rightTriggerHeld,
-            delivery);
-        if (changed)
-        {
-            logTelemetry(
-                "primaryAttack hold frame=%llu source=%s held=%d applied=%d finalConsumer=%s class=%s formId=0x%08lx slot=%lu\n",
-                static_cast<unsigned long long>(frame),
-                source ? source : "unknown",
-                static_cast<int>(rightTriggerHeld),
-                static_cast<int>(applied),
-                delivery == fnvxr::physical_input::LocomotionDelivery::InProcessNvseDirectInput
-                    ? "nvse-directinput-hold"
-                    : "shared-input-queue",
-                weaponClassName(weaponClass),
-                static_cast<unsigned long>(g_lastKnownWeaponFormId),
-                static_cast<unsigned long>(g_lastKnownWeaponFavoriteSlot));
-        }
-        return changed && applied;
-    }
-
-    holdDirectInputKey(MouseButtonOffset, false);
-    const UInt64 nowMs = GetTickCount64();
-    const bool triggerPressed = rightTriggerHeld && !state.held;
-    const bool repeatDue =
-        rightTriggerHeld
-        && state.lastTapMs != 0
-        && nowMs >= state.lastTapMs + meleeTriggerRepeatMs();
-    const bool classChanged = state.lastWeaponClass != weaponClass;
-
-    if (triggerPressed || repeatDue || classChanged)
-    {
-        const bool tapped = rightTriggerHeld && tapDirectInputKey(MouseButtonOffset);
-        if (tapped)
-            state.lastTapMs = nowMs;
         logTelemetry(
-            "primaryAttack meleeTap frame=%llu source=%s held=%d pressed=%d repeat=%d class=%s formId=0x%08lx slot=%lu tapped=%d repeatMs=%llu\n",
+            "primaryAttack hold frame=%llu source=%s held=%d applied=%d finalConsumer=%s class=%s formId=0x%08lx slot=%lu\n",
             static_cast<unsigned long long>(frame),
             source ? source : "unknown",
             static_cast<int>(rightTriggerHeld),
-            static_cast<int>(triggerPressed),
-            static_cast<int>(repeatDue),
+            static_cast<int>(applied),
+            delivery == fnvxr::physical_input::LocomotionDelivery::InProcessNvseDirectInput
+                ? "nvse-directinput-hold"
+                : "shared-input-queue",
             weaponClassName(weaponClass),
             static_cast<unsigned long>(g_lastKnownWeaponFormId),
-            static_cast<unsigned long>(g_lastKnownWeaponFavoriteSlot),
-            static_cast<int>(tapped),
-            static_cast<unsigned long long>(meleeTriggerRepeatMs()));
+            static_cast<unsigned long>(g_lastKnownWeaponFavoriteSlot));
     }
+    return changed && applied;
+}
 
-    if (!rightTriggerHeld)
-        state.lastTapMs = 0;
-    state.held = rightTriggerHeld;
-    state.lastWeaponClass = weaponClass;
-    return triggerPressed || repeatDue || classChanged;
+bool currentWeaponRequiresMuzzle()
+{
+    const UInt32 kind = currentWeaponClass();
+    return !weaponClassMeleeOrUnarmed(kind) && kind != fnvxr::shared::PlayerWeaponClassThrown;
+}
+
+bool currentWeaponUsesPhysicalThrow()
+{
+    const auto weapon = reinterpret_cast<std::uintptr_t>(currentEquippedWeaponForm());
+    const auto type = weapon ? readUInt8(weapon + fnvxr::engine::abi::RetailWeaponTypeOffset) : 0u;
+    return type == 10u || type == 13u;
 }
 
 bool tapGrenadeKey(const char* source, UInt64 frame)
@@ -15323,7 +15516,7 @@ void consumeExternalXInputGameplayControls(
         && envEnabled("FNVXR_GAMEPLAY_COMBAT_CHORDS_ENABLE", true);
     const bool protectedCombatChordHeld =
         combatChordHeld
-        && externalLeftGripPipBoyHeld();
+        && externalLeftGripHeld();
     const bool vatsChordHeld =
         keyboardGameplayFallback
         && leftTriggerHeld
@@ -15380,13 +15573,59 @@ void consumeExternalXInputGameplayControls(
             frame)
         : false;
 
+    VrRigPoseSnapshot meleePose {};
+    constexpr UInt32 meleeTracking = fnvxr::shared::VrPoseTrackingHmd
+        | fnvxr::shared::VrPoseTrackingRightGripActive
+        | fnvxr::shared::VrPoseTrackingRightGripCurrent;
+    const bool meleeAllowed = currentWeaponClassMeleeOrUnarmed() && playerWeaponOut()
+        && g_nativeControlInputAllowed && readUInt32(0x011F2258u) == 0u
+        && readLatestRetailRigPose(meleePose)
+        && (meleePose.trackingFlags & meleeTracking) == meleeTracking;
+    fnvxr::melee::Motion motion {};
+    motion.allowed = meleeAllowed && !rightTriggerHeld && !leftTriggerHeld;
+    motion.epoch = meleePose.producerEpoch;
+    motion.space = meleePose.referenceSpaceGeneration;
+    motion.timeMs = static_cast<UInt64>(meleePose.predictedDisplayTime / 1000000);
+    void* const meleeWeapon = currentEquippedWeaponForm();
+    motion.weapon = meleeWeapon ? readUInt32(reinterpret_cast<std::uintptr_t>(meleeWeapon) + 0x0Cu) : 0u;
+    void* const meleePlayer = readPointer(PlayerCharacterAddress);
+    void* const meleeCell = meleePlayer ? readPointer(reinterpret_cast<std::uintptr_t>(meleePlayer) + 0x40u) : nullptr;
+    motion.cell = meleeCell ? readUInt32(reinterpret_cast<std::uintptr_t>(meleeCell) + 0x0Cu) : 0u;
+    const Vec3 motionPoint = addVec3(subtractVec3(meleePose.rightPos, meleePose.hmdPos),
+        scaleVec3(transformVec3(matrixFromQuat(meleePose.rightRot), {0.0f, 0.0f, -1.0f}), 0.16f));
+    motion.point = {motionPoint.x, motionPoint.y, motionPoint.z};
+    const auto gesture = g_meleeGesture.sample(motion);
+    const bool gestureHeld = g_meleeAttackHold.update(
+        meleeAllowed, rightTriggerHeld, gesture.strike, GetTickCount64());
+    bool attackHeld = rightTriggerHeld || gestureHeld;
+    if (currentWeaponUsesPhysicalThrow())
+    {
+        const bool allowed = g_nativeControlInputAllowed && playerWeaponOut() && readUInt32(0x011F2258u) == 0u;
+        if (!allowed) { g_throwArmed = false; g_throwReleaseAt = 0; g_throwHistory.reset(); }
+        if (allowed && rightTriggerHeld && !previousRightTriggerHeld) g_throwArmed = true;
+        bool released = allowed && g_throwArmed && !rightTriggerHeld && previousRightTriggerHeld;
+        if (released)
+        {
+            g_throwArmed = false;
+            g_throwRelease = g_throwHistory.release(GetTickCount64());
+            released = g_throwRelease.pose.valid;
+            g_throwReleaseAt = released ? GetTickCount64() : 0;
+        }
+        attackHeld = g_throwAttackHold.update(allowed, false,
+            released ? fnvxr::melee::Strike::Normal : fnvxr::melee::Strike::None, GetTickCount64());
+    }
+    else { g_throwArmed = false; g_throwReleaseAt = 0; g_throwAttackHold.reset(); }
+    if (gesture.strike != fnvxr::melee::Strike::None)
+        logTelemetry("meleeGesture frame=%llu weapon=0x%08lx strike=%s travelMeters=%.4f peakMetersPerSecond=%.4f consumer=native-attack-control\n",
+            static_cast<unsigned long long>(frame), static_cast<unsigned long>(motion.weapon),
+            gesture.strike == fnvxr::melee::Strike::Power ? "power" : "normal", gesture.travel, gesture.peakSpeed);
     const bool primaryAttackStep = physicalLocomotionRoute
         ? drivePhysicalGameplayPrimaryAttack(
-            rightTriggerHeld,
+            attackHeld,
             previousRightTriggerHeld,
             frame)
         : driveGameplayPrimaryAttack(
-            rightTriggerHeld,
+            attackHeld,
             primaryAttackState,
             frame,
             "externalXInput:RT");
@@ -15692,6 +15931,13 @@ void consumeExternalXInputBridge(
                 static_cast<int>(installed));
         }
         static bool audioAttempted = false;
+        static bool meleeAttempted = false;
+        if (!meleeAttempted)
+        {
+            meleeAttempted = true;
+            const bool installed = fnvxr::retail_1_4_0_525::melee::install(selectTrackedNativeMeleeTarget);
+            logTelemetry("nativeTrackedMelee installed=%d contact=native-havok attackRules=native\n", installed ? 1 : 0);
+        }
         if (!audioAttempted)
         {
             audioAttempted = true;
@@ -18446,6 +18692,78 @@ void processHeadlessStereoRigVisualTrialMainLoop(
     if (envEnabled("FNVXR_HEADSET_COMBAT_VISUAL_TRIAL", false)
         || envEnabled("FNVXR_HEADSET_INVENTORY_VISUAL_TRIAL", false))
     {
+        // Explicit simulator weapon coverage in our disposable fixture. The
+        // mailbox accepts only a loaded WEAP ID and a bounded item count;
+        // gameplay, quests, actor health and positions remain native.
+        if (envEnabled("FNVXR_WEAPON_TEST_LOADOUT", false)
+            && observation.phase == RuntimePhase::Gameplay
+            && (observation.menuBits & fnvxr::shared::RuntimeBlockingMenuBits) == 0u)
+        {
+            SharedCommandState request {};
+            if (readSharedCommandSnapshot(request) && request.requestId
+                && request.requestId != g_lastCommandRequestId
+                && request.status == fnvxr::shared::CommandStatusPending
+                && request.command == fnvxr::shared::CommandTypeConsole)
+            {
+                unsigned long id = 0; unsigned count = 0; char extra = 0, canonical[64] {};
+                const bool parsed = std::memchr(request.saveName, '\0', sizeof(request.saveName))
+                    && sscanf_s(request.saveName, "weapon-test %8lx %u %c", &id, &count, &extra, 1u) == 2;
+                std::snprintf(canonical, sizeof(canonical), "weapon-test %08lX %u", id, count);
+                if (parsed && std::strcmp(canonical, request.saveName) == 0 && count <= 12)
+                {
+                    void* form = nullptr;
+                    const auto table = reinterpret_cast<std::uintptr_t>(readPointer(0x011C54C0u));
+                    const UInt32 buckets = table ? readUInt32(table + 4) : 0;
+                    if (buckets && buckets < 1000000)
+                    {
+                        const auto array = reinterpret_cast<std::uintptr_t>(readPointer(table + 8));
+                        auto entry = reinterpret_cast<std::uintptr_t>(readPointer(array + (id % buckets) * 4));
+                        for (unsigned i = 0; entry && i < 2000; ++i)
+                        {
+                            if (readUInt32(entry + 4) == id) { form = readPointer(entry + 8); break; }
+                            entry = reinterpret_cast<std::uintptr_t>(readPointer(entry));
+                        }
+                    }
+                    const bool weapon = form && readUInt8(reinterpret_cast<std::uintptr_t>(form) + 4) == 0x28;
+                    if (publishSharedCommandStatus(request.requestId, fnvxr::shared::CommandStatusRunning,
+                            observation.frame, 0, canonical))
+                    {
+                        bool ok = false;
+                        if (weapon)
+                        {
+                            char line[64] {};
+                            // Replace this test weapon's inventory stack. Repeated
+                            // runs must not accumulate weight and thereby disable
+                            // retail power attacks or running. Zero removes it.
+                            std::snprintf(line, sizeof(line), "player.removeitem %08lX 9999", id);
+                            ok = runPluginConsoleCommand("weapon-coverage", line);
+                            if (count)
+                            {
+                            std::snprintf(line, sizeof(line), "player.additem %08lX %u", id, count);
+                            ok = runPluginConsoleCommand("weapon-coverage", line) && ok;
+                            const auto ammo = reinterpret_cast<std::uintptr_t>(readPointer(reinterpret_cast<std::uintptr_t>(form) + 0xA8u));
+                            if (ammo && readUInt8(ammo + 4) == 0x29)
+                            {
+                                std::snprintf(line, sizeof(line), "player.additem %08lX 80", static_cast<unsigned long>(readUInt32(ammo + 0x0Cu)));
+                                ok = runPluginConsoleCommand("weapon-coverage", line) && ok;
+                            }
+                            // JIP's inventory-aware equip passes the full stack
+                            // for thrown weapons, as the Pip-Boy does. Vanilla
+                            // console EquipItem equips just one grenade.
+                            std::snprintf(line, sizeof(line), "player.EquipItemAlt %08lX", id);
+                            ok = runPluginConsoleCommand("weapon-coverage", line) && ok;
+                            }
+                            g_retailRigRediscoveryRequested = true;
+                            g_retailWeaponRefreshRequested = true;
+                        }
+                        g_lastCommandRequestId = request.requestId;
+                        publishSharedCommandStatus(request.requestId, ok ? fnvxr::shared::CommandStatusSucceeded
+                            : fnvxr::shared::CommandStatusFailed, observation.frame, ok ? 0u : 1u, canonical);
+                        logTelemetry("weaponCoverage equip form=0x%08lx count=%u nativeAccepted=%d\n", id, count, ok ? 1 : 0);
+                    }
+                }
+            }
+        }
         syncExternalDInputPointer(observation);
         consumeExternalDInputBridge(observation);
         consumeExternalXInputBridge(observation);

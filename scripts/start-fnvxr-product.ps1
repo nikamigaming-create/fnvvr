@@ -104,6 +104,9 @@ param(
     # Leaves the isolated simulator controller stream manual for authentic
     # Pip-Boy navigation and inventory equip proof.
     [switch]$HeadsetInventoryVisualTrial,
+    # Enables native add/equip of loaded weapon forms in a disposable simulator
+    # fixture, for broad weapon coverage. Never enabled by the play launcher.
+    [switch]$RetailWeaponCoverage,
     # Diagnostic-only selection of authenticated first-person roots:
     # weapon=1, upper-body=2, left-hand=4, right-hand=8, Pip-Boy=16.
     [ValidateRange(0, 31)][int]$FirstPersonRootMask = 31,
@@ -233,6 +236,9 @@ if ($HeadsetCombatVisualTrial -and -not $HeadsetControllerRigVisualTrial) {
 }
 if ($HeadsetInventoryVisualTrial -and -not $HeadsetControllerRigVisualTrial) {
     throw "-HeadsetInventoryVisualTrial requires -HeadsetControllerRigVisualTrial."
+}
+if ($RetailWeaponCoverage -and -not $HeadsetInventoryVisualTrial) {
+    throw "-RetailWeaponCoverage requires the headless inventory fixture."
 }
 if ($HeadsetInventoryVisualTrial -and $HeadsetCombatVisualTrial) {
     throw "-HeadsetInventoryVisualTrial and -HeadsetCombatVisualTrial are mutually exclusive."
@@ -963,6 +969,7 @@ if ($ValidateOnly) {
             -StockFirstPersonBaseline:$StockFirstPersonBaseline `
             -HeadsetControllerRigVisualTrial:$HeadsetControllerRigVisualTrial `
             -HeadsetInventoryVisualTrial:$HeadsetInventoryVisualTrial `
+            -RetailWeaponCoverage:$RetailWeaponCoverage `
             -HeadsetCombatVisualTrial:$HeadsetCombatVisualTrial `
             -PhysicalHeadsetPlay:$PhysicalHeadsetPlay `
             -PhysicalGameWidth $PhysicalGameWidth `
@@ -3163,6 +3170,7 @@ try {
         -StockFirstPersonBaseline:$StockFirstPersonBaseline `
         -HeadsetControllerRigVisualTrial:$HeadsetControllerRigVisualTrial `
         -HeadsetInventoryVisualTrial:$HeadsetInventoryVisualTrial `
+        -RetailWeaponCoverage:$RetailWeaponCoverage `
         -HeadsetCombatVisualTrial:$HeadsetCombatVisualTrial `
         -PhysicalHeadsetPlay:$PhysicalHeadsetPlay `
         -PhysicalGameWidth $PhysicalGameWidth `

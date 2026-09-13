@@ -1,5 +1,6 @@
 #include "fnvxr_weapon_frame_contract.h"
 #include "fnvxr_tracked_shot.h"
+#include "fnvxr_throw_motion.h"
 #include "../protocol/fnvxr_shared_state.h"
 
 #include <cstdint>
@@ -15,6 +16,40 @@ int fail()
 
 int main()
 {
+    for (const unsigned step : {11u, 22u})
+    {
+        for (const float speed : {0.4f, 4.0f})
+        {
+            fnvxr::throw_motion::History history;
+            fnvxr::tracked_shot::Pose p {};
+            p.valid = true; p.actor = 1; p.weapon = 2; p.cell = 3; p.epoch = 4; p.referenceSpace = 1;
+            unsigned end = 0;
+            for (unsigned t = 0; t <= 220; t += step)
+            {
+                end = t; p.position[0] = -66000; p.position[1] = -10000 + speed * 70 * t / 1000;
+                p.position[2] = 7500 + speed * 35 * t / 1000;
+                p.sampledAtMs = 1000 + t;
+                history.sample(p, 1000 + t);
+                history.sample(p, 1000 + t); // duplicate render of one pose
+            }
+            auto release = history.release(1000 + end);
+            if (!release.pose.valid || std::fabs(release.velocity[0]) > .01f
+                || std::fabs(release.velocity[1] - speed * 70) > .1f
+                || std::fabs(release.velocity[2] - speed * 35) > .1f
+                || history.release(1200 + end).pose.valid) return fail();
+            p.referenceSpace++; p.sampledAtMs += step;
+            history.sample(p, 1000 + end + step);
+            if (history.release(p.sampledAtMs).pose.valid) return fail();
+            p.position[0] += 700; p.sampledAtMs += step;
+            history.sample(p, 1000 + end + step * 2);
+            if (history.release(p.sampledAtMs).pose.valid) return fail();
+        }
+    }
+    if (!fnvxr::weapon_frame::weaponBindingReady(true, true, false, 42, 42, false)
+        || fnvxr::weapon_frame::weaponBindingReady(true, true, false, 42, 43, false)
+        || fnvxr::weapon_frame::weaponBindingReady(true, false, false, 42, 42, false)
+        || fnvxr::weapon_frame::weaponBindingReady(true, true, false, 42, 42))
+        return fail();
     // The native shot uses +Y forward and positive-down pitch. Exercise
     // compass directions and tilted aim independently of the player camera.
     constexpr float halfPi = 1.57079632679f;

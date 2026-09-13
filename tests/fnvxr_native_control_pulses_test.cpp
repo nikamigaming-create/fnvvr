@@ -1,5 +1,6 @@
 #include "fnvxr_native_control_pulses.h"
 #include "fnvxr_native_movie_input.h"
+#include "fnvxr_melee_gesture.h"
 #include <iostream>
 
 int main()
@@ -9,6 +10,44 @@ int main()
     const auto expect = [&](bool value, const char* name) {
         if (!value) { std::cerr << name << '\n'; ++failures; }
     };
+    using fnvxr::melee::Strike;
+    fnvxr::melee::Gesture gesture;
+    fnvxr::melee::Motion motion{true, 1, 1000, 1, 42, 10, {0, 0, 0}};
+    auto sample = [&](float x, unsigned dt = 20) {
+        motion.timeMs += dt; motion.point[0] = x;
+        return gesture.sample(motion).strike;
+    };
+    gesture.sample(motion);
+    for (int i = 0; i < 12; ++i) expect(sample(0) == Strike::None, "Rest arms without attacking");
+    for (int i = 1; i <= 10; ++i)
+        expect(sample(static_cast<float>(i) * .015f) == Strike::None, "A short stroke waits for its end");
+    int normal = 0;
+    for (int i = 0; i < 25; ++i) normal += sample(.15f) == Strike::Normal;
+    expect(normal == 1, "One short deliberate stroke gives one normal strike");
+    gesture.reset(); motion.timeMs += 200; motion.point = {}; gesture.sample(motion);
+    for (int i = 0; i < 12; ++i) sample(0);
+    int power = 0;
+    for (int i = 1; i <= 15; ++i) power += sample(static_cast<float>(i) * .04f) == Strike::Power;
+    expect(power == 1, "A large fast stroke gives one power attack");
+    for (int i = 0; i < 5; ++i) expect(sample(.6f) == Strike::None, "Follow-through cannot attack again");
+    motion.space++; expect(sample(2) == Strike::None, "Recenter cancels rather than attacking");
+    for (int i = 0; i < 12; ++i) sample(2);
+    expect(sample(5) == Strike::None, "Tracking teleport cannot trigger a swing");
+    motion.weapon++; expect(sample(5.1f) == Strike::None, "An equip change cancels motion");
+    motion.allowed = false; expect(sample(5.2f) == Strike::None, "Menus and lost tracking cannot attack");
+    fnvxr::melee::AttackHold attack;
+    expect(attack.update(true, false, Strike::Normal, 1000), "Short swing presses retail attack");
+    expect(!attack.update(true, false, Strike::None, 1080), "Short swing releases retail attack");
+    expect(attack.update(true, false, Strike::Power, 1100), "Large swing starts native held attack");
+    for (unsigned ms = 1120; ms < 1750; ms += 20)
+        expect(attack.update(true, false, Strike::None, ms), "Power attack remains continuously held");
+    expect(!attack.update(true, false, Strike::None, 1750), "Power attack releases once");
+    attack.update(true, false, Strike::Power, 1800);
+    expect(!attack.update(false, false, Strike::None, 1820), "Menu cancels a pending power attack");
+    expect(!attack.update(true, false, Strike::None, 1840), "Cancelled attack cannot resume");
+    attack.update(true, false, Strike::Power, 1900);
+    attack.update(true, true, Strike::None, 1920);
+    expect(!attack.update(true, false, Strike::None, 1940), "Manual input cancels the motion hold");
     fnvxr::input::NativeMovieSkipInput movie;
     expect(!movie.sample(1000, true, true), "Opening confirm cannot skip a movie");
     expect(!movie.sample(1010, true, false), "Release arms native movie input");

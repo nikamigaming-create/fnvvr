@@ -2,6 +2,44 @@
 
 Last updated: 2026-09-13
 
+## Physical melee and thrown releases
+
+Tracked small and large swings now feed the same native attack control as
+trigger tap/hold. The retail simulator has observed a normal Power Fist hit
+event after a small swing and power hit events after both a large swing and
+a held trigger. The test save initially contained 57 Power Fists, making the
+player overencumbered; retail correctly refused power attacks until that
+inventory stack was reduced. The simulator-only weapon setup replaces each
+requested weapon stack and uses inventory-aware equip for grenade stacks.
+The normal physical-headset launcher does not enable that setup mailbox.
+
+Grenade release uses a recent history of committed tracked weapon positions.
+Measured release position, direction and velocity reach the native projectile
+and Havok initialization, preserving native gravity, collision, fuse and
+damage. A gentle and a harder frag-grenade release applied approximately
+0.6 m/s and 2.7 m/s respectively in the live simulator. Native flight positions
+and the gentle throw's explosion were observed. This does not yet establish
+every grenade variant or throwing-knife/spear physics.
+
+Both eyes of the 12-second melee and 14-second grenade recordings were
+reviewed across their full timelines, with no fully black frames. The grenade
+recording exposed the console fixture equipping only one grenade despite a
+larger inventory stack; the fixture now uses JIP's stack-aware EquipItemAlt.
+Actual hostile melee damage, continuous melee weapons, complete weapon/mod/DLC
+coverage, and physical-headset acceptance remain unverified. The owned-data
+weapon catalog is an inventory of records, not a pass list.
+
+The narrow D3D9 VR path now releases its eye/UI resources before a native
+device reset and gives a recreated bridge a new resource generation. This
+addresses the observed missing-reset-handler path; recovery after a live
+device loss still needs verification.
+The subsequent save/menu run reproduced a failed Reset followed by retail's
+unbounded default-render-target fallback. A build-specific virtual-slot guard
+now permits the initial bind and one default fallback, then returns native
+failure instead of recursively exhausting the stack. A failed Reset remains
+an unresolved recovery condition; this guard must not be represented as proof
+of complete device-loss recovery.
+
 ## Tracked firing and dialogue follow-up
 
 The Sunny bottle exercise exposed a gameplay fault: the visible weapon muzzle

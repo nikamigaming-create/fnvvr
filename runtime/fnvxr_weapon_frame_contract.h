@@ -144,11 +144,12 @@ constexpr bool weaponBindingReady(
     bool modelNodePresent,
     bool endpointInCurrentModel,
     std::uint32_t equippedFormId,
-    std::uint32_t modelFormId) noexcept
+    std::uint32_t modelFormId,
+    bool requiresProjectileEndpoint = true) noexcept
 {
     return weaponNodePresent
         && modelNodePresent
-        && endpointInCurrentModel
+        && (!requiresProjectileEndpoint || endpointInCurrentModel)
         && (equippedFormId == 0u
             || modelFormId == 0u
             || equippedFormId == modelFormId);

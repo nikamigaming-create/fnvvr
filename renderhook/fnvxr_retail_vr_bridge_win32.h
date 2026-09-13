@@ -471,9 +471,10 @@ public:
         // then makes the one authoritative UI-versus-world route decision.
         // Both routes remain fail-closed until stable publications exist.
         static_cast<void>(mTrackedFrames.initialize());
-        mResourceSetId = metadata.generation;
-        if (mResourceSetId == 0u)
-            mResourceSetId = 1u;
+        // A native device reset creates a new bridge in the same process.
+        // Its resources must not reuse the previous bridge's descriptor ID.
+        static std::uint64_t resourceLifetime = 0;
+        mResourceSetId = (++resourceLifetime << 32) | (metadata.generation & 0xffffffffu);
         mCpuPublication = mOperations.publicationTransport
             == RetailVrPublicationTransport::CpuReadback;
         if (!mCpuPublication && !mPublisher.initialize())

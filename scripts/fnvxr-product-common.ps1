@@ -2245,6 +2245,7 @@ function Get-FnvxrProductMinimalEnvironment {
         [switch]$StockFirstPersonBaseline,
         [switch]$HeadsetControllerRigVisualTrial,
         [switch]$HeadsetInventoryVisualTrial,
+        [switch]$RetailWeaponCoverage,
         [switch]$HeadsetCombatVisualTrial,
         [switch]$PhysicalHeadsetPlay,
         [ValidateRange(1280, 4096)][int]$PhysicalGameWidth = 1872,
@@ -2330,6 +2331,9 @@ function Get-FnvxrProductMinimalEnvironment {
     }
     if ($HeadsetInventoryVisualTrial -and -not $HeadsetControllerRigVisualTrial) {
         throw "The headless inventory visual trial requires the controller visual-rig trial."
+    }
+    if ($RetailWeaponCoverage -and -not $HeadsetInventoryVisualTrial) {
+        throw "Weapon coverage requires the headless inventory fixture."
     }
     if ($HeadsetInventoryVisualTrial -and $HeadsetCombatVisualTrial) {
         throw "The headless inventory and automated combat visual trials are mutually exclusive."
@@ -2835,6 +2839,9 @@ function Get-FnvxrProductMinimalEnvironment {
                 # This lease leaves the per-run simulator stream manual so an
                 # authentic Pip-Boy inventory selection can be observed.
                 $environment.FNVXR_HEADSET_INVENTORY_VISUAL_TRIAL = "1"
+                if ($RetailWeaponCoverage) {
+                    $environment.FNVXR_WEAPON_TEST_LOADOUT = "1"
+                }
                 # Interactive video needs RGB frames; retain PNG alpha only
                 # for the separate fixed-pose image analysis workflow.
                 $environment.FNVXR_HMD_MIRROR_CAPTURE_JPEG = "1"
