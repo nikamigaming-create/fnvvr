@@ -61,6 +61,21 @@ int main()
         "Extended arrow keys remain valid but invalid scancodes are rejected");
     menuKeys.authorize(false); menuKeys.authorize(true);
     expect(!menuKeys.sample(0x12, 1, 3001), "Changing the top menu discards pending confirmation");
+    fnvxr::input::DeferredMenuBack back;
+    expect(back.queue(0x1000, 4000) && !back.consume(0x1000, false, 4100)
+        && !back.consume(0x1000, false, 4500) && back.consume(0x1000, true, 4600)
+        && !back.consume(0x1000, true, 4601),
+        "One Back press survives target zoom and is consumed once when native input is ready");
+    back.queue(0x1000, 5000);
+    expect(!back.consume(0x2000, true, 5010) && !back.consume(0x1000, true, 5011),
+        "A pending Back cannot dismiss another menu or a later reuse of the old address");
+    back.queue(0x1000, 6000);
+    expect(!back.consume(0x1000, true, 8001), "A stalled transition expires Back");
+    back.queue(0x1000, 9000);
+    expect(!back.consume(0x1000, true, 8999), "Clock reversal cannot replay Back");
+    back.queue(0x1000, 10000); back.reset();
+    expect(!back.consume(0x1000, true, 10001) && !back.queue(0, 10002),
+        "Disconnect and absent menu discard deferred input");
     fnvxr::input::GripChordLatch grip;
     expect(!grip.standalone(true, true) && !grip.standalone(true, false),
         "Releasing the VATS trigger before its grip cannot open Pause");

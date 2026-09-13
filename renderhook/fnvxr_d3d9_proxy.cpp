@@ -8975,6 +8975,25 @@ LONG CALLBACK observeRetailVrAccessViolation(
         stack[14],
         stack[15]);
     logRetailVrLine(message);
+    // A heap fault often surfaces in an allocator long after the bad write.
+    // Keep a bounded frame chain and its arguments in the existing local log;
+    // no dumps, debugger attachment, heap allocation, or extra capture files.
+    std::uintptr_t framePointer = context.Ebp;
+    for (unsigned depth = 0; depth < 24u; ++depth)
+    {
+        if (framePointer < context.Esp
+            || framePointer - context.Esp > 1024u * 1024u
+            || !retailVrReadableRange(framePointer, 24u)) break;
+        std::uint32_t frame[6] {};
+        std::memcpy(frame, reinterpret_cast<const void*>(framePointer), sizeof(frame));
+        sprintf_s(message,
+            "retail VR exception frame depth=%u ebp=0x%08llX return=0x%08X args=[0x%08X,0x%08X,0x%08X,0x%08X]",
+            depth, static_cast<unsigned long long>(framePointer),
+            frame[1], frame[2], frame[3], frame[4], frame[5]);
+        logRetailVrLine(message);
+        if (frame[0] <= framePointer) break;
+        framePointer = frame[0];
+    }
 #else
     char message[384] {};
     sprintf_s(

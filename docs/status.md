@@ -1,6 +1,6 @@
 # FNVVR Retail Status
 
-Last updated: 2026-09-12
+Last updated: 2026-09-13
 
 ## Current implementation
 
@@ -21,6 +21,12 @@ repair/mod menus, quantity/wait controls, VATS picking and special-action
 bindings, and native lockpick movement/tension are implemented. Coverage is
 not yet complete across all of these interactions.
 
+VATS target arrows, confirmation, cancellation and special-action buttons now
+use the native polled input path. A controller Back pressed during target
+zoom waits for the native transition and is consumed once; changing menus or
+disconnecting clears it. Animation lookup now uses the verified first-person
+argument and checks the current animation owner and scene-graph membership.
+
 Physical play no longer has the previous default 40-second supervisor limit
 or 60,000-frame host limit. Explicit bounded diagnostic runs still expire.
 
@@ -34,8 +40,12 @@ or 60,000-frame host limit. Explicit bounded diagnostic runs still expire.
   three-shot execution were exercised. The latest three-shot replay retained
   first-person stereo while the simulated headset moved, with no missing
   projection submissions in the selected 32-second interval.
-- The Win32 and x64 focused build checks passed 52 test executions, including
-  the regression that a moving cinematic camera cannot move the rig's eyes.
+- A subsequent run completed 36 consecutive VATS open/change-target/Back
+  cycles. Back was pressed before native target zoom finished in all 36;
+  every cycle returned to gameplay without another press. Both-eye samples
+  retained the first-person arms, weapon and world.
+- The Win32 and x64 focused build checks passed 54 test executions, including
+  native animation-call stack balance and deferred-input ownership checks.
 
 These runs use the actual retail game with simulated OpenXR tracking. They
 do not establish physical-headset comfort, working hardware haptics, full
@@ -50,8 +60,11 @@ has measured roughly 37–44 stereo pairs/second in recent captures; the
   terminals/lockpicking, dialogue/doors, VATS limbs/specials and transitions.
   Lockpick and special-action bindings need live confirmation.
 - Physical-headset/controller/haptics sessions and sustained performance work.
-- An earlier VATS-exit animation heap corruption remains undiagnosed; later
-  successful runs are not enough to declare it fixed.
+- Earlier VATS-exit heap corruption was reproduced after the animation ABI
+  fix. It did not recur in the 36-cycle run using native polled transitions;
+  the corrupting writer has not been independently identified.
+- Holstering changes the native weapon state but still draws the gun in the
+  private eye collector. That presentation mismatch remains open.
 - OpenMW and Godot adapter types compile against the local engine types;
   those games are not yet integrated with the shared library.
 

@@ -689,6 +689,7 @@ UInt64 g_lastUserPauseRequestMs = 0;
 fnvxr::input::NativeControlPulses g_nativeControlPulses;
 fnvxr::input::NativeMenuKeyPulses g_nativeMenuKeyPulses;
 fnvxr::input::NativeInputPulses<8> g_nativeMenuMousePulses;
+fnvxr::input::DeferredMenuBack g_deferredVatsBack;
 fnvxr::input::NativeControlPulses g_nativeMenuControlPulses;
 fnvxr::input::NativeMenuAnalogMotion g_nativeLockPickMotion;
 std::int32_t g_nativeMenuMouseDelta = 0;
@@ -11088,11 +11089,37 @@ bool updateDirectMenuPointerHover()
     return true;
 }
 
+bool dispatchNativeMenuInputKey(UInt32 keycode);
+bool dispatchNativeMenuMouseButton(UInt32 button);
+
 bool dispatchMenuClick(void* menu, void* tile, UInt32 buttonId, const char* source)
 {
     if (!menu || !tile || !getTileValue(tile, TileValueId))
         return false;
 
+    // VATS updates its target and animation collections while processing these
+    // native edges. Let its normal Update consume them instead of running that
+    // transition inside an external MainGameLoop callback. Owned 1.4.0.525:
+    // 7ED296 polls RMB; 7EEAA0/7EEAF0 poll A/D before invoking authored arrows.
+    if (readUInt32(reinterpret_cast<std::uintptr_t>(menu) + 0x20) == kMenuTypeVats)
+    {
+        bool queued = false;
+        switch (buttonId)
+        {
+            case 2u: queued = dispatchNativeMenuInputKey(DIK_A); break;
+            case 3u: queued = dispatchNativeMenuInputKey(DIK_D); break;
+            case 4u: queued = dispatchNativeMenuInputKey(DIK_E); break;
+            case 5u: queued = dispatchNativeMenuMouseButton(1u); break;
+            case 30u: queued = dispatchNativeMenuInputKey(DIK_R); break;
+            case 31u: queued = dispatchNativeMenuInputKey(DIK_F); break;
+            default: goto nativeClick;
+        }
+        if (queued)
+            fnvxr::shared::publishHapticFeedback(fnvxr::shared::HapticChannel::MenuClick, 0.0f, 0.16f, 70u);
+        return queued;
+    }
+
+nativeClick:
     __try
     {
         selectNativeMenuListRow(menu, tile);
@@ -11648,9 +11675,21 @@ UInt32 __fastcall hookedNativeMenuMouseState(void* input, void*, UInt32 button, 
     using ReadMouseFn = UInt32 (__thiscall*)(void*, UInt32, UInt32);
     const UInt32 native = reinterpret_cast<ReadMouseFn>(g_nativeMenuMouseTrampoline)(input, button, state);
     if (GetCurrentThreadId() != g_nativeMenuKeyThreadId || !g_nativeMenuInputAllowed
-        || !g_nativeMenuMousePulses.sample(button, state, GetTickCount64())
         || visibleMenuForInput() != g_nativeMenuKeyOwner)
         return native;
+    const UInt64 nowMs = GetTickCount64();
+    if (button == 1u && state == 1u
+        && reinterpret_cast<std::uintptr_t>(_ReturnAddress()) == 0x007ED29B)
+    {
+        const auto menu = reinterpret_cast<std::uintptr_t>(g_nativeMenuKeyOwner);
+        // Native VATS::Update itself requires targeting mode and fullyZoomedIn
+        // before accepting RMB. The view stays first person while that internal
+        // transition finishes. Do not lose a controller Back pressed meanwhile.
+        const bool ready = readUInt32(0x011F2258) == 2u && readUInt8(menu + 0xF8) != 0;
+        if (g_deferredVatsBack.consume(menu, ready, nowMs))
+            g_nativeMenuMousePulses.publish(1u, nowMs);
+    }
+    if (!g_nativeMenuMousePulses.sample(button, state, nowMs)) return native;
     if (state == 1u)
         logTelemetry("nativeMenu mouseObserved menu=%p button=%lu frame=%llu\n",
             g_nativeMenuKeyOwner, button, g_runtimeObservationFrame);
@@ -11693,8 +11732,12 @@ bool dispatchNativeMenuMouseButton(UInt32 button)
         }
         __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
     }
+    const bool vatsBack = button == 1u
+        && readUInt32(reinterpret_cast<std::uintptr_t>(g_nativeMenuKeyOwner) + 0x20) == kMenuTypeVats;
     const bool queued = GetCurrentThreadId() == g_nativeMenuKeyThreadId
-        && g_nativeMenuMousePulses.publish(button, GetTickCount64());
+        && (vatsBack ? g_deferredVatsBack.queue(
+                reinterpret_cast<std::uintptr_t>(g_nativeMenuKeyOwner), GetTickCount64())
+            : g_nativeMenuMousePulses.publish(button, GetTickCount64()));
     logTelemetry("nativeMenu mouseRequested menu=%p button=%lu queued=%d\n",
         g_nativeMenuKeyOwner, button, static_cast<int>(queued));
     return queued;
@@ -15574,6 +15617,7 @@ void consumeExternalXInputBridge(
     void* inputMenu = uiInputAllowed ? visibleMenuForInput() : nullptr;
     if (inputMenu != g_nativeMenuKeyOwner)
     {
+        g_deferredVatsBack.reset();
         g_nativeMenuKeyPulses.authorize(false);
         g_nativeMenuMousePulses.authorize(false);
         g_nativeMenuControlPulses.authorize(false);
@@ -15581,6 +15625,7 @@ void consumeExternalXInputBridge(
     }
     g_nativeMenuKeyOwner = inputMenu;
     g_nativeMenuInputAllowed = inputMenu && state.connected != 0u;
+    if (!g_nativeMenuInputAllowed) g_deferredVatsBack.reset();
     g_nativeMenuKeyPulses.authorize(g_nativeMenuInputAllowed);
     g_nativeMenuMousePulses.authorize(g_nativeMenuInputAllowed);
     const bool lockPickActive = g_nativeMenuInputAllowed

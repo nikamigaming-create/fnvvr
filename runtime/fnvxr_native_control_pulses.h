@@ -67,6 +67,32 @@ private:
 using NativeControlPulses = NativeInputPulses<28>;
 using NativeMenuKeyPulses = NativeInputPulses<256>;
 
+// Some native menus ignore Back during their own transition. Retain one edge
+// for that same menu, then consume it once at the native input reader.
+class DeferredMenuBack
+{
+public:
+    bool queue(std::uintptr_t owner, std::uint64_t nowMs) noexcept
+    {
+        if (!owner) return false;
+        owner_ = owner; timeMs_ = nowMs;
+        return true;
+    }
+    void reset() noexcept { owner_ = 0; }
+    bool consume(std::uintptr_t owner, bool ready, std::uint64_t nowMs) noexcept
+    {
+        if (!owner_ || owner != owner_ || nowMs < timeMs_
+            || nowMs - timeMs_ > 2000u)
+        { reset(); return false; }
+        if (!ready) return false;
+        reset();
+        return true;
+    }
+private:
+    std::uintptr_t owner_ {};
+    std::uint64_t timeMs_ {};
+};
+
 // Convert a held VR stick to relative native-menu motion without making
 // minigame speed depend on the engine's render rate.
 class NativeMenuAnalogMotion
